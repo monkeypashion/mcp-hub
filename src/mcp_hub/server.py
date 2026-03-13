@@ -78,11 +78,13 @@ def init_db(db_path: Path = DB_PATH) -> None:
 # Server
 # ---------------------------------------------------------------------------
 
-def create_server(db_path: Path = DB_PATH) -> FastMCP:
+def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 8080) -> FastMCP:
     """Create the MCP Hub server."""
     init_db(db_path)
     mcp = FastMCP(
         name="mcp-hub",
+        host=host,
+        port=port,
         instructions=(
             "MCP Hub — inter-agent messaging. Use register() first to announce yourself, "
             "then send/broadcast messages and poll with get_messages(). "
@@ -436,14 +438,8 @@ def main():
     global DB_PATH
     DB_PATH = Path(args.db)
 
-    server = create_server(DB_PATH)
-
-    if args.transport == "stdio":
-        server.run(transport="stdio")
-    elif args.transport == "sse":
-        server.run(transport="sse", host=args.host, port=args.port)
-    elif args.transport == "streamable-http":
-        server.run(transport="streamable-http", host=args.host, port=args.port)
+    server = create_server(DB_PATH, host=args.host, port=args.port)
+    server.run(transport=args.transport)
 
 
 if __name__ == "__main__":
