@@ -286,7 +286,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         ).fetchall()
 
         if not rows:
-            return "No new messages."
+            return ""
 
         # Mark as read
         ids = [r["id"] for r in rows]
@@ -319,7 +319,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         ).fetchall()
 
         if not rows:
-            return f"No recent messages in #{channel}."
+            return ""
 
         lines = []
         for r in rows:
