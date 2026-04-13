@@ -44,6 +44,7 @@ def init_db(db_path: Path = DB_PATH) -> None:
         CREATE TABLE IF NOT EXISTS agents (
             name        TEXT PRIMARY KEY,
             project     TEXT NOT NULL DEFAULT '',
+            bio         TEXT NOT NULL DEFAULT '',
             status      TEXT NOT NULL DEFAULT 'online',
             registered  REAL NOT NULL,
             last_seen   REAL NOT NULL,
@@ -73,6 +74,25 @@ def init_db(db_path: Path = DB_PATH) -> None:
     """)
     conn.commit()
 
+    # Migrate: add bio column for existing databases
+    try:
+        conn.execute("ALTER TABLE agents ADD COLUMN bio TEXT NOT NULL DEFAULT ''")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    # Migrate: deduplicate agents per project — keep the most recently seen
+    conn.execute("""
+        DELETE FROM agents WHERE rowid NOT IN (
+            SELECT rowid FROM (
+                SELECT rowid, ROW_NUMBER() OVER (
+                    PARTITION BY project ORDER BY last_seen DESC
+                ) AS rn FROM agents WHERE project != ''
+            ) WHERE rn = 1
+        ) AND project != ''
+    """)
+    conn.commit()
+
 
 # ---------------------------------------------------------------------------
 # Server
@@ -95,7 +115,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     # -- Presence --
 
     @mcp.tool()
-    def register(name: str, project: str = "", meta: str = "{}") -> str:
+    def register(name: str, project: str = "", bio: str = "", meta: str = "{}") -> str:
         """Register this agent session with the hub.
 
         Call this when your session starts. Sets you as 'online'.
@@ -103,19 +123,32 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         Args:
             name: Your agent name (e.g. 'dreamteam-lead', 'reliable-ai-dev').
             project: Project you're working on (e.g. 'dreamteam', 'mcp-hub').
+            bio: Short description of your role/skills so other agents know what you do.
             meta: Optional JSON metadata about this agent.
         """
         now = time.time()
         conn = _get_db(db_path)
+
+        # If project is set, check for an existing agent on this project (avoid duplicates)
+        if project:
+            existing = conn.execute(
+                "SELECT name FROM agents WHERE project = ? AND name != ? AND status = 'online'",
+                (project, name),
+            ).fetchone()
+            if existing:
+                # Reuse the existing name — update it instead
+                name = existing["name"]
+
         conn.execute(
-            """INSERT INTO agents (name, project, status, registered, last_seen, meta)
-               VALUES (?, ?, 'online', ?, ?, ?)
+            """INSERT INTO agents (name, project, bio, status, registered, last_seen, meta)
+               VALUES (?, ?, ?, 'online', ?, ?, ?)
                ON CONFLICT(name) DO UPDATE SET
                    project=excluded.project,
+                   bio=CASE WHEN excluded.bio = '' THEN agents.bio ELSE excluded.bio END,
                    status='online',
                    last_seen=excluded.last_seen,
                    meta=excluded.meta""",
-            (name, project, now, now, meta),
+            (name, project, bio, now, now, meta),
         )
         conn.commit()
 
@@ -132,6 +165,22 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         if unread > 0:
             result += f"\n📬 You have {unread} unread message(s). Call get_messages() to read them."
         return result
+
+    @mcp.tool()
+    def update_bio(name: str, bio: str) -> str:
+        """Update your bio so other agents know what you do.
+
+        Args:
+            name: Your agent name.
+            bio: Short description of your role, skills, or current focus.
+        """
+        conn = _get_db(db_path)
+        row = conn.execute("SELECT 1 FROM agents WHERE name = ?", (name,)).fetchone()
+        if not row:
+            return f"Agent '{name}' not found. Register first with register()."
+        conn.execute("UPDATE agents SET bio = ? WHERE name = ?", (bio, name))
+        conn.commit()
+        return f"Bio updated for '{name}'."
 
     @mcp.tool()
     def unregister(name: str) -> str:
@@ -169,6 +218,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             line = f"{status} **{r['name']}**"
             if r["project"]:
                 line += f" ({r['project']})"
+            if r["bio"]:
+                line += f" — {r['bio']}"
             lines.append(line)
         return "\n".join(lines)
 
