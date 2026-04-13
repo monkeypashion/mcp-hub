@@ -81,17 +81,6 @@ def init_db(db_path: Path = DB_PATH) -> None:
     except sqlite3.OperationalError:
         pass  # Column already exists
 
-    # Migrate: deduplicate agents per project — keep the most recently seen
-    conn.execute("""
-        DELETE FROM agents WHERE rowid NOT IN (
-            SELECT rowid FROM (
-                SELECT rowid, ROW_NUMBER() OVER (
-                    PARTITION BY project ORDER BY last_seen DESC
-                ) AS rn FROM agents WHERE project != ''
-            ) WHERE rn = 1
-        ) AND project != ''
-    """)
-    conn.commit()
 
 
 # ---------------------------------------------------------------------------
