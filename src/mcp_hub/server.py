@@ -12,13 +12,31 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sqlite3
 import time
 import threading
 from pathlib import Path
+from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.session import ServerSession
+from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
+
+
+class _ChannelNotification(BaseModel):
+    """MCP notification matching Claude Code's experimental claude/channel protocol.
+
+    Sent on `send`/`broadcast` so the recipient's Claude Code session wakes
+    (even from idle) and processes the message immediately, instead of needing
+    to be prompted to poll get_messages.
+    """
+
+    method: str = "notifications/claude/channel"
+    params: dict[str, Any]
 
 # ---------------------------------------------------------------------------
 # Database
@@ -101,13 +119,55 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         ),
     )
 
+    # Advertise the experimental `claude/channel` capability so Claude Code
+    # surfaces our `notifications/claude/channel` events as <channel> tags
+    # and wakes idle sessions. Without this, Claude Code silently drops them.
+    _orig_init_options = mcp._mcp_server.create_initialization_options
+
+    def _init_options_with_channel(notification_options=None, experimental_capabilities=None):
+        caps = dict(experimental_capabilities or {})
+        caps.setdefault("claude/channel", {})
+        return _orig_init_options(notification_options, caps)
+
+    mcp._mcp_server.create_initialization_options = _init_options_with_channel
+
+    # Map registered agent name -> active MCP session reference so we can push
+    # channel notifications to that session when a message arrives. Process-
+    # local and ephemeral; agent metadata still lives in SQLite.
+    sessions: dict[str, ServerSession] = {}
+
+    async def push_channel(agent: str, content: str, meta: dict[str, str]) -> bool:
+        """Push a channel notification to `agent` if a session is registered.
+
+        Returns True if the push went through, False if no session is bound or
+        the send failed (stale session is dropped on failure). Callers should
+        treat False as "recipient offline" — the message is already persisted
+        in SQLite, so it'll surface on next register() or get_messages().
+        """
+        sess = sessions.get(agent)
+        if sess is None:
+            return False
+        try:
+            await sess.send_notification(
+                _ChannelNotification(params={"content": content, "meta": meta})
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("push_channel to %s failed (%s); dropping session", agent, exc)
+            sessions.pop(agent, None)
+            return False
+
     # -- Presence --
 
     @mcp.tool()
-    def register(name: str, project: str = "", bio: str = "", meta: str = "{}") -> str:
+    def register(name: str, project: str = "", bio: str = "", meta: str = "{}", ctx: Context | None = None) -> str:
         """Register this agent session with the hub.
 
-        Call this when your session starts. Sets you as 'online'.
+        Call this when your session starts. Sets you as 'online' and binds
+        your MCP session so the hub can push messages to you via the
+        `claude/channel` capability — if your Claude Code was launched with
+        `--channels` (or `--dangerously-load-development-channels`), incoming
+        messages will surface in your context without polling.
 
         Args:
             name: Your agent name (e.g. 'dreamteam-lead', 'reliable-ai-dev').
@@ -140,6 +200,11 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             (name, project, bio, now, now, meta),
         )
         conn.commit()
+
+        # Bind the current MCP session so we can push channel notifications.
+        # Re-registering from a new session replaces the old reference.
+        if ctx is not None:
+            sessions[name] = ctx.session
 
         # Count unread messages for this agent
         row = conn.execute(
@@ -215,8 +280,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     # -- Direct messaging --
 
     @mcp.tool()
-    def send(from_agent: str, to: str, message: str) -> str:
+    async def send(from_agent: str, to: str, message: str) -> str:
         """Send a direct message to another agent.
+
+        If the recipient has registered an active session, the message is
+        also pushed via channel notification so their Claude Code session
+        wakes immediately. Otherwise it's persisted for them to read on
+        next register()/get_messages().
 
         Args:
             from_agent: Your agent name (must be registered).
@@ -235,7 +305,17 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             (now, from_agent, to, message),
         )
         conn.commit()
-        return f"Message sent to '{to}'."
+
+        pushed = await push_channel(
+            agent=to,
+            content=f"DM from {from_agent}: {message}",
+            meta={"source": from_agent, "kind": "dm"},
+        )
+        return (
+            f"Message sent to '{to}'."
+            if pushed
+            else f"Message sent to '{to}' (recipient offline; will see on next register/get_messages)."
+        )
 
     # -- Channels --
 
@@ -276,8 +356,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         return "\n".join(lines)
 
     @mcp.tool()
-    def broadcast(from_agent: str, channel: str, message: str) -> str:
+    async def broadcast(from_agent: str, channel: str, message: str) -> str:
         """Post a message to a channel (all agents can see it).
+
+        Pushes a channel notification to every currently-connected agent
+        (except the sender) so their Claude Code sessions wake immediately.
+        Agents not currently connected will pick the post up via
+        get_channel_messages() / get_history() as before.
 
         Args:
             from_agent: Your agent name.
@@ -300,7 +385,17 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             (now, from_agent, channel, message),
         )
         conn.commit()
-        return f"Posted to #{channel}."
+
+        recipients = [a for a in list(sessions.keys()) if a != from_agent]
+        woke = 0
+        for agent in recipients:
+            if await push_channel(
+                agent=agent,
+                content=f"#{channel} from {from_agent}: {message}",
+                meta={"source": from_agent, "kind": "broadcast", "channel": channel},
+            ):
+                woke += 1
+        return f"Posted to #{channel} (woke {woke}/{len(recipients)} connected agents)."
 
     # -- Reading messages --
 
