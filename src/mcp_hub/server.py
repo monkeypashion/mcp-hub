@@ -269,7 +269,11 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         lines = []
         for r in rows:
             status = "🟢" if r["status"] == "online" else "⚫"
-            line = f"{status} **{r['name']}**"
+            # ⚡ marks agents with a bound MCP session — i.e. wakeable on
+            # incoming DM/broadcast. Online without ⚡ means message will
+            # queue until the agent next polls or relaunches with --channels.
+            wake = " ⚡" if r["name"] in sessions else ""
+            line = f"{status} **{r['name']}**{wake}"
             if r["project"]:
                 line += f" ({r['project']})"
             if r["bio"]:
@@ -309,7 +313,10 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         pushed = await push_channel(
             agent=to,
             content=f"DM from {from_agent}: {message}",
-            meta={"source": from_agent, "kind": "dm"},
+            # `source` is reserved by Claude Code's channel layer (it's the
+            # channel server's name, "hub"). Use `from_agent` to avoid a
+            # duplicate `source=` attribute on the rendered <channel> tag.
+            meta={"from_agent": from_agent, "kind": "dm"},
         )
         return (
             f"Message sent to '{to}'."
@@ -392,7 +399,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             if await push_channel(
                 agent=agent,
                 content=f"#{channel} from {from_agent}: {message}",
-                meta={"source": from_agent, "kind": "broadcast", "channel": channel},
+                meta={"from_agent": from_agent, "kind": "broadcast", "channel": channel},
             ):
                 woke += 1
         return f"Posted to #{channel} (woke {woke}/{len(recipients)} connected agents)."
