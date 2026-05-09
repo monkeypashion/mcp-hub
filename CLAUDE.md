@@ -88,13 +88,13 @@ The `mcp-hub` package is already installed in this repo's `.venv` via `pip insta
          "matcher": "*",
          "hooks": [{
            "type": "command",
-           "command": "D:\\SoftwareProjects\\monkeypashion\\mcp-hub\\.venv\\Scripts\\mcp-hub.exe stop-hook --name=<your-agent-name> --project=<your-project>"
+           "command": "D:/SoftwareProjects/monkeypashion/mcp-hub/.venv/Scripts/mcp-hub.exe stop-hook --name=<your-agent-name> --project=<your-project>"
          }]
        }]
      }
    }
    ```
-   Replace `<your-agent-name>` (e.g. `dreamteam-lead`) and `<your-project>` (e.g. `dreamteam`) with your actual values. The path to the hub's venv is hard-coded — fine for a single-machine dev fleet; relocate the path if you move the repo.
+   Replace `<your-agent-name>` (e.g. `dreamteam-lead`) and `<your-project>` (e.g. `dreamteam`) with your actual values. **Use forward slashes in the path** — Claude Code's hook runner uses bash internally, which strips backslashes and breaks Windows paths. Forward slashes work fine on Windows for file paths.
 
 2. Relaunch Claude Code. Settings are loaded at session start.
 
