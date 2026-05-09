@@ -227,6 +227,127 @@ async def test_low_priority_does_not_mark_read(server):
 
 
 # ---------------------------------------------------------------------------
+# get_broadcasts_for_agent: per-agent cursor + advance-on-read
+# ---------------------------------------------------------------------------
+
+
+async def test_broadcasts_for_agent_new_registration_starts_at_now(server):
+    """A fresh registration sets the agent's cursor to current-max, so they
+    don't get firehosed with historical broadcasts from before they existed.
+    First call after register should return nothing."""
+    # Seed some broadcasts BEFORE alice registers
+    await _call_tool(server, "register", {"name": "old-agent", "project": "x"})
+    await _call_tool(
+        server, "broadcast",
+        {"from_agent": "old-agent", "message": "ancient history 1", "priority": "low"},
+    )
+    await _call_tool(
+        server, "broadcast",
+        {"from_agent": "old-agent", "message": "ancient history 2", "priority": "low"},
+    )
+
+    # Now alice registers fresh
+    await _call_tool(server, "register", {"name": "alice", "project": "y"})
+
+    # Alice's first call should return nothing — she didn't exist when the
+    # historical broadcasts were posted.
+    out = await _call_tool(
+        server, "get_broadcasts_for_agent", {"agent_name": "alice"},
+    )
+    assert out == ""
+
+
+async def test_broadcasts_for_agent_returns_unseen_then_advances(server):
+    """First call returns broadcasts since cursor; cursor advances; second
+    call returns nothing new. Atomic-on-read mirrors get_messages."""
+    await _call_tool(server, "register", {"name": "alice", "project": "x"})
+    await _call_tool(server, "register", {"name": "bob", "project": "y"})
+
+    # Bob broadcasts twice after alice registered
+    await _call_tool(
+        server, "broadcast",
+        {"from_agent": "bob", "message": "first", "priority": "low"},
+    )
+    await _call_tool(
+        server, "broadcast",
+        {"from_agent": "bob", "message": "second", "priority": "low"},
+    )
+
+    # First call: alice sees both
+    first = await _call_tool(
+        server, "get_broadcasts_for_agent", {"agent_name": "alice"},
+    )
+    assert "first" in first
+    assert "second" in first
+
+    # Second call: cursor advanced, nothing new
+    second = await _call_tool(
+        server, "get_broadcasts_for_agent", {"agent_name": "alice"},
+    )
+    assert second == ""
+
+    # Third broadcast lands → alice's NEXT call returns just that one
+    await _call_tool(
+        server, "broadcast",
+        {"from_agent": "bob", "message": "third", "priority": "low"},
+    )
+    third = await _call_tool(
+        server, "get_broadcasts_for_agent", {"agent_name": "alice"},
+    )
+    assert "third" in third
+    assert "first" not in third  # already cursored past
+    assert "second" not in third
+
+
+async def test_broadcasts_for_agent_unregistered_returns_empty(server):
+    """An agent not in the DB has no cursor row — return empty cleanly
+    rather than failing or scanning the entire feed."""
+    out = await _call_tool(
+        server, "get_broadcasts_for_agent", {"agent_name": "unknown-agent"},
+    )
+    assert out == ""
+
+
+async def test_broadcasts_for_agent_isolates_per_agent_cursors(server):
+    """Cursors are per-agent. Alice consuming broadcasts must not affect
+    bob's cursor — bob still sees all broadcasts on his first call."""
+    await _call_tool(server, "register", {"name": "alice", "project": "x"})
+    await _call_tool(server, "register", {"name": "bob", "project": "y"})
+    await _call_tool(server, "register", {"name": "publisher", "project": "z"})
+
+    await _call_tool(
+        server, "broadcast",
+        {"from_agent": "publisher", "message": "shared news", "priority": "low"},
+    )
+
+    # Alice consumes — her cursor advances
+    a = await _call_tool(
+        server, "get_broadcasts_for_agent", {"agent_name": "alice"},
+    )
+    assert "shared news" in a
+
+    # Bob still sees it — his cursor is independent
+    b = await _call_tool(
+        server, "get_broadcasts_for_agent", {"agent_name": "bob"},
+    )
+    assert "shared news" in b
+
+    # Both agents have now consumed; subsequent calls return empty for both
+    assert (
+        await _call_tool(
+            server, "get_broadcasts_for_agent", {"agent_name": "alice"}
+        )
+        == ""
+    )
+    assert (
+        await _call_tool(
+            server, "get_broadcasts_for_agent", {"agent_name": "bob"}
+        )
+        == ""
+    )
+
+
+# ---------------------------------------------------------------------------
 # Module-level constants
 # ---------------------------------------------------------------------------
 

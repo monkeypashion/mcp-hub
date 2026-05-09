@@ -45,14 +45,20 @@ AGENT_MARKER_PATH = pathlib.Path(".claude") / "hub-agent.json"
 # ---------------------------------------------------------------------------
 
 
-async def _query_hub(hub_url: str, agent_name: str) -> tuple[str, bool]:
-    """Connect to the hub, return (unread_messages_text, is_currently_bound).
+async def _query_hub(
+    hub_url: str, agent_name: str
+) -> tuple[str, str, bool]:
+    """Connect to the hub, return (dm_text, broadcast_text, is_currently_bound).
 
-    `unread_messages_text` is the rendered output of `get_messages` (empty
-    string if no unread). `is_currently_bound` is True when the agent's name
-    has ⚡ in `list_agents` (i.e. a live MCP session is bound on the hub
-    side). On any error, raises — the caller is responsible for fail-open
-    handling.
+    - `dm_text` is the rendered output of `get_messages` (empty if no unread).
+    - `broadcast_text` is the rendered output of `get_broadcasts_for_agent`,
+      which atomically returns broadcasts since the agent's per-agent cursor
+      and advances the cursor (so subsequent calls don't re-deliver). Empty
+      string if no unseen broadcasts.
+    - `is_currently_bound` is True when the agent's name has ⚡ in
+      `list_agents` (i.e. a live MCP session is bound on the hub side).
+
+    On any error, raises — the caller is responsible for fail-open handling.
     """
     # Lazy import so missing-deps doesn't break --help / arg parsing
     from mcp import ClientSession
@@ -65,9 +71,13 @@ async def _query_hub(hub_url: str, agent_name: str) -> tuple[str, bool]:
             messages_result = await session.call_tool(
                 "get_messages", {"agent_name": agent_name}
             )
+            broadcasts_result = await session.call_tool(
+                "get_broadcasts_for_agent", {"agent_name": agent_name}
+            )
             agents_result = await session.call_tool("list_agents", {})
 
     messages_text = _extract_text(messages_result)
+    broadcasts_text = _extract_text(broadcasts_result)
     agents_text = _extract_text(agents_result)
 
     # ⚡ next to the agent's name means they're bound for wake. Substring match
@@ -75,7 +85,7 @@ async def _query_hub(hub_url: str, agent_name: str) -> tuple[str, bool]:
     # appears immediately after the name in `**name** ⚡` form.
     is_bound = f"**{agent_name}** ⚡" in agents_text
 
-    return messages_text, is_bound
+    return messages_text, broadcasts_text, is_bound
 
 
 def _extract_text(call_tool_result: Any) -> str:
@@ -104,6 +114,7 @@ def build_hook_response(
     agent_name: str,
     project: str | None,
     messages_text: str,
+    broadcasts_text: str = "",
     is_bound: bool,
 ) -> dict[str, Any] | None:
     """Decide whether to emit a hook block and what the reason should be.
@@ -111,32 +122,32 @@ def build_hook_response(
     Returns the JSON payload Claude Code expects, or None to mean "no block,
     let Stop proceed normally."
 
-    A block is emitted in any of three cases:
-      1. Queued messages, agent bound: surface them with discipline reminder.
-      2. Queued messages, agent drifted: surface them + rebind hint.
-      3. No queued messages, agent drifted: rebind-only block. Without this,
-         drifted agents stay drifted indefinitely after a hub redeploy
-         (every redeploy wipes the in-memory session map). Self-healing
-         beats waiting for someone to DM them just to trigger a rebind.
+    A block is emitted whenever there's anything actionable:
+      - Queued DMs (with discipline reminder)
+      - Unseen broadcasts (with discipline reminder; same gating rule —
+        urgent always responds, related/important inline, FYI noted-and-defer)
+      - Agent drifted off ⚡ (rebind hint, with or without other content)
 
-    Bound agent with no queued messages → return None, Stop proceeds normally.
+    Bound agent with empty inbox AND no unseen broadcasts → return None,
+    Stop proceeds normally. This is the steady-state happy path: most Stop
+    fires are no-op when the agent is up-to-date.
     """
     has_messages = bool(messages_text.strip())
+    has_broadcasts = bool(broadcasts_text.strip())
+    has_content = has_messages or has_broadcasts
 
     # No work needed: bound + nothing queued.
-    if not has_messages and is_bound:
+    if not has_content and is_bound:
         return None
 
     parts: list[str] = []
 
-    if has_messages:
-        parts.extend(
-            [
-                "📬 Auto-checked at Stop boundary — queued items below:",
-                "",
-                messages_text.strip(),
-            ]
-        )
+    if has_content:
+        parts.append("📬 Auto-checked at Stop boundary — queued items below:")
+        if has_messages:
+            parts.extend(["", "**Direct messages:**", messages_text.strip()])
+        if has_broadcasts:
+            parts.extend(["", "**Broadcasts (since you last looked):**", broadcasts_text.strip()])
 
     if not is_bound:
         rebind_args = [f'name="{agent_name}"']
@@ -144,7 +155,7 @@ def build_hook_response(
             rebind_args.append(f'project="{project}"')
         rebind_call = f"register({', '.join(rebind_args)})"
 
-        if has_messages:
+        if has_content:
             warning = (
                 f"⚠️ Your hub session is currently NOT bound for wake "
                 f"(no ⚡ in list_agents — likely after a hub redeploy). "
@@ -159,12 +170,12 @@ def build_hook_response(
                 f"`{rebind_call}` to re-establish the wake path, then "
                 f"continue what you were doing."
             )
-        if has_messages:
+        if has_content:
             parts.extend(["", warning])
         else:
             parts.append(warning)
 
-    if has_messages:
+    if has_content:
         parts.extend(
             [
                 "",
@@ -262,7 +273,7 @@ def stop_hook_command(args: argparse.Namespace) -> int:
         return 0
 
     try:
-        messages_text, is_bound = asyncio.run(
+        messages_text, broadcasts_text, is_bound = asyncio.run(
             _query_hub(args.hub_url, name)
         )
     except Exception as exc:  # noqa: BLE001
@@ -274,6 +285,7 @@ def stop_hook_command(args: argparse.Namespace) -> int:
         agent_name=name,
         project=project,
         messages_text=messages_text,
+        broadcasts_text=broadcasts_text,
         is_bound=is_bound,
     )
 

@@ -143,6 +143,29 @@ def init_db(db_path: Path = DB_PATH) -> None:
     except sqlite3.OperationalError:
         pass  # Column already exists
 
+    # Migrate: add per-agent broadcast cursor. Stop hooks surface unseen
+    # broadcasts via this cursor so drifted agents catch up on broadcast
+    # history they missed while unbound. New rows default to 0 (will be
+    # bumped to current-max on register for first-time agents). Existing
+    # rows: bump them to current-max here so we don't firehose them with
+    # historical broadcasts they already lived through.
+    try:
+        conn.execute(
+            "ALTER TABLE agents ADD COLUMN last_broadcast_seen_id "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+        # Catch existing agents up to "now" so the first Stop hook fire
+        # post-migration doesn't dump every broadcast in the feed.
+        conn.execute(
+            "UPDATE agents SET last_broadcast_seen_id = ("
+            "  SELECT COALESCE(MAX(id), 0) FROM messages WHERE channel = ?"
+            ")",
+            (_BROADCAST_CHANNEL,),
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
 
 
 # ---------------------------------------------------------------------------
@@ -172,9 +195,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             "Use list_agents() to see who's online — the ⚡ marker indicates a live, "
             "ping-verified wakeable session.\n\n"
             "Discipline — handling auto-surfaced queued items:\n"
-            "Stop hooks (per agent's settings.json) auto-pull queued DMs at every "
-            "Stop boundary. When queued items surface, evaluate relevance to current "
-            "work before context-switching:\n"
+            "Stop hooks (per agent's settings.json) auto-pull queued DMs and unseen "
+            "broadcasts at every Stop boundary. When queued items surface, evaluate "
+            "relevance to current work before context-switching:\n"
             "- Urgent (priority=urgent): always respond.\n"
             "- Related/important to current work: respond inline.\n"
             "- Unrelated low/normal: note in one line ('saw your DM, will follow up'); "
@@ -262,16 +285,26 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 # Reuse the existing name — update it instead
                 name = existing["name"]
 
+        # For first-time registrations, set the broadcast cursor to the
+        # current max so they start "from now" instead of getting firehosed
+        # with historical broadcasts from before they existed. Re-registers
+        # of existing agents preserve their cursor (no-op in the UPDATE
+        # branch — last_broadcast_seen_id is omitted from the SET list).
+        max_broadcast_id = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS m FROM messages WHERE channel = ?",
+            (_BROADCAST_CHANNEL,),
+        ).fetchone()["m"]
+
         conn.execute(
-            """INSERT INTO agents (name, project, bio, status, registered, last_seen, meta)
-               VALUES (?, ?, ?, 'online', ?, ?, ?)
+            """INSERT INTO agents (name, project, bio, status, registered, last_seen, meta, last_broadcast_seen_id)
+               VALUES (?, ?, ?, 'online', ?, ?, ?, ?)
                ON CONFLICT(name) DO UPDATE SET
                    project=excluded.project,
                    bio=CASE WHEN excluded.bio = '' THEN agents.bio ELSE excluded.bio END,
                    status='online',
                    last_seen=excluded.last_seen,
                    meta=excluded.meta""",
-            (name, project, bio, now, now, meta),
+            (name, project, bio, now, now, meta, max_broadcast_id),
         )
         conn.commit()
 
@@ -785,6 +818,65 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 
         if not rows:
             return ""
+
+        lines = []
+        for r in rows:
+            ts = time.strftime("%H:%M:%S", time.localtime(r["ts"]))
+            prio = r["priority"] if r["priority"] != "normal" else ""
+            prio_tag = f" [{prio}]" if prio else ""
+            lines.append(f"[{ts}] **{r['from_agent']}**{prio_tag}: {r['body']}")
+        return "\n".join(lines)
+
+    @mcp.tool()
+    def get_broadcasts_for_agent(agent_name: str, limit: int = 50) -> str:
+        """Get broadcasts this agent hasn't seen yet, and advance their cursor.
+
+        Used by Stop hooks (and any future "catch up since I was away" flow):
+        atomically returns broadcasts with id > the agent's
+        last_broadcast_seen_id, then bumps the cursor to the max id returned.
+        Same semantics as get_messages for DMs — read marks as seen, so the
+        same call repeated quickly returns nothing new.
+
+        Without this primitive, broadcasts would silently bypass drifted
+        agents (their session isn't bound, channel push doesn't reach them,
+        and the Stop hook only checked DM inbox). Now they catch up.
+
+        Args:
+            agent_name: Your agent name (must be registered).
+            limit: Max broadcasts to return.
+        """
+        conn = _get_db(db_path)
+        row = conn.execute(
+            "SELECT last_broadcast_seen_id FROM agents WHERE name = ?",
+            (agent_name,),
+        ).fetchone()
+        if row is None:
+            # Unregistered agent — nothing to return; they'll get a fresh
+            # cursor when they call register().
+            return ""
+
+        cursor = row["last_broadcast_seen_id"]
+
+        rows = conn.execute(
+            """SELECT id, ts, from_agent, body, priority FROM messages
+               WHERE channel = ? AND id > ?
+               ORDER BY id ASC LIMIT ?""",
+            (_BROADCAST_CHANNEL, cursor, limit),
+        ).fetchall()
+
+        if not rows:
+            return ""
+
+        # Advance cursor to the max id we're returning. Atomic with the read
+        # — if the agent's Stop hook crashes after this commit, the cursor
+        # is already advanced, mirroring how get_messages marks DMs read on
+        # consume.
+        max_id = max(r["id"] for r in rows)
+        conn.execute(
+            "UPDATE agents SET last_broadcast_seen_id = ? WHERE name = ?",
+            (max_id, agent_name),
+        )
+        conn.commit()
 
         lines = []
         for r in rows:

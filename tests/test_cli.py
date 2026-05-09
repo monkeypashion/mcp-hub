@@ -133,6 +133,80 @@ def test_block_reason_contains_messages_verbatim():
 
 
 # ---------------------------------------------------------------------------
+# Broadcast surfacing
+# ---------------------------------------------------------------------------
+
+
+def test_broadcasts_only_emits_block():
+    """No DMs but unseen broadcasts → emit block with broadcasts. This is
+    the load-bearing case for drifted agents catching up on the broadcast
+    feed: their DM inbox might be empty, but if anyone broadcast while
+    they were drifted, those should surface."""
+    response = build_hook_response(
+        agent_name="alice",
+        project="proj",
+        messages_text="",
+        broadcasts_text="[10:00] **dt**: hub redeploying in 5 min",
+        is_bound=True,
+    )
+    assert response is not None
+    assert response["decision"] == "block"
+    assert "hub redeploying" in response["reason"]
+    assert "Broadcasts" in response["reason"]
+    # No DM section if there are no DMs
+    assert "Direct messages:" not in response["reason"]
+
+
+def test_dms_and_broadcasts_both_emit_block_with_both_sections():
+    """When both are present, they should be rendered in distinct sections
+    so the agent can tell them apart for relevance gating."""
+    response = build_hook_response(
+        agent_name="alice",
+        project="proj",
+        messages_text="[10:00] **bob**: ping",
+        broadcasts_text="[10:01] **dt**: status update",
+        is_bound=True,
+    )
+    assert response is not None
+    reason = response["reason"]
+    assert "Direct messages:" in reason
+    assert "ping" in reason
+    assert "Broadcasts" in reason
+    assert "status update" in reason
+    # DMs come before broadcasts (more directed signal first)
+    assert reason.index("Direct messages:") < reason.index("Broadcasts")
+
+
+def test_broadcasts_only_drifted_emits_block_with_rebind():
+    """Drifted + broadcasts but no DMs → block with broadcasts + rebind hint.
+    The same surfacing path that fixes the 'broadcasts silently bypass
+    drifted agents' issue."""
+    response = build_hook_response(
+        agent_name="alice",
+        project="proj",
+        messages_text="",
+        broadcasts_text="[10:00] **dt**: announcement",
+        is_bound=False,
+    )
+    assert response is not None
+    reason = response["reason"]
+    assert "announcement" in reason
+    assert 'register(name="alice", project="proj")' in reason
+
+
+def test_no_dms_no_broadcasts_bound_returns_none():
+    """The steady-state happy path: agent is up to date and bound. Most
+    Stop fires hit this — no block, no overhead."""
+    assert build_hook_response(
+        agent_name="alice",
+        project="proj",
+        messages_text="",
+        broadcasts_text="",
+        is_bound=True,
+    ) is None
+
+
+# ---------------------------------------------------------------------------
 # _extract_text helper
 # ---------------------------------------------------------------------------
 
@@ -196,7 +270,7 @@ def test_no_messages_outputs_nothing(capsys):
     args = argparse.Namespace(name="alice", project=None, hub_url="http://x/mcp")
 
     async def _fake_query(_url, _name):
-        return ("", True)  # no messages, bound
+        return ("", "", True)  # no DMs, no broadcasts, bound
 
     with patch("mcp_hub.cli._query_hub", side_effect=_fake_query):
         rc = stop_hook_command(args)
@@ -212,7 +286,7 @@ def test_messages_present_outputs_valid_hook_json(capsys):
     )
 
     async def _fake_query(_url, _name):
-        return ("[10:00] **bob**: hello", True)
+        return ("[10:00] **bob**: hello", "", True)  # DM, no broadcasts, bound
 
     with patch("mcp_hub.cli._query_hub", side_effect=_fake_query):
         rc = stop_hook_command(args)
