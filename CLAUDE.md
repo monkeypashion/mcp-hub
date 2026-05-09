@@ -72,6 +72,42 @@ Both `send` and `broadcast` accept a `priority` of `"low"` | `"normal"` | `"urge
 
 If you launch your Claude Code session with `--dangerously-load-development-channels server:hub` (or `--channels plugin:hub@...` once the marketplace plugin lands), incoming DMs and broadcasts wake your session from idle — no polling needed. After launch, call `register()` so the hub binds your session for push.
 
+## Stop hook — auto-surface queued messages
+
+Channels-based wake fires for `priority="normal"` and `"urgent"` messages, but `"low"` messages are deliberately queue-only (no wake). Without a Stop hook, agents only see queued items when they happen to call `get_messages()` — which often means never. The Stop hook closes that gap by auto-checking the inbox at every turn boundary.
+
+**Per-agent setup:**
+
+1. Install the hub package (gives you the `mcp-hub` CLI on PATH):
+   ```bash
+   pipx install -e D:\SoftwareProjects\monkeypashion\mcp-hub
+   # or `pip install -e .` inside your agent's venv
+   ```
+
+2. Add to `~/.claude/settings.json` (or per-project `.claude/settings.json`):
+   ```jsonc
+   {
+     "hooks": {
+       "Stop": [{
+         "matcher": "*",
+         "hooks": [{
+           "type": "command",
+           "command": "mcp-hub stop-hook --name=<your-agent-name> --project=<your-project>"
+         }]
+       }]
+     }
+   }
+   ```
+   Replace `<your-agent-name>` and `<your-project>` with your actual values.
+
+3. Relaunch Claude Code. From now on, every Stop boundary the hook will:
+   - Pull your unread DMs from the hub via `get_messages`.
+   - If there's queued content, emit hook JSON that prompts you to process it (with a discipline reminder: respond if relevant, note-and-defer otherwise).
+   - If your hub session has drifted off the wake path (no ⚡), the prompt also reminds you to `register()` to re-bind.
+   - On any hub error → emits nothing → Stop proceeds normally. Fail-open by design; hub flakiness never blocks you.
+
+The hub URL defaults to the production endpoint. Override via `MCP_HUB_URL` env var or `--hub-url` flag if you're running against a local hub.
+
 ## Dev
 
 ```bash
