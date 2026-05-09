@@ -39,6 +39,18 @@ class _ChannelNotification(BaseModel):
     method: str = "notifications/claude/channel"
     params: dict[str, Any]
 
+
+# Allowed priority values for send/broadcast. The hub uses priority to decide
+# whether to fire the channel-push wake; senders are responsible for picking
+# the right level so receivers aren't interrupted by FYIs while focused.
+#   - "low":    inbox only, no channel push (no wake). For status updates,
+#               EOD recaps, broadcasts that don't need attention right now.
+#   - "normal": inbox + channel push (default). Wake on receipt.
+#   - "urgent": inbox + channel push, with priority="urgent" in the rendered
+#               tag's meta so receivers can visually flag it.
+_VALID_PRIORITIES = {"low", "normal", "urgent"}
+_NO_WAKE_PRIORITIES = {"low"}
+
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
@@ -84,7 +96,8 @@ def init_db(db_path: Path = DB_PATH) -> None:
             to_agent    TEXT,
             channel     TEXT,
             body        TEXT NOT NULL,
-            read        INTEGER NOT NULL DEFAULT 0
+            read        INTEGER NOT NULL DEFAULT 0,
+            priority    TEXT NOT NULL DEFAULT 'normal'
         );
 
         CREATE INDEX IF NOT EXISTS idx_msg_to ON messages(to_agent, read);
@@ -96,6 +109,15 @@ def init_db(db_path: Path = DB_PATH) -> None:
     # Migrate: add bio column for existing databases
     try:
         conn.execute("ALTER TABLE agents ADD COLUMN bio TEXT NOT NULL DEFAULT ''")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    # Migrate: add priority column for existing databases
+    try:
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'"
+        )
         conn.commit()
     except sqlite3.OperationalError:
         pass  # Column already exists
@@ -285,19 +307,31 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     # -- Direct messaging --
 
     @mcp.tool()
-    async def send(from_agent: str, to: str, message: str) -> str:
+    async def send(from_agent: str, to: str, message: str, priority: str = "normal") -> str:
         """Send a direct message to another agent.
 
-        If the recipient has registered an active session, the message is
-        also pushed via channel notification so their Claude Code session
-        wakes immediately. Otherwise it's persisted for them to read on
-        next register()/get_messages().
+        Priority controls whether the recipient is woken from idle:
+
+        - "normal" (default): wake on receipt + persist to inbox.
+        - "low": persist to inbox only, do NOT wake. Use for status updates,
+          EOD recaps, anything the recipient can pick up at their convenience.
+          Avoids interrupting focused work with low-attention messages.
+        - "urgent": wake + persist + flag as urgent in the rendered <channel>
+          tag's meta so the recipient can visually triage. Use sparingly —
+          urgent should mean "blocking on you" or "production incident".
 
         Args:
             from_agent: Your agent name (must be registered).
             to: Target agent name.
             message: The message body.
+            priority: One of "low" | "normal" | "urgent". Defaults to "normal".
         """
+        if priority not in _VALID_PRIORITIES:
+            return (
+                f"Invalid priority '{priority}'. "
+                f"Use one of: {sorted(_VALID_PRIORITIES)}."
+            )
+
         now = time.time()
         conn = _get_db(db_path)
 
@@ -306,10 +340,18 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             "UPDATE agents SET last_seen = ? WHERE name = ?", (now, from_agent)
         )
         conn.execute(
-            "INSERT INTO messages (ts, from_agent, to_agent, body) VALUES (?, ?, ?, ?)",
-            (now, from_agent, to, message),
+            "INSERT INTO messages (ts, from_agent, to_agent, body, priority) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (now, from_agent, to, message, priority),
         )
         conn.commit()
+
+        # Low-priority messages go to the inbox only; no wake.
+        if priority in _NO_WAKE_PRIORITIES:
+            return (
+                f"Message queued for '{to}' (priority={priority}; no wake — "
+                f"will surface on their next register/get_messages)."
+            )
 
         pushed = await push_channel(
             agent=to,
@@ -317,12 +359,15 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             # `source` is reserved by Claude Code's channel layer (it's the
             # channel server's name, "hub"). Use `from_agent` to avoid a
             # duplicate `source=` attribute on the rendered <channel> tag.
-            meta={"from_agent": from_agent, "kind": "dm"},
+            meta={"from_agent": from_agent, "kind": "dm", "priority": priority},
         )
         return (
-            f"Message sent to '{to}'."
+            f"Message sent to '{to}' (priority={priority})."
             if pushed
-            else f"Message sent to '{to}' (recipient offline; will see on next register/get_messages)."
+            else (
+                f"Message sent to '{to}' (priority={priority}; recipient "
+                f"offline — will see on next register/get_messages)."
+            )
         )
 
     # -- Channels --
@@ -364,19 +409,32 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         return "\n".join(lines)
 
     @mcp.tool()
-    async def broadcast(from_agent: str, channel: str, message: str) -> str:
+    async def broadcast(from_agent: str, channel: str, message: str, priority: str = "normal") -> str:
         """Post a message to a channel (all agents can see it).
 
-        Pushes a channel notification to every currently-connected agent
-        (except the sender) so their Claude Code sessions wake immediately.
-        Agents not currently connected will pick the post up via
-        get_channel_messages() / get_history() as before.
+        Priority controls whether listening agents are woken from idle:
+
+        - "normal" (default): wake all connected agents on receipt.
+        - "low": persist to channel history only, do NOT wake anyone. Use for
+          EOD recaps, status updates, FYIs — anything that doesn't need
+          immediate attention. Agents pick it up via get_channel_messages()
+          when they next look. Strongly preferred over "normal" for
+          informational broadcasts to avoid distracting focused work.
+        - "urgent": wake all connected agents and flag as urgent in the
+          rendered tag's meta. Use sparingly.
 
         Args:
             from_agent: Your agent name.
             channel: Channel name.
             message: The message body.
+            priority: One of "low" | "normal" | "urgent". Defaults to "normal".
         """
+        if priority not in _VALID_PRIORITIES:
+            return (
+                f"Invalid priority '{priority}'. "
+                f"Use one of: {sorted(_VALID_PRIORITIES)}."
+            )
+
         now = time.time()
         conn = _get_db(db_path)
 
@@ -389,10 +447,18 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             "UPDATE agents SET last_seen = ? WHERE name = ?", (now, from_agent)
         )
         conn.execute(
-            "INSERT INTO messages (ts, from_agent, channel, body) VALUES (?, ?, ?, ?)",
-            (now, from_agent, channel, message),
+            "INSERT INTO messages (ts, from_agent, channel, body, priority) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (now, from_agent, channel, message, priority),
         )
         conn.commit()
+
+        # Low-priority broadcasts go to channel history only; no wake.
+        if priority in _NO_WAKE_PRIORITIES:
+            return (
+                f"Posted to #{channel} (priority={priority}; no wake — "
+                f"agents will see it via get_channel_messages())."
+            )
 
         recipients = [a for a in registry.names() if a != from_agent]
         woke = 0
@@ -400,10 +466,18 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             if await push_channel(
                 agent=agent,
                 content=f"#{channel} from {from_agent}: {message}",
-                meta={"from_agent": from_agent, "kind": "broadcast", "channel": channel},
+                meta={
+                    "from_agent": from_agent,
+                    "kind": "broadcast",
+                    "channel": channel,
+                    "priority": priority,
+                },
             ):
                 woke += 1
-        return f"Posted to #{channel} (woke {woke}/{len(recipients)} connected agents)."
+        return (
+            f"Posted to #{channel} (priority={priority}; "
+            f"woke {woke}/{len(recipients)} connected agents)."
+        )
 
     # -- Reading messages --
 
@@ -422,7 +496,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         conn.execute("UPDATE agents SET last_seen = ? WHERE name = ?", (now, agent_name))
 
         rows = conn.execute(
-            """SELECT id, ts, from_agent, body FROM messages
+            """SELECT id, ts, from_agent, body, priority FROM messages
                WHERE to_agent = ? AND read = 0
                ORDER BY ts ASC LIMIT ?""",
             (agent_name, limit),
@@ -440,7 +514,11 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         lines = []
         for r in rows:
             ts = time.strftime("%H:%M:%S", time.localtime(r["ts"]))
-            lines.append(f"[{ts}] **{r['from_agent']}**: {r['body']}")
+            # Show priority tag for non-normal messages so retrospective
+            # readers can triage without losing the cue from the live wake.
+            prio = r["priority"] if r["priority"] != "normal" else ""
+            prio_tag = f" [{prio}]" if prio else ""
+            lines.append(f"[{ts}] **{r['from_agent']}**{prio_tag}: {r['body']}")
         return "\n".join(lines)
 
     @mcp.tool()
@@ -455,7 +533,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         cutoff = time.time() - (since_minutes * 60)
         conn = _get_db(db_path)
         rows = conn.execute(
-            """SELECT ts, from_agent, body FROM messages
+            """SELECT ts, from_agent, body, priority FROM messages
                WHERE channel = ? AND ts > ?
                ORDER BY ts ASC LIMIT ?""",
             (channel, cutoff, limit),
@@ -467,7 +545,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         lines = []
         for r in rows:
             ts = time.strftime("%H:%M:%S", time.localtime(r["ts"]))
-            lines.append(f"[{ts}] **{r['from_agent']}**: {r['body']}")
+            prio = r["priority"] if r["priority"] != "normal" else ""
+            prio_tag = f" [{prio}]" if prio else ""
+            lines.append(f"[{ts}] **{r['from_agent']}**{prio_tag}: {r['body']}")
         return "\n".join(lines)
 
     # -- History --
