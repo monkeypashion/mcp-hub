@@ -21,8 +21,9 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
-from mcp.server.session import ServerSession
 from pydantic import BaseModel
+
+from .session_registry import SessionRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -131,31 +132,30 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 
     mcp._mcp_server.create_initialization_options = _init_options_with_channel
 
-    # Map registered agent name -> active MCP session reference so we can push
-    # channel notifications to that session when a message arrives. Process-
-    # local and ephemeral; agent metadata still lives in SQLite.
-    sessions: dict[str, ServerSession] = {}
+    # Track which agents have a live MCP session bound for channel push. The
+    # registry hooks BaseSession.__aexit__ for deterministic disconnect
+    # detection, ping-checks before each send to catch transport zombies, and
+    # runs a background reaper to keep `list_agents` accurate when sessions
+    # outlive their socket (streamable-http property). Agent metadata still
+    # lives in SQLite; this is purely the "wakeable now" signal.
+    registry = SessionRegistry()
+    # Exposed for main() so it can spawn the reaper alongside the server.
+    mcp._hub_registry = registry  # type: ignore[attr-defined]
 
     async def push_channel(agent: str, content: str, meta: dict[str, str]) -> bool:
-        """Push a channel notification to `agent` if a session is registered.
+        """Push a channel notification to `agent` via the live session registry.
 
-        Returns True if the push went through, False if no session is bound or
-        the send failed (stale session is dropped on failure). Callers should
-        treat False as "recipient offline" — the message is already persisted
-        in SQLite, so it'll surface on next register() or get_messages().
+        Returns True only if the recipient has a verifiably-live session and
+        the send succeeded. False means the recipient is offline / unbound /
+        the connection was a zombie (and is now dropped from the registry).
+        Either way the message has already been persisted in SQLite by the
+        caller, so a False here is not message loss — the recipient picks
+        it up on next register() or get_messages().
         """
-        sess = sessions.get(agent)
-        if sess is None:
-            return False
-        try:
-            await sess.send_notification(
-                _ChannelNotification(params={"content": content, "meta": meta})
-            )
-            return True
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("push_channel to %s failed (%s); dropping session", agent, exc)
-            sessions.pop(agent, None)
-            return False
+        return await registry.push(
+            agent,
+            _ChannelNotification(params={"content": content, "meta": meta}),
+        )
 
     # -- Presence --
 
@@ -202,9 +202,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         conn.commit()
 
         # Bind the current MCP session so we can push channel notifications.
-        # Re-registering from a new session replaces the old reference.
+        # Re-registering from a new session replaces the old binding atomically.
         if ctx is not None:
-            sessions[name] = ctx.session
+            registry.bind(name, ctx.session)
 
         # Count unread messages for this agent
         row = conn.execute(
@@ -269,10 +269,11 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         lines = []
         for r in rows:
             status = "🟢" if r["status"] == "online" else "⚫"
-            # ⚡ marks agents with a bound MCP session — i.e. wakeable on
-            # incoming DM/broadcast. Online without ⚡ means message will
-            # queue until the agent next polls or relaunches with --channels.
-            wake = " ⚡" if r["name"] in sessions else ""
+            # ⚡ marks agents with a live, ping-verified MCP session — i.e.
+            # actually wakeable on incoming DM/broadcast right now. Online
+            # without ⚡ means the message will queue until the agent next
+            # polls or relaunches with --channels (and registers).
+            wake = " ⚡" if r["name"] in registry else ""
             line = f"{status} **{r['name']}**{wake}"
             if r["project"]:
                 line += f" ({r['project']})"
@@ -393,7 +394,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         )
         conn.commit()
 
-        recipients = [a for a in list(sessions.keys()) if a != from_agent]
+        recipients = [a for a in registry.names() if a != from_agent]
         woke = 0
         for agent in recipients:
             if await push_channel(
@@ -581,7 +582,30 @@ def main():
     DB_PATH = Path(args.db)
 
     server = create_server(DB_PATH, host=args.host, port=args.port)
-    server.run(transport=args.transport)
+
+    if args.transport == "streamable-http":
+        # streamable-http sessions can outlive their underlying socket
+        # (StreamableHTTPSessionManager keeps them warm by session-id, not
+        # by connection). The reaper sweeps zombies so `list_agents` ⚡
+        # stays honest. Run it as a sibling task to uvicorn so both share
+        # one event loop and shutdown cancels both.
+        import anyio
+
+        registry = server._hub_registry  # type: ignore[attr-defined]
+
+        async def run_with_reaper() -> None:
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(registry.run_reaper)
+                try:
+                    await server.run_streamable_http_async()
+                finally:
+                    tg.cancel_scope.cancel()
+
+        anyio.run(run_with_reaper)
+    else:
+        # stdio / sse: session is process-bound; the lifecycle hook is
+        # sufficient and no reaper is needed.
+        server.run(transport=args.transport)
 
 
 if __name__ == "__main__":
