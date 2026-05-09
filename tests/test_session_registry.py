@@ -274,21 +274,74 @@ async def test_ping_one_keeps_live_binding(registry):
     assert s.pings == 1
 
 
-async def test_ping_one_drops_dead_binding(registry):
+async def test_ping_one_does_not_drop_on_single_failure(registry):
+    """Reaper tolerates transient blips: a single ping failure must NOT
+    drop the binding. Empirically, the same send_ping that succeeds from
+    push-time can fail intermittently from the reaper. One-strike was
+    false-positive-killing live sessions."""
     s = FakeSession(ping_raises=ConnectionResetError())
     registry.bind("alice", s)
     alive = await registry._ping_one("alice")
     assert alive is False
+    # Binding survives — only one failure, threshold is 3 by default
+    assert registry.is_bound("alice")
+
+
+async def test_ping_one_drops_after_consecutive_failures(registry):
+    """After PING_FAILURE_THRESHOLD consecutive failures, the binding IS
+    dropped. ~90s of consistent failure under default 30s reaper interval
+    reliably distinguishes transient blips from genuine session death."""
+    s = FakeSession(ping_raises=ConnectionResetError())
+    registry.bind("alice", s)
+
+    # Drop strictly at threshold (3 by default) — not before, not after
+    for i in range(registry.PING_FAILURE_THRESHOLD - 1):
+        await registry._ping_one("alice")
+        assert registry.is_bound("alice"), (
+            f"Binding dropped prematurely after {i + 1} failures"
+        )
+
+    # Final failure crosses threshold — binding drops
+    await registry._ping_one("alice")
     assert not registry.is_bound("alice")
 
 
-async def test_ping_one_drops_on_timeout(registry):
+async def test_ping_one_drops_on_consecutive_timeouts(registry):
+    """Same as the exception case but for timeouts — both should be
+    treated as failures and accumulate toward the threshold."""
     registry.PING_TIMEOUT_SECONDS = 0.05
     s = FakeSession(ping_delay=0.5)
     registry.bind("alice", s)
-    alive = await registry._ping_one("alice")
-    assert alive is False
+
+    for _ in range(registry.PING_FAILURE_THRESHOLD):
+        await registry._ping_one("alice")
+
     assert not registry.is_bound("alice")
+
+
+async def test_ping_one_success_resets_failure_count(registry):
+    """A successful ping resets the failure counter, so a session that
+    had one bad ping followed by a good ping is treated as healthy.
+    Only *consecutive* failures count toward the drop threshold."""
+    # Session that fails ping_failures_before_recovery times then recovers
+    fails_then_succeeds = FakeSession()
+
+    # First, manually inject a failure count of N-1 (just below threshold)
+    registry.bind("alice", fails_then_succeeds)
+    # Simulate previous failures via the internal counter
+    with registry._lock:
+        registry._ping_failures["alice"] = registry.PING_FAILURE_THRESHOLD - 1
+
+    # A successful ping should reset the count
+    alive = await registry._ping_one("alice")
+    assert alive is True
+    assert registry.is_bound("alice")
+
+    # Counter is now 0 — verify by checking another N-1 failures don't drop
+    fails_then_succeeds.ping_raises = ConnectionResetError()
+    for _ in range(registry.PING_FAILURE_THRESHOLD - 1):
+        await registry._ping_one("alice")
+    assert registry.is_bound("alice"), "Counter should have reset on success"
 
 
 async def test_ping_one_unbound_returns_false(registry):
@@ -297,7 +350,9 @@ async def test_ping_one_unbound_returns_false(registry):
 
 
 async def test_reaper_drops_dead_keeps_live(registry):
-    """One reaper cycle: dead binding gets dropped, live binding survives."""
+    """Dead binding gets dropped after enough consecutive failures; live
+    binding survives. The reaper loops fast enough to cross the failure
+    threshold within the test window."""
     import anyio
 
     registry.REAPER_INTERVAL_SECONDS = 0.05  # fast cycle for the test
@@ -309,8 +364,11 @@ async def test_reaper_drops_dead_keeps_live(registry):
 
     async with anyio.create_task_group() as tg:
         tg.start_soon(registry.run_reaper)
-        # Wait long enough for one reaper cycle to fire (interval + a margin)
-        await anyio.sleep(0.2)
+        # Wait long enough for the reaper to cross the failure threshold for
+        # alice (THRESHOLD cycles * interval + margin)
+        await anyio.sleep(
+            registry.PING_FAILURE_THRESHOLD * registry.REAPER_INTERVAL_SECONDS + 0.3
+        )
         tg.cancel_scope.cancel()
 
     assert not registry.is_bound("alice")

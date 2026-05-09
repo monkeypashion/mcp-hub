@@ -156,6 +156,16 @@ class SessionRegistry:
     # that staleness windows are bearable, long enough to be cheap.
     REAPER_INTERVAL_SECONDS: float = 30.0
 
+    # The reaper drops a binding only after this many *consecutive* ping
+    # failures, not on the first one. Empirically the same send_ping path
+    # that succeeds from push-time can fail intermittently from the reaper —
+    # likely a race, network blip, or client-side scheduling slow-down. A
+    # one-strike drop policy (the original) was false-positive-killing live
+    # sessions. Three strikes (~90s of consistent failure under default
+    # 30s interval) reliably distinguishes transient blips from genuine
+    # death. Successful pings reset the counter.
+    PING_FAILURE_THRESHOLD: int = 3
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         # Forward index: agent name -> session
@@ -163,6 +173,9 @@ class SessionRegistry:
         # Reverse index: id(session) -> set of names bound to it. One session
         # bound to multiple names is unusual but legal (e.g., aliases).
         self._by_session_id: dict[int, set[str]] = {}
+        # Consecutive-ping-failure counter per agent name. Reset on any
+        # successful ping; drop only at threshold.
+        self._ping_failures: dict[str, int] = {}
 
         _ensure_aexit_patched()
         with _close_handlers_lock:
@@ -199,6 +212,9 @@ class SessionRegistry:
 
     def _unbind_name_locked(self, name: str) -> None:
         session = self._by_name.pop(name, None)
+        # Drop any reaper-failure counter for this name — a future re-bind
+        # starts fresh.
+        self._ping_failures.pop(name, None)
         if session is None:
             return
         sid = id(session)
@@ -303,22 +319,46 @@ class SessionRegistry:
     # -- background reaper ---------------------------------------------------
 
     async def _ping_one(self, name: str) -> bool:
-        """Ping the session bound to `name`. Drop on failure. Returns True
-        if the session is alive after the call, False otherwise."""
+        """Ping the session bound to `name`. Drop on consecutive failures.
+        Returns True if the ping succeeded, False otherwise.
+
+        Failures are accumulated per-name; the binding is dropped only after
+        PING_FAILURE_THRESHOLD consecutive failures. A successful ping resets
+        the counter. This protects against transient blips that we've seen
+        false-positive-drop live sessions (the same send_ping from push-time
+        succeeds, but reaper-time pings occasionally fail under unclear
+        conditions — possibly client-side scheduling slowdowns, transient
+        network jitter, or races with concurrent message handling).
+        """
         session = self.get(name)
         if session is None:
             return False
         try:
             with anyio.fail_after(self.PING_TIMEOUT_SECONDS):
                 await session.send_ping()
-            return True
         except Exception as exc:  # noqa: BLE001
-            logger.info(
-                "reaper: dropping %s (%s: %s)",
-                name, type(exc).__name__, exc,
-            )
-            self.unbind_name(name)
+            with self._lock:
+                count = self._ping_failures.get(name, 0) + 1
+                self._ping_failures[name] = count
+            if count >= self.PING_FAILURE_THRESHOLD:
+                logger.info(
+                    "reaper: dropping %s after %d consecutive failures "
+                    "(latest: %s: %s)",
+                    name, count, type(exc).__name__, exc,
+                )
+                self.unbind_name(name)
+            else:
+                logger.debug(
+                    "reaper: ping to %s failed %d/%d (%s: %s); not yet at threshold",
+                    name, count, self.PING_FAILURE_THRESHOLD,
+                    type(exc).__name__, exc,
+                )
             return False
+
+        # Successful ping — reset the failure counter for this name
+        with self._lock:
+            self._ping_failures.pop(name, None)
+        return True
 
     async def run_reaper(self) -> None:
         """Background task: periodically ping every bound session and drop
