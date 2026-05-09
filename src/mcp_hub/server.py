@@ -239,6 +239,30 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     # Exposed for main() so it can spawn the reaper alongside the server.
     mcp._hub_registry = registry  # type: ignore[attr-defined]
 
+    def touch_session(name: str, ctx: Context | None) -> None:
+        """Auto-bind the agent's session if a Context is available.
+
+        Called from every tool that identifies the calling agent (by `from_agent`,
+        `agent_name`, etc.). The point: any tool call from an agent's main
+        session refreshes their registry binding. Drift across redeploys is
+        invisible — agents come back ⚡ on their next tool call without
+        needing an explicit register(), without operator nudging.
+
+        Only binds names that exist in the DB. Stops typos and made-up names
+        from creating phantom bindings. The DB row is the source of truth
+        for "this is a real agent"; the registry is the operationally-live
+        slice of that truth.
+        """
+        if ctx is None or not name:
+            return
+        conn = _get_db(db_path)
+        row = conn.execute(
+            "SELECT 1 FROM agents WHERE name = ?", (name,)
+        ).fetchone()
+        if row is None:
+            return
+        registry.bind(name, ctx.session)
+
     async def push_channel(agent: str, content: str, meta: dict[str, str]) -> bool:
         """Push a channel notification to `agent` via the live session registry.
 
@@ -328,7 +352,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         return result
 
     @mcp.tool()
-    def update_bio(name: str, bio: str) -> str:
+    def update_bio(name: str, bio: str, ctx: Context | None = None) -> str:
         """Update your bio so other agents know what you do.
 
         Args:
@@ -341,6 +365,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             return f"Agent '{name}' not found. Register first with register()."
         conn.execute("UPDATE agents SET bio = ? WHERE name = ?", (bio, name))
         conn.commit()
+        touch_session(name, ctx)
         return f"Bio updated for '{name}'."
 
     @mcp.tool()
@@ -392,7 +417,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     # -- Direct messaging --
 
     @mcp.tool()
-    async def send(from_agent: str, to: str, message: str, priority: str = "normal") -> str:
+    async def send(from_agent: str, to: str, message: str, priority: str = "normal", ctx: Context | None = None) -> str:
         """Send a direct message to another agent.
 
         Priority controls whether the recipient is woken from idle:
@@ -419,6 +444,10 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 
         now = time.time()
         conn = _get_db(db_path)
+
+        # Auto-bind sender's session — any tool call refreshes the binding
+        # so drift across redeploys self-heals without explicit register().
+        touch_session(from_agent, ctx)
 
         # Update sender's last_seen
         conn.execute(
@@ -471,7 +500,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     # -- Broadcast --
 
     @mcp.tool()
-    async def broadcast(from_agent: str, message: str, priority: str = "normal") -> str:
+    async def broadcast(from_agent: str, message: str, priority: str = "normal", ctx: Context | None = None) -> str:
         """Post a broadcast every agent will see.
 
         Broadcasts are global — they hit every connected agent regardless
@@ -509,6 +538,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 
         now = time.time()
         conn = _get_db(db_path)
+
+        # Auto-bind sender's session for drift self-heal.
+        touch_session(from_agent, ctx)
 
         conn.execute(
             "UPDATE agents SET last_seen = ? WHERE name = ?", (now, from_agent)
@@ -607,7 +639,11 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 
     @mcp.tool()
     async def post(
-        from_agent: str, channel: str, message: str, priority: str = "normal"
+        from_agent: str,
+        channel: str,
+        message: str,
+        priority: str = "normal",
+        ctx: Context | None = None,
     ) -> str:
         """Post a message to a named channel.
 
@@ -644,6 +680,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         row = conn.execute("SELECT 1 FROM channels WHERE name = ?", (channel,)).fetchone()
         if not row:
             return f"Channel '{channel}' not found. Create it with create_channel()."
+
+        # Auto-bind sender's session for drift self-heal.
+        touch_session(from_agent, ctx)
 
         conn.execute(
             "UPDATE agents SET last_seen = ? WHERE name = ?", (now, from_agent)
@@ -760,7 +799,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     # -- Reading messages --
 
     @mcp.tool()
-    def get_messages(agent_name: str, limit: int = 20) -> str:
+    def get_messages(agent_name: str, limit: int = 20, ctx: Context | None = None) -> str:
         """Get unread direct messages for this agent. Marks them as read.
 
         Args:
@@ -769,6 +808,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         """
         now = time.time()
         conn = _get_db(db_path)
+
+        # Auto-bind caller's session for drift self-heal.
+        touch_session(agent_name, ctx)
 
         # Update last_seen
         conn.execute("UPDATE agents SET last_seen = ? WHERE name = ?", (now, agent_name))
@@ -828,7 +870,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         return "\n".join(lines)
 
     @mcp.tool()
-    def get_broadcasts_for_agent(agent_name: str, limit: int = 50) -> str:
+    def get_broadcasts_for_agent(agent_name: str, limit: int = 50, ctx: Context | None = None) -> str:
         """Get broadcasts this agent hasn't seen yet, and advance their cursor.
 
         Used by Stop hooks (and any future "catch up since I was away" flow):
@@ -854,6 +896,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             # Unregistered agent — nothing to return; they'll get a fresh
             # cursor when they call register().
             return ""
+
+        # Auto-bind caller's session for drift self-heal.
+        touch_session(agent_name, ctx)
 
         cursor = row["last_broadcast_seen_id"]
 
@@ -931,14 +976,16 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     # -- Utility --
 
     @mcp.tool()
-    def ping(from_agent: str) -> str:
-        """Heartbeat — updates your last_seen timestamp.
+    def ping(from_agent: str, ctx: Context | None = None) -> str:
+        """Heartbeat — updates your last_seen timestamp and refreshes your
+        session binding.
 
         Args:
             from_agent: Your agent name.
         """
         now = time.time()
         conn = _get_db(db_path)
+        touch_session(from_agent, ctx)
         conn.execute("UPDATE agents SET last_seen = ? WHERE name = ?", (now, from_agent))
         conn.commit()
         return f"pong ({time.strftime('%H:%M:%S')})"
