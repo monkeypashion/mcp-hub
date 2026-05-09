@@ -68,12 +68,25 @@ _local = threading.local()
 
 
 def _get_db(db_path: Path = DB_PATH) -> sqlite3.Connection:
-    """Get a thread-local SQLite connection."""
-    if not hasattr(_local, "conn") or _local.conn is None:
-        _local.conn = sqlite3.connect(str(db_path), check_same_thread=False)
-        _local.conn.row_factory = sqlite3.Row
-        _local.conn.execute("PRAGMA journal_mode=WAL")
-    return _local.conn
+    """Get a thread-local SQLite connection, keyed by db_path.
+
+    Caching has to be path-aware: production runs one server with one DB,
+    so a single cached connection works there — but in tests where each
+    test uses its own tmp_path DB, sharing one connection would silently
+    leak state across tests (every call to _get_db on a different path
+    would return the FIRST path's connection, since the SQLite file
+    actually open is whatever was opened first).
+    """
+    if not hasattr(_local, "conns"):
+        _local.conns = {}
+    key = str(db_path)
+    conn = _local.conns.get(key)
+    if conn is None:
+        conn = sqlite3.connect(key, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        _local.conns[key] = conn
+    return conn
 
 
 def init_db(db_path: Path = DB_PATH) -> None:
@@ -592,25 +605,69 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 
     @mcp.tool()
     def get_channel_messages(
-        channel: str, limit: int = 20, since_minutes: int = 60
+        channel: str,
+        limit: int = 20,
+        since_minutes: int = 60,
+        since_id: int = 0,
+        format: str = "text",
     ) -> str:
         """Get recent messages from a named channel.
 
         For the global broadcast feed, use `get_broadcasts` instead.
 
+        Filtering:
+          - Default: returns the last `since_minutes` minutes of messages.
+          - When `since_id > 0`: returns messages with id strictly greater
+            than `since_id` and `since_minutes` is ignored. Use this for
+            cursor-based extraction (each call passes the max(id) seen so
+            far; loss-less on retries since duplicates are excluded by id).
+
+        Format:
+          - "text" (default): chat-style render, one line per message:
+            `[hh:mm:ss] **from** [priority]: body`. For human reading.
+          - "json": JSON array of `{id, ts, from_agent, body, priority}`
+            records. For programmatic consumption (e.g. extraction
+            pipelines that need stable message identity).
+
         Args:
             channel: Channel name.
             limit: Max messages to return.
-            since_minutes: Only show messages from the last N minutes.
+            since_minutes: Window in minutes (only applied when since_id is 0).
+            since_id: Message-id cursor; when > 0, returns messages with id
+                      greater than this and ignores `since_minutes`.
+            format: "text" (default) or "json".
         """
-        cutoff = time.time() - (since_minutes * 60)
+        if format not in ("text", "json"):
+            return f"Invalid format '{format}'. Use 'text' or 'json'."
+
         conn = _get_db(db_path)
-        rows = conn.execute(
-            """SELECT ts, from_agent, body, priority FROM messages
-               WHERE channel = ? AND ts > ?
-               ORDER BY ts ASC LIMIT ?""",
-            (channel, cutoff, limit),
-        ).fetchall()
+        if since_id > 0:
+            rows = conn.execute(
+                """SELECT id, ts, from_agent, body, priority FROM messages
+                   WHERE channel = ? AND id > ?
+                   ORDER BY id ASC LIMIT ?""",
+                (channel, since_id, limit),
+            ).fetchall()
+        else:
+            cutoff = time.time() - (since_minutes * 60)
+            rows = conn.execute(
+                """SELECT id, ts, from_agent, body, priority FROM messages
+                   WHERE channel = ? AND ts > ?
+                   ORDER BY ts ASC LIMIT ?""",
+                (channel, cutoff, limit),
+            ).fetchall()
+
+        if format == "json":
+            return json.dumps([
+                {
+                    "id": r["id"],
+                    "ts": r["ts"],
+                    "from_agent": r["from_agent"],
+                    "body": r["body"],
+                    "priority": r["priority"],
+                }
+                for r in rows
+            ])
 
         if not rows:
             return ""

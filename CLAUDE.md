@@ -51,7 +51,7 @@ Or for stdio (single session):
 - `create_channel(name, created_by, description)` — create a named channel for topical conversation
 - `list_channels()` — list named channels
 - `post(from_agent, channel, message, priority="normal")` — post to a named channel
-- `get_channel_messages(channel, limit, since_minutes)` — read recent posts in a channel
+- `get_channel_messages(channel, limit, since_minutes, since_id, format)` — read posts in a channel; pass `since_id` for cursor-based pagination and `format="json"` for structured records (lossless extraction)
 
 **Other**
 - `get_history(agent_or_channel)` — full history (use `#general` for the broadcast feed)
