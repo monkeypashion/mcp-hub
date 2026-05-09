@@ -76,9 +76,14 @@ async def test_real_basesession_close_fires_global_handler(memory_streams):
                 pass
 
 
-async def test_registry_drops_binding_on_real_session_close(memory_streams):
-    """End-to-end: bind a name in a real registry, close the session,
-    verify the binding is gone. This is the bug we're fixing."""
+async def test_registry_does_not_drop_binding_on_real_session_close(memory_streams):
+    """New contract: lifecycle hook does NOT drop bindings by default.
+
+    Claude Code's MCP client tears down and re-creates streamable-http
+    sessions per tool call, so dropping on lifecycle close caused
+    bindings to flap. Reaper + push-time ping handle correctness
+    without lifecycle drop. Tests that want the old behaviour can
+    opt in via `subscribe_to_session_close()`."""
     read_stream, write_stream = memory_streams
     registry = SessionRegistry()
 
@@ -91,22 +96,48 @@ async def test_registry_drops_binding_on_real_session_close(memory_streams):
         ) as session:
             registry.bind("alice", session)
             assert registry.is_bound("alice")
-            assert "alice" in registry
 
-        # After session close, the registry should have dropped alice
+        # After session close, binding is INTACT (no auto-drop). Reaper
+        # or next push will eventually clean it up if the session is
+        # genuinely dead.
+        assert registry.is_bound("alice")
+    finally:
+        registry.close()
+
+
+async def test_opt_in_lifecycle_drop_works(memory_streams):
+    """Tests / specialised registries can opt in to the lifecycle-drop
+    behaviour via subscribe_to_session_close(). When subscribed, closing
+    the session drops the binding (the old default contract)."""
+    read_stream, write_stream = memory_streams
+    registry = SessionRegistry()
+    registry.subscribe_to_session_close()
+
+    try:
+        async with BaseSession(
+            read_stream=read_stream,
+            write_stream=write_stream,
+            receive_request_type=types.ClientRequest,
+            receive_notification_type=types.ClientNotification,
+        ) as session:
+            registry.bind("alice", session)
+            assert registry.is_bound("alice")
+
+        # With opt-in subscription, lifecycle close DOES drop
         assert not registry.is_bound("alice")
-        assert "alice" not in registry
-        assert registry.names() == []
     finally:
         registry.close()
 
 
 async def test_multiple_registries_each_get_their_own_cleanup(memory_streams):
-    """Two registries co-existing should both receive close events for the
-    same session, each independently dropping their bindings."""
+    """Two registries that both opt in to lifecycle drop should each
+    receive close events for the same session and independently drop
+    their bindings."""
     read_stream, write_stream = memory_streams
     reg_a = SessionRegistry()
+    reg_a.subscribe_to_session_close()
     reg_b = SessionRegistry()
+    reg_b.subscribe_to_session_close()
 
     try:
         async with BaseSession(
@@ -120,7 +151,7 @@ async def test_multiple_registries_each_get_their_own_cleanup(memory_streams):
             assert reg_a.is_bound("alice")
             assert reg_b.is_bound("alice-too")
 
-        # Both registries should have dropped their bindings
+        # Both opted-in registries should have dropped their bindings
         assert not reg_a.is_bound("alice")
         assert not reg_b.is_bound("alice-too")
     finally:

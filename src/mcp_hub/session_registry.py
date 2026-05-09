@@ -178,8 +178,21 @@ class SessionRegistry:
         self._ping_failures: dict[str, int] = {}
 
         _ensure_aexit_patched()
-        with _close_handlers_lock:
-            _close_handlers.append(self._on_session_close)
+        # Note: we do NOT auto-subscribe `_on_session_close` to the global
+        # close-handler list. Reason: empirically (verified via prod-1
+        # journalctl 2026-05-09), Claude Code's MCP client closes the
+        # streamable-http session via `DELETE /mcp` after every tool call
+        # and creates a new session for the next call. The lifecycle hook
+        # fires on each DELETE, dropping the binding before the next call's
+        # auto-bind can refresh it — leaving agents drifted between calls.
+        #
+        # The reaper (3-strike threshold) and push-time ping cover correctness
+        # without needing the lifecycle hook drop. Dead sessions get cleaned
+        # up by the reaper within ~90s, and any push attempt to a dead session
+        # fails its ping check and drops cleanly.
+        #
+        # Tests that need the lifecycle behaviour can opt-in via
+        # `subscribe_to_session_close()`.
 
     # -- mutation ------------------------------------------------------------
 
@@ -260,13 +273,26 @@ class SessionRegistry:
         """Detach from the global close-handler list.
 
         Only needed if multiple registries co-exist in one process (e.g.,
-        tests). Idempotent.
+        tests). Idempotent. No-op for registries that haven't subscribed
+        (the default).
         """
         with _close_handlers_lock:
             try:
                 _close_handlers.remove(self._on_session_close)
             except ValueError:
                 pass
+
+    def subscribe_to_session_close(self) -> None:
+        """Opt-in: drop bindings when a session's __aexit__ fires.
+
+        Off by default because Claude Code's MCP client tears down and
+        re-creates streamable-http sessions per tool call, which would
+        otherwise cause bindings to flap. Tests that want to verify the
+        old lifecycle-drop behaviour can call this explicitly.
+        """
+        with _close_handlers_lock:
+            if self._on_session_close not in _close_handlers:
+                _close_handlers.append(self._on_session_close)
 
     # -- push ----------------------------------------------------------------
 

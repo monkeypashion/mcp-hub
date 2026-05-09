@@ -164,13 +164,42 @@ def test_on_session_close_empty_registry_is_noop(registry):
     registry._on_session_close(s)  # must not raise
 
 
-def test_close_handler_actually_registered():
-    """Creating a registry should register its close handler globally; calling
-    close() should remove it. This validates the lifecycle wiring."""
+def test_default_registry_does_not_subscribe_to_close():
+    """New default contract: registries do NOT subscribe to lifecycle close
+    by default. Claude Code's MCP client tears down sessions per tool call;
+    auto-dropping on close caused bindings to flap."""
     from mcp_hub import session_registry as sr
 
     initial_count = len(sr._close_handlers)
     r = SessionRegistry()
+    assert len(sr._close_handlers) == initial_count, (
+        "Default registry should NOT subscribe to lifecycle close events"
+    )
+    r.close()  # idempotent — was never subscribed
+    assert len(sr._close_handlers) == initial_count
+
+
+def test_opt_in_subscription_works():
+    """Tests / specialised registries can opt in via
+    `subscribe_to_session_close()`. close() unsubscribes."""
+    from mcp_hub import session_registry as sr
+
+    initial_count = len(sr._close_handlers)
+    r = SessionRegistry()
+    r.subscribe_to_session_close()
+    assert len(sr._close_handlers) == initial_count + 1
+    r.close()
+    assert len(sr._close_handlers) == initial_count
+
+
+def test_subscribe_is_idempotent():
+    """Calling subscribe twice should still leave only one handler registered."""
+    from mcp_hub import session_registry as sr
+
+    initial_count = len(sr._close_handlers)
+    r = SessionRegistry()
+    r.subscribe_to_session_close()
+    r.subscribe_to_session_close()
     assert len(sr._close_handlers) == initial_count + 1
     r.close()
     assert len(sr._close_handlers) == initial_count
