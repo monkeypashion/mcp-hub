@@ -162,9 +162,10 @@ class SessionRegistry:
     # Activity-based liveness (any tool call from the agent's session
     # refreshes the timestamp via touch_session) reflects reality:
     # "agent is engaged with the hub" is what we actually care about
-    # for ⚡. 15 min generous-but-not-forever — accommodates long thinking
-    # turns / quiet stretches without persisting truly-abandoned bindings.
-    ACTIVITY_TIMEOUT_SECONDS: float = 900.0  # 15 minutes
+    # for ⚡. 60 min generous-but-not-forever — accommodates long thinking
+    # turns / multi-task chains / quiet stretches between conversations
+    # without persisting truly-abandoned bindings.
+    ACTIVITY_TIMEOUT_SECONDS: float = 3600.0  # 60 minutes
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -303,49 +304,62 @@ class SessionRegistry:
     # -- push ----------------------------------------------------------------
 
     async def push(self, name: str, notification: Any) -> bool:
-        """Push `notification` to `name` with active liveness check.
+        """Push `notification` to `name`. Try ping-then-send; on any failure,
+        return False but DO NOT unbind.
 
-        Sequence:
-          1. Look up the binding. If absent, return False (recipient offline).
-          2. Send an MCP ping with a tight timeout. If it fails or times out,
-             drop the binding and return False (zombie connection).
-          3. Send the notification. If that raises, drop the binding and
-             return False.
+        Why we don't unbind on failure: Claude Code's MCP client cycles
+        streamable-http session_ids per ~30s of inactivity (DELETE /mcp,
+        new POST on next call). The session_id we have bound is therefore
+        often dead by the time anyone tries to push to it — the bound
+        ServerSession's underlying connection has been DELETEd, so
+        send_ping/send_notification raise. The PREVIOUS behaviour was to
+        unbind on those failures, which produced the same false-positive
+        symptom as the old ping-based reaper: a passing peer's send to an
+        idle agent dropped the agent's binding.
+
+        New contract:
+          1. Look up the binding. If absent, return False.
+          2. Try ping; on failure, return False — leave binding intact.
+          3. Try send; on failure, return False — leave binding intact.
           4. Return True only on a clean ping + send.
 
-        Returns True only when the notification has been written to a
-        verified-live connection. False covers all other cases — caller
-        should treat False as "recipient unreachable; rely on persisted
-        inbox / next register to deliver."
+        The activity-based reaper is the only authoritative source of drop
+        ("no tool call from this agent in N seconds"). Push failures are
+        treated as transient — caller has already persisted the message in
+        SQLite, so the recipient picks it up via Stop-hook surfacing on
+        their next turn end. Misleading-⚡ for an unreachable session lasts
+        at most ACTIVITY_TIMEOUT_SECONDS, which is the same window we
+        already tolerate for "agent went away without unregistering."
         """
         session = self.get(name)
         if session is None:
             return False
 
-        # Liveness check — the load-bearing safety net for zombies that
-        # haven't fired __aexit__ yet.
+        # Liveness check — short-circuits send when the connection is
+        # already known to be dead, saving the second round-trip. We
+        # treat the result as advisory: failure means we won't even try
+        # send, but we don't drop the binding (the activity reaper owns
+        # the lifecycle).
         try:
             with anyio.fail_after(self.PING_TIMEOUT_SECONDS):
                 await session.send_ping()
         except Exception as exc:  # noqa: BLE001
             logger.info(
-                "liveness ping to %s failed (%s: %s); dropping binding",
+                "push %s: liveness ping failed (%s: %s); skipping send, "
+                "binding kept (activity reaper owns lifecycle)",
                 name, type(exc).__name__, exc,
             )
-            self.unbind_name(name)
             return False
 
-        # Ping returned, so the connection is live as of microseconds ago.
-        # Send the actual notification.
         try:
             await session.send_notification(notification)
             return True
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "send to %s failed after live ping (%s: %s); dropping binding",
+                "push %s: send failed after live ping (%s: %s); "
+                "binding kept (activity reaper owns lifecycle)",
                 name, type(exc).__name__, exc,
             )
-            self.unbind_name(name)
             return False
 
     # -- background reaper ---------------------------------------------------
