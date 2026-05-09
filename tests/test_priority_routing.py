@@ -367,6 +367,101 @@ async def test_auto_bind_skips_unregistered_names(server):
     assert not registry.is_bound("ghost-typo")
 
 
+async def test_broadcast_advances_sender_cursor(server):
+    """The sender's `last_broadcast_seen_id` is bumped past their own
+    broadcast immediately, so they never see their own message resurfaced
+    via Stop-hook auto-pull (annoying — they wrote it)."""
+    await _call_tool(server, "register", {"name": "alice", "project": "x"})
+    await _call_tool(
+        server, "broadcast",
+        {"from_agent": "alice", "message": "my own announcement", "priority": "low"},
+    )
+    # Alice's first call after sending should return nothing — her cursor
+    # advanced past the broadcast she just authored.
+    out = await _call_tool(
+        server, "get_broadcasts_for_agent", {"agent_name": "alice"},
+    )
+    assert out == "", "Sender saw their own broadcast — cursor not advanced"
+
+
+async def test_broadcast_successful_push_advances_recipient_cursor(server):
+    """When push succeeds (recipient was reachable), advance THEIR cursor
+    past the broadcast — they saw it live, no need to re-surface via
+    Stop hook auto-pull."""
+    await _call_tool(server, "register", {"name": "alice", "project": "x"})
+    await _call_tool(server, "register", {"name": "bob", "project": "y"})
+
+    # Bob has a fake "live" session bound for push; alice doesn't (so push
+    # to alice will fail).
+    registry = server._hub_registry  # type: ignore[attr-defined]
+
+    class _FakeSess:
+        async def send_ping(self): ...
+        async def send_notification(self, _n): ...
+
+    registry.bind("bob", _FakeSess())
+
+    # Patch push to succeed for bob, fail for alice
+    from unittest.mock import AsyncMock
+    real_push = registry.push
+
+    async def selective_push(name, notif):
+        if name == "bob":
+            return True
+        return False
+
+    with patch.object(registry, "push", side_effect=selective_push):
+        await _call_tool(
+            server, "broadcast",
+            {"from_agent": "publisher", "message": "fanout test"},
+        )
+
+    # We didn't register publisher; treat alice and bob as recipients.
+    # Wait — the test setup needs publisher registered too for the broadcast
+    # call to pass the touch_session step. Let me restructure...
+    # Actually broadcast doesn't require publisher to exist in the DB —
+    # touch_session is a no-op for unregistered names. Let's verify.
+
+    # Bob got the push → cursor should have advanced past the broadcast
+    bob_out = await _call_tool(
+        server, "get_broadcasts_for_agent", {"agent_name": "bob"},
+    )
+    assert bob_out == "", "Successful push should have advanced bob's cursor"
+
+    # Alice push failed → cursor should NOT have advanced; she sees it on auto-pull
+    alice_out = await _call_tool(
+        server, "get_broadcasts_for_agent", {"agent_name": "alice"},
+    )
+    assert "fanout test" in alice_out, (
+        "Failed push should leave cursor alone so Stop hook delivers"
+    )
+
+
+async def test_low_priority_broadcast_does_not_advance_recipient_cursors(server):
+    """Low-priority broadcast skips push entirely — recipients catch it
+    on their next Stop-hook auto-pull. Their cursors must NOT advance,
+    or the auto-pull would silently lose the message."""
+    await _call_tool(server, "register", {"name": "alice", "project": "x"})
+    await _call_tool(server, "register", {"name": "bob", "project": "y"})
+
+    await _call_tool(
+        server, "broadcast",
+        {"from_agent": "alice", "message": "fyi", "priority": "low"},
+    )
+
+    # Bob hasn't read yet — should see the broadcast via auto-pull
+    bob_out = await _call_tool(
+        server, "get_broadcasts_for_agent", {"agent_name": "bob"},
+    )
+    assert "fyi" in bob_out
+
+    # Alice (sender) cursor IS advanced even on low-priority — she wrote it
+    alice_out = await _call_tool(
+        server, "get_broadcasts_for_agent", {"agent_name": "alice"},
+    )
+    assert alice_out == ""
+
+
 async def test_broadcasts_for_agent_isolates_per_agent_cursors(server):
     """Cursors are per-agent. Alice consuming broadcasts must not affect
     bob's cursor — bob still sees all broadcasts on his first call."""

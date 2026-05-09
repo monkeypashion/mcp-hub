@@ -545,14 +545,26 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         conn.execute(
             "UPDATE agents SET last_seen = ? WHERE name = ?", (now, from_agent)
         )
-        conn.execute(
+        cursor = conn.execute(
             "INSERT INTO messages (ts, from_agent, channel, body, priority) "
             "VALUES (?, ?, ?, ?, ?)",
             (now, from_agent, _BROADCAST_CHANNEL, message, priority),
         )
+        broadcast_id = cursor.lastrowid
+
+        # Always advance the sender's broadcast cursor past their own message.
+        # Without this, the sender sees their own broadcast surfaced on their
+        # next Stop-hook auto-pull (annoying — they wrote it).
+        conn.execute(
+            "UPDATE agents SET last_broadcast_seen_id = MAX(last_broadcast_seen_id, ?) "
+            "WHERE name = ?",
+            (broadcast_id, from_agent),
+        )
         conn.commit()
 
-        # Low-priority broadcasts go to the feed only; no wake.
+        # Low-priority broadcasts go to the feed only; no wake. Recipients
+        # see them via Stop-hook auto-pull on next turn — don't advance
+        # any recipient cursors.
         if priority in _NO_WAKE_PRIORITIES:
             return (
                 f"Broadcast posted (priority={priority}; no wake — "
@@ -572,6 +584,18 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 },
             ):
                 woke += 1
+                # Successful push — recipient saw the broadcast as a live
+                # `<channel>` event. Advance their cursor so Stop-hook auto-
+                # pull doesn't re-surface the same item. (Failed pushes
+                # leave the cursor alone — recipient catches up via Stop hook.)
+                conn.execute(
+                    "UPDATE agents SET last_broadcast_seen_id = "
+                    "MAX(last_broadcast_seen_id, ?) WHERE name = ?",
+                    (broadcast_id, agent),
+                )
+        if woke > 0:
+            conn.commit()
+
         return (
             f"Broadcast posted (priority={priority}; "
             f"woke {woke}/{len(recipients)} connected agents)."
