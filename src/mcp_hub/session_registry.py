@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Any, Callable
 
 import anyio
@@ -148,23 +149,22 @@ class SessionRegistry:
     # mid-conversation despite being healthy.
     PING_TIMEOUT_SECONDS: float = 5.0
 
-    # Cadence of the background liveness sweep. The lifecycle hook is the
-    # primary cleanup mechanism, but streamable-http sessions can outlive
-    # their underlying socket (StreamableHTTPSessionManager keeps sessions
-    # warm by session-id, not by connection). The reaper closes that gap
-    # so `list_agents` stays roughly honest. 30s feels right: short enough
-    # that staleness windows are bearable, long enough to be cheap.
+    # Cadence of the background liveness sweep. Cheap because the check is
+    # an in-memory timestamp comparison (not a server-initiated ping).
     REAPER_INTERVAL_SECONDS: float = 30.0
 
-    # The reaper drops a binding only after this many *consecutive* ping
-    # failures, not on the first one. Empirically the same send_ping path
-    # that succeeds from push-time can fail intermittently from the reaper —
-    # likely a race, network blip, or client-side scheduling slow-down. A
-    # one-strike drop policy (the original) was false-positive-killing live
-    # sessions. Three strikes (~90s of consistent failure under default
-    # 30s interval) reliably distinguishes transient blips from genuine
-    # death. Successful pings reset the counter.
-    PING_FAILURE_THRESHOLD: int = 3
+    # Drop a binding if no touch_session call for this many seconds. The
+    # reaper used to use server-initiated pings for liveness, but Claude
+    # Code's MCP client cycles streamable-http sessions every ~30s
+    # (DELETE /mcp + new POST), making the bound session_id dead within
+    # ~30s of any tool call. Server-pings against those dead session_ids
+    # always fail, which made the reaper drop live agents on every cycle.
+    # Activity-based liveness (any tool call from the agent's session
+    # refreshes the timestamp via touch_session) reflects reality:
+    # "agent is engaged with the hub" is what we actually care about
+    # for ⚡. 15 min generous-but-not-forever — accommodates long thinking
+    # turns / quiet stretches without persisting truly-abandoned bindings.
+    ACTIVITY_TIMEOUT_SECONDS: float = 900.0  # 15 minutes
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -173,9 +173,11 @@ class SessionRegistry:
         # Reverse index: id(session) -> set of names bound to it. One session
         # bound to multiple names is unusual but legal (e.g., aliases).
         self._by_session_id: dict[int, set[str]] = {}
-        # Consecutive-ping-failure counter per agent name. Reset on any
-        # successful ping; drop only at threshold.
-        self._ping_failures: dict[str, int] = {}
+        # Last activity timestamp per name. Updated on every bind() call,
+        # which is itself called on every tool that takes an agent's name
+        # (via touch_session in server.py). Reaper uses this to identify
+        # truly-abandoned bindings vs. agents who are just between tool calls.
+        self._last_activity: dict[str, float] = {}
 
         _ensure_aexit_patched()
         # Note: we do NOT auto-subscribe `_on_session_close` to the global
@@ -199,13 +201,17 @@ class SessionRegistry:
     def bind(self, name: str, session: ServerSession) -> None:
         """Bind `name` to `session`, replacing any prior binding for `name`.
 
-        Idempotent: re-binding the same name to the same session is a no-op.
-        Re-binding to a different session drops the old reverse-index entry
-        for the old session.
+        Re-binding the same name to the same session is a no-op for the
+        index but still refreshes the activity timestamp — that's the
+        signal the reaper uses to distinguish active agents from
+        truly-abandoned bindings.
         """
+        now = time.time()
         with self._lock:
             old = self._by_name.get(name)
             if old is session:
+                # Same session — refresh activity, don't touch indexes
+                self._last_activity[name] = now
                 return
             if old is not None:
                 old_id = id(old)
@@ -217,6 +223,7 @@ class SessionRegistry:
 
             self._by_name[name] = session
             self._by_session_id.setdefault(id(session), set()).add(name)
+            self._last_activity[name] = now
 
     def unbind_name(self, name: str) -> None:
         """Drop binding for `name` (if any). Idempotent."""
@@ -225,9 +232,8 @@ class SessionRegistry:
 
     def _unbind_name_locked(self, name: str) -> None:
         session = self._by_name.pop(name, None)
-        # Drop any reaper-failure counter for this name — a future re-bind
-        # starts fresh.
-        self._ping_failures.pop(name, None)
+        # Drop activity timestamp — a future re-bind starts fresh.
+        self._last_activity.pop(name, None)
         if session is None:
             return
         sid = id(session)
@@ -344,67 +350,62 @@ class SessionRegistry:
 
     # -- background reaper ---------------------------------------------------
 
-    async def _ping_one(self, name: str) -> bool:
-        """Ping the session bound to `name`. Drop on consecutive failures.
-        Returns True if the ping succeeded, False otherwise.
+    def _check_one(self, name: str) -> bool:
+        """Check whether `name`'s binding has had recent activity. Drop the
+        binding if not. Returns True if the binding survives, False otherwise.
 
-        Failures are accumulated per-name; the binding is dropped only after
-        PING_FAILURE_THRESHOLD consecutive failures. A successful ping resets
-        the counter. This protects against transient blips that we've seen
-        false-positive-drop live sessions (the same send_ping from push-time
-        succeeds, but reaper-time pings occasionally fail under unclear
-        conditions — possibly client-side scheduling slowdowns, transient
-        network jitter, or races with concurrent message handling).
+        "Activity" = any tool call from the agent that ran through
+        touch_session (server.py side) — register, send, broadcast, post,
+        get_messages, ping, update_bio, get_broadcasts_for_agent. Each of
+        those refreshes the timestamp via bind().
+
+        This replaces the previous server-initiated-ping liveness check,
+        which was unreliable in production: Claude Code's MCP client cycles
+        streamable-http sessions every ~30s (DELETE+new POST), so the bound
+        session_id was usually dead by the time the reaper pinged it. Pings
+        timed out, the reaper dropped the binding, and live agents looked
+        offline. Activity is the reliable signal.
         """
-        session = self.get(name)
-        if session is None:
-            return False
-        try:
-            with anyio.fail_after(self.PING_TIMEOUT_SECONDS):
-                await session.send_ping()
-        except Exception as exc:  # noqa: BLE001
-            with self._lock:
-                count = self._ping_failures.get(name, 0) + 1
-                self._ping_failures[name] = count
-            if count >= self.PING_FAILURE_THRESHOLD:
-                logger.info(
-                    "reaper: dropping %s after %d consecutive failures "
-                    "(latest: %s: %s)",
-                    name, count, type(exc).__name__, exc,
-                )
-                self.unbind_name(name)
-            else:
-                logger.debug(
-                    "reaper: ping to %s failed %d/%d (%s: %s); not yet at threshold",
-                    name, count, self.PING_FAILURE_THRESHOLD,
-                    type(exc).__name__, exc,
-                )
-            return False
-
-        # Successful ping — reset the failure counter for this name
         with self._lock:
-            self._ping_failures.pop(name, None)
-        return True
+            last = self._last_activity.get(name)
+            if last is None:
+                return False  # not bound
+            age = time.time() - last
+            if age <= self.ACTIVITY_TIMEOUT_SECONDS:
+                return True
+            # Stale — drop
+            logger.info(
+                "reaper: dropping %s after %.0fs of inactivity",
+                name, age,
+            )
+            self._unbind_name_locked(name)
+        return False
 
     async def run_reaper(self) -> None:
-        """Background task: periodically ping every bound session and drop
-        dead ones. Run as a sibling task to the server's main loop;
-        cancellation cleanly exits.
+        """Background task: periodically check every bound name for recent
+        activity, drop bindings that have been silent past the timeout.
+        Cheap: pure in-memory timestamp comparison, no network.
 
-        Without this, streamable-http sessions can stay bound after their
-        client process exits (the session manager keeps them warm by
-        session-id, not by socket), making `list_agents` ⚡ a lie until
-        something tries to push to them.
+        Run as a sibling task to the server's main loop. Cancellation
+        cleanly exits.
         """
         logger.info(
-            "reaper: started (interval=%.0fs, ping_timeout=%.1fs)",
-            self.REAPER_INTERVAL_SECONDS, self.PING_TIMEOUT_SECONDS,
+            "reaper: started (interval=%.0fs, activity_timeout=%.0fs)",
+            self.REAPER_INTERVAL_SECONDS, self.ACTIVITY_TIMEOUT_SECONDS,
         )
         try:
             while True:
                 await anyio.sleep(self.REAPER_INTERVAL_SECONDS)
-                # Snapshot under lock; ping outside lock (pings are async).
                 for name in self.names():
-                    await self._ping_one(name)
+                    try:
+                        self._check_one(name)
+                    except Exception:  # noqa: BLE001
+                        # Per-name error must not kill the loop. The check
+                        # is in-memory only, so this should be rare, but
+                        # defensiveness is cheap.
+                        logger.exception(
+                            "reaper: _check_one(%s) raised; continuing",
+                            name,
+                        )
         finally:
             logger.info("reaper: stopped")

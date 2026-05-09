@@ -290,151 +290,178 @@ async def test_push_does_not_affect_other_bindings(registry):
 
 
 # ---------------------------------------------------------------------------
-# Reaper
+# Reaper — activity-based liveness
 # ---------------------------------------------------------------------------
+#
+# The reaper used to issue server-initiated pings to verify each bound
+# session was reachable. That signal turned out to be unreliable in
+# production: Claude Code's MCP client cycles streamable-http sessions
+# every ~30s (DELETE /mcp + new POST), so the bound session_id was almost
+# always dead by the time the reaper pinged it, even when the agent was
+# actively working. The fix: track a per-name `last_activity` timestamp
+# refreshed by every `bind()` call (which is itself triggered by every
+# tool call from the agent via `touch_session`), and reap names whose
+# activity is older than ACTIVITY_TIMEOUT_SECONDS.
 
 
-async def test_ping_one_keeps_live_binding(registry):
+def test_check_one_keeps_recent_binding(registry):
+    """A binding with a fresh activity timestamp survives the reaper sweep."""
+    s = FakeSession()
+    registry.bind("alice", s)  # bind() refreshes activity
+    alive = registry._check_one("alice")
+    assert alive is True
+    assert registry.is_bound("alice")
+
+
+def test_check_one_drops_stale_binding(registry):
+    """A binding whose last activity is older than the timeout gets reaped."""
+    import time as _t
+
+    registry.ACTIVITY_TIMEOUT_SECONDS = 0.05
     s = FakeSession()
     registry.bind("alice", s)
-    alive = await registry._ping_one("alice")
-    assert alive is True
-    assert registry.is_bound("alice")
-    assert s.pings == 1
-
-
-async def test_ping_one_does_not_drop_on_single_failure(registry):
-    """Reaper tolerates transient blips: a single ping failure must NOT
-    drop the binding. Empirically, the same send_ping that succeeds from
-    push-time can fail intermittently from the reaper. One-strike was
-    false-positive-killing live sessions."""
-    s = FakeSession(ping_raises=ConnectionResetError())
-    registry.bind("alice", s)
-    alive = await registry._ping_one("alice")
-    assert alive is False
-    # Binding survives — only one failure, threshold is 3 by default
-    assert registry.is_bound("alice")
-
-
-async def test_ping_one_drops_after_consecutive_failures(registry):
-    """After PING_FAILURE_THRESHOLD consecutive failures, the binding IS
-    dropped. ~90s of consistent failure under default 30s reaper interval
-    reliably distinguishes transient blips from genuine session death."""
-    s = FakeSession(ping_raises=ConnectionResetError())
-    registry.bind("alice", s)
-
-    # Drop strictly at threshold (3 by default) — not before, not after
-    for i in range(registry.PING_FAILURE_THRESHOLD - 1):
-        await registry._ping_one("alice")
-        assert registry.is_bound("alice"), (
-            f"Binding dropped prematurely after {i + 1} failures"
-        )
-
-    # Final failure crosses threshold — binding drops
-    await registry._ping_one("alice")
-    assert not registry.is_bound("alice")
-
-
-async def test_ping_one_drops_on_consecutive_timeouts(registry):
-    """Same as the exception case but for timeouts — both should be
-    treated as failures and accumulate toward the threshold."""
-    registry.PING_TIMEOUT_SECONDS = 0.05
-    s = FakeSession(ping_delay=0.5)
-    registry.bind("alice", s)
-
-    for _ in range(registry.PING_FAILURE_THRESHOLD):
-        await registry._ping_one("alice")
-
-    assert not registry.is_bound("alice")
-
-
-async def test_ping_one_success_resets_failure_count(registry):
-    """A successful ping resets the failure counter, so a session that
-    had one bad ping followed by a good ping is treated as healthy.
-    Only *consecutive* failures count toward the drop threshold."""
-    # Session that fails ping_failures_before_recovery times then recovers
-    fails_then_succeeds = FakeSession()
-
-    # First, manually inject a failure count of N-1 (just below threshold)
-    registry.bind("alice", fails_then_succeeds)
-    # Simulate previous failures via the internal counter
+    # Backdate the activity timestamp past the timeout
     with registry._lock:
-        registry._ping_failures["alice"] = registry.PING_FAILURE_THRESHOLD - 1
+        registry._last_activity["alice"] = _t.time() - 1.0
 
-    # A successful ping should reset the count
-    alive = await registry._ping_one("alice")
-    assert alive is True
-    assert registry.is_bound("alice")
-
-    # Counter is now 0 — verify by checking another N-1 failures don't drop
-    fails_then_succeeds.ping_raises = ConnectionResetError()
-    for _ in range(registry.PING_FAILURE_THRESHOLD - 1):
-        await registry._ping_one("alice")
-    assert registry.is_bound("alice"), "Counter should have reset on success"
+    alive = registry._check_one("alice")
+    assert alive is False
+    assert not registry.is_bound("alice")
 
 
-async def test_ping_one_unbound_returns_false(registry):
-    alive = await registry._ping_one("nobody-here")
+def test_check_one_unbound_returns_false(registry):
+    """Unbound names report not-alive without raising."""
+    alive = registry._check_one("nobody-here")
     assert alive is False
 
 
-async def test_reaper_drops_dead_keeps_live(registry):
-    """Dead binding gets dropped after enough consecutive failures; live
-    binding survives. The reaper loops fast enough to cross the failure
-    threshold within the test window."""
-    import anyio
-
-    registry.REAPER_INTERVAL_SECONDS = 0.05  # fast cycle for the test
-
-    s_alice = FakeSession(ping_raises=ConnectionResetError())
-    s_bob = FakeSession()
-    registry.bind("alice", s_alice)
-    registry.bind("bob", s_bob)
-
-    async with anyio.create_task_group() as tg:
-        tg.start_soon(registry.run_reaper)
-        # Wait long enough for the reaper to cross the failure threshold for
-        # alice (THRESHOLD cycles * interval + margin)
-        await anyio.sleep(
-            registry.PING_FAILURE_THRESHOLD * registry.REAPER_INTERVAL_SECONDS + 0.3
-        )
-        tg.cancel_scope.cancel()
-
-    assert not registry.is_bound("alice")
-    assert registry.is_bound("bob")
-    assert s_bob.pings >= 1  # bob got pinged
+def test_check_one_does_not_drop_recently_refreshed_binding(registry):
+    """Even with a tight timeout, a fresh bind() keeps the binding alive
+    on the next reap. This is the steady-state pattern: every tool call
+    refreshes activity via touch_session -> bind()."""
+    registry.ACTIVITY_TIMEOUT_SECONDS = 0.05
+    s = FakeSession()
+    registry.bind("alice", s)
+    # Refresh immediately — the binding has just been touched
+    registry.bind("alice", s)
+    alive = registry._check_one("alice")
+    assert alive is True
+    assert registry.is_bound("alice")
 
 
-async def test_reaper_survives_ping_exceptions(registry):
-    """A bad ping in one iteration must not kill the reaper for subsequent
-    iterations — important so a single zombie can't permanently disable
-    background liveness checks."""
-    import anyio
+def test_bind_refreshes_activity_on_same_session(registry):
+    """Re-binding the same name to the same session is the steady-state
+    refresh path (every tool call hits this). It must update the activity
+    timestamp even though the indexes don't change."""
+    import time as _t
+
+    s = FakeSession()
+    registry.bind("alice", s)
+    # Backdate so we can detect a refresh
+    with registry._lock:
+        registry._last_activity["alice"] = _t.time() - 100.0
+    before = registry._last_activity["alice"]
+
+    registry.bind("alice", s)  # same session — exercise the no-op path
+    after = registry._last_activity["alice"]
+
+    assert after > before, "bind() on same session must refresh activity"
+
+
+def test_bind_refreshes_activity_on_session_swap(registry):
+    """When a name is rebound to a different session, the activity
+    timestamp must also refresh — the new session is the new source
+    of liveness signal."""
+    import time as _t
+
+    s1, s2 = FakeSession(), FakeSession()
+    registry.bind("alice", s1)
+    with registry._lock:
+        registry._last_activity["alice"] = _t.time() - 100.0
+    before = registry._last_activity["alice"]
+
+    registry.bind("alice", s2)  # swap path
+    after = registry._last_activity["alice"]
+
+    assert after > before
+    assert registry.get("alice") is s2
+
+
+def test_unbind_clears_activity_timestamp(registry):
+    """Dropping a binding must clear its activity timestamp so a future
+    re-bind starts fresh and stale data can't survive across cycles."""
+    s = FakeSession()
+    registry.bind("alice", s)
+    assert "alice" in registry._last_activity
+
+    registry.unbind_name("alice")
+    assert "alice" not in registry._last_activity
+
+
+async def test_reaper_drops_stale_keeps_active(registry):
+    """Stale binding gets dropped by the background reaper; an active
+    binding (whose activity keeps getting refreshed) survives."""
+    import time as _t
 
     registry.REAPER_INTERVAL_SECONDS = 0.05
+    registry.ACTIVITY_TIMEOUT_SECONDS = 0.1
 
-    s_dead = FakeSession(ping_raises=BrokenPipeError())
-    s_live = FakeSession()
-    registry.bind("dead", s_dead)
-    registry.bind("live", s_live)
+    s_stale = FakeSession()
+    s_active = FakeSession()
+    registry.bind("stale", s_stale)
+    registry.bind("active", s_active)
+    # Backdate stale so it's already past the timeout; the very first
+    # reaper sweep will drop it.
+    with registry._lock:
+        registry._last_activity["stale"] = _t.time() - 10.0
 
     async with anyio.create_task_group() as tg:
         tg.start_soon(registry.run_reaper)
-        # Wait for multiple cycles so we know the loop didn't die after the
-        # first failure.
+        # Keep refreshing 'active' across multiple reaper cycles to prove
+        # activity-based reaping is forgiving of recently-touched bindings.
+        for _ in range(4):
+            await anyio.sleep(0.05)
+            registry.bind("active", s_active)
+        tg.cancel_scope.cancel()
+
+    assert not registry.is_bound("stale")
+    assert registry.is_bound("active")
+
+
+async def test_reaper_survives_iteration_errors(registry):
+    """A failure in one name's check must not kill the reaper loop for
+    subsequent cycles. The production reaper wraps each `_check_one` call
+    in try/except so a transient error stays scoped to that one name."""
+    registry.REAPER_INTERVAL_SECONDS = 0.05
+    registry.ACTIVITY_TIMEOUT_SECONDS = 60.0  # don't actually reap during test
+
+    s = FakeSession()
+    registry.bind("alice", s)
+
+    real_check = registry._check_one
+    calls = {"n": 0}
+
+    def flaky_check(name: str) -> bool:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("boom")
+        return real_check(name)
+
+    registry._check_one = flaky_check  # type: ignore[method-assign]
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(registry.run_reaper)
         await anyio.sleep(0.3)
         tg.cancel_scope.cancel()
 
-    assert not registry.is_bound("dead")
-    assert registry.is_bound("live")
-    # Multiple cycles means live got pinged more than once
-    assert s_live.pings >= 2
+    # The flaky check ran more than once — loop survived its first error.
+    assert calls["n"] >= 2
+    # Alice's binding is still intact (activity is recent, well within timeout).
+    assert registry.is_bound("alice")
 
 
 async def test_reaper_clean_cancel(registry):
     """Cancelling the reaper exits cleanly without raising."""
-    import anyio
-
     registry.REAPER_INTERVAL_SECONDS = 1.0  # so we're sleeping when cancelled
 
     async with anyio.create_task_group() as tg:
