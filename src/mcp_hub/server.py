@@ -391,11 +391,12 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         conn.execute(
             "UPDATE agents SET last_seen = ? WHERE name = ?", (now, from_agent)
         )
-        conn.execute(
+        cursor = conn.execute(
             "INSERT INTO messages (ts, from_agent, to_agent, body, priority) "
             "VALUES (?, ?, ?, ?, ?)",
             (now, from_agent, to, message, priority),
         )
+        message_id = cursor.lastrowid
         conn.commit()
 
         # Low-priority messages go to the inbox only; no wake.
@@ -413,6 +414,18 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             # duplicate `source=` attribute on the rendered <channel> tag.
             meta={"from_agent": from_agent, "kind": "dm", "priority": priority},
         )
+
+        if pushed:
+            # The recipient saw the message via channel-push — content is
+            # already in their context. Mark the DB row read so subsequent
+            # get_messages / Stop-hook auto-pulls don't re-deliver it.
+            # (If push fails, the row stays unread and the recipient picks
+            # it up via the inbox path on next register/Stop hook.)
+            conn.execute(
+                "UPDATE messages SET read = 1 WHERE id = ?", (message_id,)
+            )
+            conn.commit()
+
         return (
             f"Message sent to '{to}' (priority={priority})."
             if pushed

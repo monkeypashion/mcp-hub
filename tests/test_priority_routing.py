@@ -173,6 +173,59 @@ async def test_normal_priority_message_no_priority_tag_in_output(server):
     assert "[low]" not in out
 
 
+async def test_send_marks_message_read_when_push_succeeds(server):
+    """When channel-push delivers successfully, the recipient saw the message
+    inline as a <channel> event — content is already in their context. The
+    DB row must be marked read=1 so Stop-hook auto-pulls and explicit
+    get_messages don't re-surface it. Without this fix, every successfully-
+    pushed DM gets delivered twice (once via channel push, once via inbox)."""
+    registry = server._hub_registry  # type: ignore[attr-defined]
+    # Simulate a successful channel push
+    with patch.object(registry, "push", AsyncMock(return_value=True)):
+        await _call_tool(
+            server, "send",
+            {"from_agent": "alice", "to": "bob", "message": "delivered via push"},
+        )
+
+    # bob's inbox should be EMPTY because the message was delivered live and
+    # marked read on the way out. Re-delivery would cause double-processing.
+    out = await _call_tool(server, "get_messages", {"agent_name": "bob"})
+    assert out == ""
+
+
+async def test_send_keeps_message_unread_when_push_fails(server):
+    """If push fails (recipient offline / zombie), the message MUST stay
+    unread so the recipient picks it up via the inbox path on next register
+    or Stop-hook auto-pull. This is the load-bearing case for the wake-path-
+    drift recovery: agents who've drifted off ⚡ rely on inbox catch-up."""
+    registry = server._hub_registry  # type: ignore[attr-defined]
+    with patch.object(registry, "push", AsyncMock(return_value=False)):
+        await _call_tool(
+            server, "send",
+            {"from_agent": "alice", "to": "bob", "message": "queued for offline bob"},
+        )
+
+    out = await _call_tool(server, "get_messages", {"agent_name": "bob"})
+    assert "queued for offline bob" in out
+
+
+async def test_low_priority_does_not_mark_read(server):
+    """Low priority skips push entirely. The message MUST stay unread so
+    the recipient sees it on their next register / get_messages call —
+    that's the whole point of low-priority queueing."""
+    registry = server._hub_registry  # type: ignore[attr-defined]
+    with patch.object(registry, "push", AsyncMock(return_value=False)) as push:
+        await _call_tool(
+            server, "send",
+            {"from_agent": "alice", "to": "bob", "message": "fyi", "priority": "low"},
+        )
+    # Sanity: low priority skipped push entirely
+    push.assert_not_called()
+
+    out = await _call_tool(server, "get_messages", {"agent_name": "bob"})
+    assert "fyi" in out
+
+
 # ---------------------------------------------------------------------------
 # Module-level constants
 # ---------------------------------------------------------------------------
