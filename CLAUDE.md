@@ -78,13 +78,9 @@ Channels-based wake fires for `priority="normal"` and `"urgent"` messages, but `
 
 **Per-agent setup:**
 
-1. Install the hub package (gives you the `mcp-hub` CLI on PATH):
-   ```bash
-   pipx install -e D:\SoftwareProjects\monkeypashion\mcp-hub
-   # or `pip install -e .` inside your agent's venv
-   ```
+The `mcp-hub` package is already installed in this repo's `.venv` via `pip install -e .`. The Stop hook just needs to invoke that venv's `mcp-hub` executable directly — no global install required.
 
-2. Add to `~/.claude/settings.json` (or per-project `.claude/settings.json`):
+1. Add to **per-project** `<your-project>/.claude/settings.local.json` (or `settings.json`):
    ```jsonc
    {
      "hooks": {
@@ -92,21 +88,25 @@ Channels-based wake fires for `priority="normal"` and `"urgent"` messages, but `
          "matcher": "*",
          "hooks": [{
            "type": "command",
-           "command": "mcp-hub stop-hook --name=<your-agent-name> --project=<your-project>"
+           "command": "D:\\SoftwareProjects\\monkeypashion\\mcp-hub\\.venv\\Scripts\\mcp-hub.exe stop-hook --name=<your-agent-name> --project=<your-project>"
          }]
        }]
      }
    }
    ```
-   Replace `<your-agent-name>` and `<your-project>` with your actual values.
+   Replace `<your-agent-name>` (e.g. `dreamteam-lead`) and `<your-project>` (e.g. `dreamteam`) with your actual values. The path to the hub's venv is hard-coded — fine for a single-machine dev fleet; relocate the path if you move the repo.
 
-3. Relaunch Claude Code. From now on, every Stop boundary the hook will:
-   - Pull your unread DMs from the hub via `get_messages`.
-   - If there's queued content, emit hook JSON that prompts you to process it (with a discipline reminder: respond if relevant, note-and-defer otherwise).
-   - If your hub session has drifted off the wake path (no ⚡), the prompt also reminds you to `register()` to re-bind.
-   - On any hub error → emits nothing → Stop proceeds normally. Fail-open by design; hub flakiness never blocks you.
+2. Relaunch Claude Code. Settings are loaded at session start.
 
-The hub URL defaults to the production endpoint. Override via `MCP_HUB_URL` env var or `--hub-url` flag if you're running against a local hub.
+From now on, every Stop boundary the hook will:
+- Pull your unread DMs from the hub via `get_messages`.
+- If there's queued content, emit hook JSON that prompts you to process it (with a discipline reminder: respond if relevant, note-and-defer otherwise).
+- If your hub session has drifted off the wake path (no ⚡), the prompt also reminds you to `register()` to re-bind.
+- On any hub error → emits nothing → Stop proceeds normally. Fail-open by design; hub flakiness never blocks you.
+
+The hub URL defaults to the production endpoint (`https://mcp.monkeypashion.co.uk/mcp`). Override via `MCP_HUB_URL` env var or `--hub-url` flag if you're running against a local hub.
+
+**Why per-project not global:** each agent has a different `--name`. Global `~/.claude/settings.json` would fire the same hook for every session regardless of agent identity — wrong. Per-project `settings.local.json` keeps each agent's hook scoped to that agent's project directory.
 
 ## Dev
 
