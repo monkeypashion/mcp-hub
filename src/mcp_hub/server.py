@@ -384,9 +384,12 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     async def broadcast(from_agent: str, message: str, priority: str = "normal") -> str:
         """Post a broadcast every agent will see.
 
-        There is one shared broadcast feed — there are no per-channel /
-        per-topic subscriptions. Every agent is implicitly a recipient.
-        Use direct messages (`send`) when you want to reach one agent.
+        Broadcasts are global — they hit every connected agent regardless
+        of which channels they're paying attention to. Use this when the
+        message is for the whole fleet ("hub redeploying in 5 min";
+        "found a bug in shared infra"; "EOD"). For topical conversation
+        scoped to a subset of activity, use `post` to a named channel
+        instead. For a single recipient, use `send`.
 
         Priority controls whether currently-connected agents are woken
         from idle on receipt:
@@ -451,6 +454,174 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             f"Broadcast posted (priority={priority}; "
             f"woke {woke}/{len(recipients)} connected agents)."
         )
+
+    # -- Channels (topical, named, posted-to via `post`) ---------------------
+
+    @mcp.tool()
+    def create_channel(name: str, created_by: str, description: str = "") -> str:
+        """Create a named channel for topical posts.
+
+        Channels are for grouping conversation by topic (e.g. "deploys",
+        "qa", "research"). Posts to a channel still reach every connected
+        agent today (we don't have per-channel subscriptions yet) but they
+        carry the channel as a label so retrospective queries can scope
+        cleanly.
+
+        Note: the name `"general"` is reserved for the global broadcast feed
+        (use `broadcast` for that). Other names can be anything reasonable.
+
+        Args:
+            name: Channel name (e.g. 'deploys', 'qa', 'chat').
+            created_by: Your agent name.
+            description: What this channel is for.
+        """
+        if name == _BROADCAST_CHANNEL:
+            return (
+                f"'{_BROADCAST_CHANNEL}' is reserved as the global broadcast "
+                f"feed — use broadcast() instead of post()."
+            )
+        now = time.time()
+        conn = _get_db(db_path)
+        try:
+            conn.execute(
+                "INSERT INTO channels (name, created_by, created_at, description) "
+                "VALUES (?, ?, ?, ?)",
+                (name, created_by, now, description),
+            )
+            conn.commit()
+            return f"Channel '{name}' created."
+        except sqlite3.IntegrityError:
+            return f"Channel '{name}' already exists."
+
+    @mcp.tool()
+    def list_channels() -> str:
+        """List all named channels.
+
+        The global broadcast feed is not a channel and is not listed here —
+        it's always available via broadcast() / get_broadcasts().
+        """
+        conn = _get_db(db_path)
+        rows = conn.execute(
+            "SELECT * FROM channels WHERE name != ? ORDER BY name",
+            (_BROADCAST_CHANNEL,),
+        ).fetchall()
+        if not rows:
+            return "No channels. Create one with create_channel()."
+        lines = []
+        for r in rows:
+            line = f"**#{r['name']}**"
+            if r["description"]:
+                line += f" — {r['description']}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def post(
+        from_agent: str, channel: str, message: str, priority: str = "normal"
+    ) -> str:
+        """Post a message to a named channel.
+
+        The channel must already exist (use `create_channel` first). Same
+        priority semantics as `broadcast`: "low" persists to channel
+        history without firing wake; "normal" wakes every connected agent;
+        "urgent" wakes with the priority surfaced in the rendered tag.
+
+        For global messages every agent should see, use `broadcast`. For
+        a single recipient, use `send`.
+
+        Args:
+            from_agent: Your agent name.
+            channel: Channel name (must exist; not "general").
+            message: The message body.
+            priority: One of "low" | "normal" | "urgent". Defaults to "normal".
+        """
+        if priority not in _VALID_PRIORITIES:
+            return (
+                f"Invalid priority '{priority}'. "
+                f"Use one of: {sorted(_VALID_PRIORITIES)}."
+            )
+        if channel == _BROADCAST_CHANNEL:
+            return (
+                f"'{_BROADCAST_CHANNEL}' is the global broadcast feed — "
+                f"use broadcast() instead of post()."
+            )
+
+        now = time.time()
+        conn = _get_db(db_path)
+
+        # Verify channel exists. Posts to non-existent channels are rejected
+        # (vs auto-creating) so typos don't accumulate phantom channels.
+        row = conn.execute("SELECT 1 FROM channels WHERE name = ?", (channel,)).fetchone()
+        if not row:
+            return f"Channel '{channel}' not found. Create it with create_channel()."
+
+        conn.execute(
+            "UPDATE agents SET last_seen = ? WHERE name = ?", (now, from_agent)
+        )
+        conn.execute(
+            "INSERT INTO messages (ts, from_agent, channel, body, priority) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (now, from_agent, channel, message, priority),
+        )
+        conn.commit()
+
+        if priority in _NO_WAKE_PRIORITIES:
+            return (
+                f"Posted to #{channel} (priority={priority}; no wake — "
+                f"agents will see it via get_channel_messages())."
+            )
+
+        recipients = [a for a in registry.names() if a != from_agent]
+        woke = 0
+        for agent in recipients:
+            if await push_channel(
+                agent=agent,
+                content=f"#{channel} from {from_agent}: {message}",
+                meta={
+                    "from_agent": from_agent,
+                    "kind": "post",
+                    "channel": channel,
+                    "priority": priority,
+                },
+            ):
+                woke += 1
+        return (
+            f"Posted to #{channel} (priority={priority}; "
+            f"woke {woke}/{len(recipients)} connected agents)."
+        )
+
+    @mcp.tool()
+    def get_channel_messages(
+        channel: str, limit: int = 20, since_minutes: int = 60
+    ) -> str:
+        """Get recent messages from a named channel.
+
+        For the global broadcast feed, use `get_broadcasts` instead.
+
+        Args:
+            channel: Channel name.
+            limit: Max messages to return.
+            since_minutes: Only show messages from the last N minutes.
+        """
+        cutoff = time.time() - (since_minutes * 60)
+        conn = _get_db(db_path)
+        rows = conn.execute(
+            """SELECT ts, from_agent, body, priority FROM messages
+               WHERE channel = ? AND ts > ?
+               ORDER BY ts ASC LIMIT ?""",
+            (channel, cutoff, limit),
+        ).fetchall()
+
+        if not rows:
+            return ""
+
+        lines = []
+        for r in rows:
+            ts = time.strftime("%H:%M:%S", time.localtime(r["ts"]))
+            prio = r["priority"] if r["priority"] != "normal" else ""
+            prio_tag = f" [{prio}]" if prio else ""
+            lines.append(f"[{ts}] **{r['from_agent']}**{prio_tag}: {r['body']}")
+        return "\n".join(lines)
 
     # -- Reading messages --
 
