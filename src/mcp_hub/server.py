@@ -173,6 +173,38 @@ def init_db(db_path: Path = DB_PATH) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _log_bind_diagnostic(source: str, name: str, session: Any) -> None:
+    """One-line dump of clientInfo + experimental capabilities on every bind.
+
+    Read prod logs for these lines to see exactly what each kind of client
+    advertises. The goal: find a reliable signal for distinguishing
+    long-lived Claude Code interactive sessions (real wake targets) from
+    ephemeral utility clients like the Stop hook's streamablehttp_client.
+    Once we have that signal, the bind can be gated on it.
+    """
+    try:
+        params = getattr(session, "client_params", None)
+        client_info = None
+        experimental = None
+        if params is not None:
+            ci = getattr(params, "clientInfo", None)
+            if ci is not None:
+                client_info = (
+                    f"{getattr(ci, 'name', '?')}/"
+                    f"{getattr(ci, 'version', '?')}"
+                )
+            caps = getattr(params, "capabilities", None)
+            if caps is not None:
+                experimental = getattr(caps, "experimental", None)
+        logger.info(
+            "bind-diag source=%s name=%s sid=%x clientInfo=%s experimental=%s",
+            source, name, id(session), client_info, experimental,
+        )
+    except Exception:  # noqa: BLE001
+        # Diagnostic must never break a real bind path.
+        logger.debug("bind-diag failed", exc_info=True)
+
+
 def is_channel_capable(session: Any) -> bool:
     """True if `session`'s client advertises the claude/channel experimental
     capability — i.e. is the kind of long-lived Claude Code session that can
@@ -273,32 +305,26 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     mcp._hub_registry = registry  # type: ignore[attr-defined]
 
     def touch_session(name: str, ctx: Context | None) -> None:
-        """Auto-bind the agent's session if a Context is available AND the
-        session is channel-capable (see `is_channel_capable`).
+        """Auto-bind the agent's session if a Context is available.
 
         Called from every tool that identifies the calling agent (by `from_agent`,
         `agent_name`, etc.). The point: any tool call from an agent's main
         session refreshes their registry binding. Drift across redeploys is
-        invisible — channel-capable agents come back ⚡ on their next tool
-        call without needing an explicit register(), without operator nudging.
+        invisible — agents come back ⚡ on their next tool call without
+        needing an explicit register(), without operator nudging.
 
         Only binds names that exist in the DB. Stops typos and made-up names
         from creating phantom bindings. The DB row is the source of truth
         for "this is a real agent"; the registry is the operationally-live
         slice of that truth.
 
-        Calls from non-channel-capable clients (e.g. the Stop hook's
-        ephemeral streamablehttp_client) are skipped — binding them would
-        overwrite the agent's real wake target with a session that's about
-        to die.
+        Diagnostic: logs the client's clientInfo + experimental capabilities
+        on every bind. Used to find a reliable signal for distinguishing
+        long-lived Claude Code interactive sessions from ephemeral utility
+        clients (the Stop hook's streamablehttp_client) so we can later gate
+        the bind on it.
         """
         if ctx is None or not name:
-            return
-        if not is_channel_capable(ctx.session):
-            logger.debug(
-                "touch_session: skipping bind for %s — client not channel-capable",
-                name,
-            )
             return
         conn = _get_db(db_path)
         row = conn.execute(
@@ -306,8 +332,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         ).fetchone()
         if row is None:
             return
+        _log_bind_diagnostic("touch_session", name, ctx.session)
         registry.bind(name, ctx.session)
-        logger.info("touch_session: bound %s (channel-capable)", name)
 
     async def push_channel(agent: str, content: str, meta: dict[str, str]) -> bool:
         """Push a channel notification to `agent` via the live session registry.
@@ -378,20 +404,11 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         )
         conn.commit()
 
-        # Bind the current MCP session so we can push channel notifications —
-        # but only if the session is channel-capable. A non-capable client
-        # calling register() (e.g. the Stop-hook utility, or a one-shot script
-        # exploring the hub) shouldn't poison the wake target. The DB row is
-        # still updated so the agent appears in list_agents; just no ⚡.
-        if ctx is not None and is_channel_capable(ctx.session):
+        # Bind the current MCP session so we can push channel notifications.
+        # Re-registering from a new session replaces the old binding atomically.
+        if ctx is not None:
+            _log_bind_diagnostic("register", name, ctx.session)
             registry.bind(name, ctx.session)
-            logger.info("register: bound %s (channel-capable)", name)
-        elif ctx is not None:
-            logger.info(
-                "register: %s — client not channel-capable; status updated, "
-                "no wake binding",
-                name,
-            )
 
         # Count unread messages for this agent
         row = conn.execute(
