@@ -15,7 +15,9 @@ from unittest.mock import patch
 import pytest
 
 from mcp_hub.cli import (
+    _discover_agent_from_marker,
     _extract_text,
+    _resolve_agent_identity,
     build_hook_response,
     build_parser,
     stop_hook_command,
@@ -203,13 +205,20 @@ def test_messages_present_outputs_valid_hook_json(capsys):
 # ---------------------------------------------------------------------------
 
 
-def test_parser_requires_name_for_stop_hook():
+def test_parser_args_free_for_auto_discovery():
+    """`--name` is now optional. Bare `stop-hook` triggers auto-discovery
+    from <cwd>/.claude/hub-agent.json via the hook's stdin payload. This is
+    the canonical shape for a global settings.json hook covering many agents."""
     parser = build_parser()
-    with pytest.raises(SystemExit):
-        parser.parse_args(["stop-hook"])  # missing --name
+    args = parser.parse_args(["stop-hook"])
+    assert args.subcommand == "stop-hook"
+    assert args.name is None
+    assert args.project is None
 
 
-def test_parser_accepts_minimal_stop_hook_args():
+def test_parser_explicit_name_still_works():
+    """Explicit --name overrides auto-discovery — useful for tests, manual
+    invocations, or non-standard setups."""
     parser = build_parser()
     args = parser.parse_args(["stop-hook", "--name", "alice"])
     assert args.subcommand == "stop-hook"
@@ -315,3 +324,136 @@ async def test_integration_no_messages_emits_nothing(live_hub):
 
     assert rc == 0
     assert captured_out.getvalue() == ""
+
+
+# ---------------------------------------------------------------------------
+# Marker-file auto-discovery
+# ---------------------------------------------------------------------------
+
+
+def test_discover_agent_from_marker_reads_valid_marker(tmp_path):
+    """Happy path: a project with a properly-shaped hub-agent.json marker."""
+    project = tmp_path / "some-project"
+    (project / ".claude").mkdir(parents=True)
+    (project / ".claude" / "hub-agent.json").write_text(
+        json.dumps({"name": "alice", "project": "some-project"}),
+        encoding="utf-8",
+    )
+    name, proj = _discover_agent_from_marker(str(project))
+    assert name == "alice"
+    assert proj == "some-project"
+
+
+def test_discover_agent_from_marker_missing_file_returns_none(tmp_path):
+    """Most projects on the dev box aren't hub agents — no marker = no-op,
+    not an error."""
+    name, proj = _discover_agent_from_marker(str(tmp_path))
+    assert name is None
+    assert proj is None
+
+
+def test_discover_agent_from_marker_malformed_json_returns_none(tmp_path):
+    """Malformed marker files should fail safe (silent no-op), not crash."""
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "hub-agent.json").write_text("not valid json {{{")
+    name, proj = _discover_agent_from_marker(str(tmp_path))
+    assert name is None
+    assert proj is None
+
+
+def test_discover_agent_from_marker_missing_fields_returns_none(tmp_path):
+    """A marker missing the `name` field is unusable — fail safe."""
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "hub-agent.json").write_text(
+        json.dumps({"project": "some-project"}),
+        encoding="utf-8",
+    )
+    name, proj = _discover_agent_from_marker(str(tmp_path))
+    assert name is None  # missing
+    assert proj == "some-project"
+
+
+def test_discover_agent_from_marker_no_cwd_returns_none():
+    name, proj = _discover_agent_from_marker(None)
+    assert name is None
+    assert proj is None
+
+
+# ---------------------------------------------------------------------------
+# Identity resolution priority
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_identity_explicit_name_wins(tmp_path, monkeypatch):
+    """Explicit --name on the CLI overrides marker discovery — useful for
+    tests, manual probing, or any non-standard invocation."""
+    # Set up a marker that says alice
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "hub-agent.json").write_text(
+        json.dumps({"name": "alice", "project": "marker-project"}),
+        encoding="utf-8",
+    )
+
+    # But pass --name=bob explicitly
+    args = argparse.Namespace(name="bob", project="cli-project", hub_url="x")
+    name, project = _resolve_agent_identity(args)
+
+    assert name == "bob"
+    assert project == "cli-project"
+
+
+def test_resolve_identity_falls_back_to_marker(tmp_path, monkeypatch):
+    """When --name is omitted, identity resolves from the marker via the
+    cwd Claude Code passes via stdin."""
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "hub-agent.json").write_text(
+        json.dumps({"name": "alice", "project": "discovered-project"}),
+        encoding="utf-8",
+    )
+
+    # Simulate Claude Code's hook stdin payload
+    import io
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(json.dumps({"cwd": str(tmp_path), "hook_event_name": "Stop"})),
+    )
+
+    args = argparse.Namespace(name=None, project=None, hub_url="x")
+    name, project = _resolve_agent_identity(args)
+
+    assert name == "alice"
+    assert project == "discovered-project"
+
+
+def test_resolve_identity_no_name_no_marker_returns_none(tmp_path, monkeypatch):
+    """No explicit --name + no marker file = silent no-op. The global Stop
+    hook fires for every project on the box; only projects opted-in via the
+    marker file should produce hook output."""
+    import io
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(json.dumps({"cwd": str(tmp_path), "hook_event_name": "Stop"})),
+    )
+
+    args = argparse.Namespace(name=None, project=None, hub_url="x")
+    name, project = _resolve_agent_identity(args)
+
+    assert name is None
+    assert project is None
+
+
+def test_stop_hook_command_silent_when_no_identity(tmp_path, monkeypatch, capsys):
+    """End-to-end: no --name, no marker, hook should exit 0 with no output."""
+    import io
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(json.dumps({"cwd": str(tmp_path), "hook_event_name": "Stop"})),
+    )
+
+    args = argparse.Namespace(name=None, project=None, hub_url="http://x/mcp")
+    rc = stop_hook_command(args)
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""

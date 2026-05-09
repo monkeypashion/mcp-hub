@@ -76,37 +76,54 @@ If you launch your Claude Code session with `--dangerously-load-development-chan
 
 Channels-based wake fires for `priority="normal"` and `"urgent"` messages, but `"low"` messages are deliberately queue-only (no wake). Without a Stop hook, agents only see queued items when they happen to call `get_messages()` — which often means never. The Stop hook closes that gap by auto-checking the inbox at every turn boundary.
 
-**Per-agent setup:**
+**Setup is now centralised — one global hook covers the whole fleet:**
 
-The `mcp-hub` package is already installed in this repo's `.venv` via `pip install -e .`. The Stop hook just needs to invoke that venv's `mcp-hub` executable directly — no global install required.
+The hook command is args-free in `~/.claude/settings.json`. The cli auto-discovers each agent's identity from a per-project marker file at `.claude/hub-agent.json`. To onboard a new agent, drop a marker in their project — no settings.json change needed.
 
-1. Add to **per-project** `<your-project>/.claude/settings.local.json` (or `settings.json`):
-   ```jsonc
-   {
-     "hooks": {
-       "Stop": [{
-         "matcher": "*",
-         "hooks": [{
-           "type": "command",
-           "command": "D:/SoftwareProjects/monkeypashion/mcp-hub/.venv/Scripts/mcp-hub.exe stop-hook --name=<your-agent-name> --project=<your-project>"
-         }]
-       }]
-     }
-   }
-   ```
-   Replace `<your-agent-name>` (e.g. `dreamteam-lead`) and `<your-project>` (e.g. `dreamteam`) with your actual values. **Use forward slashes in the path** — Claude Code's hook runner uses bash internally, which strips backslashes and breaks Windows paths. Forward slashes work fine on Windows for file paths.
+**1. Global `~/.claude/settings.json`** (one-time, applies to every session on this machine):
 
-2. Relaunch Claude Code. Settings are loaded at session start.
+```jsonc
+{
+  "hooks": {
+    "Stop": [{
+      "matcher": "*",
+      "hooks": [{
+        "type": "command",
+        "command": "D:/SoftwareProjects/monkeypashion/mcp-hub/.venv/Scripts/mcp-hub.exe stop-hook"
+      }]
+    }]
+  }
+}
+```
 
-From now on, every Stop boundary the hook will:
-- Pull your unread DMs from the hub via `get_messages`.
-- If there's queued content, emit hook JSON that prompts you to process it (with a discipline reminder: respond if relevant, note-and-defer otherwise).
-- If your hub session has drifted off the wake path (no ⚡), the prompt also reminds you to `register()` to re-bind.
-- On any hub error → emits nothing → Stop proceeds normally. Fail-open by design; hub flakiness never blocks you.
+**Use forward slashes** in the path — Claude Code's hook runner uses bash internally, which strips backslashes and breaks Windows paths. Forward slashes work fine on Windows for file paths.
 
-The hub URL defaults to the production endpoint (`https://mcp.monkeypashion.co.uk/mcp`). Override via `MCP_HUB_URL` env var or `--hub-url` flag if you're running against a local hub.
+**2. Per-agent: drop a marker file** at `<your-project>/.claude/hub-agent.json`:
 
-**Why per-project not global:** each agent has a different `--name`. Global `~/.claude/settings.json` would fire the same hook for every session regardless of agent identity — wrong. Per-project `settings.local.json` keeps each agent's hook scoped to that agent's project directory.
+```json
+{
+  "name": "<your-agent-name>",
+  "project": "<your-project>"
+}
+```
+
+Examples:
+- `D:\...\mcp-hub\.claude\hub-agent.json` → `{"name": "mcp-hub-dev", "project": "mcp-hub"}`
+- `D:\...\dreamteam\.claude\hub-agent.json` → `{"name": "dreamteam-lead", "project": "dreamteam"}`
+- `D:\...\vps-hetzner\.claude\hub-agent.json` → `{"name": "vps-admin", "project": "vps-hetzner"}`
+
+**3. Relaunch each agent's Claude Code** so settings re-load and the hook activates.
+
+**How it works each Stop:**
+- Claude Code passes the session's `cwd` to the hook via stdin.
+- The cli reads stdin, looks for `<cwd>/.claude/hub-agent.json`, uses the values it finds.
+- If no marker → silent no-op (the global hook fires for every project; only opted-in projects produce hook output).
+- If marker found → query hub for queued DMs to that agent, emit block JSON if any are pending.
+- If hub query fails → emit nothing, Stop proceeds. Fail-open by design.
+
+**Override for non-standard cases:** the cli still accepts `--name` / `--project` flags directly, which override marker discovery. Useful for tests, manual probing, or any hook configuration that wants to be explicit instead of relying on cwd.
+
+The hub URL defaults to `https://mcp.monkeypashion.co.uk/mcp`. Override via `MCP_HUB_URL` env var or `--hub-url` flag if running against a local hub.
 
 ## Dev
 

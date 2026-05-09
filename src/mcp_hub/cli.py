@@ -27,10 +27,17 @@ import argparse
 import asyncio
 import json
 import os
+import pathlib
 import sys
 from typing import Any
 
 DEFAULT_HUB_URL = os.environ.get("MCP_HUB_URL", "https://mcp.monkeypashion.co.uk/mcp")
+
+# Marker file each project uses to declare its agent identity to the hub. Lets
+# a single global Stop hook (in ~/.claude/settings.json) work across the whole
+# fleet — the cli reads cwd from the hook's stdin payload, looks here, and
+# uses the values it finds. Projects without this file silently no-op.
+AGENT_MARKER_PATH = pathlib.Path(".claude") / "hub-agent.json"
 
 
 # ---------------------------------------------------------------------------
@@ -159,11 +166,85 @@ def build_hook_response(
 # ---------------------------------------------------------------------------
 
 
+def _read_hook_stdin() -> dict[str, Any]:
+    """Read the JSON payload Claude Code sends to hooks on stdin.
+
+    Returns {} on any error (no input, malformed JSON, no stdin attached).
+    Callers should treat absent fields as "unknown" — the CLI is designed
+    to no-op rather than fail when context is missing.
+    """
+    try:
+        if sys.stdin.isatty():
+            return {}
+        raw = sys.stdin.read()
+        if not raw.strip():
+            return {}
+        return json.loads(raw)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _discover_agent_from_marker(cwd: str | None) -> tuple[str | None, str | None]:
+    """Look for `<cwd>/.claude/hub-agent.json` and read agent identity.
+
+    The marker file shape:
+        {"name": "dreamteam-lead", "project": "dreamteam"}
+
+    Returns (name, project) — either or both may be None if the marker
+    doesn't exist or is malformed. The cli silently no-ops in that case;
+    not every project on the system is a hub agent, and most aren't.
+    """
+    if not cwd:
+        return None, None
+    marker = pathlib.Path(cwd) / AGENT_MARKER_PATH
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None, None
+    name = data.get("name")
+    project = data.get("project")
+    return (
+        name if isinstance(name, str) and name else None,
+        project if isinstance(project, str) and project else None,
+    )
+
+
+def _resolve_agent_identity(
+    args: argparse.Namespace,
+) -> tuple[str | None, str | None]:
+    """Resolve which agent this hook invocation is for.
+
+    Resolution order:
+      1. Explicit --name (and --project) on the CLI — overrides everything.
+         Useful for tests, manual checks, non-standard setups.
+      2. Project marker file at <cwd>/.claude/hub-agent.json — discovered
+         from the cwd Claude Code passes to hooks via stdin. Lets a single
+         global hook config cover the whole fleet.
+      3. Nothing — return (None, None) and the cli will silently no-op.
+
+    The marker file path is fixed (`.claude/hub-agent.json`) so each
+    project self-declares with no central registry to maintain.
+    """
+    if args.name:
+        return args.name, args.project
+
+    payload = _read_hook_stdin()
+    cwd = payload.get("cwd")
+    return _discover_agent_from_marker(cwd)
+
+
 def stop_hook_command(args: argparse.Namespace) -> int:
     """Run the stop-hook subcommand. Always returns 0 (fail-open)."""
+    name, project = _resolve_agent_identity(args)
+    if name is None:
+        # No identity resolved — this project isn't onboarded as a hub agent.
+        # Silent no-op: most projects on the box aren't hub agents and the
+        # global Stop hook fires in all of them. We don't want noise.
+        return 0
+
     try:
         messages_text, is_bound = asyncio.run(
-            _query_hub(args.hub_url, args.name)
+            _query_hub(args.hub_url, name)
         )
     except Exception as exc:  # noqa: BLE001
         # Fail open — never block the agent on hub flakiness.
@@ -171,8 +252,8 @@ def stop_hook_command(args: argparse.Namespace) -> int:
         return 0
 
     response = build_hook_response(
-        agent_name=args.name,
-        project=args.project,
+        agent_name=name,
+        project=project,
         messages_text=messages_text,
         is_bound=is_bound,
     )
@@ -193,14 +274,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     stop_hook = sub.add_parser(
         "stop-hook",
-        help="Auto-check hub messages at Stop boundaries (for ~/.claude/settings.json hooks)",
+        help="Auto-check hub messages at Stop boundaries (for settings.json hooks)",
         description=(
-            "Queries the hub for queued DMs to <name> and emits Claude Code "
-            "Stop hook JSON if any are pending. Designed to be wired into "
-            "settings.json Stop hooks. Fail-open — never blocks Stop on hub errors."
+            "Queries the hub for queued DMs to the active agent and emits "
+            "Claude Code Stop hook JSON if any are pending. Designed to be "
+            "wired into a global ~/.claude/settings.json Stop hook with no "
+            "args — the cli auto-discovers agent identity from the project's "
+            ".claude/hub-agent.json marker. Use explicit --name to override "
+            "auto-discovery (e.g. for testing). Fail-open — never blocks Stop "
+            "on hub errors or missing markers."
         ),
     )
-    stop_hook.add_argument("--name", required=True, help="Your agent name on the hub")
+    stop_hook.add_argument(
+        "--name",
+        default=None,
+        help=(
+            "Agent name on the hub. If omitted, auto-discovers from "
+            "<cwd>/.claude/hub-agent.json via the cwd Claude Code passes to "
+            "hooks on stdin."
+        ),
+    )
     stop_hook.add_argument(
         "--project",
         default=None,
