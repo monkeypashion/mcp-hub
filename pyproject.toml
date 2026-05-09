@@ -33,3 +33,15 @@ select = ["E", "F", "I", "W"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+filterwarnings = [
+    # Test-shutdown noise: the live_hub fixture spawns the server in a
+    # daemon thread that dies abruptly when the test exits, occasionally
+    # leaving an unawaited coroutine on the error path. Production code
+    # is unaffected; suppress to keep test output clean.
+    "ignore:coroutine '_query_hub' was never awaited:RuntimeWarning",
+    # Upstream websockets / uvicorn deprecation warnings fired during
+    # test setup. Not actionable on our side; would resolve when uvicorn
+    # / mcp SDK upgrade their websockets usage.
+    "ignore::DeprecationWarning:websockets",
+    "ignore::DeprecationWarning:uvicorn",
+]

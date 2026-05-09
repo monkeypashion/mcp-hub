@@ -111,52 +111,71 @@ def build_hook_response(
     Returns the JSON payload Claude Code expects, or None to mean "no block,
     let Stop proceed normally."
 
-    The block is emitted in two cases:
-      1. There are queued messages (the primary purpose).
-      2. The agent has drifted off the wake path AND there's actionable
-         content — re-register reminder rides along.
+    A block is emitted in any of three cases:
+      1. Queued messages, agent bound: surface them with discipline reminder.
+      2. Queued messages, agent drifted: surface them + rebind hint.
+      3. No queued messages, agent drifted: rebind-only block. Without this,
+         drifted agents stay drifted indefinitely after a hub redeploy
+         (every redeploy wipes the in-memory session map). Self-healing
+         beats waiting for someone to DM them just to trigger a rebind.
 
-    A drifted agent with no queued content is left alone — re-registering
-    proactively on every Stop would be noisy. They'll get nudged the next
-    time something interesting lands for them.
+    Bound agent with no queued messages → return None, Stop proceeds normally.
     """
     has_messages = bool(messages_text.strip())
 
-    if not has_messages:
+    # No work needed: bound + nothing queued.
+    if not has_messages and is_bound:
         return None
 
-    # Build the reason text. The discipline part comes from the hub
-    # instructions agents already see at session register, but a brief
-    # one-line nudge here keeps it salient.
-    parts = ["📬 Auto-checked at Stop boundary — queued items below:", "", messages_text.strip()]
+    parts: list[str] = []
+
+    if has_messages:
+        parts.extend(
+            [
+                "📬 Auto-checked at Stop boundary — queued items below:",
+                "",
+                messages_text.strip(),
+            ]
+        )
 
     if not is_bound:
         rebind_args = [f'name="{agent_name}"']
         if project:
             rebind_args.append(f'project="{project}"')
+        rebind_call = f"register({', '.join(rebind_args)})"
+
+        if has_messages:
+            warning = (
+                f"⚠️ Your hub session is currently NOT bound for wake "
+                f"(no ⚡ in list_agents — likely after a hub redeploy). "
+                f"Call `{rebind_call}` to re-establish the wake path "
+                f"before processing the queue."
+            )
+        else:
+            warning = (
+                f"⚠️ Auto-checked at Stop boundary: your hub session is "
+                f"NOT bound for wake (no ⚡ in list_agents — likely after a "
+                f"hub redeploy). No queued items to process. Call "
+                f"`{rebind_call}` to re-establish the wake path, then "
+                f"continue what you were doing."
+            )
+        if has_messages:
+            parts.extend(["", warning])
+        else:
+            parts.append(warning)
+
+    if has_messages:
         parts.extend(
             [
                 "",
                 (
-                    f"⚠️ Your hub session is currently NOT bound for wake "
-                    f"(no ⚡ in list_agents — likely after a hub redeploy). "
-                    f"Call `register({', '.join(rebind_args)})` to re-establish "
-                    f"the wake path before processing the queue."
+                    "Discipline reminder: process if related/important to current "
+                    "work; otherwise note (one-line ack) and continue. Don't deeply "
+                    "context-switch on FYI/low-priority items. Urgent always "
+                    "responds."
                 ),
             ]
         )
-
-    parts.extend(
-        [
-            "",
-            (
-                "Discipline reminder: process if related/important to current "
-                "work; otherwise note (one-line ack) and continue. Don't deeply "
-                "context-switch on FYI/low-priority items. Urgent always "
-                "responds."
-            ),
-        ]
-    )
 
     return {"decision": "block", "reason": "\n".join(parts)}
 

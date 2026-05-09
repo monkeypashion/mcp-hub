@@ -39,16 +39,40 @@ def test_no_messages_no_block():
     ) is None
 
 
-def test_no_messages_unbound_still_no_block():
-    """Drifted-but-empty: don't proactively re-register on every Stop. The
-    rebind hint rides along when there's already actionable content. Empty
-    case = let it ride; next message will surface both."""
-    assert build_hook_response(
+def test_no_messages_unbound_emits_rebind_only_block():
+    """Drifted with empty inbox: emit a rebind-only block so the agent
+    self-heals on the next Stop after a hub redeploy. Without this, drifted
+    agents stay drifted indefinitely until someone DMs them — defeats
+    the wake feature for any agent that isn't actively in conversation."""
+    response = build_hook_response(
         agent_name="alice",
         project="proj",
         messages_text="",
         is_bound=False,
-    ) is None
+    )
+    assert response is not None
+    assert response["decision"] == "block"
+    reason = response["reason"]
+    # Rebind hint with the explicit register() call
+    assert 'register(name="alice", project="proj")' in reason
+    # No "queued items" header since there's nothing to process
+    assert "queued items below" not in reason
+    # No discipline reminder since there's nothing to context-switch on
+    assert "Discipline reminder" not in reason
+
+
+def test_no_messages_unbound_no_project_emits_rebind_only_block():
+    """Same as above but with project=None — the rebind call should
+    omit the `project=` argument cleanly."""
+    response = build_hook_response(
+        agent_name="alice",
+        project=None,
+        messages_text="",
+        is_bound=False,
+    )
+    assert response is not None
+    assert 'register(name="alice")' in response["reason"]
+    assert "project=" not in response["reason"]
 
 
 def test_messages_bound_emits_block_with_content():

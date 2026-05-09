@@ -140,10 +140,13 @@ class SessionRegistry:
     momentarily is fine.
     """
 
-    # Tight enough to catch true zombies, loose enough to ride out normal
-    # network jitter or a recipient that's mid-tool-call. 2s is comfortable
-    # for a same-region hub→client→hub round-trip.
-    PING_TIMEOUT_SECONDS: float = 2.0
+    # Loose enough to ride out normal network jitter, transient client
+    # slowdowns (Claude Code mid-tool-call may delay ping response), and
+    # CF/Traefik intermediaries. Tight enough that genuinely-dead sessions
+    # still get reaped reasonably quickly. 5s observed empirically: 2s
+    # was producing false-positive drops where my own session got reaped
+    # mid-conversation despite being healthy.
+    PING_TIMEOUT_SECONDS: float = 5.0
 
     # Cadence of the background liveness sweep. The lifecycle hook is the
     # primary cleanup mechanism, but streamable-http sessions can outlive
