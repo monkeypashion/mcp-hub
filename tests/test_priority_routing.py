@@ -17,7 +17,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from mcp_hub.server import _NO_WAKE_PRIORITIES, _VALID_PRIORITIES, create_server
+from mcp_hub.server import (
+    _NO_WAKE_PRIORITIES,
+    _VALID_PRIORITIES,
+    create_server,
+    is_channel_capable,
+)
 
 
 @pytest.fixture
@@ -523,6 +528,76 @@ def test_normal_is_not_no_wake():
 def test_urgent_is_not_no_wake():
     """Urgent priority must always wake — the whole point."""
     assert "urgent" not in _NO_WAKE_PRIORITIES
+
+
+# ---------------------------------------------------------------------------
+# Channel-capability gating
+# ---------------------------------------------------------------------------
+#
+# Only sessions advertising the claude/channel experimental capability are
+# real wake targets. Binding non-capable sessions (e.g. the Stop hook's
+# ephemeral streamablehttp_client) overwrites the live agent's wake binding
+# with one that's about to be DELETEd, silently breaking wake.
+
+
+class _FakeCaps:
+    def __init__(self, experimental):
+        self.experimental = experimental
+
+
+class _FakeParams:
+    def __init__(self, capabilities):
+        self.capabilities = capabilities
+
+
+class _FakeSessionWithParams:
+    def __init__(self, client_params):
+        self.client_params = client_params
+
+
+def test_is_channel_capable_true_when_experimental_includes_channel():
+    sess = _FakeSessionWithParams(
+        _FakeParams(_FakeCaps({"claude/channel": {}}))
+    )
+    assert is_channel_capable(sess) is True
+
+
+def test_is_channel_capable_false_when_experimental_missing_channel():
+    sess = _FakeSessionWithParams(
+        _FakeParams(_FakeCaps({"some/other": {}}))
+    )
+    assert is_channel_capable(sess) is False
+
+
+def test_is_channel_capable_false_when_experimental_is_none():
+    """A bare client (e.g. the Stop hook's streamablehttp_client) sends an
+    InitializeRequest without experimental capabilities — that's the signal
+    we use to skip the bind."""
+    sess = _FakeSessionWithParams(_FakeParams(_FakeCaps(None)))
+    assert is_channel_capable(sess) is False
+
+
+def test_is_channel_capable_false_when_capabilities_is_none():
+    sess = _FakeSessionWithParams(_FakeParams(None))
+    assert is_channel_capable(sess) is False
+
+
+def test_is_channel_capable_false_when_client_params_is_none():
+    """Pre-initialize sessions have no client_params yet. We must not bind
+    them — the negotiation hasn't established what they support."""
+    sess = _FakeSessionWithParams(None)
+    assert is_channel_capable(sess) is False
+
+
+def test_is_channel_capable_false_for_object_without_attrs():
+    """Defensive: any object missing the attribute chain returns False
+    rather than raising — pushes through the registry shouldn't be able
+    to crash the server with malformed sessions."""
+
+    class _Bare:
+        pass
+
+    assert is_channel_capable(_Bare()) is False
 
 
 # ---------------------------------------------------------------------------
