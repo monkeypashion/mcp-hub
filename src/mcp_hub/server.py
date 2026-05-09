@@ -896,18 +896,31 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     # -- Reading messages --
 
     @mcp.tool()
-    def get_messages(agent_name: str, limit: int = 20, ctx: Context | None = None) -> str:
+    def get_messages(
+        agent_name: str,
+        limit: int = 20,
+        bind: bool = True,
+        ctx: Context | None = None,
+    ) -> str:
         """Get unread direct messages for this agent. Marks them as read.
 
         Args:
             agent_name: Your agent name.
             limit: Max messages to return.
+            bind: If True (default), refresh the agent's wake-binding to the
+                  calling session — this is the drift self-heal property
+                  for normal interactive use. The Stop hook utility
+                  (mcp-hub stop-hook) passes bind=False because its
+                  streamablehttp_client is ephemeral: binding to it would
+                  overwrite the agent's real wake target with a session
+                  that's about to be DELETEd, silently breaking wake.
         """
         now = time.time()
         conn = _get_db(db_path)
 
         # Auto-bind caller's session for drift self-heal.
-        touch_session(agent_name, ctx)
+        if bind:
+            touch_session(agent_name, ctx)
 
         # Update last_seen
         conn.execute("UPDATE agents SET last_seen = ? WHERE name = ?", (now, agent_name))
@@ -967,7 +980,12 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         return "\n".join(lines)
 
     @mcp.tool()
-    def get_broadcasts_for_agent(agent_name: str, limit: int = 50, ctx: Context | None = None) -> str:
+    def get_broadcasts_for_agent(
+        agent_name: str,
+        limit: int = 50,
+        bind: bool = True,
+        ctx: Context | None = None,
+    ) -> str:
         """Get broadcasts this agent hasn't seen yet, and advance their cursor.
 
         Used by Stop hooks (and any future "catch up since I was away" flow):
@@ -983,6 +1001,11 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         Args:
             agent_name: Your agent name (must be registered).
             limit: Max broadcasts to return.
+            bind: If True (default), refresh the agent's wake-binding to
+                  the calling session. The Stop hook utility passes
+                  bind=False because its streamablehttp_client is ephemeral
+                  and binding to it would clobber the agent's real wake
+                  target. See note on get_messages for full rationale.
         """
         conn = _get_db(db_path)
         row = conn.execute(
@@ -995,7 +1018,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             return ""
 
         # Auto-bind caller's session for drift self-heal.
-        touch_session(agent_name, ctx)
+        if bind:
+            touch_session(agent_name, ctx)
 
         cursor = row["last_broadcast_seen_id"]
 

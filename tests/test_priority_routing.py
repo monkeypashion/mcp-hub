@@ -372,6 +372,62 @@ async def test_auto_bind_skips_unregistered_names(server):
     assert not registry.is_bound("ghost-typo")
 
 
+async def test_get_messages_bind_false_does_not_touch_registry(server):
+    """The Stop hook calls get_messages(bind=False). That MUST NOT bind the
+    agent — the Stop hook's streamablehttp_client is ephemeral and binding
+    to it would clobber the agent's real wake target.
+
+    We can't easily inject a real session through call_tool here, so we
+    instead seed a real binding directly, then call get_messages(bind=False)
+    and assert the binding is unchanged. The default bind=True path is
+    covered indirectly by `test_auto_bind_*` above.
+    """
+
+    class _SentinelSess:
+        async def send_ping(self): ...
+        async def send_notification(self, _n): ...
+
+    # Set up: alice registered + bound to a known sentinel session.
+    await _call_tool(server, "register", {"name": "alice", "project": "x"})
+    registry = server._hub_registry  # type: ignore[attr-defined]
+    registry.unbind_name("alice")
+    sentinel = _SentinelSess()
+    registry.bind("alice", sentinel)
+    assert registry.get("alice") is sentinel
+
+    # Stop-hook-style call: bind=False. Must not change the binding.
+    await _call_tool(
+        server, "get_messages",
+        {"agent_name": "alice", "bind": False},
+    )
+    assert registry.get("alice") is sentinel, (
+        "bind=False must not overwrite an existing binding"
+    )
+
+
+async def test_get_broadcasts_for_agent_bind_false_does_not_touch_registry(server):
+    """Same contract as get_messages: bind=False is the Stop-hook escape
+    hatch and must leave the existing binding alone."""
+
+    class _SentinelSess:
+        async def send_ping(self): ...
+        async def send_notification(self, _n): ...
+
+    await _call_tool(server, "register", {"name": "alice", "project": "x"})
+    registry = server._hub_registry  # type: ignore[attr-defined]
+    registry.unbind_name("alice")
+    sentinel = _SentinelSess()
+    registry.bind("alice", sentinel)
+
+    await _call_tool(
+        server, "get_broadcasts_for_agent",
+        {"agent_name": "alice", "bind": False},
+    )
+    assert registry.get("alice") is sentinel, (
+        "bind=False must not overwrite an existing binding"
+    )
+
+
 async def test_broadcast_advances_sender_cursor(server):
     """The sender's `last_broadcast_seen_id` is bumped past their own
     broadcast immediately, so they never see their own message resurfaced

@@ -68,11 +68,18 @@ async def _query_hub(
         async with ClientSession(read, write) as session:
             await session.initialize()
 
+            # bind=False on the calls below: this client is the Stop hook's
+            # ephemeral streamablehttp_client — its session_id is DELETEd
+            # when the `async with` block exits. Letting the hub auto-bind
+            # the agent's name to this short-lived session would clobber
+            # the agent's real (long-lived) wake target. The hub's
+            # touch_session honours bind=False and skips the binding.
             messages_result = await session.call_tool(
-                "get_messages", {"agent_name": agent_name}
+                "get_messages", {"agent_name": agent_name, "bind": False}
             )
             broadcasts_result = await session.call_tool(
-                "get_broadcasts_for_agent", {"agent_name": agent_name}
+                "get_broadcasts_for_agent",
+                {"agent_name": agent_name, "bind": False},
             )
             agents_result = await session.call_tool("list_agents", {})
 
