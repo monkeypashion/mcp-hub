@@ -51,6 +51,14 @@ class _ChannelNotification(BaseModel):
 _VALID_PRIORITIES = {"low", "normal", "urgent"}
 _NO_WAKE_PRIORITIES = {"low"}
 
+# Single hard-coded broadcast channel. We deliberately don't expose multi-
+# channel admin (create_channel / list_channels / per-channel ACLs / etc.)
+# — kept the model collapsed to "DMs + one global broadcast" so we can't
+# accumulate dozens of half-used channels via typos. The DB column stays
+# generic in case we ever re-introduce channels; this is just the slot
+# every broadcast goes into today.
+_BROADCAST_CHANNEL = "general"
+
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
@@ -370,62 +378,33 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             )
         )
 
-    # -- Channels --
+    # -- Broadcast --
 
     @mcp.tool()
-    def create_channel(name: str, created_by: str, description: str = "") -> str:
-        """Create a broadcast channel.
+    async def broadcast(from_agent: str, message: str, priority: str = "normal") -> str:
+        """Post a broadcast every agent will see.
 
-        Args:
-            name: Channel name (e.g. 'builds', 'qa', 'chat').
-            created_by: Your agent name.
-            description: What this channel is for.
-        """
-        now = time.time()
-        conn = _get_db(db_path)
-        try:
-            conn.execute(
-                "INSERT INTO channels (name, created_by, created_at, description) VALUES (?, ?, ?, ?)",
-                (name, created_by, now, description),
-            )
-            conn.commit()
-            return f"Channel '{name}' created."
-        except sqlite3.IntegrityError:
-            return f"Channel '{name}' already exists."
+        There is one shared broadcast feed — there are no per-channel /
+        per-topic subscriptions. Every agent is implicitly a recipient.
+        Use direct messages (`send`) when you want to reach one agent.
 
-    @mcp.tool()
-    def list_channels() -> str:
-        """List all broadcast channels."""
-        conn = _get_db(db_path)
-        rows = conn.execute("SELECT * FROM channels ORDER BY name").fetchall()
-        if not rows:
-            return "No channels. Create one with create_channel()."
-        lines = []
-        for r in rows:
-            line = f"**#{r['name']}**"
-            if r["description"]:
-                line += f" — {r['description']}"
-            lines.append(line)
-        return "\n".join(lines)
+        Priority controls whether currently-connected agents are woken
+        from idle on receipt:
 
-    @mcp.tool()
-    async def broadcast(from_agent: str, channel: str, message: str, priority: str = "normal") -> str:
-        """Post a message to a channel (all agents can see it).
-
-        Priority controls whether listening agents are woken from idle:
-
-        - "normal" (default): wake all connected agents on receipt.
-        - "low": persist to channel history only, do NOT wake anyone. Use for
-          EOD recaps, status updates, FYIs — anything that doesn't need
-          immediate attention. Agents pick it up via get_channel_messages()
-          when they next look. Strongly preferred over "normal" for
-          informational broadcasts to avoid distracting focused work.
-        - "urgent": wake all connected agents and flag as urgent in the
-          rendered tag's meta. Use sparingly.
+        - "normal" (default): wake every connected agent. Use for things
+          everyone should see now.
+        - "low": persist to the broadcast feed only; do NOT wake anyone.
+          Use for EOD recaps, status updates, FYIs — anything that doesn't
+          need immediate attention. Agents pick it up via `get_broadcasts`
+          when they next look. Strongly preferred for informational
+          broadcasts to avoid distracting focused work.
+        - "urgent": wake every connected agent with priority="urgent"
+          surfaced in the rendered tag's meta so receivers can visually
+          triage. Use sparingly — urgent should mean "everyone needs to
+          stop what they're doing."
 
         Args:
             from_agent: Your agent name.
-            channel: Channel name.
             message: The message body.
             priority: One of "low" | "normal" | "urgent". Defaults to "normal".
         """
@@ -438,26 +417,21 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         now = time.time()
         conn = _get_db(db_path)
 
-        # Verify channel exists
-        row = conn.execute("SELECT 1 FROM channels WHERE name = ?", (channel,)).fetchone()
-        if not row:
-            return f"Channel '{channel}' not found. Create it with create_channel()."
-
         conn.execute(
             "UPDATE agents SET last_seen = ? WHERE name = ?", (now, from_agent)
         )
         conn.execute(
             "INSERT INTO messages (ts, from_agent, channel, body, priority) "
             "VALUES (?, ?, ?, ?, ?)",
-            (now, from_agent, channel, message, priority),
+            (now, from_agent, _BROADCAST_CHANNEL, message, priority),
         )
         conn.commit()
 
-        # Low-priority broadcasts go to channel history only; no wake.
+        # Low-priority broadcasts go to the feed only; no wake.
         if priority in _NO_WAKE_PRIORITIES:
             return (
-                f"Posted to #{channel} (priority={priority}; no wake — "
-                f"agents will see it via get_channel_messages())."
+                f"Broadcast posted (priority={priority}; no wake — "
+                f"agents will see it via get_broadcasts())."
             )
 
         recipients = [a for a in registry.names() if a != from_agent]
@@ -465,17 +439,16 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         for agent in recipients:
             if await push_channel(
                 agent=agent,
-                content=f"#{channel} from {from_agent}: {message}",
+                content=f"BROADCAST from {from_agent}: {message}",
                 meta={
                     "from_agent": from_agent,
                     "kind": "broadcast",
-                    "channel": channel,
                     "priority": priority,
                 },
             ):
                 woke += 1
         return (
-            f"Posted to #{channel} (priority={priority}; "
+            f"Broadcast posted (priority={priority}; "
             f"woke {woke}/{len(recipients)} connected agents)."
         )
 
@@ -522,11 +495,10 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         return "\n".join(lines)
 
     @mcp.tool()
-    def get_channel_messages(channel: str, limit: int = 20, since_minutes: int = 60) -> str:
-        """Get recent messages from a channel.
+    def get_broadcasts(limit: int = 20, since_minutes: int = 60) -> str:
+        """Get recent broadcasts.
 
         Args:
-            channel: Channel name.
             limit: Max messages to return.
             since_minutes: Only show messages from the last N minutes.
         """
@@ -536,7 +508,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             """SELECT ts, from_agent, body, priority FROM messages
                WHERE channel = ? AND ts > ?
                ORDER BY ts ASC LIMIT ?""",
-            (channel, cutoff, limit),
+            (_BROADCAST_CHANNEL, cutoff, limit),
         ).fetchall()
 
         if not rows:

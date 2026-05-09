@@ -61,10 +61,9 @@ async def test_send_rejects_invalid_priority(server):
 
 
 async def test_broadcast_rejects_invalid_priority(server):
-    await _call_tool(server, "create_channel", {"name": "general", "created_by": "alice"})
     out = await _call_tool(
         server, "broadcast",
-        {"from_agent": "alice", "channel": "general", "message": "hi", "priority": "spicy"},
+        {"from_agent": "alice", "message": "hi", "priority": "spicy"},
     )
     assert "Invalid priority" in out
 
@@ -89,17 +88,11 @@ async def test_send_low_priority_skips_channel_push(server):
 
 
 async def test_broadcast_low_priority_skips_channel_push(server):
-    await _call_tool(server, "create_channel", {"name": "general", "created_by": "alice"})
     registry = server._hub_registry  # type: ignore[attr-defined]
     with patch.object(registry, "push", AsyncMock(return_value=False)) as push:
         out = await _call_tool(
             server, "broadcast",
-            {
-                "from_agent": "alice",
-                "channel": "general",
-                "message": "EOD recap",
-                "priority": "low",
-            },
+            {"from_agent": "alice", "message": "EOD recap", "priority": "low"},
         )
     push.assert_not_called()
     assert "no wake" in out.lower()

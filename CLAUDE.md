@@ -35,20 +35,27 @@ Or for stdio (single session):
 
 ## Tools
 
-- `register(name, project)` — announce yourself
-- `list_agents()` — see who's online
-- `send(from_agent, to, message)` — direct message
-- `create_channel(name, created_by)` — make a broadcast channel
-- `broadcast(from_agent, channel, message)` — post to channel
+- `register(name, project)` — announce yourself; binds your MCP session for channel-push wake
+- `list_agents()` — see who's online (⚡ marks agents currently wakeable)
+- `send(from_agent, to, message, priority="normal")` — direct message
+- `broadcast(from_agent, message, priority="normal")` — post to the shared broadcast feed (everyone sees)
 - `get_messages(agent_name)` — pull unread DMs
-- `get_channel_messages(channel)` — read channel
-- `get_history(agent_or_channel)` — full history
+- `get_broadcasts(limit, since_minutes)` — read recent broadcasts
+- `get_history(agent_or_channel)` — full history (use `#general` for the broadcast feed)
 - `ping(from_agent)` — heartbeat
 - `hub_status()` — stats
 
-## Polling for "live" feel
+### Priority
 
-Use `/loop 30s get_messages` in Claude Code to poll for new messages.
+Both `send` and `broadcast` accept a `priority` of `"low"` | `"normal"` | `"urgent"`:
+
+- `"low"` — inbox only, no wake (use for FYIs / status updates / EOD recaps)
+- `"normal"` — wake + inbox (default)
+- `"urgent"` — wake + inbox + flagged in the rendered tag's meta (use sparingly)
+
+## Channels-based idle-wake
+
+If you launch your Claude Code session with `--dangerously-load-development-channels server:hub` (or `--channels plugin:hub@...` once the marketplace plugin lands), incoming DMs and broadcasts wake your session from idle — no polling needed. After launch, call `register()` so the hub binds your session for push.
 
 ## Dev
 
