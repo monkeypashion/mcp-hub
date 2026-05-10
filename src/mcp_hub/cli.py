@@ -303,6 +303,71 @@ def stop_hook_command(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# heartbeat-daemon subcommand
+# ---------------------------------------------------------------------------
+
+
+HEARTBEAT_INTERVAL_SECONDS = 60
+HEARTBEAT_RETRY_DELAY_SECONDS = 60
+
+
+async def _heartbeat_loop(hub_url: str, agent_name: str) -> None:
+    """Long-lived loop: connect to hub, ping `heartbeat(agent_name)` every
+    HEARTBEAT_INTERVAL_SECONDS. On any connection error, sleep and reconnect.
+
+    Single MCP session is held open across heartbeats — this is the right
+    shape because heartbeat doesn't bind, so the session lifetime is just
+    a connection-pooling concern, not a wake-target concern.
+    """
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    while True:
+        try:
+            async with streamablehttp_client(hub_url, timeout=10) as (read, write, _):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    while True:
+                        await session.call_tool(
+                            "heartbeat", {"agent_name": agent_name}
+                        )
+                        await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+        except Exception as exc:  # noqa: BLE001
+            # Connection / init / call failure — log and reconnect after a
+            # delay. Fail-open: heartbeat outages don't crash the daemon.
+            print(
+                f"[mcp-hub heartbeat] connection error ({type(exc).__name__}: "
+                f"{exc}); retrying in {HEARTBEAT_RETRY_DELAY_SECONDS}s",
+                file=sys.stderr,
+            )
+            await asyncio.sleep(HEARTBEAT_RETRY_DELAY_SECONDS)
+
+
+def heartbeat_daemon_command(args: argparse.Namespace) -> int:
+    """Run the heartbeat-daemon subcommand. Long-running; only returns on
+    KeyboardInterrupt or unrecoverable error.
+
+    Designed to be spawned by an async SessionStart hook in
+    ~/.claude/settings.json. The daemon's parent is the Claude Code
+    process; when Claude Code exits, OS process-tree reaping should kill
+    the daemon (POSIX) or the daemon stays leaked until the system
+    cleans it up (Windows — to be verified empirically).
+    """
+    name, _project = _resolve_agent_identity(args)
+    if name is None:
+        # Silent no-op — same fail-open contract as stop-hook. Lets the
+        # global SessionStart hook fire in every project without
+        # needing per-project opt-out for non-hub projects.
+        return 0
+
+    try:
+        asyncio.run(_heartbeat_loop(args.hub_url, name))
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mcp-hub",
@@ -343,6 +408,39 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Hub MCP endpoint (default: {DEFAULT_HUB_URL}, or $MCP_HUB_URL)",
     )
 
+    heartbeat = sub.add_parser(
+        "heartbeat-daemon",
+        help="Long-running per-minute heartbeat to the hub (for SessionStart hooks)",
+        description=(
+            "Long-lived daemon that pings the hub's heartbeat tool every "
+            f"{HEARTBEAT_INTERVAL_SECONDS}s, proving the agent's Claude Code "
+            "session is still alive. Designed to be spawned by an async "
+            "SessionStart hook in ~/.claude/settings.json. Reads agent "
+            "identity from <cwd>/.claude/hub-agent.json (same marker as "
+            "stop-hook). Silent no-op if no marker found. Reconnects on "
+            "transient hub errors."
+        ),
+    )
+    heartbeat.add_argument(
+        "--name",
+        default=None,
+        help=(
+            "Agent name on the hub. If omitted, auto-discovers from "
+            "<cwd>/.claude/hub-agent.json via the cwd Claude Code passes "
+            "to hooks on stdin."
+        ),
+    )
+    heartbeat.add_argument(
+        "--project",
+        default=None,
+        help="Project name (currently informational; reserved for future use)",
+    )
+    heartbeat.add_argument(
+        "--hub-url",
+        default=DEFAULT_HUB_URL,
+        help=f"Hub MCP endpoint (default: {DEFAULT_HUB_URL}, or $MCP_HUB_URL)",
+    )
+
     return parser
 
 
@@ -352,6 +450,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.subcommand == "stop-hook":
         return stop_hook_command(args)
+    if args.subcommand == "heartbeat-daemon":
+        return heartbeat_daemon_command(args)
 
     parser.print_help()
     return 0

@@ -1112,6 +1112,39 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         return f"pong ({time.strftime('%H:%M:%S')})"
 
     @mcp.tool()
+    def heartbeat(agent_name: str) -> str:
+        """Out-of-session liveness signal from the agent's heartbeat daemon.
+
+        The daemon (spawned by an async SessionStart hook) calls this every
+        ~60s to prove the agent's Claude Code process is still alive. Use
+        case: keep `_last_activity` fresh so the reaper doesn't drop a
+        healthy idle agent who hasn't called the hub in a while.
+
+        Crucially this does NOT bind. Binding the daemon's ephemeral
+        streamablehttp_client would clobber the agent's real wake target —
+        same wake-clobber bug we fixed for the Stop hook with bind=False.
+        Instead `heartbeat` only refreshes the timestamp on an EXISTING
+        binding; if the agent isn't bound, the heartbeat is a no-op (the
+        agent's interactive session is responsible for register()-binding
+        first; the daemon just keeps it alive thereafter).
+
+        Args:
+            agent_name: The agent name from the project's hub-agent.json
+                marker. Daemon reads it and passes it here.
+        """
+        refreshed = registry.touch_activity(agent_name)
+        if not refreshed:
+            return f"heartbeat ignored — '{agent_name}' has no binding"
+        # Keep last_seen in sync for list_agents staleness ordering.
+        conn = _get_db(db_path)
+        conn.execute(
+            "UPDATE agents SET last_seen = ? WHERE name = ?",
+            (time.time(), agent_name),
+        )
+        conn.commit()
+        return f"heartbeat ok ({time.strftime('%H:%M:%S')})"
+
+    @mcp.tool()
     def hub_status() -> str:
         """Get hub statistics — agents online, channels, message counts."""
         conn = _get_db(db_path)
@@ -1133,7 +1166,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 # CLI
 # ---------------------------------------------------------------------------
 
-_CLI_SUBCOMMANDS = {"stop-hook"}
+_CLI_SUBCOMMANDS = {"stop-hook", "heartbeat-daemon"}
 
 
 def main():

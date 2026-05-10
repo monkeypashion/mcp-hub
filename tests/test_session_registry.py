@@ -411,6 +411,57 @@ def test_unbind_clears_activity_timestamp(registry):
     assert "alice" not in registry._last_activity
 
 
+# ---------------------------------------------------------------------------
+# touch_activity (heartbeat path) — refresh without bind
+# ---------------------------------------------------------------------------
+
+
+def test_touch_activity_refreshes_existing_binding(registry):
+    """The heartbeat daemon's signal: refresh `_last_activity` for an
+    already-bound name. Returns True. No index changes."""
+    import time as _t
+
+    s = FakeSession()
+    registry.bind("alice", s)
+    # Backdate so we can detect a refresh
+    with registry._lock:
+        registry._last_activity["alice"] = _t.time() - 100.0
+    before = registry._last_activity["alice"]
+
+    refreshed = registry.touch_activity("alice")
+
+    assert refreshed is True
+    assert registry._last_activity["alice"] > before
+    # Index must be untouched — same session, no rebind side effect.
+    assert registry.get("alice") is s
+
+
+def test_touch_activity_unbound_returns_false(registry):
+    """Heartbeat for an agent with no binding is a no-op. Must NOT create
+    a binding (would clobber the wake-target invariant) and must NOT add
+    a stray `_last_activity` entry."""
+    refreshed = registry.touch_activity("nobody-here")
+
+    assert refreshed is False
+    assert not registry.is_bound("nobody-here")
+    assert "nobody-here" not in registry._last_activity
+
+
+def test_touch_activity_does_not_change_session_indexes(registry):
+    """Critical: heartbeat must never touch the by_session_id reverse
+    index. If it did, a heartbeat-induced index entry could leak across
+    rebinds."""
+    s = FakeSession()
+    registry.bind("alice", s)
+    sid = id(s)
+    before = set(registry._by_session_id.get(sid, set()))
+
+    registry.touch_activity("alice")
+
+    after = set(registry._by_session_id.get(sid, set()))
+    assert after == before, "touch_activity must not mutate session indexes"
+
+
 async def test_reaper_drops_stale_keeps_active(registry):
     """Stale binding gets dropped by the background reaper; an active
     binding (whose activity keeps getting refreshed) survives."""

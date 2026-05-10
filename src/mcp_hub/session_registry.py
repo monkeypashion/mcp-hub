@@ -231,6 +231,29 @@ class SessionRegistry:
         with self._lock:
             self._unbind_name_locked(name)
 
+    def touch_activity(self, name: str) -> bool:
+        """Refresh `_last_activity[name]` IF a binding exists. Returns True
+        if refreshed, False if no binding (heartbeat from an unbound agent
+        is a no-op, not a bind).
+
+        Used by the heartbeat path: a per-minute daemon spawned by an async
+        SessionStart hook calls the hub from a separate process to prove
+        the agent's Claude Code session is still alive. We don't want that
+        daemon's ephemeral streamablehttp_client to be bound (same wake-
+        clobber problem as the Stop hook), so heartbeat just keeps the
+        existing binding's timestamp fresh.
+
+        If the agent has no binding when the heartbeat arrives, the
+        heartbeat is meaningless — the agent's interactive session must
+        register() to establish the bind first; daemon heartbeats only
+        keep it alive thereafter.
+        """
+        with self._lock:
+            if name not in self._by_name:
+                return False
+            self._last_activity[name] = time.time()
+            return True
+
     def _unbind_name_locked(self, name: str) -> None:
         session = self._by_name.pop(name, None)
         # Drop activity timestamp — a future re-bind starts fresh.

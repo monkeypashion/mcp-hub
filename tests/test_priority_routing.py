@@ -428,6 +428,61 @@ async def test_get_broadcasts_for_agent_bind_false_does_not_touch_registry(serve
     )
 
 
+async def test_heartbeat_refreshes_bound_agent_without_binding(server):
+    """The heartbeat tool refreshes `_last_activity` for a bound agent
+    WITHOUT side-effects on the registry's session binding. This is the
+    load-bearing property: the heartbeat daemon's MCP session is ephemeral
+    and must NOT replace the agent's real wake target."""
+    import time as _t
+
+    class _SentinelSess:
+        async def send_ping(self): ...
+        async def send_notification(self, _n): ...
+
+    await _call_tool(server, "register", {"name": "alice", "project": "x"})
+
+    registry = server._hub_registry  # type: ignore[attr-defined]
+    registry.unbind_name("alice")
+    sentinel = _SentinelSess()
+    registry.bind("alice", sentinel)
+    # Backdate so we can detect a refresh
+    with registry._lock:
+        registry._last_activity["alice"] = _t.time() - 100.0
+    before = registry._last_activity["alice"]
+
+    out = await _call_tool(server, "heartbeat", {"agent_name": "alice"})
+
+    assert "ok" in out.lower()
+    # Activity refreshed
+    assert registry._last_activity["alice"] > before
+    # CRITICAL: binding unchanged. The heartbeat call goes through MCP
+    # which has its own session_id; if heartbeat were calling touch_session
+    # it would have replaced the binding here.
+    assert registry.get("alice") is sentinel, (
+        "heartbeat must not touch the session binding"
+    )
+
+
+async def test_heartbeat_unbound_agent_is_noop(server):
+    """Heartbeat for an agent with no binding returns a friendly message
+    and does NOT create a binding (would clobber the invariant that only
+    the agent's own register() establishes the wake target)."""
+    await _call_tool(server, "register", {"name": "alice", "project": "x"})
+
+    registry = server._hub_registry  # type: ignore[attr-defined]
+    # Ensure alice is unbound — drift simulation
+    registry.unbind_name("alice")
+    assert not registry.is_bound("alice")
+
+    out = await _call_tool(server, "heartbeat", {"agent_name": "alice"})
+
+    assert "ignored" in out.lower() or "no binding" in out.lower()
+    # Most importantly, heartbeat must NOT have created a binding
+    assert not registry.is_bound("alice"), (
+        "heartbeat for unbound agent must not create a binding"
+    )
+
+
 async def test_broadcast_advances_sender_cursor(server):
     """The sender's `last_broadcast_seen_id` is bumped past their own
     broadcast immediately, so they never see their own message resurfaced
