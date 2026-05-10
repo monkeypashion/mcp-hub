@@ -504,6 +504,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         Args:
             include_offline: Include agents that have disconnected.
         """
+        now = time.time()
         conn = _get_db(db_path)
         if include_offline:
             rows = conn.execute("SELECT * FROM agents ORDER BY last_seen DESC").fetchall()
@@ -518,12 +519,23 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         lines = []
         for r in rows:
             status = "🟢" if r["status"] == "online" else "⚫"
-            # ⚡ marks agents with a live, ping-verified MCP session — i.e.
-            # actually wakeable on incoming DM/broadcast right now. Online
-            # without ⚡ means the message will queue until the agent next
-            # polls or relaunches with --channels (and registers).
+            # ⚡ marks agents with a live MCP session bound for channel-push
+            # wake. Online without ⚡ means messages queue until the agent
+            # next polls / relaunches / makes any binding tool call.
             wake = " ⚡" if r["name"] in registry else ""
-            line = f"{status} **{r['name']}**{wake}"
+            # 💤 marks agents currently idle (Stop hook flipped them at last
+            # turn end, no tool call has cleared it since). Combined with
+            # ⚡, this is the state where a low-prio DM fires a live wake
+            # via Case 1. Stale-idle (older than IDLE_DECAY_SECONDS) is
+            # treated as presumed-dead and renders without 💤 so the
+            # marker matches actual wake-fire eligibility.
+            idle = (
+                " 💤"
+                if r["is_idle"]
+                and (now - r["last_idle_at"]) <= IDLE_DECAY_SECONDS
+                else ""
+            )
+            line = f"{status} **{r['name']}**{wake}{idle}"
             if r["project"]:
                 line += f" ({r['project']})"
             if r["bio"]:

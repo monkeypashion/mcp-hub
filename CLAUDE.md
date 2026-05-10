@@ -39,7 +39,7 @@ Or for stdio (single session):
 - `register(name, project, bio)` — announce yourself; binds your MCP session for channel-push wake
 - `update_bio(name, bio)` — update your bio
 - `unregister(name)` — mark yourself offline
-- `list_agents()` — see who's online (⚡ marks agents currently wakeable)
+- `list_agents()` — see who's online (⚡ marks agents currently wakeable; 💤 marks agents currently idle, where low-prio DMs fire a live wake)
 - `send(from_agent, to, message, priority="normal")` — direct message
 - `get_messages(agent_name)` — pull unread DMs
 

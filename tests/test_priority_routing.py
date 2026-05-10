@@ -379,6 +379,87 @@ async def test_get_messages_default_does_not_mark_idle(server):
     assert row["is_idle"] == 0
 
 
+async def test_list_agents_renders_idle_marker_for_fresh_idle(server):
+    """A bound + fresh-idle agent must render with 💤 in list_agents
+    output. This is the operator's at-a-glance signal for 'low-prio DM
+    will fire a live wake here.'"""
+    import time as _t
+
+    await _call_tool(server, "register", {"name": "alice", "project": "x"})
+
+    registry = server._hub_registry  # type: ignore[attr-defined]
+
+    class _FakeSess:
+        async def send_ping(self): ...
+        async def send_notification(self, _n): ...
+
+    registry.bind("alice", _FakeSess())
+
+    conn = _idle_helper_db(server)
+    conn.execute(
+        "UPDATE agents SET is_idle = 1, last_idle_at = ? WHERE name = ?",
+        (_t.time(), "alice"),
+    )
+    conn.commit()
+
+    out = await _call_tool(server, "list_agents", {})
+    # Both ⚡ and 💤 should appear on alice's line
+    assert "**alice**" in out
+    assert "⚡" in out
+    assert "💤" in out
+
+
+async def test_list_agents_no_idle_marker_when_running(server):
+    """A bound agent who's NOT idle (in a turn) renders with ⚡ but
+    without 💤. Sender's signal that a low-prio DM here would queue,
+    not wake."""
+    await _call_tool(server, "register", {"name": "alice", "project": "x"})
+
+    registry = server._hub_registry  # type: ignore[attr-defined]
+
+    class _FakeSess:
+        async def send_ping(self): ...
+        async def send_notification(self, _n): ...
+
+    registry.bind("alice", _FakeSess())
+    # Default is_idle=0 — agent is running
+
+    out = await _call_tool(server, "list_agents", {})
+    assert "**alice**" in out
+    assert "⚡" in out
+    assert "💤" not in out
+
+
+async def test_list_agents_no_idle_marker_when_stale(server):
+    """An agent with is_idle=1 but last_idle_at older than the decay
+    window must NOT render 💤 — because the wake path also won't fire
+    on those (they're presumed-dead). Marker accuracy matches wake
+    eligibility."""
+    import time as _t
+
+    from mcp_hub.server import IDLE_DECAY_SECONDS
+
+    await _call_tool(server, "register", {"name": "alice", "project": "x"})
+
+    registry = server._hub_registry  # type: ignore[attr-defined]
+
+    class _FakeSess:
+        async def send_ping(self): ...
+        async def send_notification(self, _n): ...
+
+    registry.bind("alice", _FakeSess())
+
+    conn = _idle_helper_db(server)
+    conn.execute(
+        "UPDATE agents SET is_idle = 1, last_idle_at = ? WHERE name = ?",
+        (_t.time() - IDLE_DECAY_SECONDS - 1.0, "alice"),
+    )
+    conn.commit()
+
+    out = await _call_tool(server, "list_agents", {})
+    assert "💤" not in out
+
+
 async def test_touch_session_clears_is_idle(server):
     """Any identifying tool call from the agent's interactive session
     means they're in a turn — is_idle must clear. We exercise via a
