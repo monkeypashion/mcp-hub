@@ -304,6 +304,56 @@ def stop_hook_command(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# session-start subcommand — inject "register now" into the agent's first turn
+# ---------------------------------------------------------------------------
+
+
+def session_start_command(args: argparse.Namespace) -> int:
+    """Emit SessionStart hook JSON instructing the agent to call register()
+    immediately. This makes the agent ⚡ from session start without operator
+    nudging — closes the chicken-and-egg gap where the heartbeat daemon
+    can't bring an agent online (it doesn't bind, by design), only sustain
+    a binding once one exists.
+
+    Reads `<cwd>/.claude/hub-agent.json` for identity, same pattern as
+    stop-hook. Silent no-op if no marker (project isn't a hub agent —
+    don't spam the SessionStart of unrelated projects with register
+    instructions).
+
+    Output format: SessionStart hooks support JSON with
+    `hookSpecificOutput.additionalContext` (or plain `additionalContext`)
+    that gets injected into the agent's context before the first turn.
+    Claude reads it and acts on it proactively.
+    """
+    name, project = _resolve_agent_identity(args)
+    if name is None:
+        return 0  # no marker → silent no-op
+
+    project_str = f', project="{project}"' if project else ""
+    register_call = f'mcp__hub__register(name="{name}"{project_str})'
+
+    context = (
+        f"You are the hub agent **{name}**"
+        + (f" (project: {project})" if project else "")
+        + ". To enable channel-push wake for incoming DMs and broadcasts, "
+        + f"call `{register_call}` as your first action this session. "
+        + "The hub binds your interactive MCP session on register; the "
+        + "heartbeat daemon (separate background process) then keeps the "
+        + "binding alive across idle periods. Without register your inbox "
+        + "is queue-only — messages wait until the next Stop hook auto-pull."
+    )
+
+    output = {
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": context,
+        }
+    }
+    print(json.dumps(output))
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # heartbeat-daemon subcommand
 # ---------------------------------------------------------------------------
 
@@ -408,6 +458,28 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Hub MCP endpoint (default: {DEFAULT_HUB_URL}, or $MCP_HUB_URL)",
     )
 
+    session_start = sub.add_parser(
+        "session-start",
+        help="Inject auto-register instruction into the agent's first turn (for SessionStart hooks)",
+        description=(
+            "Reads <cwd>/.claude/hub-agent.json and emits SessionStart hook "
+            "JSON with `additionalContext` telling the agent to call "
+            "register() at session start. Claude sees the context before its "
+            "first turn and binds the hub session automatically. Silent "
+            "no-op if no marker found."
+        ),
+    )
+    session_start.add_argument(
+        "--name",
+        default=None,
+        help="Agent name override (otherwise auto-discovered from marker).",
+    )
+    session_start.add_argument(
+        "--project",
+        default=None,
+        help="Project name override (otherwise auto-discovered from marker).",
+    )
+
     heartbeat = sub.add_parser(
         "heartbeat-daemon",
         help="Long-running per-minute heartbeat to the hub (for SessionStart hooks)",
@@ -450,6 +522,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.subcommand == "stop-hook":
         return stop_hook_command(args)
+    if args.subcommand == "session-start":
+        return session_start_command(args)
     if args.subcommand == "heartbeat-daemon":
         return heartbeat_daemon_command(args)
 

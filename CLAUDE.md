@@ -126,13 +126,16 @@ Examples:
 
 The hub URL defaults to `https://mcp.monkeypashion.co.uk/mcp`. Override via `MCP_HUB_URL` env var or `--hub-url` flag if running against a local hub.
 
-## SessionStart hook — heartbeat daemon (keep agents ⚡ while they're alive)
+## SessionStart hooks — auto-register + heartbeat daemon
 
-The reaper drops bindings after `ACTIVITY_TIMEOUT_SECONDS` of no `touch_session` calls. That signal is "engaged with hub recently" — but a healthy idle agent who hasn't called the hub in a while gets dropped, even though their Claude Code process is still very much alive. The heartbeat daemon closes that gap by sending a per-minute liveness signal to the hub from a separate background process.
+Two SessionStart hooks work together to make every onboarded agent ⚡ from session start without operator nudging:
 
-**Setup is centralised, same shape as the Stop hook:**
+1. **`session-start`** (synchronous) — emits `additionalContext` JSON instructing Claude to call `register()` as its first action this session. Reads identity from the same `.claude/hub-agent.json` marker. Silent no-op if no marker.
+2. **`heartbeat-daemon`** (async, long-lived) — pings `heartbeat(agent_name)` every 60s from a separate process. Refreshes `_last_activity` on the existing binding (the one `register()` just established), keeping the agent ⚡ across reaper cycles.
 
-Add a SessionStart entry to `~/.claude/settings.json` alongside the Stop hook:
+The two-piece split is deliberate: only the agent's interactive session can establish a real wake-binding (the daemon's ephemeral client doesn't qualify and would clobber the wake target). So step 1 binds; step 2 sustains.
+
+**Setup is centralised — one settings.json edit covers the whole fleet.** Add this to `~/.claude/settings.json` alongside the Stop hook:
 
 ```jsonc
 {
@@ -146,27 +149,34 @@ Add a SessionStart entry to `~/.claude/settings.json` alongside the Stop hook:
     }],
     "SessionStart": [{
       "matcher": "*",
-      "hooks": [{
-        "type": "command",
-        "command": "D:/SoftwareProjects/monkeypashion/mcp-hub/.venv/Scripts/mcp-hub.exe heartbeat-daemon",
-        "async": true
-      }]
+      "hooks": [
+        {
+          "type": "command",
+          "command": "D:/SoftwareProjects/monkeypashion/mcp-hub/.venv/Scripts/mcp-hub.exe session-start"
+        },
+        {
+          "type": "command",
+          "command": "D:/SoftwareProjects/monkeypashion/mcp-hub/.venv/Scripts/mcp-hub.exe heartbeat-daemon",
+          "async": true
+        }
+      ]
     }]
   }
 }
 ```
 
-**`async: true` is critical** — without it the hook runner kills the daemon when the hook command "returns." With async the daemon survives and runs as a long-lived child process, naturally reaped when Claude Code exits.
+**`async: true` on the daemon hook is critical** — without it the hook runner kills the daemon when the hook command "returns." With async, the daemon survives and runs as a long-lived child process, naturally reaped when Claude Code exits.
 
-**Per-agent setup** is unchanged — the same `.claude/hub-agent.json` marker the Stop hook uses tells the daemon which agent to heartbeat for. No per-agent settings.json edit needed; one global hook covers the whole fleet.
+**Per-agent setup is unchanged** — the same `.claude/hub-agent.json` marker the Stop hook uses identifies the agent. To onboard a new agent, drop a marker in their project; no settings.json edits needed.
 
-**How it works:**
+**How it works on session launch:**
 - SessionStart fires when a Claude Code session opens.
-- The async hook spawns the daemon, which reads the cwd's `hub-agent.json`, opens an MCP session to the hub, then loops `heartbeat(agent_name)` every 60s.
-- Each heartbeat refreshes `_last_activity` for the agent IF they have an existing binding (no-op otherwise — heartbeat never binds, so it can never clobber the agent's real wake target).
+- The synchronous `session-start` hook reads the cwd's `hub-agent.json` and outputs JSON with `additionalContext` containing a `register(name=..., project=...)` instruction. Claude reads this before its first turn and calls register, binding the interactive session.
+- In parallel, the async `heartbeat-daemon` hook spawns the daemon, which opens an MCP session and loops `heartbeat(agent_name)` every 60s.
+- Each heartbeat refreshes `_last_activity` for the agent IF they have an existing binding (no-op otherwise — heartbeat never binds, so it can never clobber the wake target).
 - When Claude Code exits, OS process-tree reaping kills the daemon (POSIX) or the system cleans it up eventually (Windows; verify empirically).
 
-**No marker file → silent no-op.** Same fail-open contract as the Stop hook. The global hook fires for every Claude Code session on the box; only opted-in projects produce heartbeats.
+**No marker file → both hooks silent no-op.** Same fail-open contract as the Stop hook. The global hooks fire for every Claude Code session on the box; only opted-in projects produce hub traffic.
 
 ## Dev
 

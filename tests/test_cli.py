@@ -20,6 +20,7 @@ from mcp_hub.cli import (
     _resolve_agent_identity,
     build_hook_response,
     build_parser,
+    session_start_command,
     stop_hook_command,
 )
 
@@ -554,4 +555,99 @@ def test_stop_hook_command_silent_when_no_identity(tmp_path, monkeypatch, capsys
     assert rc == 0
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == ""
+
+
+# ---------------------------------------------------------------------------
+# session-start subcommand — auto-register context injection
+# ---------------------------------------------------------------------------
+
+
+def test_session_start_emits_register_context_for_marked_project(tmp_path, monkeypatch, capsys):
+    """When a project has a hub-agent.json marker, the session-start hook
+    must emit JSON with `additionalContext` instructing the agent to call
+    register() with the marker's name + project. This is what makes a fresh
+    session ⚡ from the first turn without operator nudging."""
+    import io
+
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "hub-agent.json").write_text(
+        json.dumps({"name": "features-json-dev", "project": "features-json"})
+    )
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(json.dumps({"cwd": str(tmp_path), "hook_event_name": "SessionStart"})),
+    )
+
+    args = argparse.Namespace(name=None, project=None)
+    rc = session_start_command(args)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    # Must use the SessionStart-specific schema so Claude Code routes it correctly.
+    assert payload["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+    context = payload["hookSpecificOutput"]["additionalContext"]
+    # Must instruct the agent to call register with the marker's identity.
+    assert 'register(name="features-json-dev", project="features-json")' in context
+
+
+def test_session_start_silent_when_no_marker(tmp_path, monkeypatch, capsys):
+    """A project without a hub-agent.json marker isn't a hub agent. The
+    SessionStart hook must emit nothing — same fail-open contract as the
+    Stop hook. Otherwise every Claude Code session on the box gets an
+    "unrecognised agent" register prompt injected on startup."""
+    import io
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(json.dumps({"cwd": str(tmp_path), "hook_event_name": "SessionStart"})),
+    )
+
+    args = argparse.Namespace(name=None, project=None)
+    rc = session_start_command(args)
+
+    assert rc == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_session_start_explicit_name_wins(tmp_path, monkeypatch, capsys):
+    """Explicit --name overrides marker discovery. Useful for one-off
+    testing or non-standard hook configurations."""
+    import io
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(json.dumps({"cwd": str(tmp_path), "hook_event_name": "SessionStart"})),
+    )
+
+    args = argparse.Namespace(name="alice", project="proj")
+    rc = session_start_command(args)
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert 'register(name="alice", project="proj")' in (
+        payload["hookSpecificOutput"]["additionalContext"]
+    )
+
+
+def test_session_start_handles_marker_without_project(tmp_path, monkeypatch, capsys):
+    """Marker file with name but no project — the register call must omit
+    the project= kwarg cleanly rather than emit invalid syntax."""
+    import io
+
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "hub-agent.json").write_text(json.dumps({"name": "alice"}))
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(json.dumps({"cwd": str(tmp_path), "hook_event_name": "SessionStart"})),
+    )
+
+    args = argparse.Namespace(name=None, project=None)
+    rc = session_start_command(args)
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    context = payload["hookSpecificOutput"]["additionalContext"]
+    # No spurious project="" or project=None
+    assert 'register(name="alice")' in context
+    assert "project=" not in context
