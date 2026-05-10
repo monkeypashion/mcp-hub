@@ -190,17 +190,17 @@ async def test_send_low_to_running_recipient_does_not_wake(server):
 
     push.assert_not_called()
     assert "queued" in out.lower()
-    assert "running or unbound" in out.lower()
+    assert "in a turn" in out.lower()
 
 
-async def test_send_low_to_stale_idle_recipient_does_not_wake(server):
-    """Decay protection: if a session crashed without firing the un-idle,
-    is_idle=1 lingers in the DB. last_idle_at older than IDLE_DECAY_SECONDS
-    must be treated as 'presumed dead' — don't fire a wake at a session
-    that's almost certainly gone."""
+async def test_send_low_to_long_idle_recipient_still_fires_wake(server):
+    """No decay on the idle flag — the registry binding is the liveness
+    gate, not the timestamp on last_idle_at. An agent that's been idle
+    for hours (operator left their Claude Code open overnight) but is
+    still bound (heartbeat daemon keeping ⚡ alive) should still receive
+    a low-prio idle wake. Earlier versions had a 30-min decay that
+    over-restricted this case."""
     import time as _t
-
-    from mcp_hub.server import IDLE_DECAY_SECONDS
 
     await _call_tool(server, "register", {"name": "alice", "project": "x"})
     await _call_tool(server, "register", {"name": "bob", "project": "y"})
@@ -213,11 +213,11 @@ async def test_send_low_to_stale_idle_recipient_does_not_wake(server):
 
     registry.bind("bob", _FakeSess())
 
-    # Stale idle: last_idle_at is older than the decay window
+    # Bob has been idle for 4 hours — old last_idle_at, but still bound.
     conn = _idle_helper_db(server)
     conn.execute(
         "UPDATE agents SET is_idle = 1, last_idle_at = ? WHERE name = ?",
-        (_t.time() - IDLE_DECAY_SECONDS - 1.0, "bob"),
+        (_t.time() - 4 * 60 * 60, "bob"),
     )
     conn.commit()
 
@@ -228,8 +228,9 @@ async def test_send_low_to_stale_idle_recipient_does_not_wake(server):
              "message": "soft ask", "priority": "low"},
         )
 
-    push.assert_not_called()
-    assert "queued" in out.lower()
+    # Wake fires regardless of how long bob has been idle.
+    push.assert_called_once()
+    assert "idle wake" in out.lower()
 
 
 async def test_send_low_to_idle_drain_batches_unread(server):
@@ -430,14 +431,12 @@ async def test_list_agents_no_idle_marker_when_running(server):
     assert "💤" not in out
 
 
-async def test_list_agents_no_idle_marker_when_stale(server):
-    """An agent with is_idle=1 but last_idle_at older than the decay
-    window must NOT render 💤 — because the wake path also won't fire
-    on those (they're presumed-dead). Marker accuracy matches wake
-    eligibility."""
+async def test_list_agents_renders_idle_for_long_idle_agent(server):
+    """An agent idle for hours (no decay timer) still renders 💤 in
+    list_agents output. Matches the no-decay wake-fire behaviour:
+    operator can see at a glance that this agent is reachable via
+    low-prio DM regardless of how long they've been idle."""
     import time as _t
-
-    from mcp_hub.server import IDLE_DECAY_SECONDS
 
     await _call_tool(server, "register", {"name": "alice", "project": "x"})
 
@@ -452,12 +451,12 @@ async def test_list_agents_no_idle_marker_when_stale(server):
     conn = _idle_helper_db(server)
     conn.execute(
         "UPDATE agents SET is_idle = 1, last_idle_at = ? WHERE name = ?",
-        (_t.time() - IDLE_DECAY_SECONDS - 1.0, "alice"),
+        (_t.time() - 4 * 60 * 60, "alice"),  # 4 hours ago
     )
     conn.commit()
 
     out = await _call_tool(server, "list_agents", {})
-    assert "💤" not in out
+    assert "💤" in out
 
 
 async def test_touch_session_clears_is_idle(server):

@@ -54,15 +54,19 @@ _VALID_PRIORITIES = {"low", "normal", "urgent"}
 _NO_WAKE_PRIORITIES = {"low"}
 
 # Case 1 — wake-on-low-prio for idle DM recipients.
-# How long is_idle remains a valid "this agent is reachable" signal before we
-# treat it as a stale flag from a crashed session. If a Claude Code session
-# died without firing the Stop hook un-idle, is_idle stays at 1 in the DB
-# forever. After IDLE_DECAY_SECONDS we ignore the flag (treat agent as
-# presumed dead for wake purposes; low-prio DMs queue rather than firing
-# a wake that's never going to land). Tuned generous-but-not-forever:
-# 30 min covers normal "I left this agent open and went for lunch" cases
-# without making the stale-flag corner permanent.
-IDLE_DECAY_SECONDS = 1800.0  # 30 minutes
+#
+# Liveness gate: we use the registry binding itself as the "is this agent
+# alive" signal — not a separate is_idle decay timer. Reasoning:
+#   - The heartbeat daemon refreshes _last_activity every 60s, keeping the
+#     binding alive while the agent's Claude Code process is up.
+#   - If the process dies, the daemon dies (process-tree reap), heartbeats
+#     stop, and the activity-based reaper drops the binding within ~60 min.
+#   - push() to an unbound name returns False, so a wake never actually
+#     fires for a "dead but flag-stuck-on" agent.
+# This means is_idle=1 is meaningful indefinitely as long as the agent is
+# bound. An earlier draft used a 30-min decay on last_idle_at; that was
+# over-defensive and caused genuinely-idle agents to stop receiving
+# Case 1 wakes after 30 min of operator inactivity.
 
 # Single hard-coded broadcast channel. We deliberately don't expose multi-
 # channel admin (create_channel / list_channels / per-channel ACLs / etc.)
@@ -504,7 +508,6 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         Args:
             include_offline: Include agents that have disconnected.
         """
-        now = time.time()
         conn = _get_db(db_path)
         if include_offline:
             rows = conn.execute("SELECT * FROM agents ORDER BY last_seen DESC").fetchall()
@@ -526,15 +529,10 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             # 💤 marks agents currently idle (Stop hook flipped them at last
             # turn end, no tool call has cleared it since). Combined with
             # ⚡, this is the state where a low-prio DM fires a live wake
-            # via Case 1. Stale-idle (older than IDLE_DECAY_SECONDS) is
-            # treated as presumed-dead and renders without 💤 so the
-            # marker matches actual wake-fire eligibility.
-            idle = (
-                " 💤"
-                if r["is_idle"]
-                and (now - r["last_idle_at"]) <= IDLE_DECAY_SECONDS
-                else ""
-            )
+            # via Case 1. No decay timer — the binding itself is the
+            # liveness gate; if the agent's process is gone, the binding
+            # gets reaped and ⚡ disappears.
+            idle = " 💤" if r["is_idle"] else ""
             line = f"{status} **{r['name']}**{wake}{idle}"
             if r["project"]:
                 line += f" ({r['project']})"
@@ -594,24 +592,23 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         conn.commit()
 
         # Low-priority — Case 1 path. Check recipient's idle state.
-        # If idle (and the flag isn't stale past IDLE_DECAY_SECONDS), fire a
-        # drain-batched wake covering all currently-unread DMs. Otherwise
-        # queue only — recipient picks up via Stop-hook auto-pull at the
-        # end of their next turn.
+        # is_idle=1 means the recipient's last Stop hook fired (turn-end
+        # transition). If the recipient is also bound, the wake will land;
+        # if not bound, push() will return False and we fall back to the
+        # queued path below. Either way it's correct — the binding check
+        # is the real liveness gate.
         if priority in _NO_WAKE_PRIORITIES:
             recipient_row = conn.execute(
-                "SELECT is_idle, last_idle_at FROM agents WHERE name = ?",
+                "SELECT is_idle FROM agents WHERE name = ?",
                 (to,),
             ).fetchone()
             recipient_is_idle = bool(
-                recipient_row
-                and recipient_row["is_idle"]
-                and (now - recipient_row["last_idle_at"]) <= IDLE_DECAY_SECONDS
+                recipient_row and recipient_row["is_idle"]
             )
             if not recipient_is_idle:
                 return (
                     f"Message queued for '{to}' (priority={priority}; no wake "
-                    f"— recipient running or unbound)."
+                    f"— recipient is in a turn or not registered)."
                 )
 
             # Drain batch: pull ALL unread DMs for the recipient (including

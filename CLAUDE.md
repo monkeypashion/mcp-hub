@@ -69,7 +69,7 @@ When in doubt: `send` for one agent, `post` for a topic, `broadcast` for the who
 - `"normal"` — wake + inbox (default)
 - `"urgent"` — wake + inbox + flagged in the rendered tag's meta (use sparingly)
 
-For low-prio DMs, the hub treats `is_idle = 1` as stale after `IDLE_DECAY_SECONDS` (30 min) — protects against crash-leaked idle flags by treating long-idle agents as presumed-dead for the wake path.
+For low-prio DMs, the registry binding is the liveness gate — if the agent's session crashes, the heartbeat daemon dies and the activity-based reaper drops the binding. So `is_idle=1` on a bound agent is meaningful indefinitely; long-idle bound agents still receive Case 1 wakes correctly.
 
 ## Channels-based idle-wake
 
