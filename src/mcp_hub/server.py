@@ -822,6 +822,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         limit: int = 20,
         since_minutes: int = 60,
         since_id: int = 0,
+        from_agent: str = "",
         format: str = "text",
     ) -> str:
         """Get recent messages from a named channel.
@@ -834,6 +835,10 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             than `since_id` and `since_minutes` is ignored. Use this for
             cursor-based extraction (each call passes the max(id) seen so
             far; loss-less on retries since duplicates are excluded by id).
+          - When `from_agent` is set, results are restricted to messages
+            posted by that agent. Useful for "show me what I've already
+            contributed to this channel" before re-posting (dedup pattern
+            for re-asks). Composes with both `since_id` and `since_minutes`.
 
         Format:
           - "text" (default): chat-style render, one line per message:
@@ -848,6 +853,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             since_minutes: Window in minutes (only applied when since_id is 0).
             since_id: Message-id cursor; when > 0, returns messages with id
                       greater than this and ignores `since_minutes`.
+            from_agent: If set, only return messages from this agent name.
             format: "text" (default) or "json".
         """
         if format not in ("text", "json"):
@@ -855,20 +861,36 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 
         conn = _get_db(db_path)
         if since_id > 0:
-            rows = conn.execute(
-                """SELECT id, ts, from_agent, body, priority FROM messages
-                   WHERE channel = ? AND id > ?
-                   ORDER BY id ASC LIMIT ?""",
-                (channel, since_id, limit),
-            ).fetchall()
+            if from_agent:
+                rows = conn.execute(
+                    """SELECT id, ts, from_agent, body, priority FROM messages
+                       WHERE channel = ? AND id > ? AND from_agent = ?
+                       ORDER BY id ASC LIMIT ?""",
+                    (channel, since_id, from_agent, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT id, ts, from_agent, body, priority FROM messages
+                       WHERE channel = ? AND id > ?
+                       ORDER BY id ASC LIMIT ?""",
+                    (channel, since_id, limit),
+                ).fetchall()
         else:
             cutoff = time.time() - (since_minutes * 60)
-            rows = conn.execute(
-                """SELECT id, ts, from_agent, body, priority FROM messages
-                   WHERE channel = ? AND ts > ?
-                   ORDER BY ts ASC LIMIT ?""",
-                (channel, cutoff, limit),
-            ).fetchall()
+            if from_agent:
+                rows = conn.execute(
+                    """SELECT id, ts, from_agent, body, priority FROM messages
+                       WHERE channel = ? AND ts > ? AND from_agent = ?
+                       ORDER BY ts ASC LIMIT ?""",
+                    (channel, cutoff, from_agent, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT id, ts, from_agent, body, priority FROM messages
+                       WHERE channel = ? AND ts > ?
+                       ORDER BY ts ASC LIMIT ?""",
+                    (channel, cutoff, limit),
+                ).fetchall()
 
         if format == "json":
             return json.dumps([
@@ -1158,6 +1180,27 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             f"Total messages: {messages['c']}\n"
             f"Unread: {unread['c']}"
         )
+
+    # ------------------------------------------------------------------
+    # Timing wrapper around tool dispatch
+    # ------------------------------------------------------------------
+    # Logs `tool=<name> ms=<float>` at INFO for every tool call. One
+    # wrapper here covers all tools without per-tool decoration. Lets
+    # us see in journalctl exactly where time is going on the hub side
+    # — useful both for ongoing observability and for diagnosing
+    # operator-reported "calling hub..." latency. Negligible overhead
+    # (one perf_counter + one log line per call).
+    _orig_call_tool = mcp._tool_manager.call_tool
+
+    async def _timed_call_tool(name, arguments, *args, **kwargs):
+        t0 = time.perf_counter()
+        try:
+            return await _orig_call_tool(name, arguments, *args, **kwargs)
+        finally:
+            duration_ms = (time.perf_counter() - t0) * 1000
+            logger.info("tool=%s ms=%.1f", name, duration_ms)
+
+    mcp._tool_manager.call_tool = _timed_call_tool
 
     return mcp
 

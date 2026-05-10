@@ -372,6 +372,32 @@ async def test_auto_bind_skips_unregistered_names(server):
     assert not registry.is_bound("ghost-typo")
 
 
+async def test_tool_call_emits_timing_log(server, caplog):
+    """The timing wrapper around _tool_manager.call_tool must emit an
+    INFO log line of the shape `tool=<name> ms=<float>` for every tool
+    call. This is the observability primitive operator can grep for in
+    journalctl when diagnosing latency."""
+    import logging
+
+    caplog.set_level(logging.INFO, logger="mcp_hub.server")
+
+    await _call_tool(server, "hub_status", {})
+
+    # Find the timing record. It logs the inner tool name as it appears
+    # to the manager (which may be a fully-qualified form); the assert
+    # is loose enough not to break on internal naming nits.
+    timing_records = [
+        r for r in caplog.records
+        if "tool=" in r.getMessage() and " ms=" in r.getMessage()
+    ]
+    assert timing_records, (
+        "expected tool=... ms=... INFO log line; got: "
+        + repr([r.getMessage() for r in caplog.records])
+    )
+    msg = timing_records[-1].getMessage()
+    assert "hub_status" in msg
+
+
 async def test_get_messages_bind_false_does_not_touch_registry(server):
     """The Stop hook calls get_messages(bind=False). That MUST NOT bind the
     agent — the Stop hook's streamablehttp_client is ephemeral and binding

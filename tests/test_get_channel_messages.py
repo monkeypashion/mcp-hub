@@ -259,3 +259,119 @@ async def test_limit_caps_results(server):
         {"channel": "deploys", "limit": 3, "format": "json"},
     )
     assert len(json.loads(out)) == 3
+
+
+# ---------------------------------------------------------------------------
+# from_agent filter — for "what have I posted" dedup pattern
+# ---------------------------------------------------------------------------
+
+
+async def _seed_channel_multi_agent(server, channel: str, posts: list[tuple[str, str]]) -> None:
+    """Seed `channel` with one post per (agent, body) tuple."""
+    await _call_tool(
+        server, "create_channel",
+        {"name": channel, "created_by": "alice"},
+    )
+    for agent, msg in posts:
+        await _call_tool(
+            server, "register",
+            {"name": agent, "project": "x"},
+        )
+        await _call_tool(
+            server, "post",
+            {"from_agent": agent, "channel": channel, "message": msg, "priority": "low"},
+        )
+
+
+async def test_from_agent_filter_returns_only_that_agents_messages(server):
+    """The dedup-on-re-asks pattern: an agent calls
+    get_channel_messages(channel=..., from_agent=their-name) before
+    re-posting to see what they already contributed."""
+    await _seed_channel_multi_agent(
+        server, "factory-backlog",
+        [
+            ("alice", "alice-item-1"),
+            ("bob", "bob-item-1"),
+            ("alice", "alice-item-2"),
+            ("bob", "bob-item-2"),
+        ],
+    )
+
+    out = await _call_tool(
+        server, "get_channel_messages",
+        {"channel": "factory-backlog", "from_agent": "alice", "format": "json"},
+    )
+    records = json.loads(out)
+    assert len(records) == 2
+    bodies = {r["body"] for r in records}
+    assert bodies == {"alice-item-1", "alice-item-2"}
+
+
+async def test_from_agent_filter_composes_with_since_id(server):
+    """from_agent + since_id must compose so an agent can ask 'what
+    have I posted SINCE my last cursor' for incremental dedup."""
+    await _seed_channel_multi_agent(
+        server, "factory-backlog",
+        [
+            ("alice", "old-1"),
+            ("bob", "interleaved"),
+            ("alice", "new-1"),
+            ("alice", "new-2"),
+        ],
+    )
+
+    # First read: alice gets all her posts; remember max id
+    out = await _call_tool(
+        server, "get_channel_messages",
+        {"channel": "factory-backlog", "from_agent": "alice", "format": "json"},
+    )
+    records = json.loads(out)
+    cursor = max(r["id"] for r in records if r["body"] == "old-1")
+
+    # Now: alice asks "what have I posted since old-1's id"
+    out = await _call_tool(
+        server, "get_channel_messages",
+        {
+            "channel": "factory-backlog",
+            "from_agent": "alice",
+            "since_id": cursor,
+            "format": "json",
+        },
+    )
+    records = json.loads(out)
+    bodies = [r["body"] for r in records]
+    # Bob's "interleaved" must NOT appear (filtered out by from_agent),
+    # and alice's old-1 must NOT appear (filtered out by since_id).
+    assert bodies == ["new-1", "new-2"]
+
+
+async def test_from_agent_filter_unknown_agent_returns_empty(server):
+    """A from_agent value with no matching messages returns empty cleanly,
+    not an error. Useful for first-time askers — the filter result is
+    'you've posted nothing yet, post freely'."""
+    await _seed_channel_multi_agent(
+        server, "factory-backlog",
+        [("alice", "first-post")],
+    )
+
+    out = await _call_tool(
+        server, "get_channel_messages",
+        {"channel": "factory-backlog", "from_agent": "ghost", "format": "json"},
+    )
+    assert json.loads(out) == []
+
+
+async def test_from_agent_default_empty_returns_all_messages(server):
+    """Default value (empty string) means 'no filter' — backward
+    compatible. Existing callers without the param see no behavior change."""
+    await _seed_channel_multi_agent(
+        server, "factory-backlog",
+        [("alice", "a"), ("bob", "b")],
+    )
+
+    out = await _call_tool(
+        server, "get_channel_messages",
+        {"channel": "factory-backlog", "format": "json"},
+    )
+    records = json.loads(out)
+    assert len(records) == 2
