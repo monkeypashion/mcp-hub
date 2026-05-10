@@ -74,8 +74,15 @@ async def _query_hub(
             # the agent's name to this short-lived session would clobber
             # the agent's real (long-lived) wake target. The hub's
             # touch_session honours bind=False and skips the binding.
+            #
+            # mark_idle=True: Stop hook fires at end of turn, which is the
+            # idle transition for the agent. The hub uses this flag for the
+            # Case 1 wake-on-low-prio path — a peer's low-prio DM to an
+            # idle recipient fires a wake (drain-batched) instead of just
+            # queuing.
             messages_result = await session.call_tool(
-                "get_messages", {"agent_name": agent_name, "bind": False}
+                "get_messages",
+                {"agent_name": agent_name, "bind": False, "mark_idle": True},
             )
             broadcasts_result = await session.call_tool(
                 "get_broadcasts_for_agent",

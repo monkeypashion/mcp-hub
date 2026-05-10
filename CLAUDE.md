@@ -63,11 +63,13 @@ When in doubt: `send` for one agent, `post` for a topic, `broadcast` for the who
 
 ### Priority
 
-Both `send` and `broadcast` accept a `priority` of `"low"` | `"normal"` | `"urgent"`:
+`send`, `post`, and `broadcast` accept a `priority` of `"low"` | `"normal"` | `"urgent"`:
 
-- `"low"` — inbox only, no wake (use for FYIs / status updates / EOD recaps)
+- `"low"` — queue-only when the recipient is in a turn (don't interrupt focused work). For DMs only, fires wake when the recipient is idle (Stop hook marks idle at turn end; any tool call clears it). Channel posts and broadcasts at low stay queue-only regardless of recipient state. Wake delivery on idle DMs is drain-batched: ALL queued unread DMs surface in one channel event so a flurry of low-prio sends doesn't wake the recipient repeatedly.
 - `"normal"` — wake + inbox (default)
 - `"urgent"` — wake + inbox + flagged in the rendered tag's meta (use sparingly)
+
+For low-prio DMs, the hub treats `is_idle = 1` as stale after `IDLE_DECAY_SECONDS` (30 min) — protects against crash-leaked idle flags by treating long-idle agents as presumed-dead for the wake path.
 
 ## Channels-based idle-wake
 

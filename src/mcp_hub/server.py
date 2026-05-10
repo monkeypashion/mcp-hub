@@ -43,13 +43,26 @@ class _ChannelNotification(BaseModel):
 # Allowed priority values for send/broadcast. The hub uses priority to decide
 # whether to fire the channel-push wake; senders are responsible for picking
 # the right level so receivers aren't interrupted by FYIs while focused.
-#   - "low":    inbox only, no channel push (no wake). For status updates,
-#               EOD recaps, broadcasts that don't need attention right now.
+#   - "low":    queue-only by default; for DMs ONLY, fires wake when the
+#               recipient is currently idle (Case 1 — see send() body).
+#               Channel posts and broadcasts at low stay queue-only
+#               regardless of recipient state.
 #   - "normal": inbox + channel push (default). Wake on receipt.
 #   - "urgent": inbox + channel push, with priority="urgent" in the rendered
 #               tag's meta so receivers can visually flag it.
 _VALID_PRIORITIES = {"low", "normal", "urgent"}
 _NO_WAKE_PRIORITIES = {"low"}
+
+# Case 1 — wake-on-low-prio for idle DM recipients.
+# How long is_idle remains a valid "this agent is reachable" signal before we
+# treat it as a stale flag from a crashed session. If a Claude Code session
+# died without firing the Stop hook un-idle, is_idle stays at 1 in the DB
+# forever. After IDLE_DECAY_SECONDS we ignore the flag (treat agent as
+# presumed dead for wake purposes; low-prio DMs queue rather than firing
+# a wake that's never going to land). Tuned generous-but-not-forever:
+# 30 min covers normal "I left this agent open and went for lunch" cases
+# without making the stale-flag corner permanent.
+IDLE_DECAY_SECONDS = 1800.0  # 30 minutes
 
 # Single hard-coded broadcast channel. We deliberately don't expose multi-
 # channel admin (create_channel / list_channels / per-channel ACLs / etc.)
@@ -165,6 +178,24 @@ def init_db(db_path: Path = DB_PATH) -> None:
         conn.commit()
     except sqlite3.OperationalError:
         pass  # Column already exists
+
+    # Migrate: add idle-tracking columns. Used by the Case 1 wake-on-low-prio
+    # path: low-prio DMs to an idle recipient fire wake (so soft asks
+    # surface immediately) while staying queue-only for running recipients
+    # (no interrupt to active work). is_idle is set true by the Stop hook
+    # at turn end and cleared by any identifying tool call (touch_session).
+    # last_idle_at decays the flag — if a session crashed without firing
+    # the Stop-hook un-idle, we treat is_idle=1 with last_idle_at older
+    # than IDLE_DECAY_SECONDS as "presumed dead" and don't wake on low.
+    for col_sql in (
+        "ALTER TABLE agents ADD COLUMN is_idle INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE agents ADD COLUMN last_idle_at REAL NOT NULL DEFAULT 0",
+    ):
+        try:
+            conn.execute(col_sql)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
 
 
@@ -318,6 +349,11 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         for "this is a real agent"; the registry is the operationally-live
         slice of that truth.
 
+        Also clears `is_idle` — a tool call from the agent's main session
+        means they're in a turn, not idle. Guard with `is_idle = 1` so the
+        UPDATE only fires when state actually changes (negligible perf, but
+        cleaner audit trail).
+
         Diagnostic: logs the client's clientInfo + experimental capabilities
         on every bind. Used to find a reliable signal for distinguishing
         long-lived Claude Code interactive sessions from ephemeral utility
@@ -334,6 +370,14 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             return
         _log_bind_diagnostic("touch_session", name, ctx.session)
         registry.bind(name, ctx.session)
+        # Clear is_idle — agent is in an interactive turn now. Conditional
+        # on is_idle=1 to skip the no-op UPDATE for the steady-state path.
+        result = conn.execute(
+            "UPDATE agents SET is_idle = 0 WHERE name = ? AND is_idle = 1",
+            (name,),
+        )
+        if result.rowcount > 0:
+            conn.commit()
 
     async def push_channel(agent: str, content: str, meta: dict[str, str]) -> bool:
         """Push a channel notification to `agent` via the live session registry.
@@ -496,9 +540,12 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         Priority controls whether the recipient is woken from idle:
 
         - "normal" (default): wake on receipt + persist to inbox.
-        - "low": persist to inbox only, do NOT wake. Use for status updates,
-          EOD recaps, anything the recipient can pick up at their convenience.
-          Avoids interrupting focused work with low-attention messages.
+        - "low": queue-only when the recipient is in a turn (don't interrupt
+          focused work). Wake when the recipient is idle (Case 1 — soft asks
+          should still reach idle agents without operator-in-the-loop).
+          Wake delivery is drain-batched: ALL queued unread DMs surface in
+          one channel event so a flurry of low-prio sends doesn't wake the
+          recipient repeatedly.
         - "urgent": wake + persist + flag as urgent in the rendered <channel>
           tag's meta so the recipient can visually triage. Use sparingly —
           urgent should mean "blocking on you" or "production incident".
@@ -534,11 +581,82 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         message_id = cursor.lastrowid
         conn.commit()
 
-        # Low-priority messages go to the inbox only; no wake.
+        # Low-priority — Case 1 path. Check recipient's idle state.
+        # If idle (and the flag isn't stale past IDLE_DECAY_SECONDS), fire a
+        # drain-batched wake covering all currently-unread DMs. Otherwise
+        # queue only — recipient picks up via Stop-hook auto-pull at the
+        # end of their next turn.
         if priority in _NO_WAKE_PRIORITIES:
+            recipient_row = conn.execute(
+                "SELECT is_idle, last_idle_at FROM agents WHERE name = ?",
+                (to,),
+            ).fetchone()
+            recipient_is_idle = bool(
+                recipient_row
+                and recipient_row["is_idle"]
+                and (now - recipient_row["last_idle_at"]) <= IDLE_DECAY_SECONDS
+            )
+            if not recipient_is_idle:
+                return (
+                    f"Message queued for '{to}' (priority={priority}; no wake "
+                    f"— recipient running or unbound)."
+                )
+
+            # Drain batch: pull ALL unread DMs for the recipient (including
+            # the one we just inserted), deliver in one channel event, then
+            # mark them all read in one commit. Avoids wake-storming when
+            # multiple low-prio sends land in quick succession against an
+            # idle recipient.
+            unread = conn.execute(
+                """SELECT id, ts, from_agent, body, priority FROM messages
+                   WHERE to_agent = ? AND read = 0 ORDER BY ts ASC""",
+                (to,),
+            ).fetchall()
+            if not unread:  # defensive — should always include our insert
+                unread = [{"id": message_id, "ts": now, "from_agent": from_agent,
+                           "body": message, "priority": priority}]
+
+            content_lines = []
+            for r in unread:
+                ts = time.strftime("%H:%M:%S", time.localtime(r["ts"]))
+                prio = r["priority"]
+                prio_tag = f" [{prio}]" if prio != "normal" else ""
+                content_lines.append(
+                    f"[{ts}] DM from {r['from_agent']}{prio_tag}: {r['body']}"
+                )
+            content = "\n".join(content_lines)
+
+            pushed = await push_channel(
+                agent=to,
+                content=content,
+                meta={
+                    "from_agent": from_agent,
+                    "kind": "dm",
+                    "priority": "low",
+                    "drain_batch": "true" if len(unread) > 1 else "false",
+                },
+            )
+
+            if pushed:
+                ids = [r["id"] for r in unread]
+                placeholders = ",".join("?" * len(ids))
+                conn.execute(
+                    f"UPDATE messages SET read = 1 WHERE id IN ({placeholders})",
+                    ids,
+                )
+                # Clear is_idle: recipient is taking a turn to process the
+                # wake event. Atomic with marking the batch read.
+                conn.execute(
+                    "UPDATE agents SET is_idle = 0 WHERE name = ?", (to,)
+                )
+                conn.commit()
+                return (
+                    f"Message sent to '{to}' (priority={priority}; idle wake "
+                    f"fired, drain batch of {len(unread)} item(s))."
+                )
             return (
-                f"Message queued for '{to}' (priority={priority}; no wake — "
-                f"will surface on their next register/get_messages)."
+                f"Message queued for '{to}' (priority={priority}; idle-wake "
+                f"push failed, will surface via Stop-hook auto-pull)."
             )
 
         pushed = await push_channel(
@@ -922,6 +1040,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         agent_name: str,
         limit: int = 20,
         bind: bool = True,
+        mark_idle: bool = False,
         ctx: Context | None = None,
     ) -> str:
         """Get unread direct messages for this agent. Marks them as read.
@@ -936,6 +1055,12 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                   streamablehttp_client is ephemeral: binding to it would
                   overwrite the agent's real wake target with a session
                   that's about to be DELETEd, silently breaking wake.
+            mark_idle: If True, set the agent's is_idle flag (used by the
+                  Case 1 wake-on-low-prio path so a low-prio DM to an idle
+                  recipient fires a wake). The Stop hook passes True
+                  because end-of-turn IS the idle transition. Default False
+                  for ordinary callers — they're in an active turn, not
+                  idle.
         """
         now = time.time()
         conn = _get_db(db_path)
@@ -943,6 +1068,16 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # Auto-bind caller's session for drift self-heal.
         if bind:
             touch_session(agent_name, ctx)
+
+        # Mark agent idle when the Stop hook calls (end of turn = idle).
+        # Only update if the agent row exists; touching a non-agent name
+        # silently no-ops (consistent with touch_session's discipline).
+        if mark_idle:
+            conn.execute(
+                "UPDATE agents SET is_idle = 1, last_idle_at = ? "
+                "WHERE name = ?",
+                (now, agent_name),
+            )
 
         # Update last_seen
         conn.execute("UPDATE agents SET last_seen = ? WHERE name = ?", (now, agent_name))
