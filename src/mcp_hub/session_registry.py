@@ -327,60 +327,40 @@ class SessionRegistry:
     # -- push ----------------------------------------------------------------
 
     async def push(self, name: str, notification: Any) -> bool:
-        """Push `notification` to `name`. Try ping-then-send; on any failure,
-        return False but DO NOT unbind.
+        """Push `notification` to `name`. On any failure, return False but
+        DO NOT unbind.
 
-        Why we don't unbind on failure: Claude Code's MCP client cycles
-        streamable-http session_ids per ~30s of inactivity (DELETE /mcp,
-        new POST on next call). The session_id we have bound is therefore
-        often dead by the time anyone tries to push to it — the bound
-        ServerSession's underlying connection has been DELETEd, so
-        send_ping/send_notification raise. The PREVIOUS behaviour was to
-        unbind on those failures, which produced the same false-positive
-        symptom as the old ping-based reaper: a passing peer's send to an
-        idle agent dropped the agent's binding.
+        The previous implementation pinged before sending; that ping was
+        observed in production to fail false-positively against live
+        sessions (Claude Code's interactive MCP client may not respond to
+        `ping` requests at all, even when the underlying connection is
+        fine and the channel-notification listener is alive). The ping was
+        therefore a worse-than-useless gate — it short-circuited valid
+        sends because of an unrelated client-side ping handler quirk.
 
-        New contract:
-          1. Look up the binding. If absent, return False.
-          2. Try ping; on failure, return False — leave binding intact.
-          3. Try send; on failure, return False — leave binding intact.
-          4. Return True only on a clean ping + send.
+        New contract: just send. Trust the bound session is alive; if it
+        isn't, send raises and we report False. Same correctness as the
+        ping-then-send version, half the round-trips, no false negatives
+        from ping handler absence.
 
-        The activity-based reaper is the only authoritative source of drop
-        ("no tool call from this agent in N seconds"). Push failures are
-        treated as transient — caller has already persisted the message in
-        SQLite, so the recipient picks it up via Stop-hook surfacing on
-        their next turn end. Misleading-⚡ for an unreachable session lasts
-        at most ACTIVITY_TIMEOUT_SECONDS, which is the same window we
-        already tolerate for "agent went away without unregistering."
+        Failure handling unchanged from the post-67f5ea4 contract:
+        binding is kept on send failure. The activity-based reaper is
+        the only authoritative drop path. Caller has already persisted
+        the message in SQLite, so a False return doesn't mean message
+        loss — recipient picks it up via Stop-hook auto-pull on their
+        next turn end.
         """
         session = self.get(name)
         if session is None:
-            return False
-
-        # Liveness check — short-circuits send when the connection is
-        # already known to be dead, saving the second round-trip. We
-        # treat the result as advisory: failure means we won't even try
-        # send, but we don't drop the binding (the activity reaper owns
-        # the lifecycle).
-        try:
-            with anyio.fail_after(self.PING_TIMEOUT_SECONDS):
-                await session.send_ping()
-        except Exception as exc:  # noqa: BLE001
-            logger.info(
-                "push %s: liveness ping failed (%s: %s); skipping send, "
-                "binding kept (activity reaper owns lifecycle)",
-                name, type(exc).__name__, exc,
-            )
             return False
 
         try:
             await session.send_notification(notification)
             return True
         except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "push %s: send failed after live ping (%s: %s); "
-                "binding kept (activity reaper owns lifecycle)",
+            logger.info(
+                "push %s: send failed (%s: %s); binding kept "
+                "(activity reaper owns lifecycle)",
                 name, type(exc).__name__, exc,
             )
             return False

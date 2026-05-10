@@ -224,7 +224,10 @@ async def test_push_to_unbound_returns_false(registry):
     assert result is False
 
 
-async def test_push_to_live_session_pings_then_sends(registry):
+async def test_push_to_live_session_sends_directly(registry):
+    """Push contract: just send_notification. No ping (the old ping was a
+    false-negative gate against Claude Code clients that don't respond to
+    ping requests even when fully alive)."""
     s = FakeSession()
     registry.bind("alice", s)
 
@@ -232,63 +235,34 @@ async def test_push_to_live_session_pings_then_sends(registry):
     result = await registry.push("alice", notif)
 
     assert result is True
-    assert s.pings == 1
+    # No ping — that's the whole point of the latency cleanup.
+    assert s.pings == 0
     assert s.sends == [notif]
     # Binding survives a successful push
     assert registry.is_bound("alice")
 
 
-async def test_push_returns_false_when_ping_raises_keeps_binding(registry):
-    """Push contract changed: ping failure must NOT drop the binding.
-    Claude Code's MCP client cycles streamable-http session_ids ~30s after
-    activity, so the bound session can be transiently dead while the agent
-    is still very much alive. The activity-based reaper is the only
-    authoritative drop path."""
-    s = FakeSession(ping_raises=ConnectionResetError("dead socket"))
-    registry.bind("alice", s)
-
-    result = await registry.push("alice", {"x": 1})
-
-    assert result is False
-    assert s.pings == 1
-    assert s.sends == []  # send is skipped when ping fails
-    # New contract: binding survives — only the activity reaper drops.
-    assert registry.is_bound("alice")
-
-
-async def test_push_returns_false_when_ping_times_out_keeps_binding(registry):
-    """Same contract for timeouts as for exceptions: don't drop on push
-    failure, just report False and let the inbox/Stop-hook path deliver."""
-    registry.PING_TIMEOUT_SECONDS = 0.05
-    s = FakeSession(ping_delay=0.5)
-    registry.bind("alice", s)
-
-    result = await registry.push("alice", {"x": 1})
-
-    assert result is False
-    assert s.sends == []
-    assert registry.is_bound("alice")
-
-
 async def test_push_returns_false_when_send_raises_keeps_binding(registry):
-    """Send failure after a successful ping: binding still kept. Same
-    rationale — transient send failure shouldn't drop a bound agent."""
+    """Send failure: binding still kept. The activity-based reaper is the
+    only authoritative drop path — push failures are transient by design."""
     s = FakeSession(send_raises=BrokenPipeError("write-side dead"))
     registry.bind("alice", s)
 
     result = await registry.push("alice", {"x": 1})
 
     assert result is False
-    assert s.pings == 1  # ping succeeded
+    # Send was attempted (no pre-ping gate)
+    assert s.pings == 0
+    # Binding survives — only the activity reaper drops.
     assert registry.is_bound("alice")
 
 
 async def test_push_does_not_affect_other_bindings(registry):
     """A push failure to one agent must not collateral-damage other
-    bindings. With the new keep-on-failure contract, neither side is
-    affected — but the test stays as a sanity check that registry state
-    is per-name independent."""
-    s_alice = FakeSession(ping_raises=ConnectionResetError())
+    bindings. With the new keep-on-failure + no-ping contract, neither
+    side is affected — sanity check that registry state is per-name
+    independent."""
+    s_alice = FakeSession(send_raises=ConnectionResetError())
     s_bob = FakeSession()
     registry.bind("alice", s_alice)
     registry.bind("bob", s_bob)
