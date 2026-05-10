@@ -20,6 +20,7 @@ from mcp_hub.cli import (
     _resolve_agent_identity,
     build_hook_response,
     build_parser,
+    session_rewake_command,
     session_start_command,
     stop_hook_command,
 )
@@ -651,3 +652,51 @@ def test_session_start_handles_marker_without_project(tmp_path, monkeypatch, cap
     # No spurious project="" or project=None
     assert 'register(name="alice")' in context
     assert "project=" not in context
+
+
+def test_session_rewake_emits_stderr_and_exits_2_for_marked_project(tmp_path, monkeypatch, capsys):
+    """asyncRewake variant: when marker present, write register instruction
+    to stderr and exit 2 so Claude Code's asyncRewake mechanism may fire
+    an unprompted first turn. Empirically untested — docs are ambiguous on
+    whether this triggers from cold session start. Worst case: no-op,
+    additionalContext path still works."""
+    import io
+
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "hub-agent.json").write_text(
+        json.dumps({"name": "features-json-dev", "project": "features-json"})
+    )
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(json.dumps({"cwd": str(tmp_path), "hook_event_name": "SessionStart"})),
+    )
+
+    args = argparse.Namespace(name=None, project=None)
+    rc = session_rewake_command(args)
+
+    assert rc == 2  # asyncRewake trigger
+    captured = capsys.readouterr()
+    # Stderr carries the instruction shown to Claude as a system reminder
+    assert 'register(name="features-json-dev", project="features-json")' in captured.err
+    # Stdout is empty — asyncRewake reads stderr (or stdout if stderr empty)
+    assert captured.out == ""
+
+
+def test_session_rewake_silent_when_no_marker(tmp_path, monkeypatch, capsys):
+    """No marker → exit 0, no wake. Same fail-open contract as the rest
+    of the cli — non-hub projects on the box don't get spurious wake
+    events."""
+    import io
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(json.dumps({"cwd": str(tmp_path), "hook_event_name": "SessionStart"})),
+    )
+
+    args = argparse.Namespace(name=None, project=None)
+    rc = session_rewake_command(args)
+
+    assert rc == 0  # NOT 2 — no wake when no marker
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == ""

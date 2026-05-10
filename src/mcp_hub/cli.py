@@ -353,6 +353,37 @@ def session_start_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def session_rewake_command(args: argparse.Namespace) -> int:
+    """Companion to `session-start`: writes the register instruction to
+    stderr and exits with code 2 to trigger Claude Code's asyncRewake
+    behaviour. The intent is to fire an unprompted first turn at session
+    start so Claude calls register() before the operator has typed
+    anything.
+
+    This is empirically untested in this codebase — the docs are ambiguous
+    about whether asyncRewake fires from a cold session start (no prior
+    turns to "wake" from) or only between turns of an active conversation.
+    If it doesn't fire, this is a no-op; the synchronous `session-start`
+    hook's additionalContext still drives the register on first prompt.
+
+    Reads `<cwd>/.claude/hub-agent.json`; silent no-op (exit 0) if no
+    marker found, so non-hub projects don't get spurious wake events.
+    """
+    name, project = _resolve_agent_identity(args)
+    if name is None:
+        return 0  # no marker → exit 0, no wake
+
+    project_str = f', project="{project}"' if project else ""
+    register_call = f'mcp__hub__register(name="{name}"{project_str})'
+    msg = (
+        f"Hub auto-register: call `{register_call}` now to bind your "
+        f"interactive MCP session for channel-push wake. The heartbeat "
+        f"daemon (separate process) will then keep your binding alive."
+    )
+    print(msg, file=sys.stderr)
+    return 2  # asyncRewake trigger
+
+
 # ---------------------------------------------------------------------------
 # heartbeat-daemon subcommand
 # ---------------------------------------------------------------------------
@@ -480,6 +511,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Project name override (otherwise auto-discovered from marker).",
     )
 
+    session_rewake = sub.add_parser(
+        "session-rewake",
+        help="Try to trigger an unprompted first turn via asyncRewake (for SessionStart hooks)",
+        description=(
+            "Companion to session-start. Writes the register instruction to "
+            "stderr and exits with code 2 to trigger Claude Code's "
+            "asyncRewake behaviour. If asyncRewake fires from a cold "
+            "session start, Claude takes an unprompted first turn and "
+            "calls register before the operator types anything. If it "
+            "doesn't fire, this is a no-op; session-start's additionalContext "
+            "still drives the register on first prompt."
+        ),
+    )
+    session_rewake.add_argument(
+        "--name",
+        default=None,
+        help="Agent name override (otherwise auto-discovered from marker).",
+    )
+    session_rewake.add_argument(
+        "--project",
+        default=None,
+        help="Project name override (otherwise auto-discovered from marker).",
+    )
+
     heartbeat = sub.add_parser(
         "heartbeat-daemon",
         help="Long-running per-minute heartbeat to the hub (for SessionStart hooks)",
@@ -524,6 +579,8 @@ def main(argv: list[str] | None = None) -> int:
         return stop_hook_command(args)
     if args.subcommand == "session-start":
         return session_start_command(args)
+    if args.subcommand == "session-rewake":
+        return session_rewake_command(args)
     if args.subcommand == "heartbeat-daemon":
         return heartbeat_daemon_command(args)
 
