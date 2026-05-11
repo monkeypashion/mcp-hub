@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.streamable_http import GET_STREAM_KEY
 from pydantic import BaseModel
 
 from .session_registry import SessionRegistry
@@ -383,6 +384,47 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         if result.rowcount > 0:
             conn.commit()
 
+    def _can_deliver_push(session: Any) -> bool:
+        """True if `session`'s streamable-http transport is in the manager's
+        active set AND has the GET /mcp listener (`GET_STREAM_KEY`) currently
+        registered. False means the notification would be silently dropped.
+
+        Why this gate exists: `ServerSession.send_notification` writes to the
+        session's internal write_stream, which always succeeds (no exception)
+        regardless of client state. The streamable-http transport's
+        message_router then routes server-initiated notifications to
+        `GET_STREAM_KEY`. If the client hasn't opened a GET /mcp stream (or
+        has closed it on /compact / network drop / disconnect), the router
+        logs "Request stream _GET_stream not found" at DEBUG and drops the
+        message. We run with event_store=None, so no replay buffer either.
+
+        Without this gate, push_channel returns True for a silent black-hole
+        — the hub reports `woke N/M` lies and `⚡` no longer means wakeable.
+        Reproduced empirically against the SDK in
+        tests/test_streamable_silent_drop.py.
+
+        Returns True (pass-through) if we can't introspect — e.g. the
+        session_manager isn't initialized (stdio/test mode) or the bound
+        session isn't a streamable-http one. In those cases the previous
+        behavior is preserved.
+        """
+        try:
+            manager = mcp.session_manager
+        except RuntimeError:
+            return True
+        instances = getattr(manager, "_server_instances", None)
+        if not instances:
+            return True
+        session_write = getattr(session, "_write_stream", None)
+        if session_write is None:
+            return True
+        for transport in instances.values():
+            if getattr(transport, "_write_stream", None) is session_write:
+                return GET_STREAM_KEY in getattr(transport, "_request_streams", {})
+        # Session is bound but its transport is no longer in the manager's
+        # active set — the underlying session_id has been DELETEd/crashed.
+        return False
+
     async def push_channel(agent: str, content: str, meta: dict[str, str]) -> bool:
         """Push a channel notification to `agent` via the live session registry.
 
@@ -393,6 +435,23 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         caller, so a False here is not message loss — the recipient picks
         it up on next register() or get_messages().
         """
+        # Gate the silent-drop case: if there's a binding but its transport
+        # has no GET /mcp listener (or the transport is no longer in the
+        # manager's active set), the send would silently succeed and the
+        # hub would lie in its `woke` count. Catch it here and report False
+        # so the recipient picks the message up via Stop-hook auto-pull.
+        #
+        # Done as a pre-check rather than inside registry.push so the
+        # registry stays transport-agnostic. Unbound names still flow
+        # through registry.push (which returns False) — that's the
+        # "never bound" branch and doesn't need the gate.
+        session = registry.get(agent)
+        if session is not None and not _can_deliver_push(session):
+            logger.info(
+                "push %s: gated — no GET /mcp listener (would be silent drop)",
+                agent,
+            )
+            return False
         return await registry.push(
             agent,
             _ChannelNotification(params={"content": content, "meta": meta}),
