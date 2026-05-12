@@ -15,11 +15,12 @@ import json
 import logging
 import os
 import sqlite3
-import time
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
+import anyio
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.streamable_http import GET_STREAM_KEY
 from pydantic import BaseModel
@@ -831,9 +832,17 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             )
 
         recipients = [a for a in registry.names() if a != from_agent]
-        woke = 0
-        for agent in recipients:
-            if await push_channel(
+
+        # Parallel fan-out. Each push_channel involves an async send through
+        # the recipient's MCP write stream; serializing them means broadcast
+        # latency is the SUM of recipient send times. Task-group fan-out
+        # drops it to ≈ the MAX (slowest single recipient). Results land in
+        # a dict keyed by agent name — anyio task groups run cooperatively
+        # on one event loop, so concurrent writes to the dict are safe.
+        push_results: dict[str, bool] = {}
+
+        async def _push_one(agent: str) -> None:
+            push_results[agent] = await push_channel(
                 agent=agent,
                 content=f"BROADCAST from {from_agent}: {message}",
                 meta={
@@ -841,23 +850,29 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                     "kind": "broadcast",
                     "priority": priority,
                 },
-            ):
-                woke += 1
-                # Successful push — recipient saw the broadcast as a live
-                # `<channel>` event. Advance their cursor so Stop-hook auto-
-                # pull doesn't re-surface the same item. (Failed pushes
-                # leave the cursor alone — recipient catches up via Stop hook.)
-                conn.execute(
-                    "UPDATE agents SET last_broadcast_seen_id = "
-                    "MAX(last_broadcast_seen_id, ?) WHERE name = ?",
-                    (broadcast_id, agent),
-                )
-        if woke > 0:
+            )
+
+        async with anyio.create_task_group() as tg:
+            for agent in recipients:
+                tg.start_soon(_push_one, agent)
+
+        # Successful pushes — advance each recipient's cursor in one batched
+        # UPDATE so Stop-hook auto-pull doesn't re-surface the same item.
+        # Failed pushes leave the cursor alone; those agents catch up via
+        # Stop hook on their next turn boundary.
+        successes = [a for a, pushed in push_results.items() if pushed]
+        if successes:
+            placeholders = ",".join("?" * len(successes))
+            conn.execute(
+                f"UPDATE agents SET last_broadcast_seen_id = "
+                f"MAX(last_broadcast_seen_id, ?) WHERE name IN ({placeholders})",
+                (broadcast_id, *successes),
+            )
             conn.commit()
 
         return (
             f"Broadcast posted (priority={priority}; "
-            f"woke {woke}/{len(recipients)} connected agents)."
+            f"woke {len(successes)}/{len(recipients)} connected agents)."
         )
 
     # -- Channels (topical, named, posted-to via `post`) ---------------------
@@ -984,9 +999,14 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             )
 
         recipients = [a for a in registry.names() if a != from_agent]
-        woke = 0
-        for agent in recipients:
-            if await push_channel(
+
+        # Parallel fan-out — same rationale as broadcast(). Posts have no
+        # per-recipient cursor to advance, so the post-loop simply counts
+        # successful pushes.
+        push_results: dict[str, bool] = {}
+
+        async def _push_one(agent: str) -> None:
+            push_results[agent] = await push_channel(
                 agent=agent,
                 content=f"#{channel} from {from_agent}: {message}",
                 meta={
@@ -995,8 +1015,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                     "channel": channel,
                     "priority": priority,
                 },
-            ):
-                woke += 1
+            )
+
+        async with anyio.create_task_group() as tg:
+            for agent in recipients:
+                tg.start_soon(_push_one, agent)
+
+        woke = sum(1 for pushed in push_results.values() if pushed)
         return (
             f"Posted to #{channel} (priority={priority}; "
             f"woke {woke}/{len(recipients)} connected agents)."
