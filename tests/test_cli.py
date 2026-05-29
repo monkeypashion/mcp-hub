@@ -15,8 +15,12 @@ from unittest.mock import patch
 import pytest
 
 from mcp_hub.cli import (
+    _claim_singleton,
     _discover_agent_from_marker,
     _extract_text,
+    _heartbeat_pidfile,
+    _is_live_daemon,
+    _release_singleton,
     _resolve_agent_identity,
     build_hook_response,
     build_parser,
@@ -700,3 +704,127 @@ def test_session_rewake_silent_when_no_marker(tmp_path, monkeypatch, capsys):
     captured = capsys.readouterr()
     assert captured.err == ""
     assert captured.out == ""
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat-daemon singleton — stops the Windows daemon leak
+# ---------------------------------------------------------------------------
+
+
+def test_heartbeat_pidfile_sanitizes_agent_name(tmp_path, monkeypatch):
+    """Pidfile lives under the stable per-user dir and the agent name is
+    sanitized so a name with path-hostile chars can't escape the dir or
+    collide."""
+    monkeypatch.setattr("mcp_hub.cli._PIDFILE_DIR", tmp_path)
+    pf = _heartbeat_pidfile("dream/team:lead")
+    assert pf.parent == tmp_path
+    assert pf.name == "heartbeat-dream_team_lead.pid"
+
+
+def test_claim_singleton_wins_when_no_prior(tmp_path, monkeypatch):
+    """First daemon for an agent: no prior pidfile → win the claim and record
+    our PID."""
+    monkeypatch.setattr("mcp_hub.cli._PIDFILE_DIR", tmp_path)
+    pf = _claim_singleton("alice", getpid=lambda: 4242)
+    assert pf is not None
+    assert pf.read_text(encoding="utf-8") == "4242"
+
+
+def test_claim_singleton_creates_state_dir_if_missing(tmp_path, monkeypatch):
+    """The per-user state dir is created on first claim if absent."""
+    state = tmp_path / "nested" / ".mcp-hub"
+    monkeypatch.setattr("mcp_hub.cli._PIDFILE_DIR", state)
+    assert not state.exists()
+    pf = _claim_singleton("alice", getpid=lambda: 4242)
+    assert pf is not None and pf.exists()
+
+
+def test_claim_singleton_stands_down_for_live_owner(tmp_path, monkeypatch):
+    """A live daemon already owns the agent → newcomer returns None (stand
+    down) and the incumbent's pidfile is left untouched. This is the core
+    leak fix: extra daemons exit instead of looping forever."""
+    monkeypatch.setattr("mcp_hub.cli._PIDFILE_DIR", tmp_path)
+    pf_path = _heartbeat_pidfile("alice")
+    pf_path.write_text("1111", encoding="utf-8")
+
+    with patch("mcp_hub.cli._is_live_daemon", return_value=True) as live:
+        result = _claim_singleton("alice", getpid=lambda: 2222)
+
+    assert result is None
+    live.assert_called_once_with(1111)
+    assert pf_path.read_text(encoding="utf-8") == "1111"  # incumbent untouched
+
+
+def test_claim_singleton_takes_over_dead_owner(tmp_path, monkeypatch):
+    """A stale pidfile (owner dead / PID recycled to a stranger) is removed
+    and the newcomer claims it."""
+    monkeypatch.setattr("mcp_hub.cli._PIDFILE_DIR", tmp_path)
+    pf_path = _heartbeat_pidfile("alice")
+    pf_path.write_text("1111", encoding="utf-8")
+
+    with patch("mcp_hub.cli._is_live_daemon", return_value=False):
+        result = _claim_singleton("alice", getpid=lambda: 2222)
+
+    assert result is not None
+    assert pf_path.read_text(encoding="utf-8") == "2222"
+
+
+def test_claim_singleton_takes_over_garbage_pidfile(tmp_path, monkeypatch):
+    """A corrupt/non-integer pidfile must not block startup — treat as stale
+    and claim it."""
+    monkeypatch.setattr("mcp_hub.cli._PIDFILE_DIR", tmp_path)
+    pf_path = _heartbeat_pidfile("alice")
+    pf_path.write_text("not-a-pid", encoding="utf-8")
+
+    result = _claim_singleton("alice", getpid=lambda: 2222)
+    assert result is not None
+    assert pf_path.read_text(encoding="utf-8") == "2222"
+
+
+def test_claim_singleton_is_race_safe_second_caller_stands_down(tmp_path, monkeypatch):
+    """Two real claims for the same agent: the first wins (atomic O_EXCL), the
+    second sees a live owner and stands down. Exercises the actual filesystem
+    create path, not just mocks."""
+    monkeypatch.setattr("mcp_hub.cli._PIDFILE_DIR", tmp_path)
+    first = _claim_singleton("alice", getpid=lambda: 1111)
+    assert first is not None
+    # Second caller: incumbent (1111) reported live → must stand down.
+    with patch("mcp_hub.cli._is_live_daemon", return_value=True):
+        second = _claim_singleton("alice", getpid=lambda: 2222)
+    assert second is None
+    assert first.read_text(encoding="utf-8") == "1111"
+
+
+def test_release_singleton_removes_pidfile_when_owner(tmp_path, monkeypatch):
+    """Clean exit by the current owner removes the pidfile."""
+    monkeypatch.setattr("mcp_hub.cli._PIDFILE_DIR", tmp_path)
+    pf_path = _heartbeat_pidfile("alice")
+    pf_path.write_text("2222", encoding="utf-8")
+
+    _release_singleton(pf_path, getpid=lambda: 2222)
+    assert not pf_path.exists()
+
+
+def test_release_singleton_keeps_successor_claim(tmp_path, monkeypatch):
+    """If a successor daemon already took over (pidfile names someone else),
+    our exit must NOT delete their claim."""
+    monkeypatch.setattr("mcp_hub.cli._PIDFILE_DIR", tmp_path)
+    pf_path = _heartbeat_pidfile("alice")
+    pf_path.write_text("3333", encoding="utf-8")  # successor's PID
+
+    _release_singleton(pf_path, getpid=lambda: 2222)
+    assert pf_path.exists()
+    assert pf_path.read_text(encoding="utf-8") == "3333"
+
+
+def test_release_singleton_missing_pidfile_is_noop(tmp_path, monkeypatch):
+    """No pidfile (already cleaned) → no error."""
+    monkeypatch.setattr("mcp_hub.cli._PIDFILE_DIR", tmp_path)
+    pf_path = _heartbeat_pidfile("alice")
+    _release_singleton(pf_path, getpid=lambda: 2222)  # must not raise
+
+
+def test_is_live_daemon_rejects_nonpositive_pid():
+    """PID 0 / negative are never valid daemons."""
+    assert _is_live_daemon(0) is False
+    assert _is_live_daemon(-1) is False
