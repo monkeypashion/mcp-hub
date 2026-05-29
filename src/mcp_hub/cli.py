@@ -28,6 +28,7 @@ import asyncio
 import json
 import os
 import pathlib
+import subprocess
 import sys
 from typing import Any
 
@@ -400,6 +401,175 @@ HEARTBEAT_INTERVAL_SECONDS = 60
 HEARTBEAT_RETRY_DELAY_SECONDS = 60
 
 
+# ---------------------------------------------------------------------------
+# Singleton enforcement — stop the daemon leak.
+#
+# Each SessionStart spawns a heartbeat daemon. On POSIX the OS reaps it when
+# the parent Claude Code process dies; on Windows it does NOT — so every
+# session restart (and every SessionStart-resume, which fires on each hub
+# reconnect) leaves the old daemon running AND adds a new one. Observed
+# 2026-05-29: ~12 daemons accumulated on one machine, and pre-cutover ones
+# kept pinging the dead public hub URL.
+#
+# We enforce one-daemon-per-agent with an atomic pidfile claim:
+#   - First daemon for an agent atomically creates the pidfile (O_EXCL) and
+#     runs the heartbeat loop.
+#   - Any later daemon finds the pidfile, sees a live daemon already owns it,
+#     and EXITS immediately instead of looping forever. No accumulation.
+#   - If the pidfile is stale (owner dead/crashed, or garbage), the newcomer
+#     removes it and claims it — self-healing.
+#
+# Design choices and why:
+#   * "Old wins" (incumbent keeps running, newcomer exits) rather than
+#     "new wins (kill incumbent)". The daemon is FUNGIBLE — it only calls
+#     heartbeat(agent_name), which refreshes whatever binding currently
+#     exists for that agent, regardless of which process sends it. So one
+#     surviving daemon per agent is fully sufficient even across session
+#     restarts. Old-wins also means we NEVER terminate another process —
+#     zero risk of killing a PID-reused stranger — and the atomic O_EXCL
+#     create makes it race-safe (two near-simultaneous daemons can't both
+#     win). New-wins-by-kill had a kill-war race and PID-reuse hazard.
+#   * Tradeoff: a config change (e.g. the MCP_HUB_URL cutover) is NOT
+#     auto-adopted while an old-config daemon is still alive — the newcomer
+#     with the new config exits. Mitigation: a one-off `Stop-Process` sweep
+#     of the daemons on the rare config change (operationally cheap; we did
+#     exactly this for the 2026-05-29 cutover). Frequency strongly favours
+#     this: the leak/accumulation happens on every restart; config changes
+#     are rare and operator-driven.
+#   * A parent-death watch can't fix the Windows leak: the daemon's parent is
+#     the `mcp-hub.exe` console-script launcher, which leaks alongside the
+#     python daemon when Claude Code dies, so the parent PID stays "alive".
+#
+# See project_heartbeat_daemon_leak memory.
+# ---------------------------------------------------------------------------
+
+# Stable per-agent pidfile directory. Deliberately NOT tempfile.gettempdir():
+# that honours TMPDIR/TEMP, which Claude Code overrides for its subprocesses
+# (observed: ...\Temp\claude). A daemon spawned by the SessionStart hook could
+# then land on a different temp dir than another context, so the pidfiles
+# wouldn't find each other and dedup would silently fail. The home dir is
+# invariant across however the daemon gets spawned.
+_PIDFILE_DIR = pathlib.Path.home() / ".mcp-hub"
+
+
+def _heartbeat_pidfile(agent_name: str) -> pathlib.Path:
+    """Stable per-agent pidfile path under ~/.mcp-hub.
+
+    Per-agent (not global) so each agent on a shared machine keeps its own
+    single daemon — the claim only ever considers the same agent's daemon.
+    """
+    safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in agent_name)
+    return _PIDFILE_DIR / f"heartbeat-{safe}.pid"
+
+
+def _is_live_daemon(pid: int) -> bool:
+    """True if `pid` is a live process that looks like a heartbeat daemon.
+
+    Conservative: returns False whenever identity is uncertain (so a recycled
+    PID belonging to an unrelated process is treated as 'not a daemon' and the
+    newcomer takes over the stale pidfile rather than deferring to a stranger).
+    Note this function never kills anything — it's purely a liveness/identity
+    probe for the claim logic.
+    """
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        # Windows os.kill(pid, 0) is not a safe liveness probe (non-CTRL
+        # signals unconditionally TerminateProcess the target), so use
+        # tasklist and verify the PID exists AND its image is python/launcher.
+        try:
+            out = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return False
+        low = out.lower()
+        return str(pid) in out and ("python" in low or "mcp-hub" in low)
+    # POSIX: signal 0 is a real liveness probe.
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Alive but owned by another user — not our daemon.
+        return False
+    except OSError:
+        return False
+    # When /proc is available (Linux), confirm it's actually a heartbeat
+    # daemon. Elsewhere (e.g. macOS) trust liveness — the leak this guards
+    # against is Windows-only anyway.
+    cmdline = pathlib.Path(f"/proc/{pid}/cmdline")
+    try:
+        data = cmdline.read_bytes().replace(b"\x00", b" ").decode("utf-8", "replace")
+    except (FileNotFoundError, OSError):
+        return True
+    return "heartbeat-daemon" in data
+
+
+def _claim_singleton(agent_name: str, *, getpid=os.getpid) -> pathlib.Path | None:
+    """Try to become the sole heartbeat daemon for `agent_name`.
+
+    Returns the pidfile path if we won the claim (caller should run the loop),
+    or None if a live daemon already owns it (caller should exit immediately).
+
+    Race-safe via atomic O_EXCL create. If an existing pidfile is stale
+    (owner dead, or garbage contents), it's removed and the claim retried.
+    """
+    pidfile = _heartbeat_pidfile(agent_name)
+    try:
+        pidfile.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # Can't create the state dir — fail open: run unguarded rather than
+        # refuse to heartbeat. Worst case is the pre-fix behaviour (possible
+        # duplicate), never a missing heartbeat.
+        return pidfile
+
+    # Bounded retry: each iteration either wins the create, defers to a live
+    # owner, or clears one stale pidfile and loops. A handful of iterations is
+    # plenty; the cap just prevents a pathological spin.
+    for _ in range(10):
+        try:
+            fd = os.open(str(pidfile), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                prev = int(pidfile.read_text(encoding="utf-8").strip())
+            except (FileNotFoundError, ValueError, OSError):
+                prev = None
+            if prev is not None and prev != getpid() and _is_live_daemon(prev):
+                return None  # a live daemon already owns this agent — stand down
+            # Stale/garbage/own-PID — drop it and retry the atomic create.
+            try:
+                pidfile.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return None  # lost the race to another claimant — stand down
+            continue
+        else:
+            with os.fdopen(fd, "w") as f:
+                f.write(str(getpid()))
+            return pidfile
+    # Couldn't settle the claim (extreme contention) — fail open and run.
+    return pidfile
+
+
+def _release_singleton(pidfile: pathlib.Path, *, getpid=os.getpid) -> None:
+    """Remove the pidfile on clean exit, but only if it still names us — so we
+    never delete a successor daemon's claim."""
+    try:
+        owner = int(pidfile.read_text(encoding="utf-8").strip())
+    except (FileNotFoundError, ValueError, OSError):
+        return
+    if owner == getpid():
+        try:
+            pidfile.unlink()
+        except OSError:
+            pass
+
+
 async def _heartbeat_loop(hub_url: str, agent_name: str) -> None:
     """Long-lived loop: connect to hub, ping `heartbeat(agent_name)` every
     HEARTBEAT_INTERVAL_SECONDS. On any connection error, sleep and reconnect.
@@ -437,10 +607,12 @@ def heartbeat_daemon_command(args: argparse.Namespace) -> int:
     KeyboardInterrupt or unrecoverable error.
 
     Designed to be spawned by an async SessionStart hook in
-    ~/.claude/settings.json. The daemon's parent is the Claude Code
-    process; when Claude Code exits, OS process-tree reaping should kill
-    the daemon (POSIX) or the daemon stays leaked until the system
-    cleans it up (Windows — to be verified empirically).
+    ~/.claude/settings.json. On POSIX the OS reaps the daemon when Claude
+    Code exits; on Windows it does not, so we enforce one-daemon-per-agent
+    via `_claim_singleton`: the first daemon for an agent atomically claims a
+    pidfile and runs; any later daemon sees a live owner and stands down
+    instead of looping forever. This caps accumulation at one per agent. See
+    the _claim_singleton block comment for the old-wins rationale.
     """
     name, _project = _resolve_agent_identity(args)
     if name is None:
@@ -449,10 +621,17 @@ def heartbeat_daemon_command(args: argparse.Namespace) -> int:
         # needing per-project opt-out for non-hub projects.
         return 0
 
+    pidfile = _claim_singleton(name)
+    if pidfile is None:
+        # A live daemon already owns this agent — stand down rather than
+        # leak a second one. This is the fix for the daemon accumulation.
+        return 0
     try:
         asyncio.run(_heartbeat_loop(args.hub_url, name))
     except KeyboardInterrupt:
         return 0
+    finally:
+        _release_singleton(pidfile)
     return 0
 
 
