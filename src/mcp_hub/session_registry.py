@@ -167,8 +167,14 @@ class SessionRegistry:
     # without persisting truly-abandoned bindings.
     ACTIVITY_TIMEOUT_SECONDS: float = 3600.0  # 60 minutes
 
-    def __init__(self) -> None:
+    def __init__(self, on_reap: Callable[[str], None] | None = None) -> None:
         self._lock = threading.Lock()
+        # Optional callback invoked (outside the lock) when the reaper drops a
+        # binding for inactivity. The server wires this to mark the agent
+        # offline in the DB so `list_agents` status stays truthful — a binding
+        # the reaper gave up on means the agent is no longer connected. Kept as
+        # an injected callback so the registry stays DB/transport-agnostic.
+        self._on_reap = on_reap
         # Forward index: agent name -> session
         self._by_name: dict[str, ServerSession] = {}
         # Reverse index: id(session) -> set of names bound to it. One session
@@ -383,6 +389,7 @@ class SessionRegistry:
         timed out, the reaper dropped the binding, and live agents looked
         offline. Activity is the reliable signal.
         """
+        dropped = False
         with self._lock:
             last = self._last_activity.get(name)
             if last is None:
@@ -396,6 +403,16 @@ class SessionRegistry:
                 name, age,
             )
             self._unbind_name_locked(name)
+            dropped = True
+        # Fire the offline callback OUTSIDE the lock — it may do a DB write,
+        # which we don't want to hold the registry lock across.
+        if dropped and self._on_reap is not None:
+            try:
+                self._on_reap(name)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "reaper: on_reap(%s) callback raised; continuing", name
+                )
         return False
 
     async def run_reaper(self) -> None:

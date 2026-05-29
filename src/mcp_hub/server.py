@@ -277,6 +277,19 @@ def is_channel_capable(session: Any) -> bool:
 def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 8080) -> FastMCP:
     """Create the MCP Hub server."""
     init_db(db_path)
+
+    # Startup presence reset — a fresh server instance has ZERO live sessions
+    # (a restart/redeploy drops every client connection and wipes the in-memory
+    # registry). The DB `status` field is persistent, though, and is only
+    # flipped to 'offline' by an explicit unregister() — so without this reset
+    # every agent that was online before the restart lingers as a stale 🟢
+    # 'online' forever, even though nothing is connected. Mark everyone offline
+    # at boot; register() flips them back to 'online' as they reconnect. This
+    # makes 🟢 mean "connected to THIS instance" rather than "ever registered".
+    _boot_conn = _get_db(db_path)
+    _boot_conn.execute("UPDATE agents SET status = 'offline'")
+    _boot_conn.commit()
+
     mcp = FastMCP(
         name="mcp-hub",
         host=host,
@@ -337,7 +350,21 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     # runs a background reaper to keep `list_agents` accurate when sessions
     # outlive their socket (streamable-http property). Agent metadata still
     # lives in SQLite; this is purely the "wakeable now" signal.
-    registry = SessionRegistry()
+    def _mark_offline_on_reap(name: str) -> None:
+        """Reaper callback: when a binding is dropped for inactivity, the agent
+        is no longer connected — reflect that in the DB so `list_agents` status
+        stays truthful. Best-effort; reaper liveness shouldn't hinge on the DB
+        write succeeding."""
+        try:
+            conn = _get_db(db_path)
+            conn.execute(
+                "UPDATE agents SET status = 'offline' WHERE name = ?", (name,)
+            )
+            conn.commit()
+        except Exception:  # noqa: BLE001
+            logger.exception("reaper offline-mark for %s failed", name)
+
+    registry = SessionRegistry(on_reap=_mark_offline_on_reap)
     # Exposed for main() so it can spawn the reaper alongside the server.
     mcp._hub_registry = registry  # type: ignore[attr-defined]
 
@@ -582,10 +609,15 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         lines = []
         for r in rows:
             status = "🟢" if r["status"] == "online" else "⚫"
-            # ⚡ marks agents with a live MCP session bound for channel-push
-            # wake. Online without ⚡ means messages queue until the agent
-            # next polls / relaunches / makes any binding tool call.
-            wake = " ⚡" if r["name"] in registry else ""
+            # ⚡ marks agents we can wake RIGHT NOW — not merely "has a registry
+            # binding". A bound session whose GET /mcp listener is gone (closed
+            # on /compact, cycled out, or never reopened after a hub redeploy)
+            # would silently drop a push, so it is NOT wakeable even though it's
+            # bound. `_can_deliver_push` is the same gate push_channel uses, so
+            # ⚡ now means exactly "a push would land". A bound-but-undeliverable
+            # agent shows 🟢 without ⚡ — the visible "needs relaunch" signal.
+            sess = registry.get(r["name"])
+            wake = " ⚡" if (sess is not None and _can_deliver_push(sess)) else ""
             # 💤 marks agents currently idle (Stop hook flipped them at last
             # turn end, no tool call has cleared it since). Combined with
             # ⚡, this is the state where a low-prio DM fires a live wake
