@@ -41,7 +41,7 @@ def test_no_messages_no_block():
         agent_name="alice",
         project="proj",
         messages_text="",
-        is_bound=True,
+        is_online=True,
     ) is None
 
 
@@ -54,7 +54,7 @@ def test_no_messages_unbound_emits_rebind_only_block():
         agent_name="alice",
         project="proj",
         messages_text="",
-        is_bound=False,
+        is_online=False,
     )
     assert response is not None
     assert response["decision"] == "block"
@@ -74,7 +74,7 @@ def test_no_messages_unbound_no_project_emits_rebind_only_block():
         agent_name="alice",
         project=None,
         messages_text="",
-        is_bound=False,
+        is_online=False,
     )
     assert response is not None
     assert 'register(name="alice")' in response["reason"]
@@ -86,7 +86,7 @@ def test_messages_bound_emits_block_with_content():
         agent_name="alice",
         project="proj",
         messages_text="[10:00] **bob**: hello there",
-        is_bound=True,
+        is_online=True,
     )
     assert response is not None
     assert response["decision"] == "block"
@@ -101,14 +101,14 @@ def test_messages_unbound_emits_block_with_rebind_hint():
         agent_name="alice",
         project="my-proj",
         messages_text="[10:00] **bob**: ping",
-        is_bound=False,
+        is_online=False,
     )
     assert response is not None
     reason = response["reason"]
     assert "ping" in reason
     # Rebind hint must include the agent's exact name + project for copy-paste
     assert 'register(name="alice", project="my-proj")' in reason
-    assert "NOT bound" in reason
+    assert "isn't showing as online" in reason
 
 
 def test_messages_unbound_no_project_still_emits_rebind():
@@ -118,7 +118,7 @@ def test_messages_unbound_no_project_still_emits_rebind():
         agent_name="alice",
         project=None,
         messages_text="[10:00] **bob**: hi",
-        is_bound=False,
+        is_online=False,
     )
     assert response is not None
     assert 'register(name="alice")' in response["reason"]
@@ -133,7 +133,7 @@ def test_block_reason_contains_messages_verbatim():
         agent_name="alice",
         project="proj",
         messages_text=msg_body,
-        is_bound=True,
+        is_online=True,
     )
     assert msg_body in response["reason"]
 
@@ -153,7 +153,7 @@ def test_broadcasts_only_emits_block():
         project="proj",
         messages_text="",
         broadcasts_text="[10:00] **dt**: hub redeploying in 5 min",
-        is_bound=True,
+        is_online=True,
     )
     assert response is not None
     assert response["decision"] == "block"
@@ -171,7 +171,7 @@ def test_dms_and_broadcasts_both_emit_block_with_both_sections():
         project="proj",
         messages_text="[10:00] **bob**: ping",
         broadcasts_text="[10:01] **dt**: status update",
-        is_bound=True,
+        is_online=True,
     )
     assert response is not None
     reason = response["reason"]
@@ -192,7 +192,7 @@ def test_broadcasts_only_drifted_emits_block_with_rebind():
         project="proj",
         messages_text="",
         broadcasts_text="[10:00] **dt**: announcement",
-        is_bound=False,
+        is_online=False,
     )
     assert response is not None
     reason = response["reason"]
@@ -201,15 +201,62 @@ def test_broadcasts_only_drifted_emits_block_with_rebind():
 
 
 def test_no_dms_no_broadcasts_bound_returns_none():
-    """The steady-state happy path: agent is up to date and bound. Most
+    """The steady-state happy path: agent is up to date and online. Most
     Stop fires hit this — no block, no overhead."""
     assert build_hook_response(
         agent_name="alice",
         project="proj",
         messages_text="",
         broadcasts_text="",
-        is_bound=True,
+        is_online=True,
     ) is None
+
+
+def test_online_idle_without_wake_marker_is_not_nagged():
+    """Regression for the fleet-wide false-rebind loop.
+
+    After PR #3, an idle agent is 🟢 (online) but lacks ⚡ (no open GET /mcp
+    stream between turns). The Stop hook fires exactly at that idle moment.
+    The rebind nag MUST key on online status, not ⚡ — so an online agent
+    with an empty inbox gets NO block, even though it isn't ⚡-wakeable this
+    instant. Keying on ⚡ poked every idle agent to re-register every turn."""
+    assert build_hook_response(
+        agent_name="alice",
+        project="proj",
+        messages_text="",
+        broadcasts_text="",
+        is_online=True,
+    ) is None
+
+
+def test_stop_hook_active_suppresses_content_less_reblock():
+    """Loop backstop: when a Stop fires because a prior block fired
+    (stop_hook_active) and there's nothing new to surface, do not re-block —
+    even for a genuinely offline agent. Otherwise a content-less rebind nag
+    re-emits every turn and wedges the agent."""
+    assert build_hook_response(
+        agent_name="alice",
+        project="proj",
+        messages_text="",
+        broadcasts_text="",
+        is_online=False,
+        stop_hook_active=True,
+    ) is None
+
+
+def test_stop_hook_active_still_surfaces_new_content():
+    """stop_hook_active only suppresses content-LESS blocks. A genuinely
+    queued DM must still surface even on a re-fire."""
+    response = build_hook_response(
+        agent_name="alice",
+        project="proj",
+        messages_text="[10:00] **bob**: urgent ping",
+        broadcasts_text="",
+        is_online=True,
+        stop_hook_active=True,
+    )
+    assert response is not None
+    assert "urgent ping" in response["reason"]
 
 
 # ---------------------------------------------------------------------------
