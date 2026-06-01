@@ -30,6 +30,37 @@ from .session_registry import SessionRegistry
 logger = logging.getLogger(__name__)
 
 
+def _resolve_commit() -> str:
+    """Best-effort git SHA of the running code, for the /health endpoint.
+
+    Resolution order: MCP_HUB_GIT_SHA env (baked at build time via the
+    Dockerfile ARG) → read the repo's .git directly (the image ships the
+    source incl. .git, so this works even when the env isn't set) →
+    'unknown'. Pure-Python git read so the slim image needs no git binary.
+    """
+    sha = os.environ.get("MCP_HUB_GIT_SHA")
+    if sha and sha.strip() and sha.strip() != "unknown":
+        return sha.strip()
+    try:
+        git_dir = Path(__file__).resolve().parents[2] / ".git"
+        head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+        if not head.startswith("ref:"):
+            return head  # detached HEAD — already a raw SHA
+        ref = head.split(":", 1)[1].strip()
+        loose = git_dir / ref
+        if loose.exists():
+            return loose.read_text(encoding="utf-8").strip()
+        packed = git_dir / "packed-refs"
+        if packed.exists():
+            for line in packed.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.endswith(" " + ref):
+                    return line.split(" ", 1)[0]
+    except Exception:  # noqa: BLE001
+        pass
+    return "unknown"
+
+
 class _ChannelNotification(BaseModel):
     """MCP notification matching Claude Code's experimental claude/channel protocol.
 
@@ -376,6 +407,29 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     )
     # Exposed for main() so it can spawn the reaper alongside the server.
     mcp._hub_registry = registry  # type: ignore[attr-defined]
+
+    # Plain HTTP health/version probe: `curl http://<hub>/health` returns the
+    # running git commit so the deployed version is verifiable without
+    # guessing (the hub otherwise speaks only MCP at /mcp). Registered on the
+    # streamable-http Starlette app via FastMCP's custom_route.
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+
+    @mcp.custom_route("/health", methods=["GET"])
+    async def health(_request: Request) -> JSONResponse:
+        try:
+            from . import __version__ as pkg_version
+        except Exception:  # noqa: BLE001
+            pkg_version = "?"
+        return JSONResponse(
+            {
+                "status": "ok",
+                "service": "mcp-hub",
+                "version": pkg_version,
+                "commit": _resolve_commit(),
+                "agents_bound": len(registry.names()),
+            }
+        )
 
     def touch_session(name: str, ctx: Context | None) -> None:
         """Auto-bind the agent's session if a Context is available.
