@@ -364,7 +364,16 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         except Exception:  # noqa: BLE001
             logger.exception("reaper offline-mark for %s failed", name)
 
-    registry = SessionRegistry(on_reap=_mark_offline_on_reap)
+    # liveness_probe is a late-binding lambda: `_can_deliver_push` is defined
+    # further down in this scope, but the reaper only invokes the probe long
+    # after create_server() has finished, so the name resolves fine at call
+    # time. The reaper uses it to spare still-deliverable idle bindings from
+    # the activity-timeout drop (a `--channels` session's live connection is
+    # its own heartbeat — no daemon needed).
+    registry = SessionRegistry(
+        on_reap=_mark_offline_on_reap,
+        liveness_probe=lambda session: _can_deliver_push(session),
+    )
     # Exposed for main() so it can spawn the reaper alongside the server.
     mcp._hub_registry = registry  # type: ignore[attr-defined]
 
