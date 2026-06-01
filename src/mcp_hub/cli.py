@@ -49,15 +49,16 @@ AGENT_MARKER_PATH = pathlib.Path(".claude") / "hub-agent.json"
 async def _query_hub(
     hub_url: str, agent_name: str
 ) -> tuple[str, str, bool]:
-    """Connect to the hub, return (dm_text, broadcast_text, is_currently_bound).
+    """Connect to the hub, return (dm_text, broadcast_text, is_online).
 
     - `dm_text` is the rendered output of `get_messages` (empty if no unread).
     - `broadcast_text` is the rendered output of `get_broadcasts_for_agent`,
       which atomically returns broadcasts since the agent's per-agent cursor
       and advances the cursor (so subsequent calls don't re-deliver). Empty
       string if no unseen broadcasts.
-    - `is_currently_bound` is True when the agent's name has ⚡ in
-      `list_agents` (i.e. a live MCP session is bound on the hub side).
+    - `is_online` is True when the agent's name appears in `list_agents`
+      (status='online' / 🟢). Deliberately NOT keyed on the ⚡ marker — see
+      the inline note below on why ⚡ is the wrong signal for the rebind nag.
 
     On any error, raises — the caller is responsible for fail-open handling.
     """
@@ -95,12 +96,21 @@ async def _query_hub(
     broadcasts_text = _extract_text(broadcasts_result)
     agents_text = _extract_text(agents_result)
 
-    # ⚡ next to the agent's name means they're bound for wake. Substring match
-    # is good enough — list_agents output is one line per agent and the marker
-    # appears immediately after the name in `**name** ⚡` form.
-    is_bound = f"**{agent_name}** ⚡" in agents_text
+    # Is the agent shown as online? list_agents (default include_offline=False)
+    # lists ONLY agents with status='online', so the name appearing at all
+    # means they're connected to this hub instance (PR #3's 🟢 semantics).
+    #
+    # We deliberately do NOT key on the ⚡ marker. Since PR #3, ⚡ means
+    # "push-deliverable RIGHT NOW" — an open GET /mcp stream. A perfectly
+    # healthy agent lacks ⚡ while idle between turns, and the Stop hook fires
+    # exactly at that idle transition. Keying the rebind nag on ⚡ produced a
+    # false "you're not bound, re-register" alarm on every Stop for every idle
+    # agent — a fleet-wide loop that register() couldn't clear (re-binding
+    # doesn't reopen the GET stream at idle). Online (🟢) is the correct
+    # "is this agent bound?" signal; ⚡ is not.
+    is_online = f"**{agent_name}**" in agents_text
 
-    return messages_text, broadcasts_text, is_bound
+    return messages_text, broadcasts_text, is_online
 
 
 def _extract_text(call_tool_result: Any) -> str:
@@ -130,7 +140,8 @@ def build_hook_response(
     project: str | None,
     messages_text: str,
     broadcasts_text: str = "",
-    is_bound: bool,
+    is_online: bool,
+    stop_hook_active: bool = False,
 ) -> dict[str, Any] | None:
     """Decide whether to emit a hook block and what the reason should be.
 
@@ -141,18 +152,36 @@ def build_hook_response(
       - Queued DMs (with discipline reminder)
       - Unseen broadcasts (with discipline reminder; same gating rule —
         urgent always responds, related/important inline, FYI noted-and-defer)
-      - Agent drifted off ⚡ (rebind hint, with or without other content)
+      - Agent genuinely offline / absent from list_agents (rebind hint, with
+        or without other content). NOTE: this keys on online status (🟢), NOT
+        the ⚡ wake-marker — an idle-but-online agent is not nagged, since it
+        legitimately lacks ⚡ between turns. Keying on ⚡ caused a fleet-wide
+        false-rebind loop after PR #3 tightened ⚡ to "deliverable now".
 
-    Bound agent with empty inbox AND no unseen broadcasts → return None,
+    Online agent with empty inbox AND no unseen broadcasts → return None,
     Stop proceeds normally. This is the steady-state happy path: most Stop
     fires are no-op when the agent is up-to-date.
+
+    `stop_hook_active` is Claude Code's flag for "this Stop is firing because
+    a prior Stop-hook block already fired". It's a loop backstop: a re-fire
+    has no fresh content (DMs were marked read, the broadcast cursor advanced
+    on the first fire), so a content-less block would re-emit forever. When
+    it's set and there's nothing new to surface, we let Stop proceed.
     """
     has_messages = bool(messages_text.strip())
     has_broadcasts = bool(broadcasts_text.strip())
     has_content = has_messages or has_broadcasts
 
-    # No work needed: bound + nothing queued.
-    if not has_content and is_bound:
+    # Loop backstop: never re-block a Stop that's only firing because a prior
+    # block fired, when there's nothing new to surface. Guards against any
+    # content-less block (e.g. a rebind nag) wedging the agent in a re-block
+    # loop, independent of the online/⚡ fix above.
+    if stop_hook_active and not has_content:
+        return None
+
+    # No work needed: online + nothing queued. (Online — not ⚡ — is the gate:
+    # an idle agent legitimately lacks ⚡ between turns.)
+    if not has_content and is_online:
         return None
 
     parts: list[str] = []
@@ -164,7 +193,7 @@ def build_hook_response(
         if has_broadcasts:
             parts.extend(["", "**Broadcasts (since you last looked):**", broadcasts_text.strip()])
 
-    if not is_bound:
+    if not is_online:
         rebind_args = [f'name="{agent_name}"']
         if project:
             rebind_args.append(f'project="{project}"')
@@ -172,17 +201,17 @@ def build_hook_response(
 
         if has_content:
             warning = (
-                f"⚠️ Your hub session is currently NOT bound for wake "
-                f"(no ⚡ in list_agents — likely after a hub redeploy). "
-                f"Call `{rebind_call}` to re-establish the wake path "
+                f"⚠️ Your hub session isn't showing as online in "
+                f"list_agents (likely after a hub redeploy or a dropped "
+                f"connection). Call `{rebind_call}` to re-register "
                 f"before processing the queue."
             )
         else:
             warning = (
-                f"⚠️ Auto-checked at Stop boundary: your hub session is "
-                f"NOT bound for wake (no ⚡ in list_agents — likely after a "
-                f"hub redeploy). No queued items to process. Call "
-                f"`{rebind_call}` to re-establish the wake path, then "
+                f"⚠️ Auto-checked at Stop boundary: your hub session "
+                f"isn't showing as online in list_agents (likely after a "
+                f"hub redeploy or a dropped connection). No queued items "
+                f"to process. Call `{rebind_call}` to re-register, then "
                 f"continue what you were doing."
             )
         if has_content:
@@ -256,6 +285,7 @@ def _discover_agent_from_marker(cwd: str | None) -> tuple[str | None, str | None
 
 def _resolve_agent_identity(
     args: argparse.Namespace,
+    payload: dict[str, Any] | None = None,
 ) -> tuple[str | None, str | None]:
     """Resolve which agent this hook invocation is for.
 
@@ -269,26 +299,38 @@ def _resolve_agent_identity(
 
     The marker file path is fixed (`.claude/hub-agent.json`) so each
     project self-declares with no central registry to maintain.
+
+    `payload` is the already-parsed Stop-hook stdin. Callers that also need
+    other stdin fields (e.g. `stop_hook_active`) must read stdin ONCE and
+    pass it in — stdin is not re-readable, so a second `_read_hook_stdin()`
+    would return {}. If None, we read it here.
     """
     if args.name:
         return args.name, args.project
 
-    payload = _read_hook_stdin()
+    if payload is None:
+        payload = _read_hook_stdin()
     cwd = payload.get("cwd")
     return _discover_agent_from_marker(cwd)
 
 
 def stop_hook_command(args: argparse.Namespace) -> int:
     """Run the stop-hook subcommand. Always returns 0 (fail-open)."""
-    name, project = _resolve_agent_identity(args)
+    # Read stdin ONCE — both agent identity (cwd marker) and the
+    # stop_hook_active loop-backstop flag come from this single payload.
+    payload = _read_hook_stdin()
+    name, project = _resolve_agent_identity(args, payload)
     if name is None:
         # No identity resolved — this project isn't onboarded as a hub agent.
         # Silent no-op: most projects on the box aren't hub agents and the
         # global Stop hook fires in all of them. We don't want noise.
         return 0
 
+    # True when this Stop is firing because a prior Stop-hook block fired.
+    stop_hook_active = bool(payload.get("stop_hook_active"))
+
     try:
-        messages_text, broadcasts_text, is_bound = asyncio.run(
+        messages_text, broadcasts_text, is_online = asyncio.run(
             _query_hub(args.hub_url, name)
         )
     except Exception as exc:  # noqa: BLE001
@@ -301,7 +343,8 @@ def stop_hook_command(args: argparse.Namespace) -> int:
         project=project,
         messages_text=messages_text,
         broadcasts_text=broadcasts_text,
-        is_bound=is_bound,
+        is_online=is_online,
+        stop_hook_active=stop_hook_active,
     )
 
     if response is None:
