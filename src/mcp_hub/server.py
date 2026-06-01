@@ -802,14 +802,15 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             )
 
             if pushed:
-                ids = [r["id"] for r in unread]
-                placeholders = ",".join("?" * len(ids))
-                conn.execute(
-                    f"UPDATE messages SET read = 1 WHERE id IN ({placeholders})",
-                    ids,
-                )
-                # Clear is_idle: recipient is taking a turn to process the
-                # wake event. Atomic with marking the batch read.
+                # Do NOT mark the batch read on push. push_channel returning
+                # True only means the notification was written to the bound
+                # stream — not that the recipient surfaced it (a stale/
+                # non-surfacing stream still reports deliverable, which silently
+                # destroyed messages). The inbox is the source of truth;
+                # get_messages marks read only when the recipient genuinely
+                # pulls. We still clear is_idle (recipient is taking a turn) —
+                # which also prevents a re-push storm: subsequent low-prio sends
+                # see not-idle and queue instead of re-pushing the batch.
                 conn.execute(
                     "UPDATE agents SET is_idle = 0 WHERE name = ?", (to,)
                 )
@@ -832,16 +833,15 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             meta={"from_agent": from_agent, "kind": "dm", "priority": priority},
         )
 
-        if pushed:
-            # The recipient saw the message via channel-push — content is
-            # already in their context. Mark the DB row read so subsequent
-            # get_messages / Stop-hook auto-pulls don't re-deliver it.
-            # (If push fails, the row stays unread and the recipient picks
-            # it up via the inbox path on next register/Stop hook.)
-            conn.execute(
-                "UPDATE messages SET read = 1 WHERE id = ?", (message_id,)
-            )
-            conn.commit()
+        # Do NOT mark the message read on push success. push_channel returning
+        # True only means the notification was written to the bound stream — NOT
+        # that the recipient actually surfaced it. A stale or non-surfacing
+        # stream still reports deliverable, so marking read here destroyed
+        # messages silently (recipient never saw it, yet it vanished from the
+        # inbox). The inbox is the source of truth: the row stays unread until
+        # the recipient genuinely pulls it via get_messages (Stop-hook auto-pull
+        # or explicit). Worst case, a live-surfaced push is seen once more on the
+        # next inbox pull — a harmless duplicate, vs. the silent loss this fixes.
 
         return (
             f"Message sent to '{to}' (priority={priority})."

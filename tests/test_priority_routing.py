@@ -582,24 +582,33 @@ async def test_normal_priority_message_no_priority_tag_in_output(server):
     assert "[low]" not in out
 
 
-async def test_send_marks_message_read_when_push_succeeds(server):
-    """When channel-push delivers successfully, the recipient saw the message
-    inline as a <channel> event — content is already in their context. The
-    DB row must be marked read=1 so Stop-hook auto-pulls and explicit
-    get_messages don't re-surface it. Without this fix, every successfully-
-    pushed DM gets delivered twice (once via channel push, once via inbox)."""
+async def test_send_does_not_mark_read_on_push_so_message_survives(server):
+    """A successful push must NOT mark the DM read. push returning True only
+    means the notification was written to the bound stream — not that the
+    recipient surfaced it. A stale/non-surfacing stream still reports
+    deliverable, so marking read on push silently destroyed messages (the
+    recipient never saw it, yet it vanished from the inbox). The inbox is the
+    source of truth: the message stays unread and retrievable via get_messages
+    until the recipient genuinely pulls it. (Tradeoff: a live-surfaced push may
+    be seen once more on the next inbox pull — a harmless duplicate, vs. loss.)"""
     registry = server._hub_registry  # type: ignore[attr-defined]
-    # Simulate a successful channel push
+    # Simulate a "successful" channel push (returns True even though we can't
+    # prove the recipient actually surfaced it).
     with patch.object(registry, "push", AsyncMock(return_value=True)):
         await _call_tool(
             server, "send",
             {"from_agent": "alice", "to": "bob", "message": "delivered via push"},
         )
 
-    # bob's inbox should be EMPTY because the message was delivered live and
-    # marked read on the way out. Re-delivery would cause double-processing.
+    # The message MUST still be retrievable from bob's inbox — push success
+    # does not consume it. This is the fix for the silent-loss bug.
     out = await _call_tool(server, "get_messages", {"agent_name": "bob"})
-    assert out == ""
+    assert "delivered via push" in out
+
+    # And get_messages (the genuine pull) marks it read, so a second pull is
+    # empty — no infinite re-delivery.
+    out2 = await _call_tool(server, "get_messages", {"agent_name": "bob"})
+    assert out2 == ""
 
 
 async def test_send_keeps_message_unread_when_push_fails(server):
