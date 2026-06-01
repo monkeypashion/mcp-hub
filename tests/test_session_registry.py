@@ -19,7 +19,6 @@ import pytest
 
 from mcp_hub.session_registry import SessionRegistry
 
-
 # ---------------------------------------------------------------------------
 # Minimal session stand-in
 # ---------------------------------------------------------------------------
@@ -334,6 +333,131 @@ def test_check_one_does_not_drop_recently_refreshed_binding(registry):
     alive = registry._check_one("alice")
     assert alive is True
     assert registry.is_bound("alice")
+
+
+def test_check_one_keeps_stale_but_deliverable_binding():
+    """The fix for the idle-fleet-offline bug: a binding whose activity has
+    gone stale is NOT reaped while its session is still push-deliverable. A
+    `--channels` session sitting idle holds a live connection — that IS the
+    heartbeat. The reaper refreshes the timestamp and keeps it; on_reap does
+    NOT fire (the agent is still genuinely online)."""
+    import time as _t
+
+    reaped: list[str] = []
+    r = SessionRegistry(
+        on_reap=reaped.append,
+        liveness_probe=lambda _s: True,  # still deliverable
+    )
+    try:
+        r.ACTIVITY_TIMEOUT_SECONDS = 0.05
+        s = FakeSession()
+        r.bind("alice", s)
+        with r._lock:
+            r._last_activity["alice"] = _t.time() - 1.0  # stale
+        before = r._last_activity["alice"]
+
+        alive = r._check_one("alice")
+
+        assert alive is True
+        assert r.is_bound("alice")
+        assert r._last_activity["alice"] > before  # live conn refreshed it
+        assert reaped == []  # never marked offline
+    finally:
+        r.close()
+
+
+def test_check_one_drops_stale_and_undeliverable_binding():
+    """A stale binding whose session is no longer deliverable (connection
+    gone) IS reaped, and on_reap fires so the agent is marked offline."""
+    import time as _t
+
+    reaped: list[str] = []
+    r = SessionRegistry(
+        on_reap=reaped.append,
+        liveness_probe=lambda _s: False,  # connection dead
+    )
+    try:
+        r.ACTIVITY_TIMEOUT_SECONDS = 0.05
+        s = FakeSession()
+        r.bind("alice", s)
+        with r._lock:
+            r._last_activity["alice"] = _t.time() - 1.0  # stale
+
+        alive = r._check_one("alice")
+
+        assert alive is False
+        assert not r.is_bound("alice")
+        assert reaped == ["alice"]
+    finally:
+        r.close()
+
+
+def test_check_one_drops_stale_binding_when_no_probe():
+    """With no liveness_probe wired (default), a stale binding is dropped —
+    preserves the pre-fix behaviour for setups without a probe."""
+    import time as _t
+
+    reaped: list[str] = []
+    r = SessionRegistry(on_reap=reaped.append)  # no liveness_probe
+    try:
+        r.ACTIVITY_TIMEOUT_SECONDS = 0.05
+        s = FakeSession()
+        r.bind("alice", s)
+        with r._lock:
+            r._last_activity["alice"] = _t.time() - 1.0
+
+        alive = r._check_one("alice")
+
+        assert alive is False
+        assert not r.is_bound("alice")
+        assert reaped == ["alice"]
+    finally:
+        r.close()
+
+
+def test_check_one_probe_exception_treated_as_undeliverable():
+    """If the liveness probe raises, the reaper must not wedge — it treats the
+    session as undeliverable and drops the stale binding."""
+    import time as _t
+
+    def boom(_s):
+        raise RuntimeError("probe blew up")
+
+    r = SessionRegistry(liveness_probe=boom)
+    try:
+        r.ACTIVITY_TIMEOUT_SECONDS = 0.05
+        s = FakeSession()
+        r.bind("alice", s)
+        with r._lock:
+            r._last_activity["alice"] = _t.time() - 1.0
+
+        alive = r._check_one("alice")
+
+        assert alive is False
+        assert not r.is_bound("alice")
+    finally:
+        r.close()
+
+
+def test_check_one_does_not_probe_recent_binding():
+    """Fast path: a recently-active binding is kept WITHOUT consulting the
+    probe. Activity alone suffices; the probe is only the fallback for
+    bindings that have gone stale."""
+    probe_calls: list = []
+
+    def probe(s):
+        probe_calls.append(s)
+        return True
+
+    r = SessionRegistry(liveness_probe=probe)
+    try:
+        s = FakeSession()
+        r.bind("alice", s)  # fresh activity
+        alive = r._check_one("alice")
+        assert alive is True
+        assert probe_calls == []  # never probed — activity was fresh
+    finally:
+        r.close()
 
 
 def test_bind_refreshes_activity_on_same_session(registry):

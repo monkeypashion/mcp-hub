@@ -171,6 +171,11 @@ def test_reaper_drop_marks_agent_offline(tmp_path: Path):
     db = tmp_path / "test.db"
     server = create_server(db_path=db)
     registry: SessionRegistry = server._hub_registry  # type: ignore[attr-defined]
+    # The reap scenario is an ABANDONED binding: stale activity AND a dead
+    # connection. Force the liveness probe to report undeliverable so the
+    # reaper drops it (a still-deliverable idle binding is deliberately kept
+    # now — see test_session_registry deliverability tests).
+    registry._liveness_probe = lambda _s: False
 
     conn = _get_db(db)
     # Seed an online + bound agent directly (register requires a Context for
@@ -204,6 +209,9 @@ def test_reaper_callback_survives_db_error(tmp_path: Path):
     db = tmp_path / "test.db"
     server = create_server(db_path=db)
     registry: SessionRegistry = server._hub_registry  # type: ignore[attr-defined]
+    # Abandoned binding (dead connection) → probe reports undeliverable so the
+    # reaper actually drops it and invokes the on_reap callback.
+    registry._liveness_probe = lambda _s: False
 
     import time as _t
 

@@ -167,7 +167,11 @@ class SessionRegistry:
     # without persisting truly-abandoned bindings.
     ACTIVITY_TIMEOUT_SECONDS: float = 3600.0  # 60 minutes
 
-    def __init__(self, on_reap: Callable[[str], None] | None = None) -> None:
+    def __init__(
+        self,
+        on_reap: Callable[[str], None] | None = None,
+        liveness_probe: Callable[[ServerSession], bool] | None = None,
+    ) -> None:
         self._lock = threading.Lock()
         # Optional callback invoked (outside the lock) when the reaper drops a
         # binding for inactivity. The server wires this to mark the agent
@@ -175,6 +179,16 @@ class SessionRegistry:
         # the reaper gave up on means the agent is no longer connected. Kept as
         # an injected callback so the registry stays DB/transport-agnostic.
         self._on_reap = on_reap
+        # Optional probe: given a bound session, return True if a push would
+        # actually land RIGHT NOW (live GET /mcp listener). The server wires
+        # this to `_can_deliver_push`. The reaper uses it so a still-deliverable
+        # binding is NOT dropped for tool-call inactivity: a `--channels`
+        # session sitting idle holds a live connection, which IS the liveness
+        # signal — the open connection is the heartbeat. Without this, the
+        # reaper dropped genuinely-wakeable idle agents after ACTIVITY_TIMEOUT,
+        # marking the whole fleet offline if left idle past the timeout. Kept
+        # injected so the registry stays transport-agnostic.
+        self._liveness_probe = liveness_probe
         # Forward index: agent name -> session
         self._by_name: dict[str, ServerSession] = {}
         # Reverse index: id(session) -> set of names bound to it. One session
@@ -374,22 +388,29 @@ class SessionRegistry:
     # -- background reaper ---------------------------------------------------
 
     def _check_one(self, name: str) -> bool:
-        """Check whether `name`'s binding has had recent activity. Drop the
-        binding if not. Returns True if the binding survives, False otherwise.
+        """Check whether `name`'s binding should survive. Drop it only if it's
+        both inactive past ACTIVITY_TIMEOUT *and* no longer push-deliverable.
+        Returns True if the binding survives, False otherwise.
 
         "Activity" = any tool call from the agent that ran through
         touch_session (server.py side) — register, send, broadcast, post,
         get_messages, ping, update_bio, get_broadcasts_for_agent. Each of
         those refreshes the timestamp via bind().
 
-        This replaces the previous server-initiated-ping liveness check,
-        which was unreliable in production: Claude Code's MCP client cycles
-        streamable-http sessions every ~30s (DELETE+new POST), so the bound
-        session_id was usually dead by the time the reaper pinged it. Pings
-        timed out, the reaper dropped the binding, and live agents looked
-        offline. Activity is the reliable signal.
+        Activity alone is not enough: a `--channels` session sitting idle for
+        hours makes no tool calls, yet holds a live GET /mcp connection the
+        hub can push to — it's genuinely wakeable and must NOT be reaped. So
+        once activity goes stale we consult `_liveness_probe` (the server's
+        `_can_deliver_push`): if a push would still land, the open connection
+        IS the heartbeat — refresh the timestamp and keep the binding. Only a
+        binding that is BOTH silent AND undeliverable is truly abandoned.
+
+        (Activity is still the fast path: a recently-active agent is kept
+        without probing. The probe replaces the old server-initiated ping,
+        which was unreliable because Claude Code cycles streamable-http POST
+        sessions ~every 30s; the channel GET stream, by contrast, persists
+        across idle, so probing it is a sound liveness signal.)
         """
-        dropped = False
         with self._lock:
             last = self._last_activity.get(name)
             if last is None:
@@ -397,10 +418,44 @@ class SessionRegistry:
             age = time.time() - last
             if age <= self.ACTIVITY_TIMEOUT_SECONDS:
                 return True
-            # Stale — drop
+            session = self._by_name.get(name)
+
+        # Activity is stale. Before dropping, check whether the bound session
+        # is still push-deliverable — done OUTSIDE the lock because the probe
+        # introspects transport state and we don't hold the registry lock
+        # across it.
+        if session is not None and self._liveness_probe is not None:
+            try:
+                deliverable = self._liveness_probe(session)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "reaper: liveness_probe(%s) raised; treating as "
+                    "undeliverable", name,
+                )
+                deliverable = False
+            if deliverable:
+                # Live connection is the heartbeat — keep it, refresh activity.
+                with self._lock:
+                    if name in self._by_name:
+                        self._last_activity[name] = time.time()
+                logger.debug(
+                    "reaper: %s stale (%.0fs) but still deliverable — kept",
+                    name, age,
+                )
+                return True
+
+        # Both silent and undeliverable (or unprobeable) — drop.
+        dropped = False
+        with self._lock:
+            # Re-check: activity may have arrived while we probed.
+            last = self._last_activity.get(name)
+            if last is None:
+                return False
+            if time.time() - last <= self.ACTIVITY_TIMEOUT_SECONDS:
+                return True
             logger.info(
-                "reaper: dropping %s after %.0fs of inactivity",
-                name, age,
+                "reaper: dropping %s after %.0fs of inactivity (not deliverable)",
+                name, time.time() - last,
             )
             self._unbind_name_locked(name)
             dropped = True
