@@ -20,8 +20,11 @@ from mcp_hub.cli import (
     _extract_text,
     _heartbeat_pidfile,
     _is_live_daemon,
+    _parse_status_from_agents,
     _release_singleton,
     _resolve_agent_identity,
+    _status_cache_path,
+    _write_status_cache,
     build_hook_response,
     build_parser,
     session_rewake_command,
@@ -644,6 +647,27 @@ def test_session_start_emits_register_context_for_marked_project(tmp_path, monke
     assert 'register(name="features-json-dev", project="features-json")' in context
 
 
+def test_session_start_context_is_resume_race_resilient(tmp_path, monkeypatch, capsys):
+    """The register instruction must tell the agent NOT to give up if the hub
+    MCP server is still connecting on resume — it should wait/retry rather than
+    conclude the hub is down. This is the gap that left dreamteam-lead
+    connected-but-unregistered (MCP up, never registered)."""
+    import io
+    monkeypatch.setattr(
+        "sys.stdin", io.StringIO(json.dumps({"cwd": str(tmp_path)}))
+    )
+    args = argparse.Namespace(name="alice", project="proj")
+    rc = session_start_command(args)
+    assert rc == 0
+    context = json.loads(capsys.readouterr().out)[
+        "hookSpecificOutput"
+    ]["additionalContext"]
+    low = context.lower()
+    assert "wait" in low  # tells the agent to wait for the server
+    assert "retry" in low  # ...and retry rather than give up
+    assert 'register(name="alice", project="proj")' in context
+
+
 def test_session_start_silent_when_no_marker(tmp_path, monkeypatch, capsys):
     """A project without a hub-agent.json marker isn't a hub agent. The
     SessionStart hook must emit nothing — same fail-open contract as the
@@ -875,3 +899,105 @@ def test_is_live_daemon_rejects_nonpositive_pid():
     """PID 0 / negative are never valid daemons."""
     assert _is_live_daemon(0) is False
     assert _is_live_daemon(-1) is False
+
+
+# ---------------------------------------------------------------------------
+# _parse_status_from_agents — statusline wakeability snapshot
+# ---------------------------------------------------------------------------
+
+# A realistic list_agents() render: 🟢 = online, ⚡ = wakeable, 💤 = idle.
+_AGENTS_SAMPLE = (
+    "🟢 **dreamteam-lead** ⚡ (dreamteam) — DreamTeam factory lead.\n"
+    "🟢 **factory-operations-dev** 💤 (factory-operations) — Owns the gateway.\n"
+    "🟢 **vps-admin** ⚡ 💤 (vps-hetzner) — VPS/infra-ops lane.\n"
+    "🟢 **mcp-hub-dev** ⚡ 💤 (mcp-hub) — Hub maintainer.\n"
+)
+
+
+def test_parse_status_self_wakeable_and_fleet_counts():
+    s = _parse_status_from_agents(_AGENTS_SAMPLE, "mcp-hub-dev")
+    assert s["online"] is True
+    assert s["wakeable"] is True
+    assert s["fleet_total"] == 4
+    assert s["fleet_wakeable"] == 3  # dreamteam-lead, vps-admin, mcp-hub-dev
+
+
+def test_parse_status_self_online_but_not_wakeable():
+    """Bound (🟢) but no ⚡ — the exact failure we surface in the statusline."""
+    s = _parse_status_from_agents(_AGENTS_SAMPLE, "factory-operations-dev")
+    assert s["online"] is True
+    assert s["wakeable"] is False
+
+
+def test_parse_status_self_absent_is_offline():
+    s = _parse_status_from_agents(_AGENTS_SAMPLE, "nobody")
+    assert s["online"] is False
+    assert s["wakeable"] is False
+    # Fleet totals are still computed for everyone else.
+    assert s["fleet_total"] == 4
+    assert s["fleet_wakeable"] == 3
+
+
+def test_parse_status_bio_markers_do_not_skew_counts():
+    """A bio that mentions ⚡ or 🟢 (after the ` — ` separator) must not be
+    miscounted as wakeability/an extra agent."""
+    text = (
+        "🟢 **alice** ⚡ (proj) — explains the ⚡ wake marker and 🟢 presence\n"
+        "🟢 **bob** 💤 (proj) — idle, no markers here\n"
+    )
+    s = _parse_status_from_agents(text, "alice")
+    assert s["fleet_total"] == 2
+    assert s["fleet_wakeable"] == 1  # only alice's real ⚡, not bob's bio
+    assert s["wakeable"] is True
+
+
+def test_parse_status_empty_text():
+    s = _parse_status_from_agents("", "alice")
+    assert s == {
+        "online": False,
+        "wakeable": False,
+        "fleet_wakeable": 0,
+        "fleet_total": 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# _write_status_cache — atomic snapshot write (fail-soft)
+# ---------------------------------------------------------------------------
+
+
+def test_write_status_cache_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setattr("mcp_hub.cli._PIDFILE_DIR", tmp_path)
+    _write_status_cache("mcp-hub-dev", _AGENTS_SAMPLE)
+
+    path = _status_cache_path("mcp-hub-dev")
+    assert path.exists()
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["agent"] == "mcp-hub-dev"
+    assert data["online"] is True
+    assert data["wakeable"] is True
+    assert data["fleet_wakeable"] == 3
+    assert data["fleet_total"] == 4
+    assert isinstance(data["ts"], int) and data["ts"] > 0
+    # No leftover temp file from the atomic write.
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_write_status_cache_sanitizes_filename(tmp_path, monkeypatch):
+    monkeypatch.setattr("mcp_hub.cli._PIDFILE_DIR", tmp_path)
+    _write_status_cache("weird/name:1", _AGENTS_SAMPLE)
+    # Path is sanitized; the write still lands somewhere readable.
+    assert _status_cache_path("weird/name:1").exists()
+
+
+def test_write_status_cache_is_fail_soft(tmp_path, monkeypatch):
+    """A write error must be swallowed — the heartbeat loop must never die
+    because the cosmetic status cache couldn't be written."""
+    monkeypatch.setattr("mcp_hub.cli._PIDFILE_DIR", tmp_path)
+
+    def _boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("mcp_hub.cli._parse_status_from_agents", _boom)
+    # Must not raise.
+    _write_status_cache("mcp-hub-dev", _AGENTS_SAMPLE)

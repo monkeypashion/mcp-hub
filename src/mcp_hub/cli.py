@@ -30,6 +30,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import time
 from typing import Any
 
 DEFAULT_HUB_URL = os.environ.get("MCP_HUB_URL", "https://mcp.monkeypashion.co.uk/mcp")
@@ -386,12 +387,19 @@ def session_start_command(args: argparse.Namespace) -> int:
     context = (
         f"You are the hub agent **{name}**"
         + (f" (project: {project})" if project else "")
-        + ". To enable channel-push wake for incoming DMs and broadcasts, "
-        + f"call `{register_call}` as your first action this session. "
-        + "The hub binds your interactive MCP session on register; the "
-        + "heartbeat daemon (separate background process) then keeps the "
-        + "binding alive across idle periods. Without register your inbox "
-        + "is queue-only — messages wait until the next Stop hook auto-pull."
+        + ". Your first action this session is to register on the hub for "
+        + "channel-push wake.\n"
+        + f"1. Call `{register_call}` now.\n"
+        + "2. If the hub's tools aren't available yet, the `hub` MCP server is "
+        + "simply still connecting — this is common right after a resume. Do "
+        + "NOT conclude the hub is down and do NOT just hold: wait for it to "
+        + "finish connecting, then register. If a `WaitForMcpServers` tool is "
+        + "available, use it to wait for the `hub` server; otherwise pause "
+        + "briefly and retry. The connection usually settles within ~30s.\n"
+        + "3. Once register succeeds you are bound for wake and the heartbeat "
+        + "daemon keeps the binding alive across idle periods. Until you "
+        + "register, your inbox is queue-only (messages wait for the next Stop "
+        + "hook auto-pull) and your statusline shows `hub ✖ REGISTER`."
     )
 
     output = {
@@ -442,6 +450,9 @@ def session_rewake_command(args: argparse.Namespace) -> int:
 
 HEARTBEAT_INTERVAL_SECONDS = 60
 HEARTBEAT_RETRY_DELAY_SECONDS = 60
+# Statusline cache is refreshed more often than the heartbeat so register/
+# offline transitions show up promptly (not up to a full heartbeat late).
+STATUS_REFRESH_SECONDS = 15
 
 
 # ---------------------------------------------------------------------------
@@ -613,6 +624,83 @@ def _release_singleton(pidfile: pathlib.Path, *, getpid=os.getpid) -> None:
             pass
 
 
+# ---------------------------------------------------------------------------
+# Status cache — powers the hub segment in the Claude Code statusline.
+#
+# The statusline command (a fast Node script in ~/.claude) must NOT do a hub
+# round-trip on every refresh — that's slow and hammers the hub. Instead the
+# heartbeat daemon, which already holds an open MCP session and runs every
+# minute even while the agent is idle, writes a tiny per-agent JSON snapshot of
+# wakeability here. The statusline just reads that file (instant, no network,
+# no Python spawn). The daemon survives a stream death (it's what keeps the
+# binding 🟢), so it keeps reporting "this window went unwakeable" — exactly the
+# failure we want surfaced. Staleness is the reader's job: if `ts` is older than
+# a few heartbeat intervals, the daemon has stopped and the snapshot is suspect.
+# ---------------------------------------------------------------------------
+
+
+def _parse_status_from_agents(agents_text: str, agent_name: str) -> dict[str, Any]:
+    """Parse `list_agents` rendered output into a wakeability snapshot.
+
+    Each online agent is one line shaped like:
+        🟢 **name** ⚡ 💤 (project) — bio...
+    We read only the head (before the ` — ` bio separator) for markers so a
+    bio that happens to contain ⚡/🟢/`**` can't skew the counts.
+
+    Returns {online, wakeable, fleet_wakeable, fleet_total} where online/
+    wakeable are this agent's own state and the fleet_* are totals across all
+    listed (online) agents.
+    """
+    fleet_total = 0
+    fleet_wakeable = 0
+    self_online = False
+    self_wakeable = False
+    for line in agents_text.splitlines():
+        head = line.split("—", 1)[0]
+        if "🟢" not in head:
+            continue  # not an agent row
+        fleet_total += 1
+        is_wakeable = "⚡" in head
+        if is_wakeable:
+            fleet_wakeable += 1
+        if f"**{agent_name}**" in head:
+            self_online = True
+            self_wakeable = is_wakeable
+    return {
+        "online": self_online,
+        "wakeable": self_wakeable,
+        "fleet_wakeable": fleet_wakeable,
+        "fleet_total": fleet_total,
+    }
+
+
+def _status_cache_path(agent_name: str) -> pathlib.Path:
+    """Per-agent status snapshot path under ~/.mcp-hub (alongside pidfiles)."""
+    safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in agent_name)
+    return _PIDFILE_DIR / f"status-{safe}.json"
+
+
+def _write_status_cache(agent_name: str, agents_text: str) -> None:
+    """Parse `agents_text` and atomically write this agent's status snapshot.
+
+    Fail-soft by contract: a parse/write error must NEVER propagate into the
+    heartbeat loop (a broken statusline cache is cosmetic; a broken heartbeat
+    drops the binding). Atomic tmp+replace so the reader never sees a partial
+    file.
+    """
+    try:
+        status = _parse_status_from_agents(agents_text, agent_name)
+        status["agent"] = agent_name
+        status["ts"] = int(time.time())
+        path = _status_cache_path(agent_name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(status), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def _heartbeat_loop(hub_url: str, agent_name: str) -> None:
     """Long-lived loop: connect to hub, ping `heartbeat(agent_name)` every
     HEARTBEAT_INTERVAL_SECONDS. On any connection error, sleep and reconnect.
@@ -620,6 +708,14 @@ async def _heartbeat_loop(hub_url: str, agent_name: str) -> None:
     Single MCP session is held open across heartbeats — this is the right
     shape because heartbeat doesn't bind, so the session lifetime is just
     a connection-pooling concern, not a wake-target concern.
+
+    The status cache is refreshed every STATUS_REFRESH_SECONDS (snappy
+    statusline) while heartbeat fires every HEARTBEAT_INTERVAL_SECONDS (binding
+    keep-alive) — decoupled so a register/offline change shows up promptly
+    instead of up to a full heartbeat late. list_agents failing is treated as a
+    connection problem (propagates to the reconnect handler, same as a failed
+    heartbeat); only the parse/write step is fail-soft (inside
+    _write_status_cache).
     """
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
@@ -629,11 +725,20 @@ async def _heartbeat_loop(hub_url: str, agent_name: str) -> None:
             async with streamablehttp_client(hub_url, timeout=10) as (read, write, _):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
+                    # Force a heartbeat on the first tick after each (re)connect.
+                    since_heartbeat = HEARTBEAT_INTERVAL_SECONDS
                     while True:
-                        await session.call_tool(
-                            "heartbeat", {"agent_name": agent_name}
+                        if since_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
+                            await session.call_tool(
+                                "heartbeat", {"agent_name": agent_name}
+                            )
+                            since_heartbeat = 0
+                        agents_result = await session.call_tool("list_agents", {})
+                        _write_status_cache(
+                            agent_name, _extract_text(agents_result)
                         )
-                        await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+                        await asyncio.sleep(STATUS_REFRESH_SECONDS)
+                        since_heartbeat += STATUS_REFRESH_SECONDS
         except Exception as exc:  # noqa: BLE001
             # Connection / init / call failure — log and reconnect after a
             # delay. Fail-open: heartbeat outages don't crash the daemon.
