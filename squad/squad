@@ -87,10 +87,11 @@ add_agent() {  # squad add <org>/<repo> [agent-name] — clone/pull + enroll in 
   out="$(pull_local "$spec")" || return 1          # clones/pulls; last line is the dest path
   dest="$(printf '%s\n' "$out" | tail -1)"
   [ -d "$dest" ] || { echo "!! clone failed for $spec"; return 1; }
+  # name precedence: explicit 3rd arg > repo's .claude/hub-agent.json marker > repo name
   if [ -z "$name" ]; then
     name="$(grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]+"' "$dest/.claude/hub-agent.json" 2>/dev/null | head -1 | sed -E 's/.*"([^"]+)"$/\1/')"
   fi
-  [ -n "$name" ] || { echo "!! no agent name: $dest/.claude/hub-agent.json missing — pass one: $CMD add $spec <name>"; return 1; }
+  [ -n "$name" ] || name="$(basename "$dest")"     # default to the repo name
   if agents | grep -qx "$name"; then echo "'$name' already in $CONF — nothing added"; return 0; fi
   mkdir -p "$(dirname "$CONF")"
   printf '%s|%s||--dangerously-load-development-channels server:hub\n' "$name" "$dest" >> "$CONF"
@@ -112,13 +113,13 @@ handoff() {
 
 case "${1:-help}" in
   up)       ensure_server; for a in $(agents); do up_one "$a"; done ;;
-  restart)  require_agent "$2"; tm kill-session -t "=$2" 2>/dev/null || true; ensure_server; up_one "$2" ;;
+  restart)  require_agent "${2:-}"; tm kill-session -t "=$2" 2>/dev/null || true; ensure_server; up_one "$2" ;;
   down)     for a in $(agents); do tm kill-session -t "=$a" 2>/dev/null || true; done; tm kill-session -t "=ops" 2>/dev/null || true ;;
-  cmd)      t="$2"; shift 2
+  cmd)      t="${2:-}"; [ -n "$t" ] || { echo "usage: $CMD cmd <agent|all> \"text\""; exit 1; }; shift 2
             if [ "$t" = all ]; then for a in $(agents); do type_line "$a" "$@"; done
             else require_agent "$t"; type_line "$t" "$@"; fi ;;
-  key)      t="$2"; shift 2; tm send-keys -t "$t" "$@" ;;
-  attach)   a="$2"
+  key)      t="${2:-}"; [ -n "$t" ] || { echo "usage: $CMD key <agent> <keys>"; exit 1; }; shift 2; tm send-keys -t "$t" "$@" ;;
+  attach)   a="${2:-}"; [ -n "$a" ] || { echo "usage: $CMD attach <agent|ops>"; exit 1; }
             if [ "$a" != ops ]; then
               require_agent "$a"
               if ! tm has-session -t "=$a" 2>/dev/null; then
@@ -133,12 +134,12 @@ case "${1:-help}" in
               else printf '%-26s down\n' "$a"; fi
             done
             tm has-session -t "=ops" 2>/dev/null && printf '%-26s up\n' "ops" || true ;;
-  args)     require_agent "$2"; a="$2"; shift 2
+  args)     require_agent "${2:-}"; a="$2"; shift 2
             tmp="$(mktemp)"; awk -F'|' -v a="$a" -v n="$*" 'BEGIN{OFS="|"} $1==a{$4=n} {print}' "$CONF" > "$tmp" && mv "$tmp" "$CONF"
             echo "next launch of $a: $*" ;;
-  handoff)  require_agent "$2"; handoff "$2" ;;
-  add)      add_agent "$2" "${3:-}" ;;
-  pull-local) pull_local "$2" ;;
+  handoff)  require_agent "${2:-}"; handoff "$2" ;;
+  add)      add_agent "${2:-}" "${3:-}" ;;
+  pull-local) pull_local "${2:-}" ;;
   *) cat <<EOF
 $CMD up                       start the squad (idempotent) + an ops shell
 $CMD down                     stop everything
@@ -149,7 +150,7 @@ $CMD cmd <agent|all> "..."    type text + Enter into session(s)   e.g. $CMD cmd 
 $CMD key <agent> <keys>       raw tmux send-keys (tmux key names allowed, no Enter appended)
 $CMD args <agent> "..."       set next-launch claude args (col 4 of squad.conf)
 $CMD handoff <agent>          commit WIP to wip/<agent>-<date> + push (before switching machines)
-$CMD add <org>/<repo> [name]  clone/pull + enroll as a squad agent (name from .claude/hub-agent.json)
+$CMD add <org>/<repo> [name]  clone/pull + enroll as a squad agent (name: 3rd arg, else marker, else repo name)
 $CMD pull-local <org>/<repo>  clone/pull into the correct account folder (org derives the alias)
 
 config: $CONF

@@ -33,10 +33,10 @@ squad add dreamteam-ai-labs/browser-agent    # clone/pull + enroll in squad.conf
 squad restart browser-agent                  # launch it
 ```
 
-`squad add` clones the repo into the right account folder, reads its `.claude/hub-agent.json` for
-the agent name, and appends the roster line (default hub args). Pass an explicit name as a 3rd arg
-if the repo has no marker: `squad add <org>/<repo> <name>`. Use `squad pull-local` instead if you
-just want to clone a repo *without* enrolling it as an agent.
+`squad add` clones the repo into the right account folder and appends the roster line (default hub
+args). Agent name precedence: **explicit 3rd arg → the repo's `.claude/hub-agent.json` name → the
+repo name** (so `squad add dreamteam-ai-labs/dreamteam` enrols as `dreamteam`). Use `squad
+pull-local` instead if you just want to clone a repo *without* enrolling it as an agent.
 
 ## Config
 
