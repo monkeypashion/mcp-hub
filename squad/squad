@@ -134,9 +134,16 @@ case "${1:-help}" in
               require_agent "$a"
               if ! tm has-session -t "=$a" 2>/dev/null; then
                 echo "$a not running — starting it..."; ensure_server; up_one "$a"; sleep 1
+              elif ! pane_alive "$a"; then
+                echo "$a was degraded — restarting claude..."; tm kill-session -t "=$a" 2>/dev/null || true; ensure_server; up_one "$a"; sleep 1
               fi
             fi
-            exec tmux -L "$SOCK" attach -t "=$a" ;;
+            if [ -n "${TMUX:-}" ]; then           # already inside tmux — switch, don't nest
+              tmux -L "$SOCK" switch-client -t "=$a" 2>/dev/null \
+                || { echo "you're inside a different tmux — detach first (Ctrl-b d), then: $CMD attach $a"; exit 1; }
+            else
+              exec tmux -L "$SOCK" attach -t "=$a"
+            fi ;;
   ls)       for a in $(agents); do
               if tm has-session -t "=$a" 2>/dev/null; then
                 if pane_alive "$a"; then printf '%-26s up        (%s)\n' "$a" "$(pane_cmd "$a")"
