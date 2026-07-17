@@ -40,10 +40,13 @@ ensure_server() {
   fi
 }
 
-pane_cmd()   { tm display-message -p -t "=$1" '#{pane_current_command}' 2>/dev/null || true; }
+# NB: pane-target commands (send-keys / display-message / capture) do NOT accept the "=" exact-match
+# prefix on tmux 3.4 — only session-target commands (has-session / kill-session / attach) do. So we
+# use the bare name here (exact-match still wins: tmux tries exact before fnmatch/prefix).
+pane_cmd()   { tm display-message -p -t "$1" '#{pane_current_command}' 2>/dev/null || true; }
 pane_alive() { local c; c="$(pane_cmd "$1")"; [ -n "$c" ] && [ "$c" != bash ] && [ "$c" != sh ] && [ "$c" != zsh ]; }
 
-type_line() { local t="$1"; shift; tm send-keys -t "=$t" -l "$*"; sleep 0.2; tm send-keys -t "=$t" Enter; }
+type_line() { local t="$1"; shift; tm send-keys -t "$t" -l "$*"; sleep 0.2; tm send-keys -t "$t" Enter; }
 
 up_one() {
   local a="$1" dir ghdir args
@@ -98,7 +101,7 @@ case "${1:-help}" in
   cmd)      t="$2"; shift 2
             if [ "$t" = all ]; then for a in $(agents); do type_line "$a" "$@"; done
             else require_agent "$t"; type_line "$t" "$@"; fi ;;
-  key)      t="$2"; shift 2; tm send-keys -t "=$t" "$@" ;;
+  key)      t="$2"; shift 2; tm send-keys -t "$t" "$@" ;;
   attach)   a="$2"
             if [ "$a" != ops ]; then
               require_agent "$a"
