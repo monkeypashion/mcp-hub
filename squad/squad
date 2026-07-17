@@ -82,6 +82,22 @@ pull_local() {
   echo "$dest"
 }
 
+add_agent() {  # squad add <org>/<repo> [agent-name] — clone/pull + enroll in squad.conf
+  local spec="$1" name="${2:-}" out dest
+  out="$(pull_local "$spec")" || return 1          # clones/pulls; last line is the dest path
+  dest="$(printf '%s\n' "$out" | tail -1)"
+  [ -d "$dest" ] || { echo "!! clone failed for $spec"; return 1; }
+  if [ -z "$name" ]; then
+    name="$(grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]+"' "$dest/.claude/hub-agent.json" 2>/dev/null | head -1 | sed -E 's/.*"([^"]+)"$/\1/')"
+  fi
+  [ -n "$name" ] || { echo "!! no agent name: $dest/.claude/hub-agent.json missing — pass one: $CMD add $spec <name>"; return 1; }
+  if agents | grep -qx "$name"; then echo "'$name' already in $CONF — nothing added"; return 0; fi
+  mkdir -p "$(dirname "$CONF")"
+  printf '%s|%s||--dangerously-load-development-channels server:hub\n' "$name" "$dest" >> "$CONF"
+  echo "enrolled '$name' -> $dest"
+  echo "  run: $CMD restart $name   (or $CMD up)  to launch it"
+}
+
 handoff() {
   local a="$1" dir cur
   dir="$(untilde "$(field "$a" 2)")"; cur="$(git -C "$dir" branch --show-current)"
@@ -121,6 +137,7 @@ case "${1:-help}" in
             tmp="$(mktemp)"; awk -F'|' -v a="$a" -v n="$*" 'BEGIN{OFS="|"} $1==a{$4=n} {print}' "$CONF" > "$tmp" && mv "$tmp" "$CONF"
             echo "next launch of $a: $*" ;;
   handoff)  require_agent "$2"; handoff "$2" ;;
+  add)      add_agent "$2" "${3:-}" ;;
   pull-local) pull_local "$2" ;;
   *) cat <<EOF
 $CMD up                       start the squad (idempotent) + an ops shell
@@ -132,6 +149,7 @@ $CMD cmd <agent|all> "..."    type text + Enter into session(s)   e.g. $CMD cmd 
 $CMD key <agent> <keys>       raw tmux send-keys (tmux key names allowed, no Enter appended)
 $CMD args <agent> "..."       set next-launch claude args (col 4 of squad.conf)
 $CMD handoff <agent>          commit WIP to wip/<agent>-<date> + push (before switching machines)
+$CMD add <org>/<repo> [name]  clone/pull + enroll as a squad agent (name from .claude/hub-agent.json)
 $CMD pull-local <org>/<repo>  clone/pull into the correct account folder (org derives the alias)
 
 config: $CONF
