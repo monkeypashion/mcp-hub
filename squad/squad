@@ -153,7 +153,7 @@ case "${1:-help}" in
             echo "removed '$a' from $CONF (worktree + marker left in place)" ;;
   pull-local) pull_local "${2:-}" ;;
   *) cat <<EOF
-$CMD up                       start the squad (idempotent) + an ops shell
+$CMD up                       start the whole squad (idempotent)
 $CMD down                     stop everything
 $CMD restart <agent>          cycle one agent with its current squad.conf entry
 $CMD ls                       squad status (DEGRADED = session up but claude dead)
