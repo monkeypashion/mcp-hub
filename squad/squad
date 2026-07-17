@@ -82,18 +82,27 @@ pull_local() {
   echo "$dest"
 }
 
-add_agent() {  # squad add <org>/<repo> [agent-name] — clone/pull + enroll in squad.conf
-  local spec="$1" name="${2:-}" out dest
-  [[ "$spec" == ?*/?* ]] || { echo "usage: $CMD add <org>/<repo> [name]"; return 1; }
+add_agent() {  # squad add <org>/<repo> [name] [project] — clone/pull, create hub marker, enroll
+  local spec="$1" name="${2:-}" proj="${3:-}" out dest marker
+  [[ "$spec" == ?*/?* ]] || { echo "usage: $CMD add <org>/<repo> [name] [project]"; return 1; }
   out="$(pull_local "$spec")" || return 1          # clones/pulls; last line is the dest path
   dest="$(printf '%s\n' "$out" | tail -1)"
   [ -d "$dest" ] || { echo "!! clone failed for $spec"; return 1; }
-  # name precedence: explicit 3rd arg > repo's .claude/hub-agent.json marker > repo name
-  if [ -z "$name" ] && [ -f "$dest/.claude/hub-agent.json" ]; then
-    name="$(grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]+"' "$dest/.claude/hub-agent.json" | head -1 | sed -E 's/.*"([^"]+)"$/\1/' || true)"
+  marker="$dest/.claude/hub-agent.json"
+  # name precedence: explicit 2nd arg > existing marker > repo name
+  if [ -z "$name" ] && [ -f "$marker" ]; then
+    name="$(grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]+"' "$marker" | head -1 | sed -E 's/.*"([^"]+)"$/\1/' || true)"
   fi
-  [ -n "$name" ] || name="$(basename "$dest")"     # default to the repo name
-  if agents | grep -qx "$name"; then echo "'$name' already in $CONF — nothing added"; return 0; fi
+  [ -n "$name" ] || name="$(basename "$dest")"
+  # create the hub-identity marker if the repo lacks one (project defaults to the repo name)
+  if [ ! -f "$marker" ]; then
+    [ -n "$proj" ] || proj="$(basename "$dest")"
+    mkdir -p "$dest/.claude"
+    printf '{\n  "name": "%s",\n  "project": "%s"\n}\n' "$name" "$proj" > "$marker"
+    echo "created $marker  (name=$name, project=$proj) — commit it in that repo so the hub identity persists"
+  fi
+  # enroll in the roster
+  if agents | grep -qx "$name"; then echo "'$name' already in $CONF — roster unchanged"; return 0; fi
   mkdir -p "$(dirname "$CONF")"
   printf '%s|%s||--dangerously-load-development-channels server:hub\n' "$name" "$dest" >> "$CONF"
   echo "enrolled '$name' -> $dest"
@@ -139,7 +148,7 @@ case "${1:-help}" in
             tmp="$(mktemp)"; awk -F'|' -v a="$a" -v n="$*" 'BEGIN{OFS="|"} $1==a{$4=n} {print}' "$CONF" > "$tmp" && mv "$tmp" "$CONF"
             echo "next launch of $a: $*" ;;
   handoff)  require_agent "${2:-}"; handoff "$2" ;;
-  add)      add_agent "${2:-}" "${3:-}" ;;
+  add)      add_agent "${2:-}" "${3:-}" "${4:-}" ;;
   pull-local) pull_local "${2:-}" ;;
   *) cat <<EOF
 $CMD up                       start the squad (idempotent) + an ops shell
@@ -151,7 +160,7 @@ $CMD cmd <agent|all> "..."    type text + Enter into session(s)   e.g. $CMD cmd 
 $CMD key <agent> <keys>       raw tmux send-keys (tmux key names allowed, no Enter appended)
 $CMD args <agent> "..."       set next-launch claude args (col 4 of squad.conf)
 $CMD handoff <agent>          commit WIP to wip/<agent>-<date> + push (before switching machines)
-$CMD add <org>/<repo> [name]  clone/pull + enroll as a squad agent (name: 3rd arg, else marker, else repo name)
+$CMD add <org>/<repo> [name] [project]   clone/pull + create hub marker + enroll (name/project default to repo name)
 $CMD pull-local <org>/<repo>  clone/pull into the correct account folder (org derives the alias)
 
 config: $CONF
