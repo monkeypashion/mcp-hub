@@ -17,13 +17,14 @@ cp squad/squad.conf.example ~/.config/squad/squad.conf   # then edit the roster
 ## Use
 
 ```bash
-squad up                    # start the whole squad + an ops shell
+squad up                    # start the whole squad
 squad ls                    # status (DEGRADED = tmux session up but claude died)
-squad attach <agent>        # attach (starts it first if down); Ctrl-b d to detach; agent keeps running
+squad attach <agent>        # attach (starts/restarts if down/degraded); Ctrl-b d to detach; agent keeps running
 squad cmd all "/compact"    # inject a slash-command into every agent
 squad cmd <agent> "carry on"
 squad restart <agent>
-squad down
+squad rm <agent>            # unenroll: kill session + remove from roster (keeps the repo + marker)
+squad down                  # stop the whole squad (kills the tmux server)
 ```
 
 ## Adding an agent
