@@ -26,7 +26,7 @@ rows()   { grep -vE '^[[:space:]]*(#|$)' "$CONF" 2>/dev/null || true; }
 agents() { rows | cut -d'|' -f1; }
 field()  { rows | awk -F'|' -v a="$1" -v n="$2" '$1==a {print $n; exit}'; }
 untilde(){ printf '%s\n' "${1/#\~/$HOME}"; }
-require_agent() { field "$1" 1 | grep -qx "$1" || { echo "!! unknown agent '$1' (see $CONF)"; exit 1; }; }
+require_agent() { [ -n "${1:-}" ] || { echo "usage: $CMD <verb> <agent>"; exit 1; }; field "$1" 1 | grep -qx "$1" || { echo "!! unknown agent '$1' (see $CONF)"; exit 1; }; }
 
 ensure_server() {
   tm has-session -t "=ops" 2>/dev/null && return 0
@@ -84,6 +84,7 @@ pull_local() {
 
 add_agent() {  # squad add <org>/<repo> [agent-name] — clone/pull + enroll in squad.conf
   local spec="$1" name="${2:-}" out dest
+  [[ "$spec" == ?*/?* ]] || { echo "usage: $CMD add <org>/<repo> [name]"; return 1; }
   out="$(pull_local "$spec")" || return 1          # clones/pulls; last line is the dest path
   dest="$(printf '%s\n' "$out" | tail -1)"
   [ -d "$dest" ] || { echo "!! clone failed for $spec"; return 1; }
