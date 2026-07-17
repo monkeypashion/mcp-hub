@@ -1,5 +1,5 @@
-# ~/.config/conductor/fleet.conf — Claude Code fleet roster
-# Copy this to ~/.config/conductor/fleet.conf and edit.
+# ~/.config/squad/squad.conf — Claude Code squad roster
+# Copy this to ~/.config/squad/squad.conf and edit.
 #
 # Format:  agent_name | worktree | gh_config_dir | claude_args
 #   agent_name    hub name — MUST match .claude/hub-agent.json in the worktree
@@ -10,10 +10,10 @@
 #
 # The --dangerously-load-development-channels server:hub flag enables live channel-push wake.
 # The hub MCP tools (list_agents/send/...) come from ~/.claude.json (user-scope) — already set up.
-# Add --continue per agent (via `<cmd> args <agent> "..."`) if you want it to resume its last thread.
+# Add --continue per agent (via `squad args <agent> "..."`) if you want it to resume its last thread.
 
 mcp-hub-dev|~/SoftwareProjects/monkeypashion/mcp-hub||--dangerously-load-development-channels server:hub
 
-# --- add more agents as the fleet grows (uncomment + edit) ---
+# --- add more agents as the squad grows (uncomment + edit) ---
 # agent-name|~/SoftwareProjects/dreamteam-ai-labs/some-repo||--dangerously-load-development-channels server:hub
 # agent-name|~/SoftwareProjects/monkeypashion/some-repo||--dangerously-load-development-channels server:hub

@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# conductor — tmux fleet orchestrator for Claude Code agents.
-# Lives in mcp-hub/conductor/. Runs on the fleet HOST (where tmux + the agents live).
-# Symlink onto PATH under any name you like:
-#     ln -sf "$PWD/conductor/conductor" ~/.local/bin/<name>
+# squad — tmux orchestrator for a squad of Claude Code agents.
+# Lives in mcp-hub/squad/. Runs on the host (where tmux + the agents live).
+# Symlink onto PATH:  ln -sf "$PWD/squad/squad" ~/.local/bin/squad
 #
 # Design:
 #   - dedicated tmux socket + session prefix ($PREFIX) so it never collides with other tmux use
@@ -11,9 +10,9 @@
 #   - no eval on config content
 set -euo pipefail
 
-CONF="${CONDUCTOR_CONF:-$HOME/.config/conductor/fleet.conf}"
-PREFIX="${CONDUCTOR_PREFIX:-fleet}"        # tmux socket + session-name prefix
-SLICE="${CONDUCTOR_SLICE:-}"              # optional systemd user slice for ceilings; empty = none
+CONF="${SQUAD_CONF:-$HOME/.config/squad/squad.conf}"
+PREFIX="${SQUAD_PREFIX:-squad}"           # tmux socket + session-name prefix
+SLICE="${SQUAD_SLICE:-}"                  # optional systemd user slice for ceilings; empty = none
 OPS_DIR="$HOME/SoftwareProjects"
 CMD="$(basename "$0")"                    # whatever you symlinked this as (help text only)
 
@@ -111,14 +110,14 @@ case "${1:-help}" in
   handoff)  require_agent "$2"; handoff "$2" ;;
   pull-local) pull_local "$2" ;;
   *) cat <<EOF
-$CMD up                       start the fleet (idempotent) + an ops shell
+$CMD up                       start the squad (idempotent) + an ops shell
 $CMD down                     stop everything
-$CMD restart <agent>          cycle one agent with its current fleet.conf entry
-$CMD ls                       fleet status (DEGRADED = session up but claude dead)
+$CMD restart <agent>          cycle one agent with its current squad.conf entry
+$CMD ls                       squad status (DEGRADED = session up but claude dead)
 $CMD attach <agent|ops>       attach this terminal (Ctrl-b d detaches; agent keeps running)
 $CMD cmd <agent|all> "..."    type text + Enter into session(s)   e.g. $CMD cmd all "/compact"
 $CMD key <agent> <keys>       raw tmux send-keys (tmux key names allowed, no Enter appended)
-$CMD args <agent> "..."       set next-launch claude args (col 4 of fleet.conf)
+$CMD args <agent> "..."       set next-launch claude args (col 4 of squad.conf)
 $CMD handoff <agent>          commit WIP to wip/<agent>-<date> + push (before switching machines)
 $CMD pull-local <org>/<repo>  clone/pull into the correct account folder (org derives the alias)
 
