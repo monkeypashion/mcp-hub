@@ -19,7 +19,7 @@ cp squad/squad.conf.example ~/.config/squad/squad.conf   # then edit the roster
 ```bash
 squad up                    # start the whole squad + an ops shell
 squad ls                    # status (DEGRADED = tmux session up but claude died)
-squad attach <agent>        # attach (Ctrl-b d to detach; the agent keeps running)
+squad attach <agent>        # attach (starts it first if down); Ctrl-b d to detach; agent keeps running
 squad cmd all "/compact"    # inject a slash-command into every agent
 squad cmd <agent> "carry on"
 squad restart <agent>
@@ -34,8 +34,11 @@ squad down
 agent_name | worktree | gh_config_dir (may be empty) | claude_args
 ```
 
-Env overrides: `SQUAD_CONF` (config path), `SQUAD_PREFIX` (tmux socket + session prefix,
-default `squad`), `SQUAD_SLICE` (optional systemd user slice for CPU/RAM ceilings).
+Env overrides: `SQUAD_CONF` (config path), `SQUAD_SOCKET` (dedicated tmux socket, default
+`squad`), `SQUAD_SLICE` (optional systemd user slice for CPU/RAM ceilings).
+
+The tmux **session name IS the agent name** (squad runs on its own tmux socket, so no prefix is
+needed). The ops shell session is `ops` — so don't name an agent `ops`.
 
 ## How it relates to the hub
 

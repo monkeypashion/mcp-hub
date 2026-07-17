@@ -4,19 +4,22 @@
 # Symlink onto PATH:  ln -sf "$PWD/squad/squad" ~/.local/bin/squad
 #
 # Design:
-#   - dedicated tmux socket + session prefix ($PREFIX) so it never collides with other tmux use
+#   - dedicated tmux socket ($SOCK) so squad sessions never collide with other tmux use;
+#     session names ARE the agent names (no prefix). The ops shell session is "ops"
+#     (so don't name an agent "ops").
 #   - send-keys -l (literal) + beat + Enter — delivers slash-commands (/compact), which MCP cannot
+#   - attach starts the agent first if it's down (must be a known agent, so typos error not spawn)
 #   - health = pane runs a non-shell foreground command, not mere session existence
 #   - no eval on config content
 set -euo pipefail
 
 CONF="${SQUAD_CONF:-$HOME/.config/squad/squad.conf}"
-PREFIX="${SQUAD_PREFIX:-squad}"           # tmux socket + session-name prefix
-SLICE="${SQUAD_SLICE:-}"                  # optional systemd user slice for ceilings; empty = none
+SOCK="${SQUAD_SOCKET:-squad}"            # dedicated tmux socket (namespaces the whole squad)
+SLICE="${SQUAD_SLICE:-}"                 # optional systemd user slice for ceilings; empty = none
 OPS_DIR="$HOME/SoftwareProjects"
-CMD="$(basename "$0")"                    # whatever you symlinked this as (help text only)
+CMD="$(basename "$0")"                   # whatever you symlinked this as (help text only)
 
-tm() { command tmux -L "$PREFIX" "$@"; }  # NB: never a var named TMUX (tmux reserves it)
+tm() { command tmux -L "$SOCK" "$@"; }   # NB: never a var named TMUX (tmux reserves it)
 
 # ---- config (agent|worktree|gh_config_dir|claude_args ; gh_config_dir may be empty) ----
 rows()   { grep -vE '^[[:space:]]*(#|$)' "$CONF" 2>/dev/null || true; }
@@ -26,35 +29,35 @@ untilde(){ printf '%s\n' "${1/#\~/$HOME}"; }
 require_agent() { field "$1" 1 | grep -qx "$1" || { echo "!! unknown agent '$1' (see $CONF)"; exit 1; }; }
 
 ensure_server() {
-  tm has-session -t "=$PREFIX-ops" 2>/dev/null && return 0
+  tm has-session -t "=ops" 2>/dev/null && return 0
   if tm list-sessions >/dev/null 2>&1; then
-    tm new-session -d -s "$PREFIX-ops" -c "$OPS_DIR"; return 0
+    tm new-session -d -s ops -c "$OPS_DIR"; return 0
   fi
   if [ -n "$SLICE" ] && systemctl --user list-unit-files 2>/dev/null | grep -q "^$SLICE"; then
-    systemd-run --user --slice="$SLICE" --scope -q tmux -L "$PREFIX" new-session -d -s "$PREFIX-ops" -c "$OPS_DIR"
+    systemd-run --user --slice="$SLICE" --scope -q tmux -L "$SOCK" new-session -d -s ops -c "$OPS_DIR"
   else
-    tm new-session -d -s "$PREFIX-ops" -c "$OPS_DIR"
+    tm new-session -d -s ops -c "$OPS_DIR"
   fi
 }
 
-pane_cmd()   { tm display-message -p -t "=$PREFIX-$1" '#{pane_current_command}' 2>/dev/null || true; }
+pane_cmd()   { tm display-message -p -t "=$1" '#{pane_current_command}' 2>/dev/null || true; }
 pane_alive() { local c; c="$(pane_cmd "$1")"; [ -n "$c" ] && [ "$c" != bash ] && [ "$c" != sh ] && [ "$c" != zsh ]; }
 
-type_line() { local t="$1"; shift; tm send-keys -t "=$PREFIX-$t" -l "$*"; sleep 0.2; tm send-keys -t "=$PREFIX-$t" Enter; }
+type_line() { local t="$1"; shift; tm send-keys -t "=$t" -l "$*"; sleep 0.2; tm send-keys -t "=$t" Enter; }
 
 up_one() {
   local a="$1" dir ghdir args
   dir="$(untilde "$(field "$a" 2)")"; ghdir="$(untilde "$(field "$a" 3)")"; args="$(field "$a" 4)"
   [ -d "$dir" ] || { echo "!! $a: missing worktree $dir"; return 1; }
-  if tm has-session -t "=$PREFIX-$a" 2>/dev/null; then
-    if pane_alive "$a"; then echo "$PREFIX-$a already up"
-    else echo "!! $PREFIX-$a: session exists but claude is NOT running — try: $CMD restart $a"; fi
+  if tm has-session -t "=$a" 2>/dev/null; then
+    if pane_alive "$a"; then echo "$a already up"
+    else echo "!! $a: session exists but claude is NOT running — try: $CMD restart $a"; fi
     return 0
   fi
-  tm new-session -d -s "$PREFIX-$a" -c "$dir"
+  tm new-session -d -s "$a" -c "$dir"
   [ -n "$ghdir" ] && type_line "$a" "export GH_CONFIG_DIR=\"$ghdir\""
   type_line "$a" "claude $args"
-  echo "started $PREFIX-$a  ($args)"
+  echo "started $a  ($args)"
 }
 
 org_alias() {
@@ -90,20 +93,27 @@ handoff() {
 
 case "${1:-help}" in
   up)       ensure_server; for a in $(agents); do up_one "$a"; done ;;
-  restart)  require_agent "$2"; tm kill-session -t "=$PREFIX-$2" 2>/dev/null || true; ensure_server; up_one "$2" ;;
-  down)     for a in $(agents); do tm kill-session -t "=$PREFIX-$a" 2>/dev/null || true; done; tm kill-session -t "=$PREFIX-ops" 2>/dev/null || true ;;
+  restart)  require_agent "$2"; tm kill-session -t "=$2" 2>/dev/null || true; ensure_server; up_one "$2" ;;
+  down)     for a in $(agents); do tm kill-session -t "=$a" 2>/dev/null || true; done; tm kill-session -t "=ops" 2>/dev/null || true ;;
   cmd)      t="$2"; shift 2
             if [ "$t" = all ]; then for a in $(agents); do type_line "$a" "$@"; done
             else require_agent "$t"; type_line "$t" "$@"; fi ;;
-  key)      t="$2"; shift 2; tm send-keys -t "=$PREFIX-$t" "$@" ;;
-  attach)   exec tmux -L "$PREFIX" attach -t "=$PREFIX-$2" ;;
+  key)      t="$2"; shift 2; tm send-keys -t "=$t" "$@" ;;
+  attach)   a="$2"
+            if [ "$a" != ops ]; then
+              require_agent "$a"
+              if ! tm has-session -t "=$a" 2>/dev/null; then
+                echo "$a not running — starting it..."; ensure_server; up_one "$a"; sleep 1
+              fi
+            fi
+            exec tmux -L "$SOCK" attach -t "=$a" ;;
   ls)       for a in $(agents); do
-              if tm has-session -t "=$PREFIX-$a" 2>/dev/null; then
-                if pane_alive "$a"; then printf '%-30s up        (%s)\n' "$PREFIX-$a" "$(pane_cmd "$a")"
-                else printf '%-30s DEGRADED  session up, claude not running\n' "$PREFIX-$a"; fi
-              else printf '%-30s down\n' "$PREFIX-$a"; fi
+              if tm has-session -t "=$a" 2>/dev/null; then
+                if pane_alive "$a"; then printf '%-26s up        (%s)\n' "$a" "$(pane_cmd "$a")"
+                else printf '%-26s DEGRADED  session up, claude not running\n' "$a"; fi
+              else printf '%-26s down\n' "$a"; fi
             done
-            tm has-session -t "=$PREFIX-ops" 2>/dev/null && printf '%-30s up\n' "$PREFIX-ops" || true ;;
+            tm has-session -t "=ops" 2>/dev/null && printf '%-26s up\n' "ops" || true ;;
   args)     require_agent "$2"; a="$2"; shift 2
             tmp="$(mktemp)"; awk -F'|' -v a="$a" -v n="$*" 'BEGIN{OFS="|"} $1==a{$4=n} {print}' "$CONF" > "$tmp" && mv "$tmp" "$CONF"
             echo "next launch of $a: $*" ;;
@@ -114,7 +124,7 @@ $CMD up                       start the squad (idempotent) + an ops shell
 $CMD down                     stop everything
 $CMD restart <agent>          cycle one agent with its current squad.conf entry
 $CMD ls                       squad status (DEGRADED = session up but claude dead)
-$CMD attach <agent|ops>       attach this terminal (Ctrl-b d detaches; agent keeps running)
+$CMD attach <agent|ops>       attach (starts the agent first if it's down); Ctrl-b d detaches
 $CMD cmd <agent|all> "..."    type text + Enter into session(s)   e.g. $CMD cmd all "/compact"
 $CMD key <agent> <keys>       raw tmux send-keys (tmux key names allowed, no Enter appended)
 $CMD args <agent> "..."       set next-launch claude args (col 4 of squad.conf)
