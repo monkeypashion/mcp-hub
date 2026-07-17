@@ -56,6 +56,13 @@ up_one() {
   [ -n "$ghdir" ] && type_line "$a" "export GH_CONFIG_DIR=\"$ghdir\""
   type_line "$a" "claude $args"
   echo "started $a  ($args)"
+  # --dangerously-load-development-channels pops a confirm prompt on launch; auto-accept it
+  # (server:hub is your own hub = the "local development" case; option 1 is the default → Enter).
+  case "$args" in *dangerously-load-development-channels*)
+    for _ in $(seq 1 10); do sleep 1
+      tm capture-pane -t "$a" -p 2>/dev/null | grep -qi 'channel development' && { tm send-keys -t "$a" Enter; break; }
+    done ;;
+  esac
 }
 
 org_alias() {
