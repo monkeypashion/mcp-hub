@@ -330,6 +330,11 @@ def stop_hook_command(args: argparse.Namespace) -> int:
     # True when this Stop is firing because a prior Stop-hook block fired.
     stop_hook_active = bool(payload.get("stop_hook_active"))
 
+    # Self-heal the keep-alive daemon before anything else — this runs even if
+    # the hub is unreachable (the daemon will retry-connect on its own), so a
+    # dead/absent daemon is revived at the next turn regardless of hub health.
+    _ensure_daemon_alive(name, args.hub_url)
+
     try:
         messages_text, broadcasts_text, is_online = asyncio.run(
             _query_hub(args.hub_url, name)
@@ -622,6 +627,68 @@ def _release_singleton(pidfile: pathlib.Path, *, getpid=os.getpid) -> None:
             pidfile.unlink()
         except OSError:
             pass
+
+
+def _daemon_alive_for(agent_name: str) -> bool:
+    """True if a live heartbeat daemon currently owns `agent_name`'s pidfile.
+
+    Cheap check (reuses the singleton's liveness probe) so the Stop hook can
+    decide whether to self-heal a missing/dead daemon at a turn boundary.
+    """
+    pidfile = _heartbeat_pidfile(agent_name)
+    try:
+        prev = int(pidfile.read_text(encoding="utf-8").strip())
+    except (FileNotFoundError, ValueError, OSError):
+        return False
+    return _is_live_daemon(prev)
+
+
+def _spawn_daemon_detached(agent_name: str, hub_url: str) -> None:
+    """Launch `heartbeat-daemon` fully detached so it outlives the short-lived
+    Stop hook that spawns it.
+
+    Cross-platform: POSIX uses a new session (setsid) so the daemon isn't
+    killed when the hook returns; Windows uses DETACHED_PROCESS. Invoked via
+    `python -m mcp_hub.cli` (not a PATH lookup for the console script) so it
+    works from any venv layout. The singleton claim inside the daemon makes
+    this safe to call redundantly — a second daemon stands down at once.
+    """
+    cmd = [
+        sys.executable, "-m", "mcp_hub.cli", "heartbeat-daemon",
+        "--name", agent_name, "--hub-url", hub_url,
+    ]
+    kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = (
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+    else:
+        kwargs["start_new_session"] = True
+    subprocess.Popen(cmd, **kwargs)  # noqa: S603 — fire-and-forget self-heal
+
+
+def _ensure_daemon_alive(agent_name: str, hub_url: str) -> None:
+    """Self-heal the keep-alive daemon: if none is running for `agent_name`,
+    spawn one (detached).
+
+    Called from the Stop hook so a crashed or never-started daemon is revived
+    at the next turn boundary instead of leaving the agent without ⚡ keep-alive
+    until a full session relaunch. Idempotent by construction — the singleton
+    caps it at one daemon per agent on every platform, so a redundant call is a
+    no-op. Fail-open: any error here must never disturb the Stop hook.
+    """
+    try:
+        if _daemon_alive_for(agent_name):
+            return
+        _spawn_daemon_detached(agent_name, hub_url)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[mcp-hub stop-hook] daemon self-heal failed: {exc!r}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------

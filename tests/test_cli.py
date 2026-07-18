@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,10 +18,13 @@ import pytest
 
 from mcp_hub.cli import (
     _claim_singleton,
+    _daemon_alive_for,
     _discover_agent_from_marker,
+    _ensure_daemon_alive,
     _extract_text,
     _heartbeat_pidfile,
     _is_live_daemon,
+    _spawn_daemon_detached,
     _parse_status_from_agents,
     _release_singleton,
     _resolve_agent_identity,
@@ -899,6 +904,74 @@ def test_is_live_daemon_rejects_nonpositive_pid():
     """PID 0 / negative are never valid daemons."""
     assert _is_live_daemon(0) is False
     assert _is_live_daemon(-1) is False
+
+
+# ---------------------------------------------------------------------------
+# Daemon self-heal — the Stop hook revives a dead/absent keep-alive daemon
+# ---------------------------------------------------------------------------
+
+
+def test_daemon_alive_for_no_pidfile_is_false(tmp_path, monkeypatch):
+    """No pidfile → no daemon → self-heal should fire."""
+    monkeypatch.setattr("mcp_hub.cli._PIDFILE_DIR", tmp_path)
+    assert _daemon_alive_for("alice") is False
+
+
+def test_daemon_alive_for_live_owner_is_true(tmp_path, monkeypatch):
+    """Pidfile names a live daemon → alive."""
+    monkeypatch.setattr("mcp_hub.cli._PIDFILE_DIR", tmp_path)
+    _heartbeat_pidfile("alice").write_text("1234", encoding="utf-8")
+    with patch("mcp_hub.cli._is_live_daemon", return_value=True):
+        assert _daemon_alive_for("alice") is True
+
+
+def test_daemon_alive_for_dead_owner_is_false(tmp_path, monkeypatch):
+    """Pidfile names a dead PID → not alive → self-heal should fire."""
+    monkeypatch.setattr("mcp_hub.cli._PIDFILE_DIR", tmp_path)
+    _heartbeat_pidfile("alice").write_text("1234", encoding="utf-8")
+    with patch("mcp_hub.cli._is_live_daemon", return_value=False):
+        assert _daemon_alive_for("alice") is False
+
+
+def test_ensure_daemon_alive_spawns_when_absent():
+    """No live daemon → spawn exactly one detached daemon."""
+    with patch("mcp_hub.cli._daemon_alive_for", return_value=False), \
+         patch("mcp_hub.cli._spawn_daemon_detached") as spawn:
+        _ensure_daemon_alive("alice", "http://hub/mcp")
+    spawn.assert_called_once_with("alice", "http://hub/mcp")
+
+
+def test_ensure_daemon_alive_noop_when_already_running():
+    """A daemon is already alive → do not spawn a second one."""
+    with patch("mcp_hub.cli._daemon_alive_for", return_value=True), \
+         patch("mcp_hub.cli._spawn_daemon_detached") as spawn:
+        _ensure_daemon_alive("alice", "http://hub/mcp")
+    spawn.assert_not_called()
+
+
+def test_ensure_daemon_alive_is_fail_open(capsys):
+    """A spawn error must never propagate into the Stop hook."""
+    with patch("mcp_hub.cli._daemon_alive_for", return_value=False), \
+         patch("mcp_hub.cli._spawn_daemon_detached", side_effect=OSError("boom")):
+        _ensure_daemon_alive("alice", "http://hub/mcp")  # must not raise
+    assert "self-heal failed" in capsys.readouterr().err
+
+
+def test_spawn_daemon_detached_builds_module_invocation():
+    """Spawn via `python -m mcp_hub.cli heartbeat-daemon` with the agent name,
+    detached, and no inherited stdio (so it outlives the hook)."""
+    with patch("mcp_hub.cli.subprocess.Popen") as popen:
+        _spawn_daemon_detached("alice", "http://hub/mcp")
+    cmd = popen.call_args.args[0]
+    assert cmd[:3] == [sys.executable, "-m", "mcp_hub.cli"]
+    assert "heartbeat-daemon" in cmd
+    assert cmd[cmd.index("--name") + 1] == "alice"
+    assert cmd[cmd.index("--hub-url") + 1] == "http://hub/mcp"
+    kwargs = popen.call_args.kwargs
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["stdout"] is subprocess.DEVNULL
+    # Detached: new session on POSIX, DETACHED_PROCESS flags on Windows.
+    assert kwargs.get("start_new_session") or kwargs.get("creationflags")
 
 
 # ---------------------------------------------------------------------------
