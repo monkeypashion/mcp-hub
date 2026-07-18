@@ -42,6 +42,14 @@ from typing import Any
 # would aim at a dead endpoint. Every fleet machine is on the tailnet.
 DEFAULT_HUB_URL = os.environ.get("MCP_HUB_URL", "http://100.109.6.114:8090/mcp")
 
+# Windows: a console-subsystem child (git, tasklist, python) launched from a
+# window-less parent ALLOCATES A NEW VISIBLE CONSOLE. Our hooks run at every
+# turn boundary and shell out (git for identity derivation, tasklist for the
+# daemon singleton, python -m for the daemon spawn) — without this flag the
+# operator's desktop flashes console windows on every Stop (observed live on
+# fireblade 2026-07-18). No-op on POSIX.
+_NO_WINDOW_FLAG = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
 # Marker file each project uses to declare its agent identity to the hub. Lets
 # a single global Stop hook (in ~/.claude/settings.json) work across the whole
 # fleet — the cli reads cwd from the hook's stdin payload, looks here, and
@@ -342,6 +350,7 @@ def _git_remote_url(cwd: str) -> str | None:
             capture_output=True,
             text=True,
             timeout=5,
+            creationflags=_NO_WINDOW_FLAG,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -1065,6 +1074,7 @@ def _is_live_daemon(pid: int) -> bool:
                 capture_output=True,
                 text=True,
                 timeout=5,
+                creationflags=_NO_WINDOW_FLAG,
             ).stdout
         except (OSError, subprocess.SubprocessError):
             return False
@@ -1190,6 +1200,7 @@ def _spawn_daemon_detached(agent_name: str, hub_url: str) -> None:
         kwargs["creationflags"] = (
             getattr(subprocess, "DETACHED_PROCESS", 0)
             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | _NO_WINDOW_FLAG
         )
     else:
         kwargs["start_new_session"] = True
