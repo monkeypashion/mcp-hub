@@ -23,7 +23,7 @@ squad attach [agent]        # attach (starts/restarts if down/degraded); Ctrl-b 
 squad cmd all "/compact"    # inject a slash-command into every agent
 squad cmd [agent] "carry on"
 squad restart [agent]
-squad rm [agent]            # unenroll: kill session + remove from roster (keeps the repo + marker)
+squad rm [agent]            # unenroll: kill session + remove from roster (keeps the repo)
 squad heal                  # nudge UP-but-offline agents to re-register (post hub-redeploy recovery)
 squad down                  # stop the whole squad (kills the tmux server + keep-alive daemons)
 ```
@@ -39,22 +39,24 @@ tells you to name an agent explicitly.
 ## Adding an agent
 
 ```bash
-squad add dreamteam-ai-labs/browser-agent    # clone/pull + enroll in squad.conf automatically
-squad restart browser-agent                  # launch it
+squad add dreamteam-ai-labs/browser-agent      # clone/pull + opt in + enroll
+squad restart browser-agent-$(hostname)        # launch it (name is derived)
 ```
 
-`squad add` does three things: clones/pulls the repo into the right account folder, **creates the
-hub-identity marker** `<worktree>/.claude/hub-agent.json` if the repo doesn't have one, and appends
-the roster line (default hub args).
+`squad add` does three things: clones/pulls the repo into the right account folder, **opts the
+project into `~/.mcp-hub/config.json`** (the machine-local participation list), and appends the
+roster line (default hub args).
 
-- **Name** precedence: explicit 2nd arg → existing marker → repo name.
-- **Project** (for a newly-created marker): explicit 3rd arg → repo name.
-- So `squad add dreamteam-ai-labs/dreamteam` enrols as `dreamteam` and writes `{name: dreamteam,
-  project: dreamteam}`. Override: `squad add <org>/<repo> <name> <project>`.
+**Identity is derived, not configured** — nothing identity-related is written into the repo:
 
-The marker defines the agent's hub identity (what it registers as) — **commit it in that repo** so it
-travels. `squad add` never overwrites an existing marker. Use `squad pull-local` if you just want to
-clone a repo *without* enrolling it as an agent.
+- **name** = `<repo>-<hostname>` (e.g. `mcp-hub-dev-vm-1`) — unique per clone/machine.
+- **project** = `<org>/<repo>` from `git remote get-url origin` — identical for every clone of the
+  repo, so clones discover each other on the hub and can DM/coordinate instead of fighting over
+  one identity.
+
+The old committed `.claude/hub-agent.json` marker is deprecated (it made every clone register as
+the same agent). The hub cli still honours it as a fallback for unmigrated repos. Use
+`squad pull-local` if you just want to clone a repo *without* enrolling it as an agent.
 
 ## Config
 

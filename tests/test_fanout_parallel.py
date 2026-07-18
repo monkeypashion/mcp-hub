@@ -54,9 +54,9 @@ async def _register_and_bind(server, names: list[str]) -> None:
     """Register each name as an agent and bind a fake session so it shows
     up as a live recipient in registry.names().
 
-    Each agent gets a unique `project=` value — register() dedups by project
-    when one is supplied (reuses the existing online name on that project),
-    which would collapse our test recipients into a single agent.
+    Each agent gets a unique `project=` value for realism only — register()
+    no longer dedups by project (distinct names coexist under one project,
+    the multi-clone model), so unique projects aren't load-bearing here.
     """
     registry = server._hub_registry  # type: ignore[attr-defined]
     for n in names:

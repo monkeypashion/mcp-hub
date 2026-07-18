@@ -2,7 +2,7 @@
 # Copy this to ~/.config/squad/squad.conf and edit.
 #
 # Format:  agent_name | worktree | gh_config_dir | claude_args
-#   agent_name    hub name — MUST match .claude/hub-agent.json in the worktree
+#   agent_name    hub name — the DERIVED identity: <repo>-<hostname> (squad add fills this in)
 #   worktree      path to the project ( ~ is expanded )
 #   gh_config_dir GH_CONFIG_DIR for the gh CLI; leave EMPTY if the agent doesn't run `gh`
 #                 (git push/pull uses the SSH keys + per-folder identity, no gh needed)

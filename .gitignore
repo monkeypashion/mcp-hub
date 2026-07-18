@@ -6,3 +6,6 @@ build/
 .venv/
 *.db
 .ruff_cache/
+# Legacy hub-identity marker — identity is now DERIVED (git remote + hostname);
+# a committed marker makes every clone register as the same agent. Never commit.
+.claude/hub-agent.json

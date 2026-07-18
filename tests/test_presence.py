@@ -113,6 +113,65 @@ async def test_list_agents_no_lightning_for_undeliverable_bound_agent(tmp_path: 
 
 
 # ---------------------------------------------------------------------------
+# Multi-clone model — distinct names coexist under one shared project
+# ---------------------------------------------------------------------------
+
+
+async def test_register_same_project_distinct_names_coexist(tmp_path: Path):
+    """Two clones of one repo register derived names (<repo>-<hostname>)
+    under the SAME project and must both exist as separate agents. The old
+    one-agent-per-project dedup silently remapped the second register onto
+    the first online agent — collapsing clones and hijacking the wake
+    binding (observed live: statusline showed 1/1 on both machines)."""
+    server = create_server(db_path=tmp_path / "test.db")
+
+    r1 = await _call_tool(
+        server, "register", {"name": "widgets-linux-box", "project": "acme/widgets"}
+    )
+    r2 = await _call_tool(
+        server, "register", {"name": "widgets-win-box", "project": "acme/widgets"}
+    )
+    # Neither register may be remapped onto the other's name.
+    assert "Registered as 'widgets-linux-box'" in r1
+    assert "Registered as 'widgets-win-box'" in r2
+
+    out = await _call_tool(server, "list_agents", {})
+    assert "**widgets-linux-box**" in out
+    assert "**widgets-win-box**" in out
+
+
+async def test_same_project_clones_can_dm_each_other(tmp_path: Path):
+    """The point of coexisting: clone→clone DMs address the intended clone,
+    not a collapsed shared identity."""
+    server = create_server(db_path=tmp_path / "test.db")
+
+    await _call_tool(
+        server, "register", {"name": "widgets-linux-box", "project": "acme/widgets"}
+    )
+    await _call_tool(
+        server, "register", {"name": "widgets-win-box", "project": "acme/widgets"}
+    )
+    await _call_tool(
+        server,
+        "send",
+        {
+            "from_agent": "widgets-linux-box",
+            "to": "widgets-win-box",
+            "message": "memory note: prefer derived identity",
+        },
+    )
+    inbox = await _call_tool(
+        server, "get_messages", {"agent_name": "widgets-win-box"}
+    )
+    assert "memory note" in inbox
+    # And it must NOT have landed on the sender's own queue.
+    own = await _call_tool(
+        server, "get_messages", {"agent_name": "widgets-linux-box"}
+    )
+    assert "memory note" not in own
+
+
+# ---------------------------------------------------------------------------
 # Bug B — 🟢 status is truthful (no stale online)
 # ---------------------------------------------------------------------------
 

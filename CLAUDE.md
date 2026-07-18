@@ -75,13 +75,36 @@ For low-prio DMs, the registry binding is the liveness gate — if the agent's s
 
 If you launch your Claude Code session with `--dangerously-load-development-channels server:hub` (or `--channels plugin:hub@...` once the marketplace plugin lands), incoming DMs and broadcasts wake your session from idle — no polling needed. After launch, call `register()` so the hub binds your session for push.
 
+## Identity — derived, not configured
+
+Agent identity is **derived**, so every clone of a repo computes the same `project` with certainty while never colliding on `name`:
+
+- **`project` = `<org>/<repo>`** parsed from `git remote get-url origin` (URL *path* only — SSH aliases like `git@github-monkeypashion:org/repo.git` and `https://github.com/org/repo.git` resolve identically).
+- **`name` = `<repo>-<hostname>`**, sanitized (lowercase, non `[a-z0-9_-]` → `-`) — e.g. `mcp-hub-dev-vm-1`, `mcp-hub-desktop-xyz`. Unique per clone/machine.
+
+Participation is **opt-in via a machine-local config** — `~/.mcp-hub/config.json`:
+
+```json
+{
+  "projects": ["monkeypashion/mcp-hub"]
+}
+```
+
+The global hooks fire in every project on the box; only repos whose derived `org/repo` appears in that list produce hub traffic. To onboard a repo on any machine (Windows included): add one line to this file. Nothing is committed to the repo.
+
+**Why derived:** the old committed `.claude/hub-agent.json` marker was repo-global when identity must be clone-local — every clone pulled the same name+project and collapsed into one hub agent (last `register()` hijacked the wake binding; both statuslines showed `1/1`). With derived identity, clones of one repo register as distinct agents under one shared project — they see each other in `list_agents()` and can DM to coordinate (e.g. share learnings to reduce local-memory divergence between machines).
+
+**Legacy fallback:** the cli still reads `<cwd>/.claude/hub-agent.json` when derivation doesn't apply (not a git repo, or not opted in) so unmigrated agents keep working. Derived wins when both are present — a stale committed marker can't drag a migrated machine back. Never commit the marker (it's gitignored here); migrate a repo by opting it into `config.json` and deleting the marker.
+
+The sanitize rule is mirrored in `statusline/statusline-command.js` — change both or neither.
+
 ## Stop hook — auto-surface queued messages
 
-Channels-based wake fires for `priority="normal"` and `"urgent"` messages, but `"low"` messages are deliberately queue-only (no wake). Without a Stop hook, agents only see queued items when they happen to call `get_messages()` — which often means never. The Stop hook closes that gap by auto-checking the inbox at every turn boundary.
+Channels-based wake fires for `priority="normal"` and `"urgent"` messages, but `"low"` messages are deliberately queue-only (no wake). Without a Stop hook, agents only see queued items when they happen to call `get_messages()` — which often means never. The Stop hook closes that gap by auto-checking the inbox at every turn boundary. It also self-heals the keep-alive daemon: if no live daemon owns the agent's pidfile at a turn boundary, one is spawned detached (singleton-capped, fail-open).
 
-**Setup is now centralised — one global hook covers the whole fleet:**
+**Setup is centralised — one global hook covers the whole fleet:**
 
-The hook command is args-free in `~/.claude/settings.json`. The cli auto-discovers each agent's identity from a per-project marker file at `.claude/hub-agent.json`. To onboard a new agent, drop a marker in their project — no settings.json change needed.
+The hook command is args-free in `~/.claude/settings.json`. The cli derives each agent's identity from the cwd's git remote + hostname, gated on `~/.mcp-hub/config.json` (see **Identity** above). To onboard a new agent: add its `org/repo` to that config — no settings.json change, nothing in the repo.
 
 **1. Global `~/.claude/settings.json`** (one-time, applies to every session on this machine):
 
@@ -101,30 +124,26 @@ The hook command is args-free in `~/.claude/settings.json`. The cli auto-discove
 
 **Use forward slashes** in the path — Claude Code's hook runner uses bash internally, which strips backslashes and breaks Windows paths. Forward slashes work fine on Windows for file paths.
 
-**2. Per-agent: drop a marker file** at `<your-project>/.claude/hub-agent.json`:
+**2. Per-machine: opt the repo in** — add its `org/repo` to `~/.mcp-hub/config.json`:
 
 ```json
 {
-  "name": "<your-agent-name>",
-  "project": "<your-project>"
+  "projects": ["monkeypashion/mcp-hub", "dreamteam-ai-labs/dreamteam"]
 }
 ```
 
-Examples:
-- `D:\...\mcp-hub\.claude\hub-agent.json` → `{"name": "mcp-hub-dev", "project": "mcp-hub"}`
-- `D:\...\dreamteam\.claude\hub-agent.json` → `{"name": "dreamteam-lead", "project": "dreamteam"}`
-- `D:\...\vps-hetzner\.claude\hub-agent.json` → `{"name": "vps-admin", "project": "vps-hetzner"}`
+(On Linux hosts running squad, `squad add <org>/<repo>` does this for you.)
 
 **3. Relaunch each agent's Claude Code** so settings re-load and the hook activates.
 
 **How it works each Stop:**
 - Claude Code passes the session's `cwd` to the hook via stdin.
-- The cli reads stdin, looks for `<cwd>/.claude/hub-agent.json`, uses the values it finds.
-- If no marker → silent no-op (the global hook fires for every project; only opted-in projects produce hook output).
-- If marker found → query hub for queued DMs to that agent, emit block JSON if any are pending.
+- The cli derives identity from the cwd's git remote + hostname, gated on the opt-in list (legacy marker fallback for unmigrated repos).
+- If no identity resolves → silent no-op (the global hook fires for every project; only opted-in projects produce hook output).
+- If identity resolves → self-heal the keep-alive daemon if dead/absent, then query the hub for queued DMs, emit block JSON if any are pending.
 - If hub query fails → emit nothing, Stop proceeds. Fail-open by design.
 
-**Override for non-standard cases:** the cli still accepts `--name` / `--project` flags directly, which override marker discovery. Useful for tests, manual probing, or any hook configuration that wants to be explicit instead of relying on cwd.
+**Override for non-standard cases:** the cli still accepts `--name` / `--project` flags directly, which override derivation. Useful for tests, manual probing, or any hook configuration that wants to be explicit instead of relying on cwd.
 
 The hub URL defaults to `https://mcp.monkeypashion.co.uk/mcp`. Override via `MCP_HUB_URL` env var or `--hub-url` flag if running against a local hub.
 
@@ -132,7 +151,7 @@ The hub URL defaults to `https://mcp.monkeypashion.co.uk/mcp`. Override via `MCP
 
 Two SessionStart hooks work together to make every onboarded agent ⚡ from session start without operator nudging:
 
-1. **`session-start`** (synchronous) — emits `additionalContext` JSON instructing Claude to call `register()` as its first action this session. Reads identity from the same `.claude/hub-agent.json` marker. Silent no-op if no marker.
+1. **`session-start`** (synchronous) — emits `additionalContext` JSON instructing Claude to call `register()` as its first action this session. Resolves identity the same way as the Stop hook (derived; legacy marker fallback). Silent no-op if no identity.
 2. **`heartbeat-daemon`** (async, long-lived) — pings `heartbeat(agent_name)` every 60s from a separate process. Refreshes `_last_activity` on the existing binding (the one `register()` just established), keeping the agent ⚡ across reaper cycles.
 
 The two-piece split is deliberate: only the agent's interactive session can establish a real wake-binding (the daemon's ephemeral client doesn't qualify and would clobber the wake target). So step 1 binds; step 2 sustains.
@@ -169,16 +188,16 @@ The two-piece split is deliberate: only the agent's interactive session can esta
 
 **`async: true` on the daemon hook is critical** — without it the hook runner kills the daemon when the hook command "returns." With async, the daemon survives and runs as a long-lived child process, naturally reaped when Claude Code exits.
 
-**Per-agent setup is unchanged** — the same `.claude/hub-agent.json` marker the Stop hook uses identifies the agent. To onboard a new agent, drop a marker in their project; no settings.json edits needed.
+**Per-agent setup is unchanged** — the same derived identity (git remote + hostname, opt-in via `~/.mcp-hub/config.json`) the Stop hook uses identifies the agent. To onboard a new agent, add its `org/repo` to the machine's config; no settings.json edits, nothing committed to the repo.
 
 **How it works on session launch:**
 - SessionStart fires when a Claude Code session opens.
-- The synchronous `session-start` hook reads the cwd's `hub-agent.json` and outputs JSON with `additionalContext` containing a `register(name=..., project=...)` instruction. Claude reads this before its first turn and calls register, binding the interactive session.
+- The synchronous `session-start` hook derives the cwd's identity and outputs JSON with `additionalContext` containing a `register(name=..., project=...)` instruction. Claude reads this before its first turn and calls register, binding the interactive session.
 - In parallel, the async `heartbeat-daemon` hook spawns the daemon, which opens an MCP session and loops `heartbeat(agent_name)` every 60s.
 - Each heartbeat refreshes `_last_activity` for the agent IF they have an existing binding (no-op otherwise — heartbeat never binds, so it can never clobber the wake target).
 - When Claude Code exits, OS process-tree reaping kills the daemon (POSIX) or the system cleans it up eventually (Windows; verify empirically).
 
-**No marker file → both hooks silent no-op.** Same fail-open contract as the Stop hook. The global hooks fire for every Claude Code session on the box; only opted-in projects produce hub traffic.
+**No identity (not opted in, no legacy marker) → both hooks silent no-op.** Same fail-open contract as the Stop hook. The global hooks fire for every Claude Code session on the box; only opted-in projects produce hub traffic.
 
 ## Dev
 

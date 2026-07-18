@@ -28,6 +28,7 @@ import asyncio
 import json
 import os
 import pathlib
+import platform
 import subprocess
 import sys
 import time
@@ -259,8 +260,122 @@ def _read_hook_stdin() -> dict[str, Any]:
         return {}
 
 
+# ---------------------------------------------------------------------------
+# Derived identity — the canonical way a clone knows who it is.
+#
+# Identity is DERIVED, not configured, so two clones of the same repo are
+# structurally guaranteed to agree on `project` while never colliding on
+# `name`:
+#   project = "<org>/<repo>"        parsed from `git remote get-url origin`
+#                                   (URL path only — SSH aliases like
+#                                   git@github-monkeypashion:org/repo.git and
+#                                   https://github.com/org/repo.git resolve
+#                                   identically)
+#   name    = "<repo>-<hostname>"   unique per clone/machine
+#
+# Participation is opt-in via a machine-local config (~/.mcp-hub/config.json,
+# {"projects": ["org/repo", ...]}) — NOT a file committed to the repo. A
+# committed marker is repo-global when identity must be clone-local; that's
+# what made clones fight over one identity.
+#
+# The sanitization rule here is mirrored in ~/.claude/statusline-command.js —
+# keep them in lockstep or the statusline can't find the status cache file.
+# ---------------------------------------------------------------------------
+
+_HUB_CONFIG_PATH = pathlib.Path.home() / ".mcp-hub" / "config.json"
+
+
+def _load_hub_config() -> dict[str, Any]:
+    """Read the machine-local hub config. {} on any error (fail-open)."""
+    try:
+        data = json.loads(_HUB_CONFIG_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _sanitize_ident(raw: str) -> str:
+    """Canonical agent-name sanitization: lowercase, non [a-z0-9_-] → '-'.
+
+    Mirrored in statusline-command.js — change both or neither.
+    """
+    return "".join(
+        c if (c.isalnum() or c in "-_") else "-" for c in raw.lower()
+    ).strip("-")
+
+
+def _parse_org_repo(url: str) -> tuple[str, str] | None:
+    """Parse (org, repo) from a git remote URL, ignoring the host entirely.
+
+    Handles scp-like (git@host:org/repo.git), ssh:// and https:// forms. The
+    host is deliberately not inspected so SSH aliases (git@github-monkeypashion:...)
+    and canonical hosts (github.com) yield the same org/repo. For nested paths
+    (GitLab subgroups) the last two segments win.
+    """
+    s = url.strip().removesuffix("/").removesuffix(".git")
+    if not s:
+        return None
+    if "://" in s:
+        rest = s.split("://", 1)[1]
+        path = rest.split("/", 1)[1] if "/" in rest else ""
+    elif ":" in s:
+        path = s.split(":", 1)[1]
+    else:
+        path = s
+    parts = [p for p in path.strip("/").split("/") if p]
+    if len(parts) < 2:
+        return None
+    return parts[-2], parts[-1]
+
+
+def _git_remote_url(cwd: str) -> str | None:
+    """`git remote get-url origin` for cwd, or None (no git / no origin)."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", cwd, "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    url = out.stdout.strip()
+    return url or None
+
+
+def _derive_agent_identity(cwd: str | None) -> tuple[str | None, str | None]:
+    """Derive (name, project) for cwd, gated on the machine-local opt-in list.
+
+    Returns (None, None) unless cwd is a git repo whose origin org/repo
+    appears in ~/.mcp-hub/config.json's "projects" list. Never raises.
+    """
+    if not cwd:
+        return None, None
+    url = _git_remote_url(cwd)
+    if not url:
+        return None, None
+    parsed = _parse_org_repo(url)
+    if not parsed:
+        return None, None
+    org, repo = parsed
+    project = f"{org}/{repo}"
+    opted_in = _load_hub_config().get("projects")
+    if not isinstance(opted_in, list) or project not in opted_in:
+        return None, None
+    host = _sanitize_ident(platform.node() or "unknown-host")
+    name = _sanitize_ident(f"{repo}-{host}") or None
+    return name, project
+
+
 def _discover_agent_from_marker(cwd: str | None) -> tuple[str | None, str | None]:
-    """Look for `<cwd>/.claude/hub-agent.json` and read agent identity.
+    """LEGACY fallback: read identity from `<cwd>/.claude/hub-agent.json`.
+
+    Deprecated in favour of derived identity (_derive_agent_identity) — a
+    committed marker is shared by every clone of the repo, which makes clones
+    collide into one hub identity. Kept as a fallback so not-yet-migrated
+    agents keep working; remove once the fleet is on derived identity.
 
     The marker file shape:
         {"name": "dreamteam-lead", "project": "dreamteam"}
@@ -293,13 +408,15 @@ def _resolve_agent_identity(
     Resolution order:
       1. Explicit --name (and --project) on the CLI — overrides everything.
          Useful for tests, manual checks, non-standard setups.
-      2. Project marker file at <cwd>/.claude/hub-agent.json — discovered
-         from the cwd Claude Code passes to hooks via stdin. Lets a single
-         global hook config cover the whole fleet.
-      3. Nothing — return (None, None) and the cli will silently no-op.
+      2. Derived identity — org/repo from the cwd's git remote + hostname,
+         gated on the ~/.mcp-hub/config.json opt-in list. The canonical
+         path: clone-local name, repo-global project, nothing committed.
+      3. LEGACY: marker file at <cwd>/.claude/hub-agent.json — kept so
+         not-yet-migrated agents keep working.
+      4. Nothing — return (None, None) and the cli will silently no-op.
 
-    The marker file path is fixed (`.claude/hub-agent.json`) so each
-    project self-declares with no central registry to maintain.
+    Derived wins over the marker: a repo that still carries a committed
+    marker must not drag a migrated machine back into the shared identity.
 
     `payload` is the already-parsed Stop-hook stdin. Callers that also need
     other stdin fields (e.g. `stop_hook_active`) must read stdin ONCE and
@@ -312,6 +429,9 @@ def _resolve_agent_identity(
     if payload is None:
         payload = _read_hook_stdin()
     cwd = payload.get("cwd")
+    name, project = _derive_agent_identity(cwd)
+    if name is not None:
+        return name, project
     return _discover_agent_from_marker(cwd)
 
 

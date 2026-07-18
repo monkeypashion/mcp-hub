@@ -19,15 +19,18 @@ import pytest
 from mcp_hub.cli import (
     _claim_singleton,
     _daemon_alive_for,
+    _derive_agent_identity,
     _discover_agent_from_marker,
     _ensure_daemon_alive,
     _extract_text,
     _heartbeat_pidfile,
     _is_live_daemon,
-    _spawn_daemon_detached,
+    _parse_org_repo,
     _parse_status_from_agents,
     _release_singleton,
     _resolve_agent_identity,
+    _sanitize_ident,
+    _spawn_daemon_detached,
     _status_cache_path,
     _write_status_cache,
     build_hook_response,
@@ -36,7 +39,6 @@ from mcp_hub.cli import (
     session_start_command,
     stop_hook_command,
 )
-
 
 # ---------------------------------------------------------------------------
 # build_hook_response — pure decision logic
@@ -445,8 +447,8 @@ async def live_hub(tmp_path: Path):
     thread.start()
 
     # Poll until the server is responsive
-    import urllib.request
     import urllib.error
+    import urllib.request
     deadline = _time.time() + 5.0
     while _time.time() < deadline:
         try:
@@ -536,6 +538,124 @@ def test_discover_agent_from_marker_no_cwd_returns_none():
     name, proj = _discover_agent_from_marker(None)
     assert name is None
     assert proj is None
+
+
+# ---------------------------------------------------------------------------
+# Derived identity — org/repo from git remote + hostname, opt-in gated
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        # scp-like with an SSH alias host — the host must be ignored
+        ("git@github-monkeypashion:monkeypashion/mcp-hub.git", ("monkeypashion", "mcp-hub")),
+        ("git@github.com:org/repo.git", ("org", "repo")),
+        ("https://github.com/org/repo.git", ("org", "repo")),
+        ("https://github.com/org/repo", ("org", "repo")),
+        ("ssh://git@github.com:22/org/repo.git", ("org", "repo")),
+        # nested groups: last two segments win
+        ("https://gitlab.com/group/subgroup/repo.git", ("subgroup", "repo")),
+        ("https://github.com/org/repo/", ("org", "repo")),
+        ("not-a-url", None),
+        ("", None),
+        ("git@host:only-repo.git", None),
+    ],
+)
+def test_parse_org_repo(url, expected):
+    """Every remote URL form for the same repo must parse identically —
+    that's the structural same-project guarantee across clones."""
+    assert _parse_org_repo(url) == expected
+
+
+def test_sanitize_ident_lowercases_and_dashes():
+    """Windows hostnames like DESKTOP-XYZ.local must become clean idents.
+    Rule mirrored in statusline-command.js — change both or neither."""
+    assert _sanitize_ident("DESKTOP-XYZ.local") == "desktop-xyz-local"
+    assert _sanitize_ident("dev-vm-1") == "dev-vm-1"
+    assert _sanitize_ident("...") == ""
+
+
+def _derivation_env(monkeypatch, *, url, projects, host="myhost"):
+    """Patch the derivation inputs: remote URL, opt-in config, hostname."""
+    monkeypatch.setattr("mcp_hub.cli._git_remote_url", lambda _cwd: url)
+    monkeypatch.setattr(
+        "mcp_hub.cli._load_hub_config", lambda: {"projects": projects}
+    )
+    monkeypatch.setattr("mcp_hub.cli.platform.node", lambda: host)
+
+
+def test_derive_identity_opted_in(monkeypatch):
+    """Opted-in repo derives name=<repo>-<hostname>, project=<org>/<repo>."""
+    _derivation_env(
+        monkeypatch,
+        url="git@github-alias:acme/widgets.git",
+        projects=["acme/widgets"],
+        host="Win-Box",
+    )
+    name, project = _derive_agent_identity("/anywhere")
+    assert name == "widgets-win-box"
+    assert project == "acme/widgets"
+
+
+def test_derive_identity_not_opted_in_returns_none(monkeypatch):
+    """A repo missing from the opt-in list must not participate — the global
+    hooks fire in every git repo on the box."""
+    _derivation_env(
+        monkeypatch, url="git@github.com:acme/widgets.git", projects=["other/repo"]
+    )
+    assert _derive_agent_identity("/anywhere") == (None, None)
+
+
+def test_derive_identity_no_remote_returns_none(monkeypatch):
+    """Not a git repo / no origin remote → silent no-op."""
+    monkeypatch.setattr("mcp_hub.cli._git_remote_url", lambda _cwd: None)
+    assert _derive_agent_identity("/anywhere") == (None, None)
+
+
+def test_derive_identity_no_config_returns_none(monkeypatch):
+    """No ~/.mcp-hub/config.json at all → nothing participates."""
+    monkeypatch.setattr(
+        "mcp_hub.cli._git_remote_url", lambda _cwd: "git@github.com:a/b.git"
+    )
+    monkeypatch.setattr("mcp_hub.cli._load_hub_config", lambda: {})
+    assert _derive_agent_identity("/anywhere") == (None, None)
+
+
+def test_resolve_identity_derived_beats_marker(tmp_path, monkeypatch):
+    """A repo still carrying a committed marker must not drag a migrated
+    machine back into the shared identity — derived wins."""
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "hub-agent.json").write_text(
+        json.dumps({"name": "shared-marker-name", "project": "marker-proj"}),
+        encoding="utf-8",
+    )
+    _derivation_env(
+        monkeypatch,
+        url="git@github.com:acme/widgets.git",
+        projects=["acme/widgets"],
+        host="hostA",
+    )
+    args = argparse.Namespace(name=None, project=None, hub_url="x")
+    name, project = _resolve_agent_identity(args, {"cwd": str(tmp_path)})
+    assert name == "widgets-hosta"
+    assert project == "acme/widgets"
+
+
+def test_resolve_identity_marker_fallback_when_not_opted_in(tmp_path, monkeypatch):
+    """Legacy agents (marker present, machine not opted in) keep working."""
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "hub-agent.json").write_text(
+        json.dumps({"name": "legacy-agent", "project": "legacy-proj"}),
+        encoding="utf-8",
+    )
+    _derivation_env(
+        monkeypatch, url="git@github.com:acme/widgets.git", projects=[]
+    )
+    args = argparse.Namespace(name=None, project=None, hub_url="x")
+    name, project = _resolve_agent_identity(args, {"cwd": str(tmp_path)})
+    assert name == "legacy-agent"
+    assert project == "legacy-proj"
 
 
 # ---------------------------------------------------------------------------

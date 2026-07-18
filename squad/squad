@@ -118,25 +118,46 @@ pull_local() {
   echo "$dest"
 }
 
-add_agent() {  # squad add <org>/<repo> [name] [project] — clone/pull, create hub marker, enroll
-  local spec="$1" name="${2:-}" proj="${3:-}" out dest marker
-  [[ "$spec" == ?*/?* ]] || { echo "usage: $CMD add <org>/<repo> [name] [project]"; return 1; }
+# Mirror of cli.py _sanitize_ident: lowercase, non [a-z0-9_-] -> '-', trim '-'.
+sanitize_ident() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9_-]/-/g' -e 's/^-*//' -e 's/-*$//'; }
+
+# Opt org/repo into ~/.mcp-hub/config.json's projects list (idempotent).
+# Identity is DERIVED by the hub cli (repo-hostname / org/repo from the git
+# remote); this machine-local list is the only thing that opts a repo in.
+optin_project() {
+  local proj="$1" cfg="$HOME/.mcp-hub/config.json"
+  mkdir -p "$HOME/.mcp-hub"
+  python3 - "$cfg" "$proj" <<'PYEOF'
+import json, pathlib, sys
+cfg, proj = pathlib.Path(sys.argv[1]), sys.argv[2]
+try:
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    assert isinstance(data, dict)
+except Exception:
+    data = {}
+projects = data.get("projects")
+if not isinstance(projects, list):
+    projects = []
+if proj not in projects:
+    projects.append(proj)
+    data["projects"] = projects
+    cfg.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    print(f"opted in: {proj}  ({cfg})")
+else:
+    print(f"already opted in: {proj}")
+PYEOF
+}
+
+add_agent() {  # squad add <org>/<repo> — clone/pull, opt in, enroll under the DERIVED name
+  local spec="$1" out dest name
+  [[ "$spec" == ?*/?* ]] || { echo "usage: $CMD add <org>/<repo>"; return 1; }
+  [ -z "${2:-}" ] || echo "note: identity is now derived (<repo>-<hostname>); extra args ignored"
   out="$(pull_local "$spec")" || return 1          # clones/pulls; last line is the dest path
   dest="$(printf '%s\n' "$out" | tail -1)"
   [ -d "$dest" ] || { echo "!! clone failed for $spec"; return 1; }
-  marker="$dest/.claude/hub-agent.json"
-  # name precedence: explicit 2nd arg > existing marker > repo name
-  if [ -z "$name" ] && [ -f "$marker" ]; then
-    name="$(grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]+"' "$marker" | head -1 | sed -E 's/.*"([^"]+)"$/\1/' || true)"
-  fi
-  [ -n "$name" ] || name="$(basename "$dest")"
-  # create the hub-identity marker if the repo lacks one (project defaults to the repo name)
-  if [ ! -f "$marker" ]; then
-    [ -n "$proj" ] || proj="$(basename "$dest")"
-    mkdir -p "$dest/.claude"
-    printf '{\n  "name": "%s",\n  "project": "%s"\n}\n' "$name" "$proj" > "$marker"
-    echo "created $marker  (name=$name, project=$proj) — commit it in that repo so the hub identity persists"
-  fi
+  # derived identity: name = <repo>-<hostname>, project = <org>/<repo>
+  name="$(sanitize_ident "$(basename "$dest")-$(hostname)")"
+  optin_project "${spec%.git}"
   # enroll in the roster
   if agents | grep -qxF -- "$name"; then echo "'$name' already in $CONF — roster unchanged"; return 0; fi
   mkdir -p "$(dirname "$CONF")"
@@ -235,7 +256,7 @@ $CMD cmd [agent|all] "..."    type text + Enter into session(s)   e.g. $CMD cmd 
 $CMD key [agent] <keys>       raw tmux send-keys (tmux key names allowed, no Enter appended)
 $CMD args [agent] "..."       set next-launch claude args (col 4 of squad.conf)
 $CMD handoff [agent]          commit WIP to wip/<agent>-<date> + push (before switching machines)
-$CMD add <org>/<repo> [name] [project]   clone/pull + create hub marker + enroll (name/project default to repo name)
+$CMD add <org>/<repo>         clone/pull + opt in (~/.mcp-hub/config.json) + enroll as <repo>-<hostname>
 $CMD rm [agent]               unenroll: kill session + remove from squad.conf (keeps the repo + marker)
 $CMD pull-local <org>/<repo>  clone/pull into the correct account folder (org derives the alias)
 

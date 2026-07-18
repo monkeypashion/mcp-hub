@@ -569,15 +569,12 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         now = time.time()
         conn = _get_db(db_path)
 
-        # If project is set, check for an existing agent on this project (avoid duplicates)
-        if project:
-            existing = conn.execute(
-                "SELECT name FROM agents WHERE project = ? AND name != ? AND status = 'online'",
-                (project, name),
-            ).fetchone()
-            if existing:
-                # Reuse the existing name — update it instead
-                name = existing["name"]
+        # NOTE: no one-agent-per-project dedup here, deliberately. Multiple
+        # clones of the same repo register distinct derived names
+        # (<repo>-<hostname>) under one shared project — that's how they
+        # discover each other. The old dedup silently remapped any new name
+        # onto an existing online agent for the project, collapsing clones
+        # into a single identity (and hijacking its wake binding).
 
         # For first-time registrations, set the broadcast cursor to the
         # current max so they start "from now" instead of getting firehosed
