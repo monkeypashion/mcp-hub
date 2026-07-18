@@ -40,6 +40,28 @@ from mcp_hub.cli import (
     stop_hook_command,
 )
 
+
+@pytest.fixture(autouse=True)
+def _no_real_daemons(tmp_path, monkeypatch):
+    """Hermetic guard: tests must NEVER spawn real detached daemons or touch
+    the real ~/.mcp-hub.
+
+    Without this, any test that drives stop_hook_command trips the daemon
+    self-heal and launches a real `python -m mcp_hub.cli heartbeat-daemon`
+    process (observed 2026-07-18: orphaned 'alice' and 'ghost-agent' daemons
+    from the integration tests, one retrying http://nowhere.invalid/mcp
+    forever, plus their pidfiles in the real home dir).
+
+    Tests that exercise the spawn path re-patch these seams explicitly;
+    test_spawn_daemon_detached_* calls the original function via its direct
+    import, so it is unaffected by the module-attribute no-op here.
+    """
+    monkeypatch.setattr("mcp_hub.cli._PIDFILE_DIR", tmp_path / "mcp-hub-state")
+    monkeypatch.setattr(
+        "mcp_hub.cli._spawn_daemon_detached", lambda *_a, **_k: None
+    )
+
+
 # ---------------------------------------------------------------------------
 # build_hook_response — pure decision logic
 # ---------------------------------------------------------------------------
