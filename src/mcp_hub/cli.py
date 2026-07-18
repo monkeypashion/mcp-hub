@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import pathlib
@@ -543,7 +544,13 @@ async def _memory_export(hub_url: str, name: str, project: str, cwd: str) -> int
 
 
 async def _memory_import(
-    hub_url: str, project: str, cwd: str, *, force: bool, dry_run: bool
+    hub_url: str,
+    project: str,
+    cwd: str,
+    *,
+    force: bool,
+    dry_run: bool,
+    replace_index: bool = False,
 ) -> int:
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
@@ -590,34 +597,122 @@ async def _memory_import(
                 target.write_text(content, encoding="utf-8")
                 imported.append(fname)
 
-    # MEMORY.md merge — the index Claude loads each session. Append staged
-    # lines whose linked file isn't already referenced locally; never remove
-    # or reorder local lines.
+    # MEMORY.md handling — the index Claude loads each session.
+    # Default: MERGE (append staged lines whose linked file isn't already
+    # referenced locally; never remove or reorder local lines) — right for a
+    # first import into a machine with its own memories.
+    # --replace-index: adopt the staged index VERBATIM — the reconciliation
+    # return-leg, where the curated canonical index (possibly restructured)
+    # must replace the local one for the fleet to converge.
     merged_lines = 0
+    index_replaced = False
     if staged_index and not dry_run:
         index_path = mem_dir / "MEMORY.md"
-        local_index = (
-            index_path.read_text(encoding="utf-8") if index_path.exists() else ""
-        )
-        merged, merged_lines = _merge_memory_index(
-            local_index, staged_index, mem_dir
-        )
-        if merged_lines:
+        if replace_index:
             mem_dir.mkdir(parents=True, exist_ok=True)
-            index_path.write_text(merged, encoding="utf-8")
+            index_path.write_text(staged_index, encoding="utf-8")
+            index_replaced = True
+        else:
+            local_index = (
+                index_path.read_text(encoding="utf-8") if index_path.exists() else ""
+            )
+            merged, merged_lines = _merge_memory_index(
+                local_index, staged_index, mem_dir
+            )
+            if merged_lines:
+                mem_dir.mkdir(parents=True, exist_ok=True)
+                index_path.write_text(merged, encoding="utf-8")
 
     for f in imported:
         print(f"  + {f}")
     for s in skipped:
         print(f"  - {s}")
+    index_note = (
+        "MEMORY.md REPLACED with canonical index"
+        if index_replaced
+        else f"MEMORY.md lines merged: {merged_lines}"
+    )
     print(
         f"{'DRY RUN — ' if dry_run else ''}imported {len(imported)}, "
-        f"skipped {len(skipped)}, MEMORY.md lines merged: {merged_lines} "
+        f"skipped {len(skipped)}, {index_note} "
         f"({mem_dir})"
     )
     if imported and not dry_run:
         print("imported memories are live from the next Claude session in this repo")
     return 0
+
+
+def _text_digest(text: str) -> str:
+    """Truncated sha256 of TEXT content — mirrors the server's memory_list
+    hash. Computed on decoded text (not raw bytes) so CRLF/LF differences
+    between Windows and Linux disks never cause false mismatches: read_text
+    normalizes newlines identically on both sides."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+async def _memory_verify(hub_url: str, project: str, cwd: str) -> int:
+    """Compare local memory files against the hub's staged set by hash.
+
+    Exit 0 = every staged file exists locally with identical content (the
+    convergence proof). Local files NOT in the staged set are reported as
+    extras (informational — they don't fail verification, but after a full
+    reconciliation ceremony there should be none)."""
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    mem_dir = _claude_memory_dir(cwd)
+
+    async with streamablehttp_client(hub_url, timeout=15) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool("memory_list", {"project": project})
+            listing = _extract_text(result) or ""
+
+    staged: dict[str, str] = {}
+    for ln in listing.splitlines():
+        parts = ln.split("\t")
+        if len(parts) >= 5:
+            staged[parts[0]] = parts[4]
+
+    if not staged:
+        print(f"nothing staged on the hub for {project} — nothing to verify")
+        return 1
+
+    ok, missing, differs = [], [], []
+    for fname, remote_hash in sorted(staged.items()):
+        target = mem_dir / fname
+        if not target.exists():
+            missing.append(fname)
+            continue
+        local_hash = _text_digest(target.read_text(encoding="utf-8"))
+        (ok if local_hash == remote_hash else differs).append(fname)
+
+    local_files = (
+        {p.name for p in mem_dir.glob("*.md")} if mem_dir.is_dir() else set()
+    )
+    extras = sorted(local_files - set(staged))
+
+    for f in missing:
+        print(f"  ✗ missing locally: {f}")
+    for f in differs:
+        print(f"  ✗ differs: {f}")
+    for f in extras:
+        print(f"  · local-only (not staged): {f}")
+    print(
+        f"identical: {len(ok)}/{len(staged)}"
+        + (" ✓" if len(ok) == len(staged) else " ✗")
+        + f", local extras: {len(extras)}  ({mem_dir})"
+    )
+    return 0 if len(ok) == len(staged) else 1
+
+
+def memory_verify_command(args: argparse.Namespace) -> int:
+    resolved = _resolve_for_memory(args)
+    if resolved is None:
+        return 1
+    _name, project, cwd = resolved
+    print(f"verifying local memory against staged set for {project}")
+    return asyncio.run(_memory_verify(args.hub_url, project, cwd))
 
 
 def _resolve_for_memory(args: argparse.Namespace) -> tuple[str, str, str] | None:
@@ -653,7 +748,12 @@ def memory_import_command(args: argparse.Namespace) -> int:
     print(f"importing memory for {project}")
     return asyncio.run(
         _memory_import(
-            args.hub_url, project, cwd, force=args.force, dry_run=args.dry_run
+            args.hub_url,
+            project,
+            cwd,
+            force=args.force,
+            dry_run=args.dry_run,
+            replace_index=args.replace_index,
         )
     )
 
@@ -1400,6 +1500,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show what would be imported without writing anything.",
     )
     mem_import.add_argument(
+        "--replace-index", action="store_true",
+        help=(
+            "Adopt the staged MEMORY.md verbatim instead of merging — the "
+            "reconciliation return-leg (accept the curated canonical index)."
+        ),
+    )
+    mem_import.add_argument(
+        "--hub-url",
+        default=DEFAULT_HUB_URL,
+        help=f"Hub MCP endpoint (default: {DEFAULT_HUB_URL}, or $MCP_HUB_URL)",
+    )
+
+    mem_verify = sub.add_parser(
+        "memory-verify",
+        help="Prove local memory matches the hub's staged set (hash compare)",
+        description=(
+            "Compares every staged file's hash against the local memory dir. "
+            "Exit 0 only when all staged files exist locally with identical "
+            "content — the convergence proof after a sync ceremony. Local "
+            "files not in the staged set are reported as extras."
+        ),
+    )
+    mem_verify.add_argument("--path", default=None, help="Repo path (default: cwd).")
+    mem_verify.add_argument(
         "--hub-url",
         default=DEFAULT_HUB_URL,
         help=f"Hub MCP endpoint (default: {DEFAULT_HUB_URL}, or $MCP_HUB_URL)",
@@ -1459,6 +1583,8 @@ def main(argv: list[str] | None = None) -> int:
         return memory_export_command(args)
     if args.subcommand == "memory-import":
         return memory_import_command(args)
+    if args.subcommand == "memory-verify":
+        return memory_verify_command(args)
 
     parser.print_help()
     return 0

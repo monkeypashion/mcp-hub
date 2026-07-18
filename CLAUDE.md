@@ -115,10 +115,23 @@ mcp-hub memory-import            # --dry-run to preview, --force to overwrite
 ```
 
 - **Filenames preserved verbatim**; files land as real local files in the receiving machine's `~/.claude/projects/<encoded-path>/memory/` — picked up by Claude at its next session in that repo, like any locally-written memory.
-- **`MEMORY.md` (the index) is merged, never clobbered** — staged lines are appended only for files that were actually imported and aren't already indexed locally.
+- **`MEMORY.md` (the index) is merged by default** — staged lines are appended only for files that were actually imported and aren't already indexed locally. `--replace-index` adopts the staged index verbatim (the reconciliation return-leg).
 - **Existing local files are kept** by default (reported as skipped); `--force` overwrites.
 - **Twins are auto-notified**: export DMs every online clone of the project ("run memory-import"), riding the normal wake path.
+- **`mcp-hub memory-verify`** hash-compares local files against the staged set — exit 0 only when identical. The staging area is the convergence witness: N machines all verifying clean against the same staged set proves fleet-wide convergence.
 - The hub is a *staging* store (last-write-wins per project+filename), not the system of record.
+
+**`/memory-sync` skill**: `skills/memory-sync/SKILL.md` packages the whole ceremony for the invoking agent (flush-first, quick vs full modes, twin coordination). Install per machine: copy to `~/.claude/skills/memory-sync/`. Invoking it counts as operator pre-authorization for the twins' import/export actions.
+
+### The sync ceremony (full reconciliation, per project)
+
+1. **Source** (a live session — only the model knows what's unwritten): *flush* — write any unsaved context to memory first, then `mcp-hub memory-export`.
+2. **Canonical machine**: `memory-import` (dry-run first), then **curate** — dedupe topics, reconcile contradictions, retire stale entries. Curation happens exactly once, here.
+3. **Canonical**: `memory-export` (return leg — publishes the curated set).
+4. **Every other clone**: `memory-import --force --replace-index` (accept canonical).
+5. **Everyone**: `memory-verify` → `identical: N/N ✓` on all machines = converged.
+
+**Three or more clones**: same ceremony, star-shaped. Each spoke exports **in turn** with the canonical machine importing between exports (staging is last-write-wins per filename — draining between exports means the curator sees every divergent version instead of only the last). Then one curation, one publish, all spokes force-import + verify. Linear cost, single curation point, no pairwise sync.
 
 ## Stop hook — auto-surface queued messages
 

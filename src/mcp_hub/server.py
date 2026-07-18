@@ -11,6 +11,7 @@ Backed by SQLite for persistence across restarts.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -1588,18 +1589,26 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     @mcp.tool()
     def memory_list(project: str) -> str:
         """List memory files staged for `project` (one per line:
-        `filename\\tsize\\torigin_agent\\tupdated_iso`), or '' if none."""
+        `filename\\tsize\\torigin_agent\\tupdated_iso\\tsha256_16`), or '' if
+        none. The truncated content hash lets clients verify local files
+        against the staged set without downloading them (memory-verify)."""
         conn = _get_db(db_path)
         rows = conn.execute(
-            "SELECT filename, LENGTH(content) AS size, origin_agent, updated_ts "
+            "SELECT filename, content, origin_agent, updated_ts "
             "FROM memory_files WHERE project = ? ORDER BY filename",
             (project,),
         ).fetchall()
-        return "\n".join(
-            f"{r['filename']}\t{r['size']}\t{r['origin_agent']}\t"
-            + time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(r["updated_ts"]))
-            for r in rows
-        )
+        lines = []
+        for r in rows:
+            digest = hashlib.sha256(r["content"].encode("utf-8")).hexdigest()[:16]
+            lines.append(
+                f"{r['filename']}\t{len(r['content'])}\t{r['origin_agent']}\t"
+                + time.strftime(
+                    "%Y-%m-%dT%H:%M:%S", time.localtime(r["updated_ts"])
+                )
+                + f"\t{digest}"
+            )
+        return "\n".join(lines)
 
     @mcp.tool()
     def memory_get(project: str, filename: str) -> str:
@@ -1663,6 +1672,7 @@ _CLI_SUBCOMMANDS = {
     "onboard",
     "memory-export",
     "memory-import",
+    "memory-verify",
 }
 
 
