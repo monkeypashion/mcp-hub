@@ -26,7 +26,34 @@ rows()   { grep -vE '^[[:space:]]*(#|$)' "$CONF" 2>/dev/null || true; }
 agents() { rows | cut -d'|' -f1; }
 field()  { rows | awk -F'|' -v a="$1" -v n="$2" '$1==a {print $n; exit}'; }
 untilde(){ printf '%s\n' "${1/#\~/$HOME}"; }
-require_agent() { [ -n "${1:-}" ] || { echo "usage: $CMD <verb> <agent>"; exit 1; }; field "$1" 1 | grep -qx "$1" || { echo "!! unknown agent '$1' (see $CONF)"; exit 1; }; }
+# Resolve an agent name: an explicit arg always wins; otherwise derive it from
+# $PWD by matching against each agent's worktree — so running a verb from inside
+# a worktree targets that worktree's agent with no name typed. Prints the name
+# on success; returns non-zero (no output) if no arg and $PWD isn't under any
+# worktree. Trailing-slash compare so /foo doesn't match worktree /foobar.
+resolve_agent() {
+  if [ -n "${1:-}" ]; then printf '%s\n' "$1"; return 0; fi
+  local cwd a dir
+  cwd="$(pwd -P 2>/dev/null || printf '%s' "$PWD")"
+  for a in $(agents); do
+    dir="$(untilde "$(field "$a" 2)")"
+    [ -d "$dir" ] && dir="$(cd "$dir" 2>/dev/null && pwd -P)"
+    [ -n "$dir" ] || continue
+    case "$cwd/" in "$dir"/*) printf '%s\n' "$a"; return 0 ;; esac
+  done
+  return 1
+}
+
+# resolve_agent + validate it's a real roster entry. The cwd-default that every
+# agent-taking verb shares flows through here. Errors go to stderr (so command
+# substitution captures only the resolved name); callers use `|| exit 1`.
+need_agent() {
+  local a
+  a="$(resolve_agent "${1:-}")" || {
+    echo "!! no agent given and \$PWD isn't inside any squad worktree — name one (see $CONF)" >&2; return 1; }
+  field "$a" 1 | grep -qxF -- "$a" || { echo "!! unknown agent '$a' (see $CONF)" >&2; return 1; }
+  printf '%s\n' "$a"
+}
 
 # No dedicated "ops" session — the first agent's new-session bootstraps the tmux server (see up_one).
 
@@ -37,6 +64,13 @@ pane_cmd()   { tm display-message -p -t "$1" '#{pane_current_command}' 2>/dev/nu
 pane_alive() { local c; c="$(pane_cmd "$1")"; [ -n "$c" ] && [ "$c" != bash ] && [ "$c" != sh ] && [ "$c" != zsh ]; }
 
 type_line() { local t="$1"; shift; tm send-keys -t "$t" -l "$*"; sleep 0.2; tm send-keys -t "$t" Enter; }
+
+# Per-agent hub state files under ~/.mcp-hub, named with the same sanitisation
+# the daemon uses (non [A-Za-z0-9_-] -> _). status-*.json is the daemon's
+# wakeability snapshot; heartbeat-*.pid is its singleton claim.
+safe_name()    { printf '%s' "$1" | sed 's/[^A-Za-z0-9_-]/_/g'; }
+status_file()  { printf '%s\n' "$HOME/.mcp-hub/status-$(safe_name "$1").json"; }
+pidfile()      { printf '%s\n' "$HOME/.mcp-hub/heartbeat-$(safe_name "$1").pid"; }
 
 up_one() {
   local a="$1" dir ghdir args
@@ -104,7 +138,7 @@ add_agent() {  # squad add <org>/<repo> [name] [project] — clone/pull, create 
     echo "created $marker  (name=$name, project=$proj) — commit it in that repo so the hub identity persists"
   fi
   # enroll in the roster
-  if agents | grep -qx "$name"; then echo "'$name' already in $CONF — roster unchanged"; return 0; fi
+  if agents | grep -qxF -- "$name"; then echo "'$name' already in $CONF — roster unchanged"; return 0; fi
   mkdir -p "$(dirname "$CONF")"
   printf '%s|%s||--dangerously-load-development-channels server:hub\n' "$name" "$dest" >> "$CONF"
   echo "enrolled '$name' -> $dest"
@@ -123,16 +157,46 @@ handoff() {
   fi
 }
 
+# Agent-taking verbs omit the name to mean "the agent for $PWD" (need_agent).
+# For cmd/key/args the first token is the agent ONLY if it's a known roster
+# name (or `all`); otherwise it's treated as payload and the agent is $PWD's.
 case "${1:-help}" in
   up)       for a in $(agents); do up_one "$a"; done ;;
-  restart)  require_agent "${2:-}"; tm kill-session -t "=$2" 2>/dev/null || true; up_one "$2" ;;
-  down)     tm kill-server 2>/dev/null || true ;;
-  cmd)      t="${2:-}"; [ -n "$t" ] || { echo "usage: $CMD cmd <agent|all> \"text\""; exit 1; }; shift 2
-            if [ "$t" = all ]; then for a in $(agents); do type_line "$a" "$@"; done
-            else require_agent "$t"; type_line "$t" "$@"; fi ;;
-  key)      t="${2:-}"; [ -n "$t" ] || { echo "usage: $CMD key <agent> <keys>"; exit 1; }; shift 2; tm send-keys -t "$t" "$@" ;;
-  attach)   a="${2:-}"; [ -n "$a" ] || { echo "usage: $CMD attach <agent>"; exit 1; }
-            require_agent "$a"
+  restart)  a="$(need_agent "${2:-}")" || exit 1; tm kill-session -t "=$a" 2>/dev/null || true; up_one "$a" ;;
+  down)     tm kill-server 2>/dev/null || true
+            # The keep-alive daemons are detached (they outlive tmux), so kill
+            # them explicitly via their pidfiles and clear the stale claim.
+            for a in $(agents); do
+              pf="$(pidfile "$a")"
+              [ -f "$pf" ] && kill "$(cat "$pf" 2>/dev/null)" 2>/dev/null && rm -f "$pf"
+            done ;;
+  heal)     # Redeploy recovery: a hub restart drops every binding, and an idle
+            # agent can't wake to re-register on its own. For each agent that is
+            # UP but whose FRESH daemon snapshot says offline, nudge its session
+            # to re-register. Fresh-only so we never nag on a stale/missing cache;
+            # re-register is idempotent so a spurious nudge is harmless.
+            healed=0
+            for a in $(agents); do
+              tm has-session -t "=$a" 2>/dev/null || continue
+              pane_alive "$a" || continue
+              sf="$(status_file "$a")"
+              [ -n "$(find "$sf" -mmin -3 2>/dev/null)" ] || continue   # snapshot fresh (<3m)?
+              grep -q '"online"[[:space:]]*:[[:space:]]*false' "$sf" 2>/dev/null || continue
+              echo "$a: up but offline on hub — nudging re-register"
+              type_line "$a" "hub: your session shows offline (likely a hub restart dropped bindings). Call register() now to rebind your wake session."
+              healed=$((healed+1))
+            done
+            [ "$healed" = 0 ] && echo "all up agents online — nothing to heal" || true ;;
+  cmd)      if [ "${2:-}" = all ]; then shift 2; for a in $(agents); do type_line "$a" "$@"; done
+            elif [ -n "${2:-}" ] && agents | grep -qxF -- "${2:-}"; then a="$2"; shift 2; type_line "$a" "$@"
+            else a="$(need_agent "")" || exit 1; shift
+                 [ -n "${1:-}" ] || { echo "usage: $CMD cmd [agent|all] \"text\"" >&2; exit 1; }
+                 type_line "$a" "$@"; fi ;;
+  key)      if [ -n "${2:-}" ] && agents | grep -qxF -- "${2:-}"; then t="$2"; shift 2; tm send-keys -t "$t" "$@"
+            else t="$(need_agent "")" || exit 1; shift
+                 [ -n "${1:-}" ] || { echo "usage: $CMD key [agent] <keys>" >&2; exit 1; }
+                 tm send-keys -t "$t" "$@"; fi ;;
+  attach)   a="$(need_agent "${2:-}")" || exit 1
             if ! tm has-session -t "=$a" 2>/dev/null; then
               echo "$a not running — starting it..."; up_one "$a"; sleep 1
             elif ! pane_alive "$a"; then
@@ -150,28 +214,33 @@ case "${1:-help}" in
                 else printf '%-26s DEGRADED  session up, claude not running\n' "$a"; fi
               else printf '%-26s down\n' "$a"; fi
             done ;;
-  args)     require_agent "${2:-}"; a="$2"; shift 2
+  args)     if [ -n "${2:-}" ] && agents | grep -qxF -- "${2:-}"; then a="$2"; shift 2
+            else a="$(need_agent "")" || exit 1; shift; fi
             tmp="$(mktemp)"; awk -F'|' -v a="$a" -v n="$*" 'BEGIN{OFS="|"} $1==a{$4=n} {print}' "$CONF" > "$tmp" && mv "$tmp" "$CONF"
             echo "next launch of $a: $*" ;;
-  handoff)  require_agent "${2:-}"; handoff "$2" ;;
+  handoff)  a="$(need_agent "${2:-}")" || exit 1; handoff "$a" ;;
   add)      add_agent "${2:-}" "${3:-}" "${4:-}" ;;
-  rm)       require_agent "${2:-}"; a="$2"; tm kill-session -t "=$a" 2>/dev/null || true
+  rm)       a="$(need_agent "${2:-}")" || exit 1; tm kill-session -t "=$a" 2>/dev/null || true
             tmp="$(mktemp)"; awk -F'|' -v a="$a" '$1!=a' "$CONF" > "$tmp" && mv "$tmp" "$CONF"
             echo "removed '$a' from $CONF (worktree + marker left in place)" ;;
   pull-local) pull_local "${2:-}" ;;
   *) cat <<EOF
 $CMD up                       start the whole squad (idempotent)
 $CMD down                     stop everything
-$CMD restart <agent>          cycle one agent with its current squad.conf entry
+$CMD restart [agent]          cycle one agent with its current squad.conf entry
 $CMD ls                       squad status (DEGRADED = session up but claude dead)
-$CMD attach <agent>           attach (starts/restarts it if down/degraded); Ctrl-b d detaches
-$CMD cmd <agent|all> "..."    type text + Enter into session(s)   e.g. $CMD cmd all "/compact"
-$CMD key <agent> <keys>       raw tmux send-keys (tmux key names allowed, no Enter appended)
-$CMD args <agent> "..."       set next-launch claude args (col 4 of squad.conf)
-$CMD handoff <agent>          commit WIP to wip/<agent>-<date> + push (before switching machines)
+$CMD heal                     nudge UP-but-offline agents to re-register (post hub-redeploy recovery)
+$CMD attach [agent]           attach (starts/restarts it if down/degraded); Ctrl-b d detaches
+$CMD cmd [agent|all] "..."    type text + Enter into session(s)   e.g. $CMD cmd all "/compact"
+$CMD key [agent] <keys>       raw tmux send-keys (tmux key names allowed, no Enter appended)
+$CMD args [agent] "..."       set next-launch claude args (col 4 of squad.conf)
+$CMD handoff [agent]          commit WIP to wip/<agent>-<date> + push (before switching machines)
 $CMD add <org>/<repo> [name] [project]   clone/pull + create hub marker + enroll (name/project default to repo name)
-$CMD rm <agent>               unenroll: kill session + remove from squad.conf (keeps the repo + marker)
+$CMD rm [agent]               unenroll: kill session + remove from squad.conf (keeps the repo + marker)
 $CMD pull-local <org>/<repo>  clone/pull into the correct account folder (org derives the alias)
+
+[agent] defaults to the agent whose worktree is your current directory ($PWD),
+so from inside a repo you can just: $CMD attach   /   $CMD restart   /   $CMD cmd "/compact"
 
 config: $CONF
 format: agent | worktree | gh_config_dir (may be empty) | claude_args

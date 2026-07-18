@@ -19,13 +19,22 @@ cp squad/squad.conf.example ~/.config/squad/squad.conf   # then edit the roster
 ```bash
 squad up                    # start the whole squad
 squad ls                    # status (DEGRADED = tmux session up but claude died)
-squad attach <agent>        # attach (starts/restarts if down/degraded); Ctrl-b d to detach; agent keeps running
+squad attach [agent]        # attach (starts/restarts if down/degraded); Ctrl-b d to detach; agent keeps running
 squad cmd all "/compact"    # inject a slash-command into every agent
-squad cmd <agent> "carry on"
-squad restart <agent>
-squad rm <agent>            # unenroll: kill session + remove from roster (keeps the repo + marker)
-squad down                  # stop the whole squad (kills the tmux server)
+squad cmd [agent] "carry on"
+squad restart [agent]
+squad rm [agent]            # unenroll: kill session + remove from roster (keeps the repo + marker)
+squad heal                  # nudge UP-but-offline agents to re-register (post hub-redeploy recovery)
+squad down                  # stop the whole squad (kills the tmux server + keep-alive daemons)
 ```
+
+**`[agent]` defaults to your current directory.** Any verb that targets one agent
+(`attach`, `restart`, `cmd`, `key`, `args`, `handoff`, `rm`) derives the agent from
+`$PWD` when you omit the name — so from inside a repo you just run `squad attach`,
+`squad restart`, or `squad cmd "/compact"`. For `cmd`/`key`/`args` the first token is
+treated as the agent only if it's a known roster name (or `all`); otherwise it's the
+payload and the agent is `$PWD`'s. Run one of these outside every worktree and squad
+tells you to name an agent explicitly.
 
 ## Adding an agent
 
