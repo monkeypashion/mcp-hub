@@ -121,7 +121,15 @@ mcp-hub memory-import            # --dry-run to preview, --force to overwrite
 - **`mcp-hub memory-verify`** hash-compares local files against the staged set — exit 0 only when identical. The staging area is the convergence witness: N machines all verifying clean against the same staged set proves fleet-wide convergence.
 - The hub is a *staging* store (last-write-wins per project+filename), not the system of record.
 
-**`/memory-sync` skill**: `skills/memory-sync/SKILL.md` packages the whole ceremony for the invoking agent (flush-first, quick vs full modes, twin coordination). Install per machine: copy to `~/.claude/skills/memory-sync/`. Invoking it counts as operator pre-authorization for the twins' import/export actions.
+**`/memory-sync` skill**: `skills/memory-sync/SKILL.md` packages the whole ceremony for the invoking agent (flush-first, quick vs full modes, twin coordination). Invoking it counts as operator pre-authorization for the twins' import/export actions.
+
+**Install per machine as a LINK, never a copy** (the repo is the single version; `git pull` updates every machine — no drift). User-scope, so `/memory-sync` is available in every project on the box:
+```bash
+# Linux
+ln -sfn ~/SoftwareProjects/monkeypashion/mcp-hub/skills/memory-sync ~/.claude/skills/memory-sync
+# Windows (no admin needed — directory junction)
+mklink /J %USERPROFILE%\.claude\skills\memory-sync D:\SoftwareProjects\monkeypashion\mcp-hub\skills\memory-sync
+```
 
 ### The sync ceremony (full reconciliation, per project)
 
