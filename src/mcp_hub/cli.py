@@ -36,7 +36,11 @@ import sys
 import time
 from typing import Any
 
-DEFAULT_HUB_URL = os.environ.get("MCP_HUB_URL", "https://mcp.monkeypashion.co.uk/mcp")
+# Fallback is the Tailscale-only prod endpoint — the public FQDN was
+# deliberately cut 2026-05-29 (a domain 404 is correct, not an outage), but
+# this default still pointed at it, so a fresh machine without MCP_HUB_URL
+# would aim at a dead endpoint. Every fleet machine is on the tailnet.
+DEFAULT_HUB_URL = os.environ.get("MCP_HUB_URL", "http://100.109.6.114:8090/mcp")
 
 # Marker file each project uses to declare its agent identity to the hub. Lets
 # a single global Stop hook (in ~/.claude/settings.json) work across the whole
@@ -572,9 +576,11 @@ async def _memory_import(
 
             imported: list[str] = []
             skipped: list[str] = []
+            identical = 0
             staged_index: str | None = None
             for parts in entries:
                 fname = parts[0]
+                staged_hash = parts[4] if len(parts) >= 5 else None
                 if not _is_safe_memory_filename(fname):
                     skipped.append(f"{fname} (unsafe name)")
                     continue
@@ -585,7 +591,15 @@ async def _memory_import(
                     continue  # merged below, never bulk-written
                 target = mem_dir / fname
                 if target.exists() and not force:
-                    skipped.append(f"{fname} (exists locally; --force to overwrite)")
+                    # Distinguish a harmless already-in-sync skip from a real
+                    # divergence — "40 skipped" on a clean re-sync used to
+                    # read as alarming when everything actually matched.
+                    if staged_hash is not None and _text_digest(
+                        target.read_text(encoding="utf-8")
+                    ) == staged_hash:
+                        identical += 1
+                    else:
+                        skipped.append(f"{fname} (DIFFERS from local; --force to overwrite)")
                     continue
                 if dry_run:
                     imported.append(f"{fname} (dry-run)")
@@ -633,9 +647,9 @@ async def _memory_import(
         else f"MEMORY.md lines merged: {merged_lines}"
     )
     print(
-        f"{'DRY RUN — ' if dry_run else ''}imported {len(imported)}, "
-        f"skipped {len(skipped)}, {index_note} "
-        f"({mem_dir})"
+        f"{'DRY RUN — ' if dry_run else ''}new: {len(imported)}, "
+        f"identical: {identical}, differs/skipped: {len(skipped)}, "
+        f"{index_note} ({mem_dir})"
     )
     if imported and not dry_run:
         print("imported memories are live from the next Claude session in this repo")

@@ -1292,3 +1292,66 @@ async def test_create_channel_idempotent_for_existing(server):
         {"name": "deploys", "created_by": "bob"},
     )
     assert "already exists" in out.lower()
+
+
+# ---------------------------------------------------------------------------
+# touch_session capability gate — the wake-clobber fix (2026-07-18)
+#
+# is_channel_capable existed with a docstring describing exactly this failure
+# but was never wired into touch_session: any send/post/broadcast from an
+# ephemeral CLI session (memory-export's twin-notify being the everyday case)
+# re-pointed the CALLER's wake binding at a session that dies with the
+# process. Observed live: exporter goes ✖ REBIND ~3 min after every export.
+# ---------------------------------------------------------------------------
+
+
+class _GateCtx:
+    """Minimal stand-in for FastMCP's Context — touch_session only reads
+    .session."""
+
+    def __init__(self, session):
+        self.session = session
+
+
+def _capable_session():
+    return _FakeSessionWithParams(_FakeParams(_FakeCaps({"claude/channel": {}})))
+
+
+def _ephemeral_session():
+    """Shaped like a bare streamablehttp_client: no claude/channel."""
+    return _FakeSessionWithParams(_FakeParams(_FakeCaps({})))
+
+
+async def test_send_from_ephemeral_session_does_not_clobber_binding(server):
+    """The exporter's own notify-send must not steal its wake binding."""
+    registry = server._hub_registry
+    await _call_tool(server, "register", {"name": "alice", "project": "p"})
+    await _call_tool(server, "register", {"name": "bob", "project": "p"})
+    live = _capable_session()
+    registry.bind("alice", live)
+
+    # alice sends via an EPHEMERAL session (CLI) — like memory-export's notify
+    await server._tool_manager.call_tool(
+        "send",
+        {"from_agent": "alice", "to": "bob", "message": "hi"},
+        context=_GateCtx(_ephemeral_session()),
+    )
+    assert registry.get("alice") is live  # binding untouched
+
+
+async def test_send_from_capable_session_still_self_heals_binding(server):
+    """The drift self-heal must survive the gate: a REAL interactive session
+    calling send still refreshes/repoints the binding."""
+    registry = server._hub_registry
+    await _call_tool(server, "register", {"name": "alice", "project": "p"})
+    await _call_tool(server, "register", {"name": "bob", "project": "p"})
+    old = _capable_session()
+    registry.bind("alice", old)
+
+    new_live = _capable_session()
+    await server._tool_manager.call_tool(
+        "send",
+        {"from_agent": "alice", "to": "bob", "message": "hi"},
+        context=_GateCtx(new_live),
+    )
+    assert registry.get("alice") is new_live  # rebound to current session

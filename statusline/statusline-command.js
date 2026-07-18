@@ -126,7 +126,7 @@ process.stdin.on('end', () => {
       } else if (!st.online) {
         hubSeg = paint('hub ✖ REGISTER', C.bold, C.red);
       } else if (!st.wakeable) {
-        hubSeg = paint(`hub ✖ RELAUNCH ${fleet}`, C.bold, C.red);
+        hubSeg = paint(`hub ✖ REBIND ${fleet}`, C.bold, C.red);
       } else {
         hubSeg = paint(`⚡ ${fleet}`, C.green);
       }

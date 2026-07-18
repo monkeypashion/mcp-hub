@@ -72,9 +72,27 @@ safe_name()    { printf '%s' "$1" | sed 's/[^A-Za-z0-9_-]/_/g'; }
 status_file()  { printf '%s\n' "$HOME/.mcp-hub/status-$(safe_name "$1").json"; }
 pidfile()      { printf '%s\n' "$HOME/.mcp-hub/heartbeat-$(safe_name "$1").pid"; }
 
+# Type the launch sequence (GH env + claude + channels confirm-dance) into an
+# agent's existing pane. Shared by up_one (fresh session) and restart (respawn
+# in place).
+launch_agent_cmd() {
+  local a="$1" ghdir args
+  ghdir="$(untilde "$(field "$a" 3)")"; args="$(field "$a" 4)"
+  [ -n "$ghdir" ] && type_line "$a" "export GH_CONFIG_DIR=\"$ghdir\""
+  type_line "$a" "claude $args"
+  echo "started $a  ($args)"
+  # --dangerously-load-development-channels pops a confirm prompt on launch; auto-accept it
+  # (server:hub is your own hub = the "local development" case; option 1 is the default → Enter).
+  case "$args" in *dangerously-load-development-channels*)
+    for _ in $(seq 1 10); do sleep 1
+      tm capture-pane -t "$a" -p 2>/dev/null | grep -qi 'channel development' && { tm send-keys -t "$a" Enter; break; }
+    done ;;
+  esac
+}
+
 up_one() {
-  local a="$1" dir ghdir args
-  dir="$(untilde "$(field "$a" 2)")"; ghdir="$(untilde "$(field "$a" 3)")"; args="$(field "$a" 4)"
+  local a="$1" dir
+  dir="$(untilde "$(field "$a" 2)")"
   [ -d "$dir" ] || { echo "!! $a: missing worktree $dir"; return 1; }
   if tm has-session -t "=$a" 2>/dev/null; then
     if pane_alive "$a"; then echo "$a already up"
@@ -87,16 +105,7 @@ up_one() {
   else
     tm new-session -d -s "$a" -c "$dir"
   fi
-  [ -n "$ghdir" ] && type_line "$a" "export GH_CONFIG_DIR=\"$ghdir\""
-  type_line "$a" "claude $args"
-  echo "started $a  ($args)"
-  # --dangerously-load-development-channels pops a confirm prompt on launch; auto-accept it
-  # (server:hub is your own hub = the "local development" case; option 1 is the default → Enter).
-  case "$args" in *dangerously-load-development-channels*)
-    for _ in $(seq 1 10); do sleep 1
-      tm capture-pane -t "$a" -p 2>/dev/null | grep -qi 'channel development' && { tm send-keys -t "$a" Enter; break; }
-    done ;;
-  esac
+  launch_agent_cmd "$a"
 }
 
 org_alias() {
@@ -228,7 +237,17 @@ handoff() {
 # name (or `all`); otherwise it's treated as payload and the agent is $PWD's.
 case "${1:-help}" in
   up)       for a in $(agents); do up_one "$a"; done ;;
-  restart)  a="$(need_agent "${2:-}")" || exit 1; tm kill-session -t "=$a" 2>/dev/null || true; up_one "$a" ;;
+  restart)  a="$(need_agent "${2:-}")" || exit 1
+            if tm has-session -t "=$a" 2>/dev/null; then
+              # Respawn IN PLACE: kills the pane's process and gives it a fresh
+              # shell, but the session survives — attached viewers keep watching
+              # instead of being dumped to their own shell mid-restart.
+              tm respawn-pane -k -t "$a"
+              sleep 0.5
+              launch_agent_cmd "$a"
+            else
+              up_one "$a"
+            fi ;;
   down)     tm kill-server 2>/dev/null || true
             # The keep-alive daemons are detached (they outlive tmux), so kill
             # them explicitly via their pidfiles and clear the stale claim.

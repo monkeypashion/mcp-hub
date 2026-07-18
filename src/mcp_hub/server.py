@@ -473,6 +473,18 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         """
         if ctx is None or not name:
             return
+        # THE GATE (wired 2026-07-18, corroborated by both clones): only
+        # sessions advertising claude/channel may bind. An ephemeral utility
+        # client (memory-export's twin-notify, any CLI calling send/post/
+        # broadcast as an agent) would otherwise re-point the agent's wake
+        # target at a session that dies when the process exits — the exact
+        # failure is_channel_capable's docstring was written for, previously
+        # only defended piecemeal via bind=False on the get_* paths. A
+        # non-capable session also must NOT clear is_idle: a CLI call is not
+        # the agent's interactive turn.
+        if not is_channel_capable(ctx.session):
+            _log_bind_diagnostic("touch_session-skipped", name, ctx.session)
+            return
         conn = _get_db(db_path)
         row = conn.execute(
             "SELECT 1 FROM agents WHERE name = ?", (name,)
