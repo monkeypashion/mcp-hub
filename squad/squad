@@ -255,23 +255,38 @@ case "${1:-help}" in
               pf="$(pidfile "$a")"
               [ -f "$pf" ] && kill "$(cat "$pf" 2>/dev/null)" 2>/dev/null && rm -f "$pf"
             done ;;
-  heal)     # Redeploy recovery: a hub restart drops every binding, and an idle
-            # agent can't wake to re-register on its own. For each agent that is
-            # UP but whose FRESH daemon snapshot says offline, nudge its session
-            # to re-register. Fresh-only so we never nag on a stale/missing cache;
-            # re-register is idempotent so a spurious nudge is harmless.
+  heal)     # Recovery for agents that are UP in tmux but broken on the hub:
+            #   offline     -> binding lost (redeploy/reconnect): nudge register()
+            #   unwakeable  -> online but wake-stream dead: nudge, and if STILL
+            #                  bad on the next heal pass (flag file <10m) AND the
+            #                  agent launches with --continue (restart preserves
+            #                  its conversation), RESTART it in place.
+            # Fresh snapshots only (<3m) so a stale/missing cache never triggers.
             healed=0
             for a in $(agents); do
               tm has-session -t "=$a" 2>/dev/null || continue
               pane_alive "$a" || continue
               sf="$(status_file "$a")"
+              flag="$HOME/.mcp-hub/heal-flag-$(safe_name "$a")"
               [ -n "$(find "$sf" -mmin -3 2>/dev/null)" ] || continue   # snapshot fresh (<3m)?
-              grep -q '"online"[[:space:]]*:[[:space:]]*false' "$sf" 2>/dev/null || continue
-              echo "$a: up but offline on hub — nudging re-register"
-              type_line "$a" "hub: your session shows offline (likely a hub restart dropped bindings). Call register() now to rebind your wake session."
+              state=""
+              if grep -q '"online"[[:space:]]*:[[:space:]]*false' "$sf" 2>/dev/null; then state="offline"
+              elif grep -q '"wakeable"[[:space:]]*:[[:space:]]*false' "$sf" 2>/dev/null; then state="unwakeable"
+              fi
+              if [ -z "$state" ]; then rm -f "$flag"; continue; fi   # healthy — clear strikes
+              args="$(field "$a" 4)"
+              if [ -n "$(find "$flag" -mmin -10 2>/dev/null)" ] && [[ "$args" == *--continue* ]]; then
+                echo "$a: STILL $state after a nudge — restarting in place (--continue keeps context)"
+                tm respawn-pane -k -t "$a"; sleep 0.5; launch_agent_cmd "$a"
+                rm -f "$flag"
+              else
+                echo "$a: $state on hub — nudging re-register"
+                type_line "$a" "hub: your session shows $state. Call register() now to rebind. If this recurs, your wake-stream is dead — re-register won't fix it; a relaunch will (squad restart resumes your conversation)."
+                touch "$flag"
+              fi
               healed=$((healed+1))
             done
-            [ "$healed" = 0 ] && echo "all up agents online — nothing to heal" || true ;;
+            [ "$healed" = 0 ] && echo "all up agents healthy — nothing to heal" || true ;;
   cmd)      if [ "${2:-}" = all ]; then shift 2; for a in $(agents); do type_line "$a" "$@"; done
             elif [ -n "${2:-}" ] && agents | grep -qxF -- "${2:-}"; then a="$2"; shift 2; type_line "$a" "$@"
             else a="$(need_agent "")" || exit 1; shift

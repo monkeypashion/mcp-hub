@@ -1,0 +1,6 @@
+[Unit]
+Description=squad heal — nudge/restart hub agents that are up but offline/unwakeable
+
+[Service]
+Type=oneshot
+ExecStart=%h/SoftwareProjects/monkeypashion/mcp-hub/squad/squad heal

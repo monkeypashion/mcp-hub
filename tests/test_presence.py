@@ -333,3 +333,47 @@ def test_reaper_callback_survives_db_error(tmp_path: Path):
     survived = registry._check_one("ghost")
     assert survived is False
     assert "ghost" not in registry
+
+
+async def test_wake_dead_drop_marks_offline_and_queues_guidance(tmp_path: Path):
+    """Wake-ack end to end at the server: pushed wake + no activity → strikes
+    → binding dropped, agent truthfully offline, and a 'hub' guidance DM
+    queued telling them re-register won't revive a dead stream."""
+    import time as _t
+
+    server = create_server(db_path=tmp_path / "t.db")
+    registry = server._hub_registry  # type: ignore[attr-defined]
+    registry.WAKE_ACK_TIMEOUT_SECONDS = 0.01
+
+    await _call_tool(server, "register", {"name": "alice", "project": "x"})
+    registry.bind("alice", _FakeSess())
+
+    for _ in range(2):
+        registry.expect_wake_ack("alice")
+        with registry._lock:
+            registry._wake_expect["alice"] = _t.time() - 1.0
+        registry.sweep_wake_acks()
+
+    assert not registry.is_bound("alice")
+    out = await _call_tool(server, "list_agents", {})
+    assert "alice" not in out  # truthfully offline
+
+    inbox = await _call_tool(server, "get_messages", {"agent_name": "alice"})
+    assert "hub" in inbox and "RELAUNCH" in inbox
+    assert "re-register" in inbox.lower() or "register()" in inbox
+
+
+async def test_get_messages_acks_pending_wake_expectation(tmp_path: Path):
+    """A Stop-hook style drain (bind=False) still counts as the wake-ack."""
+    server = create_server(db_path=tmp_path / "t.db")
+    registry = server._hub_registry  # type: ignore[attr-defined]
+
+    await _call_tool(server, "register", {"name": "alice", "project": "x"})
+    registry.bind("alice", _FakeSess())
+    registry.expect_wake_ack("alice")
+
+    await _call_tool(
+        server, "get_messages", {"agent_name": "alice", "bind": False}
+    )
+    with registry._lock:
+        assert "alice" not in registry._wake_expect

@@ -416,8 +416,44 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     # time. The reaper uses it to spare still-deliverable idle bindings from
     # the activity-timeout drop (a `--channels` session's live connection is
     # its own heartbeat — no daemon needed).
+    def _on_wake_dead(name: str) -> None:
+        """Wake-ack callback: the agent's stream is presumed dead (pushed
+        wakes produced zero activity). The binding is already dropped and
+        on_reap marked them offline; queue guidance so their next Stop-hook
+        pull tells them the RIGHT recovery — a plain re-register rebinds but
+        cannot revive a dead stream."""
+        try:
+            conn = _get_db(db_path)
+            conn.execute(
+                "INSERT INTO messages (ts, from_agent, to_agent, body, priority) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    time.time(),
+                    "hub",
+                    name,
+                    (
+                        "⚠️ Wake-stream check: the hub pushed wakes to your "
+                        "session and saw no activity — your wake-receive "
+                        "stream appears DEAD even though your binding was "
+                        "live. Your binding has been dropped (you'll show "
+                        "offline). A plain register() will rebind you but "
+                        "may NOT revive the stream: if you go unwakeable "
+                        "again without a hub redeploy, RELAUNCH your Claude "
+                        "session (with --continue to keep context; on squad "
+                        "hosts: squad restart <you>). Rule: re-register "
+                        "fixes a stale binding; only relaunch fixes a dead "
+                        "stream."
+                    ),
+                    "normal",
+                ),
+            )
+            conn.commit()
+        except Exception:  # noqa: BLE001
+            logger.exception("wake-dead guidance DM for %s failed", name)
+
     registry = SessionRegistry(
         on_reap=_mark_offline_on_reap,
+        on_wake_dead=_on_wake_dead,
         liveness_probe=lambda session: _can_deliver_push(session),
     )
     # Exposed for main() so it can spawn the reaper alongside the server.
@@ -570,10 +606,17 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 agent,
             )
             return False
-        return await registry.push(
+        pushed = await registry.push(
             agent,
             _ChannelNotification(params={"content": content, "meta": meta}),
         )
+        if pushed:
+            # Arm the wake-ack expectation: a delivered wake must produce
+            # SOME agent activity (bind or message drain) within the ack
+            # window, else the stream is presumed dead behind the live
+            # binding — the one state transport introspection can't see.
+            registry.expect_wake_ack(agent)
+        return pushed
 
     # -- Presence --
 
@@ -1296,6 +1339,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         now = time.time()
         conn = _get_db(db_path)
 
+        # Draining messages is a wake-ack regardless of bind: the agent's
+        # process is demonstrably alive and reading — even the Stop hook's
+        # bind=False pull proves the wake pipeline's PURPOSE (delivery) was
+        # served. Without this, an agent that answers a wake using only
+        # non-hub tools would be falsely struck when its Stop hook fires.
+        registry.wake_ack(agent_name)
+
         # Auto-bind caller's session for drift self-heal.
         if bind:
             touch_session(agent_name, ctx)
@@ -1396,6 +1446,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                   target. See note on get_messages for full rationale.
         """
         conn = _get_db(db_path)
+        # Broadcast drain is a wake-ack too — same rationale as get_messages.
+        registry.wake_ack(agent_name)
         row = conn.execute(
             "SELECT last_broadcast_seen_id FROM agents WHERE name = ?",
             (agent_name,),

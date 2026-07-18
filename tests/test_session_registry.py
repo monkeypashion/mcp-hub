@@ -753,3 +753,111 @@ def test_heartbeat_touch_probe_exception_counts_as_undeliverable():
     assert reg.heartbeat_touch("alice") == "undeliverable"
     assert reg.heartbeat_touch("alice") == "dropped"
     assert reaped == ["alice"]
+
+
+# ---------------------------------------------------------------------------
+# Wake-ack expectation — dead-stream detection (the last lying-⚡ mode)
+#
+# A client whose SSE stream is half-dead accepts pushes but renders nothing:
+# binding fresh, deliverability probe green, ⚡ lit, wakes vanishing. The
+# server can't introspect the far end, so it demands evidence it CAN see:
+# a pushed wake must be followed by agent activity (bind or message drain)
+# within WAKE_ACK_TIMEOUT_SECONDS; WAKE_STRIKES_TO_DROP consecutive unacked
+# wakes drop the binding (on_reap → truthful offline) and fire on_wake_dead
+# (server queues relaunch guidance).
+# ---------------------------------------------------------------------------
+
+
+def _ack_registry(reaped: list, wake_dead: list) -> SessionRegistry:
+    reg = SessionRegistry(
+        on_reap=reaped.append, on_wake_dead=wake_dead.append
+    )
+    reg.WAKE_ACK_TIMEOUT_SECONDS = 0.01  # expire instantly for tests
+    return reg
+
+
+def _expire(reg, name):
+    """Force the pending expectation past its deadline."""
+    import time as _t
+
+    with reg._lock:
+        if name in reg._wake_expect:
+            reg._wake_expect[name] = _t.time() - 1.0
+
+
+def test_wake_ack_two_unacked_wakes_drop_binding():
+    reaped, wake_dead = [], []
+    reg = _ack_registry(reaped, wake_dead)
+    reg.bind("alice", FakeSession())
+
+    reg.expect_wake_ack("alice")
+    _expire(reg, "alice")
+    assert reg.sweep_wake_acks() == []  # strike 1 — binding survives
+    assert reg.is_bound("alice")
+
+    reg.expect_wake_ack("alice")
+    _expire(reg, "alice")
+    assert reg.sweep_wake_acks() == ["alice"]  # strike 2 — dropped
+    assert not reg.is_bound("alice")
+    assert reaped == ["alice"]
+    assert wake_dead == ["alice"]
+
+
+def test_wake_ack_drain_clears_expectation_and_strikes():
+    """get_messages-style ack resets everything — even after a strike."""
+    reaped, wake_dead = [], []
+    reg = _ack_registry(reaped, wake_dead)
+    reg.bind("alice", FakeSession())
+
+    reg.expect_wake_ack("alice")
+    _expire(reg, "alice")
+    reg.sweep_wake_acks()  # strike 1
+    reg.wake_ack("alice")  # agent drained its inbox
+
+    reg.expect_wake_ack("alice")
+    _expire(reg, "alice")
+    assert reg.sweep_wake_acks() == []  # back to strike 1, not 2
+    assert reg.is_bound("alice")
+    assert wake_dead == []
+
+
+def test_wake_ack_bind_is_an_ack():
+    """Any interactive tool call (bind, incl. same-session refresh) acks."""
+    reaped, wake_dead = [], []
+    reg = _ack_registry(reaped, wake_dead)
+    s = FakeSession()
+    reg.bind("alice", s)
+
+    reg.expect_wake_ack("alice")
+    reg.bind("alice", s)  # same-session touch — the common turn pattern
+    _expire(reg, "alice")  # no pending expectation left to expire
+    assert reg.sweep_wake_acks() == []
+    with reg._lock:
+        assert "alice" not in reg._wake_strikes
+
+
+def test_wake_ack_unbound_noop_and_no_stacking():
+    reaped, wake_dead = [], []
+    reg = _ack_registry(reaped, wake_dead)
+    reg.expect_wake_ack("nobody")  # unbound — no-op
+    assert reg.sweep_wake_acks() == []
+
+    reg.bind("alice", FakeSession())
+    reg.expect_wake_ack("alice")
+    with reg._lock:
+        first_deadline = reg._wake_expect["alice"]
+    reg.expect_wake_ack("alice")  # burst of wakes — deadline must not reset
+    with reg._lock:
+        assert reg._wake_expect["alice"] == first_deadline
+
+
+def test_wake_ack_timely_ack_before_sweep_is_clean():
+    """The healthy path: wake pushed, agent acts within the window."""
+    reaped, wake_dead = [], []
+    reg = _ack_registry(reaped, wake_dead)
+    reg.WAKE_ACK_TIMEOUT_SECONDS = 60.0  # generous — not expiring in-test
+    reg.bind("alice", FakeSession())
+    reg.expect_wake_ack("alice")
+    reg.wake_ack("alice")
+    assert reg.sweep_wake_acks() == []
+    assert reg.is_bound("alice")

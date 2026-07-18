@@ -167,10 +167,23 @@ class SessionRegistry:
     # without persisting truly-abandoned bindings.
     ACTIVITY_TIMEOUT_SECONDS: float = 3600.0  # 60 minutes
 
+    # Wake-ack expectation: after the hub pushes a wake, the woken agent
+    # always produces SOME observable activity (a tool call that binds, or
+    # at minimum its Stop-hook draining messages). A client whose SSE stream
+    # is half-dead accepts the push but renders nothing — binding fresh,
+    # deliverability probe green, ⚡ lying. The server can't introspect the
+    # far end, so it uses evidence it CAN see: no ack within the timeout is
+    # a strike; WAKE_STRIKES_TO_DROP consecutive unacked wakes drop the
+    # binding through the reaper path (truthful offline → Stop-hook nag),
+    # and on_wake_dead lets the server queue relaunch guidance.
+    WAKE_ACK_TIMEOUT_SECONDS: float = 90.0
+    WAKE_STRIKES_TO_DROP: int = 2
+
     def __init__(
         self,
         on_reap: Callable[[str], None] | None = None,
         liveness_probe: Callable[[ServerSession], bool] | None = None,
+        on_wake_dead: Callable[[str], None] | None = None,
     ) -> None:
         self._lock = threading.Lock()
         # Optional callback invoked (outside the lock) when the reaper drops a
@@ -202,6 +215,14 @@ class SessionRegistry:
         # Consecutive undeliverable heartbeats per name (see heartbeat_touch).
         # Reset by any successful probe or a fresh bind.
         self._undeliverable_beats: dict[str, int] = {}
+        # Wake-ack tracking: name -> ack deadline for the most recent pushed
+        # wake, and consecutive unacked-wake strikes. Cleared by bind() or an
+        # explicit wake_ack() (message drain); NOT by daemon heartbeats — the
+        # daemon proves the process lives, not that the human-facing session
+        # heard anything.
+        self._on_wake_dead = on_wake_dead
+        self._wake_expect: dict[str, float] = {}
+        self._wake_strikes: dict[str, int] = {}
 
         _ensure_aexit_patched()
         # Note: we do NOT auto-subscribe `_on_session_close` to the global
@@ -234,8 +255,12 @@ class SessionRegistry:
         with self._lock:
             old = self._by_name.get(name)
             if old is session:
-                # Same session — refresh activity, don't touch indexes
+                # Same session — refresh activity, don't touch indexes.
+                # Still counts as a wake-ack: the agent's interactive
+                # session made a tool call.
                 self._last_activity[name] = now
+                self._wake_expect.pop(name, None)
+                self._wake_strikes.pop(name, None)
                 return
             if old is not None:
                 old_id = id(old)
@@ -248,8 +273,11 @@ class SessionRegistry:
             self._by_name[name] = session
             self._by_session_id.setdefault(id(session), set()).add(name)
             self._last_activity[name] = now
-            # A fresh binding starts with a clean undeliverable-beat slate.
+            # A fresh binding starts with a clean undeliverable-beat slate,
+            # and any interactive bind is also a wake-ack (the agent acted).
             self._undeliverable_beats.pop(name, None)
+            self._wake_expect.pop(name, None)
+            self._wake_strikes.pop(name, None)
 
     def unbind_name(self, name: str) -> None:
         """Drop binding for `name` (if any). Idempotent."""
@@ -375,6 +403,8 @@ class SessionRegistry:
         # Drop activity timestamp — a future re-bind starts fresh.
         self._last_activity.pop(name, None)
         self._undeliverable_beats.pop(name, None)
+        self._wake_expect.pop(name, None)
+        self._wake_strikes.pop(name, None)
         if session is None:
             return
         sid = id(session)
@@ -482,6 +512,69 @@ class SessionRegistry:
             )
             return False
 
+    # -- wake-ack expectation (dead-stream detection) -------------------------
+
+    def expect_wake_ack(self, name: str) -> None:
+        """Arm an ack expectation after a wake was pushed to `name`.
+
+        No-op if unbound or an expectation is already pending (a burst of
+        wakes shouldn't stack deadlines — one outstanding expectation at a
+        time is enough evidence)."""
+        with self._lock:
+            if name not in self._by_name or name in self._wake_expect:
+                return
+            self._wake_expect[name] = time.time() + self.WAKE_ACK_TIMEOUT_SECONDS
+
+    def wake_ack(self, name: str) -> None:
+        """Record evidence the agent's session is alive and hearing us —
+        called on message drain (get_messages / get_broadcasts_for_agent,
+        regardless of bind flag) in addition to bind()'s implicit ack."""
+        with self._lock:
+            self._wake_expect.pop(name, None)
+            self._wake_strikes.pop(name, None)
+
+    def sweep_wake_acks(self) -> list[str]:
+        """Expire overdue expectations; drop bindings past the strike limit.
+
+        Returns the names dropped this sweep (already unbound; on_reap and
+        on_wake_dead fired for each — outside the lock, same contract as the
+        reaper). Run from the reaper loop every REAPER_INTERVAL_SECONDS."""
+        now = time.time()
+        dropped: list[str] = []
+        with self._lock:
+            for name, deadline in list(self._wake_expect.items()):
+                if now < deadline:
+                    continue
+                del self._wake_expect[name]
+                strikes = self._wake_strikes.get(name, 0) + 1
+                if strikes >= self.WAKE_STRIKES_TO_DROP and name in self._by_name:
+                    logger.info(
+                        "wake-ack: dropping %s after %d unacked wakes "
+                        "(stream presumed dead behind live binding)",
+                        name, strikes,
+                    )
+                    self._unbind_name_locked(name)
+                    dropped.append(name)
+                else:
+                    self._wake_strikes[name] = strikes
+                    logger.info(
+                        "wake-ack: %s missed ack (strike %d/%d)",
+                        name, strikes, self.WAKE_STRIKES_TO_DROP,
+                    )
+        for name in dropped:
+            for cb, label in ((self._on_reap, "on_reap"),
+                              (self._on_wake_dead, "on_wake_dead")):
+                if cb is None:
+                    continue
+                try:
+                    cb(name)
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "wake-ack: %s(%s) callback raised; continuing",
+                        label, name,
+                    )
+        return dropped
+
     # -- background reaper ---------------------------------------------------
 
     def _check_one(self, name: str) -> bool:
@@ -582,6 +675,10 @@ class SessionRegistry:
         try:
             while True:
                 await anyio.sleep(self.REAPER_INTERVAL_SECONDS)
+                try:
+                    self.sweep_wake_acks()
+                except Exception:  # noqa: BLE001
+                    logger.exception("reaper: wake-ack sweep raised; continuing")
                 for name in self.names():
                     try:
                         self._check_one(name)
