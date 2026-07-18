@@ -56,7 +56,7 @@ Or for stdio (single session):
 **Other**
 - `get_history(agent_or_channel)` — full history (use `#general` for the broadcast feed)
 - `ping(from_agent)` — interactive heartbeat (refreshes binding via touch_session)
-- `heartbeat(agent_name)` — out-of-session liveness signal from the heartbeat-daemon. Refreshes `_last_activity` for an existing binding without rebinding (does NOT clobber wake target). No-op if agent is unbound.
+- `heartbeat(agent_name)` — out-of-session liveness signal from the heartbeat-daemon. Refreshes `_last_activity` for an existing binding without rebinding (does NOT clobber wake target). No-op if agent is unbound. **Deliverability-verified**: a binding whose session is no longer push-deliverable (stale after a client reconnect) is NOT refreshed, and after 3 consecutive undeliverable beats it's dropped — the agent goes truthfully offline and the Stop-hook nag drives re-register. Heartbeats must never keep a dead binding warm.
 - `hub_status()` — stats
 
 When in doubt: `send` for one agent, `post` for a topic, `broadcast` for the whole fleet.

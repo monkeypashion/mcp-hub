@@ -199,6 +199,9 @@ class SessionRegistry:
         # (via touch_session in server.py). Reaper uses this to identify
         # truly-abandoned bindings vs. agents who are just between tool calls.
         self._last_activity: dict[str, float] = {}
+        # Consecutive undeliverable heartbeats per name (see heartbeat_touch).
+        # Reset by any successful probe or a fresh bind.
+        self._undeliverable_beats: dict[str, int] = {}
 
         _ensure_aexit_patched()
         # Note: we do NOT auto-subscribe `_on_session_close` to the global
@@ -245,6 +248,8 @@ class SessionRegistry:
             self._by_name[name] = session
             self._by_session_id.setdefault(id(session), set()).add(name)
             self._last_activity[name] = now
+            # A fresh binding starts with a clean undeliverable-beat slate.
+            self._undeliverable_beats.pop(name, None)
 
     def unbind_name(self, name: str) -> None:
         """Drop binding for `name` (if any). Idempotent."""
@@ -274,10 +279,102 @@ class SessionRegistry:
             self._last_activity[name] = time.time()
             return True
 
+    # After this many CONSECUTIVE undeliverable heartbeats the binding is
+    # dropped. At the daemon's 60s cadence that's ~3 minutes — long enough
+    # that a transient GET-stream flicker (one bad probe) never kills a
+    # healthy binding, short enough that a genuinely dead binding stops
+    # lying about wakeability quickly (vs. the 60-min activity reaper).
+    UNDELIVERABLE_BEATS_TO_DROP: int = 3
+
+    def heartbeat_touch(self, name: str) -> str:
+        """Deliverability-verified activity refresh for the heartbeat path.
+
+        Returns "refreshed" | "unbound" | "undeliverable" | "dropped".
+
+        Plain touch_activity refreshes a binding UNCONDITIONALLY — which is
+        the stale-binding blind spot: when the agent's client reconnects
+        (hub redeploy, network blip), the binding points at the dead old
+        session, but the daemon's heartbeats kept its activity fresh, so
+        the reaper never dropped it and the agent looked online while
+        wakes vanished into a dead socket (observed live 2026-07-18).
+
+        This variant probes the bound session first (same probe as the
+        reaper). Deliverable → refresh + reset the failure counter.
+        Undeliverable → do NOT refresh; after UNDELIVERABLE_BEATS_TO_DROP
+        consecutive failures, drop the binding via the reaper's exact
+        path (unbind + on_reap → agent marked offline in the DB → the
+        existing Stop-hook nag drives re-register). Worst case on a false
+        drop is one nag + one idempotent re-register.
+
+        No probe configured (test mode / non-introspectable transport) →
+        behaves like touch_activity: refresh, trust the binding.
+        """
+        with self._lock:
+            session = self._by_name.get(name)
+        if session is None:
+            return "unbound"
+
+        deliverable = True
+        if self._liveness_probe is not None:
+            # Probe OUTSIDE the lock — it introspects transport state.
+            try:
+                deliverable = self._liveness_probe(session)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "heartbeat: liveness_probe(%s) raised; treating as "
+                    "undeliverable", name,
+                )
+                deliverable = False
+
+        if deliverable:
+            with self._lock:
+                if name not in self._by_name:
+                    return "unbound"
+                self._last_activity[name] = time.time()
+                self._undeliverable_beats.pop(name, None)
+                return "refreshed"
+
+        dropped = False
+        with self._lock:
+            # Re-check under the lock: a register() may have replaced the
+            # binding while we probed — a fresh binding must not inherit
+            # the dead one's strikes.
+            if self._by_name.get(name) is not session:
+                self._undeliverable_beats.pop(name, None)
+                return "refreshed" if name in self._by_name else "unbound"
+            beats = self._undeliverable_beats.get(name, 0) + 1
+            if beats >= self.UNDELIVERABLE_BEATS_TO_DROP:
+                logger.info(
+                    "heartbeat: dropping %s after %d consecutive "
+                    "undeliverable beats (stale binding)", name, beats,
+                )
+                self._unbind_name_locked(name)
+                dropped = True
+            else:
+                self._undeliverable_beats[name] = beats
+                logger.info(
+                    "heartbeat: %s undeliverable (beat %d/%d) — not "
+                    "refreshed", name, beats, self.UNDELIVERABLE_BEATS_TO_DROP,
+                )
+        if dropped:
+            # Same contract as the reaper: callback OUTSIDE the lock (it
+            # does a DB write to mark the agent offline).
+            if self._on_reap is not None:
+                try:
+                    self._on_reap(name)
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "heartbeat: on_reap(%s) callback raised; continuing",
+                        name,
+                    )
+            return "dropped"
+        return "undeliverable"
+
     def _unbind_name_locked(self, name: str) -> None:
         session = self._by_name.pop(name, None)
         # Drop activity timestamp — a future re-bind starts fresh.
         self._last_activity.pop(name, None)
+        self._undeliverable_beats.pop(name, None)
         if session is None:
             return
         sid = id(session)

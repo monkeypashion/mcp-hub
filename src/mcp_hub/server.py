@@ -1474,10 +1474,26 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             agent_name: The agent name from the project's hub-agent.json
                 marker. Daemon reads it and passes it here.
         """
-        refreshed = registry.touch_activity(agent_name)
-        if not refreshed:
+        outcome = registry.heartbeat_touch(agent_name)
+        if outcome == "unbound":
             return f"heartbeat ignored — '{agent_name}' has no binding"
-        # Keep last_seen in sync for list_agents staleness ordering.
+        if outcome == "undeliverable":
+            # Binding exists but a push would not land (stale after a client
+            # reconnect). NOT refreshed — repeated failures drop the binding
+            # so the agent's offline status becomes truthful and the Stop-hook
+            # nag drives a re-register. See SessionRegistry.heartbeat_touch.
+            return (
+                f"heartbeat noted — '{agent_name}' binding is not "
+                "push-deliverable; not refreshed (drops after "
+                f"{registry.UNDELIVERABLE_BEATS_TO_DROP} consecutive misses)"
+            )
+        if outcome == "dropped":
+            return (
+                f"heartbeat: dropped stale binding for '{agent_name}' "
+                "(undeliverable); agent marked offline — the interactive "
+                "session must register() to rebind"
+            )
+        # refreshed — keep last_seen in sync for list_agents ordering.
         conn = _get_db(db_path)
         conn.execute(
             "UPDATE agents SET last_seen = ? WHERE name = ?",

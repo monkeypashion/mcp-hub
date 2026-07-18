@@ -631,3 +631,125 @@ async def test_reaper_clean_cancel(registry):
         await anyio.sleep(0.05)  # enough to enter the sleep
         tg.cancel_scope.cancel()
     # Reaching here means the cancel propagated cleanly
+
+
+# ---------------------------------------------------------------------------
+# heartbeat_touch — deliverability-verified refresh (stale-binding fix)
+#
+# The blind spot this covers (observed live 2026-07-18): a client reconnect
+# orphans the bound session; the daemon's heartbeats kept refreshing its
+# activity via touch_activity, so the reaper never dropped it — the agent
+# looked 🟢 online while wakes vanished into a dead socket, and the Stop-hook
+# nag (gated on 🟢, deliberately) never fired. heartbeat_touch refuses to keep
+# a dead binding warm, and after UNDELIVERABLE_BEATS_TO_DROP consecutive
+# misses drops it through the reaper's exact on_reap path so the agent's
+# offline status becomes truthful and the existing nag drives re-register.
+# ---------------------------------------------------------------------------
+
+
+def _probe_registry(*, deliverable_flag: dict, reaped: list) -> SessionRegistry:
+    """Registry whose probe reads `deliverable_flag['ok']` and whose on_reap
+    appends to `reaped` — lets tests flip deliverability mid-flight."""
+    return SessionRegistry(
+        on_reap=reaped.append,
+        liveness_probe=lambda _s: deliverable_flag["ok"],
+    )
+
+
+def test_heartbeat_touch_refreshes_deliverable_binding():
+    flag, reaped = {"ok": True}, []
+    reg = _probe_registry(deliverable_flag=flag, reaped=reaped)
+    reg.bind("alice", FakeSession())
+    with reg._lock:
+        reg._last_activity["alice"] = 1.0  # ancient
+    assert reg.heartbeat_touch("alice") == "refreshed"
+    with reg._lock:
+        assert reg._last_activity["alice"] > 1.0  # actually refreshed
+    assert reg.is_bound("alice")
+    assert reaped == []
+
+
+def test_heartbeat_touch_no_probe_behaves_like_touch_activity():
+    """No liveness probe configured (test mode) → trust and refresh."""
+    reg = SessionRegistry()
+    reg.bind("alice", FakeSession())
+    assert reg.heartbeat_touch("alice") == "refreshed"
+
+
+def test_heartbeat_touch_unbound_is_noop():
+    flag, reaped = {"ok": True}, []
+    reg = _probe_registry(deliverable_flag=flag, reaped=reaped)
+    assert reg.heartbeat_touch("nobody") == "unbound"
+    assert reaped == []
+
+
+def test_heartbeat_touch_undeliverable_does_not_refresh():
+    """The core of the fix: a dead binding's activity must NOT be kept warm."""
+    flag, reaped = {"ok": False}, []
+    reg = _probe_registry(deliverable_flag=flag, reaped=reaped)
+    reg.bind("alice", FakeSession())
+    with reg._lock:
+        reg._last_activity["alice"] = 1.0
+    assert reg.heartbeat_touch("alice") == "undeliverable"
+    with reg._lock:
+        assert reg._last_activity["alice"] == 1.0  # untouched
+    assert reg.is_bound("alice")  # kept — first strike only
+
+
+def test_heartbeat_touch_drops_after_consecutive_misses():
+    """Third consecutive undeliverable beat drops the binding and fires
+    on_reap (same contract as the reaper → agent marked offline in DB)."""
+    flag, reaped = {"ok": False}, []
+    reg = _probe_registry(deliverable_flag=flag, reaped=reaped)
+    reg.bind("alice", FakeSession())
+    assert reg.heartbeat_touch("alice") == "undeliverable"
+    assert reg.heartbeat_touch("alice") == "undeliverable"
+    assert reg.heartbeat_touch("alice") == "dropped"
+    assert not reg.is_bound("alice")
+    assert reaped == ["alice"]
+    # Subsequent beats see no binding.
+    assert reg.heartbeat_touch("alice") == "unbound"
+
+
+def test_heartbeat_touch_flicker_resets_strikes():
+    """A deliverable beat between failures resets the counter — transient
+    GET-stream flickers never accumulate toward a drop."""
+    flag, reaped = {"ok": False}, []
+    reg = _probe_registry(deliverable_flag=flag, reaped=reaped)
+    reg.bind("alice", FakeSession())
+    assert reg.heartbeat_touch("alice") == "undeliverable"
+    assert reg.heartbeat_touch("alice") == "undeliverable"
+    flag["ok"] = True
+    assert reg.heartbeat_touch("alice") == "refreshed"  # resets strikes
+    flag["ok"] = False
+    assert reg.heartbeat_touch("alice") == "undeliverable"
+    assert reg.heartbeat_touch("alice") == "undeliverable"
+    assert reg.is_bound("alice")  # never reached 3 consecutive
+    assert reaped == []
+
+
+def test_heartbeat_touch_rebind_resets_strikes():
+    """register() replacing the binding wipes the dead session's strikes —
+    a fresh binding must not inherit them."""
+    flag, reaped = {"ok": False}, []
+    reg = _probe_registry(deliverable_flag=flag, reaped=reaped)
+    reg.bind("alice", FakeSession())
+    assert reg.heartbeat_touch("alice") == "undeliverable"
+    assert reg.heartbeat_touch("alice") == "undeliverable"
+    reg.bind("alice", FakeSession())  # re-register on a new session
+    assert reg.heartbeat_touch("alice") == "undeliverable"
+    assert reg.heartbeat_touch("alice") == "undeliverable"
+    assert reg.is_bound("alice")  # fresh binding: strikes started over
+    assert reaped == []
+
+
+def test_heartbeat_touch_probe_exception_counts_as_undeliverable():
+    reaped: list = []
+    def _boom(_s):
+        raise RuntimeError("probe exploded")
+    reg = SessionRegistry(on_reap=reaped.append, liveness_probe=_boom)
+    reg.bind("alice", FakeSession())
+    assert reg.heartbeat_touch("alice") == "undeliverable"
+    assert reg.heartbeat_touch("alice") == "undeliverable"
+    assert reg.heartbeat_touch("alice") == "dropped"
+    assert reaped == ["alice"]

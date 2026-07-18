@@ -172,6 +172,58 @@ async def test_same_project_clones_can_dm_each_other(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# Stale-binding fix — heartbeats must not keep a dead binding warm
+# ---------------------------------------------------------------------------
+
+
+async def test_heartbeat_drops_stale_binding_and_marks_offline(tmp_path: Path):
+    """The 2026-07-18 blind spot, end to end: agent bound, client reconnects
+    (bound session no longer deliverable), daemon keeps heartbeating. The
+    heartbeat must NOT keep refreshing the dead binding; after 3 consecutive
+    undeliverable beats it drops it and the agent goes truthfully offline —
+    which is what re-arms the Stop-hook re-register nag."""
+    server = create_server(db_path=tmp_path / "test.db")
+
+    # Non-empty session manager whose transports don't include the bound
+    # session → _can_deliver_push returns False (bound-but-undeliverable).
+    class _OtherTransport:
+        _write_stream = object()
+        _request_streams: dict = {}
+
+    class _FakeManager:
+        _server_instances = {"some-other-session": _OtherTransport()}
+
+    server._session_manager = _FakeManager()  # type: ignore[attr-defined]
+    registry = server._hub_registry  # type: ignore[attr-defined]
+
+    await _call_tool(server, "register", {"name": "alice", "project": "x"})
+
+    class _DeadSession:
+        _write_stream = object()
+
+    registry.bind("alice", _DeadSession())
+
+    r1 = await _call_tool(server, "heartbeat", {"agent_name": "alice"})
+    r2 = await _call_tool(server, "heartbeat", {"agent_name": "alice"})
+    assert "not push-deliverable" in r1
+    assert "not push-deliverable" in r2
+    # Still bound (hysteresis), still online in the DB.
+    assert registry.is_bound("alice")
+
+    r3 = await _call_tool(server, "heartbeat", {"agent_name": "alice"})
+    assert "dropped stale binding" in r3
+    assert not registry.is_bound("alice")
+    # on_reap marked the agent offline → list_agents no longer shows them,
+    # so the agent's own Stop-hook will now fire the re-register nag.
+    out = await _call_tool(server, "list_agents", {})
+    assert "alice" not in out
+
+    # A subsequent heartbeat is a plain no-op (nothing bound).
+    r4 = await _call_tool(server, "heartbeat", {"agent_name": "alice"})
+    assert "no binding" in r4
+
+
+# ---------------------------------------------------------------------------
 # Bug B — 🟢 status is truthful (no stale online)
 # ---------------------------------------------------------------------------
 
