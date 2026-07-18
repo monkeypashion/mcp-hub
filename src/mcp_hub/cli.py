@@ -29,6 +29,7 @@ import json
 import os
 import pathlib
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -417,6 +418,244 @@ def onboard_command(args: argparse.Namespace) -> int:
         "turn — the Stop hook self-heals the daemon and prompts register)"
     )
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Memory export/import — move Claude memory files between paired clones.
+#
+# Twin clones (same derived project, different machines) each keep their
+# Claude memory under ~/.claude/projects/<encoded-cwd>/memory — and the
+# encoding is machine-specific because it's derived from the clone's absolute
+# path. The hub stages files keyed on the SHARED project, so the transfer is:
+#   source machine:  mcp-hub memory-export   (push files, notify twins)
+#   dest machine:    mcp-hub memory-import   (pull files, merge MEMORY.md)
+# Filenames are preserved verbatim; MEMORY.md (the index Claude loads each
+# session) is merged, never clobbered — that's what makes imported memories
+# picked up seamlessly on the next session.
+# ---------------------------------------------------------------------------
+
+
+def _claude_project_dirname(cwd: str) -> str:
+    """Encode an absolute project path the way Claude Code names its
+    per-project state dir: every path separator (and drive colon) becomes
+    '-'. Examples:
+      /home/monke/SoftwareProjects/monkeypashion/mcp-hub
+        -> -home-monke-SoftwareProjects-monkeypashion-mcp-hub
+      D:\\SoftwareProjects\\monkeypashion\\mcp-hub
+        -> D--SoftwareProjects-monkeypashion-mcp-hub
+    """
+    return "".join("-" if c in "/\\:" else c for c in cwd.rstrip("/\\"))
+
+
+def _claude_memory_dir(cwd: str) -> pathlib.Path:
+    """The Claude Code memory dir for the project at `cwd` on THIS machine."""
+    return (
+        pathlib.Path.home() / ".claude" / "projects"
+        / _claude_project_dirname(cwd) / "memory"
+    )
+
+
+def _is_safe_memory_filename(name: str) -> bool:
+    return bool(name) and "/" not in name and "\\" not in name and name not in (".", "..")
+
+
+def _merge_memory_index(
+    local_index: str, staged_index: str, mem_dir: pathlib.Path
+) -> tuple[str, int]:
+    """Merge a twin's exported MEMORY.md into the local one.
+
+    Returns (merged_text, lines_added). Local lines are never removed or
+    reordered — we only APPEND staged index lines whose linked memory file
+    (a) isn't already referenced locally and (b) actually exists in mem_dir
+    (i.e. was imported, not skipped). Keeps the index truthful either way.
+    """
+    additions: list[str] = []
+    for line in staged_index.splitlines():
+        m = re.search(r"\]\(([^)]+\.md)\)", line)
+        if not m:
+            continue
+        linked = m.group(1)
+        if f"({linked})" in local_index:
+            continue  # already indexed locally
+        if not (mem_dir / linked).exists():
+            continue  # don't index files that weren't imported
+        additions.append(line)
+    if not additions:
+        return local_index, 0
+    body = local_index.rstrip("\n")
+    merged = (body + "\n" if body else "") + "\n".join(additions) + "\n"
+    return merged, len(additions)
+
+
+async def _memory_export(hub_url: str, name: str, project: str, cwd: str) -> int:
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    mem_dir = _claude_memory_dir(cwd)
+    if not mem_dir.is_dir():
+        print(f"!! no memory dir on this machine: {mem_dir}", file=sys.stderr)
+        return 1
+    files = sorted(p for p in mem_dir.glob("*.md") if p.is_file())
+    if not files:
+        print(f"nothing to export — no .md files in {mem_dir}")
+        return 0
+
+    async with streamablehttp_client(hub_url, timeout=15) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+
+            async def call(tool: str, args: dict[str, Any]) -> str:
+                return _extract_text(await session.call_tool(tool, args)) or ""
+
+            for p in files:
+                result = await call("memory_put", {
+                    "project": project,
+                    "filename": p.name,
+                    "content": p.read_text(encoding="utf-8"),
+                    "from_agent": name,
+                })
+                print(f"  {p.name}: {result}")
+
+            # Twin notification — reuse send()'s full wake semantics rather
+            # than duplicating delivery logic hub-side.
+            twins_text = await call(
+                "list_twins", {"project": project, "exclude_agent": name}
+            )
+            twins = [t for t in twins_text.splitlines() if t.strip()]
+            for twin in twins:
+                await call("send", {
+                    "from_agent": name,
+                    "to": twin,
+                    "message": (
+                        f"🧠 Memory snapshot published for {project}: "
+                        f"{len(files)} file(s) exported by {name}. Run "
+                        "`mcp-hub memory-import` in your clone to pull it "
+                        "(existing local files are kept; --force overwrites; "
+                        "MEMORY.md is merged)."
+                    ),
+                    "priority": "normal",
+                })
+            print(
+                f"exported {len(files)} file(s) from {mem_dir}\n"
+                f"notified {len(twins)} twin(s): {', '.join(twins) or '(none online)'}"
+            )
+    return 0
+
+
+async def _memory_import(
+    hub_url: str, project: str, cwd: str, *, force: bool, dry_run: bool
+) -> int:
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    mem_dir = _claude_memory_dir(cwd)
+
+    async with streamablehttp_client(hub_url, timeout=15) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+
+            async def call(tool: str, args: dict[str, Any]) -> str:
+                return _extract_text(await session.call_tool(tool, args)) or ""
+
+            listing = await call("memory_list", {"project": project})
+            entries = [ln.split("\t") for ln in listing.splitlines() if ln.strip()]
+            if not entries:
+                print(f"nothing staged on the hub for {project}")
+                return 0
+
+            imported: list[str] = []
+            skipped: list[str] = []
+            staged_index: str | None = None
+            for parts in entries:
+                fname = parts[0]
+                if not _is_safe_memory_filename(fname):
+                    skipped.append(f"{fname} (unsafe name)")
+                    continue
+                if fname == "MEMORY.md":
+                    staged_index = await call(
+                        "memory_get", {"project": project, "filename": fname}
+                    )
+                    continue  # merged below, never bulk-written
+                target = mem_dir / fname
+                if target.exists() and not force:
+                    skipped.append(f"{fname} (exists locally; --force to overwrite)")
+                    continue
+                if dry_run:
+                    imported.append(f"{fname} (dry-run)")
+                    continue
+                content = await call(
+                    "memory_get", {"project": project, "filename": fname}
+                )
+                mem_dir.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+                imported.append(fname)
+
+    # MEMORY.md merge — the index Claude loads each session. Append staged
+    # lines whose linked file isn't already referenced locally; never remove
+    # or reorder local lines.
+    merged_lines = 0
+    if staged_index and not dry_run:
+        index_path = mem_dir / "MEMORY.md"
+        local_index = (
+            index_path.read_text(encoding="utf-8") if index_path.exists() else ""
+        )
+        merged, merged_lines = _merge_memory_index(
+            local_index, staged_index, mem_dir
+        )
+        if merged_lines:
+            mem_dir.mkdir(parents=True, exist_ok=True)
+            index_path.write_text(merged, encoding="utf-8")
+
+    for f in imported:
+        print(f"  + {f}")
+    for s in skipped:
+        print(f"  - {s}")
+    print(
+        f"{'DRY RUN — ' if dry_run else ''}imported {len(imported)}, "
+        f"skipped {len(skipped)}, MEMORY.md lines merged: {merged_lines} "
+        f"({mem_dir})"
+    )
+    if imported and not dry_run:
+        print("imported memories are live from the next Claude session in this repo")
+    return 0
+
+
+def _resolve_for_memory(args: argparse.Namespace) -> tuple[str, str, str] | None:
+    """(name, project, cwd) for memory commands — derived identity only.
+    Prints guidance and returns None when the repo isn't onboarded."""
+    cwd = args.path or os.getcwd()
+    name, project = _derive_agent_identity(cwd)
+    if name is None or project is None:
+        print(
+            f"!! {cwd} has no derived hub identity — run `mcp-hub onboard` "
+            "in the repo first (memory transfer pairs clones by their "
+            "derived project).",
+            file=sys.stderr,
+        )
+        return None
+    return name, project, cwd
+
+
+def memory_export_command(args: argparse.Namespace) -> int:
+    resolved = _resolve_for_memory(args)
+    if resolved is None:
+        return 1
+    name, project, cwd = resolved
+    print(f"exporting memory for {project} as {name}")
+    return asyncio.run(_memory_export(args.hub_url, name, project, cwd))
+
+
+def memory_import_command(args: argparse.Namespace) -> int:
+    resolved = _resolve_for_memory(args)
+    if resolved is None:
+        return 1
+    _name, project, cwd = resolved
+    print(f"importing memory for {project}")
+    return asyncio.run(
+        _memory_import(
+            args.hub_url, project, cwd, force=args.force, dry_run=args.dry_run
+        )
+    )
 
 
 def _discover_agent_from_marker(cwd: str | None) -> tuple[str | None, str | None]:
@@ -1123,6 +1362,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="Repo path to onboard (default: current directory).",
     )
 
+    mem_export = sub.add_parser(
+        "memory-export",
+        help="Push this clone's Claude memory files to the hub for its twins",
+        description=(
+            "Reads ~/.claude/projects/<this-clone>/memory, stages every .md "
+            "file on the hub keyed by the derived project, and DMs each "
+            "online twin (same project, other machines) to run "
+            "memory-import. Filenames preserved verbatim."
+        ),
+    )
+    mem_export.add_argument("--path", default=None, help="Repo path (default: cwd).")
+    mem_export.add_argument(
+        "--hub-url",
+        default=DEFAULT_HUB_URL,
+        help=f"Hub MCP endpoint (default: {DEFAULT_HUB_URL}, or $MCP_HUB_URL)",
+    )
+
+    mem_import = sub.add_parser(
+        "memory-import",
+        help="Pull twin-exported Claude memory files into this clone",
+        description=(
+            "Fetches the memory files staged for this repo's derived project "
+            "and writes them into ~/.claude/projects/<this-clone>/memory as "
+            "real local files (picked up by Claude next session). Existing "
+            "local files are kept unless --force; MEMORY.md is merged, never "
+            "clobbered."
+        ),
+    )
+    mem_import.add_argument("--path", default=None, help="Repo path (default: cwd).")
+    mem_import.add_argument(
+        "--force", action="store_true",
+        help="Overwrite local memory files that already exist.",
+    )
+    mem_import.add_argument(
+        "--dry-run", action="store_true",
+        help="Show what would be imported without writing anything.",
+    )
+    mem_import.add_argument(
+        "--hub-url",
+        default=DEFAULT_HUB_URL,
+        help=f"Hub MCP endpoint (default: {DEFAULT_HUB_URL}, or $MCP_HUB_URL)",
+    )
+
     heartbeat = sub.add_parser(
         "heartbeat-daemon",
         help="Long-running per-minute heartbeat to the hub (for SessionStart hooks)",
@@ -1173,6 +1455,10 @@ def main(argv: list[str] | None = None) -> int:
         return heartbeat_daemon_command(args)
     if args.subcommand == "onboard":
         return onboard_command(args)
+    if args.subcommand == "memory-export":
+        return memory_export_command(args)
+    if args.subcommand == "memory-import":
+        return memory_import_command(args)
 
     parser.print_help()
     return 0

@@ -174,6 +174,20 @@ def init_db(db_path: Path = DB_PATH) -> None:
         CREATE INDEX IF NOT EXISTS idx_msg_to ON messages(to_agent, read);
         CREATE INDEX IF NOT EXISTS idx_msg_channel ON messages(channel, ts);
         CREATE INDEX IF NOT EXISTS idx_msg_ts ON messages(ts);
+
+        -- Memory transfer store: a staging area for exporting a clone's
+        -- Claude memory files to its twins (same derived project, other
+        -- machines). NOT the system of record — the files' home remains
+        -- each machine's ~/.claude/projects/<dir>/memory. Last-write-wins
+        -- per (project, filename).
+        CREATE TABLE IF NOT EXISTS memory_files (
+            project      TEXT NOT NULL,
+            filename     TEXT NOT NULL,
+            content      TEXT NOT NULL,
+            updated_ts   REAL NOT NULL,
+            origin_agent TEXT NOT NULL,
+            PRIMARY KEY (project, filename)
+        );
     """)
     conn.commit()
 
@@ -615,6 +629,25 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         result = f"Registered as '{name}'"
         if project:
             result += f" (project: {project})"
+
+        # Twin pairing: clones of one repo derive the same project, so
+        # "who else is this repo on another machine?" is a pure query.
+        # (This is the same lookup the old one-agent-per-project dedup ran —
+        # now it introduces the clones to each other instead of collapsing
+        # them into one identity.)
+        if project:
+            twins = conn.execute(
+                "SELECT name FROM agents WHERE project = ? AND name != ? "
+                "AND status = 'online' ORDER BY name",
+                (project, name),
+            ).fetchall()
+            if twins:
+                result += (
+                    "\n👥 Paired clones of this project online: "
+                    + ", ".join(t["name"] for t in twins)
+                    + " — same repo on another machine; DM them to coordinate."
+                )
+
         if unread > 0:
             result += f"\n📬 You have {unread} unread message(s). Call get_messages() to read them."
         return result
@@ -1503,6 +1536,83 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         return f"heartbeat ok ({time.strftime('%H:%M:%S')})"
 
     @mcp.tool()
+    def list_twins(project: str, exclude_agent: str = "") -> str:
+        """List online agents on `project` — the paired clones of one repo
+        across machines (same derived org/repo, different <repo>-<hostname>
+        names). Returns one name per line, or '' if none.
+
+        Args:
+            project: The derived project key, e.g. 'monkeypashion/mcp-hub'.
+            exclude_agent: Optional name to omit (usually the caller).
+        """
+        conn = _get_db(db_path)
+        rows = conn.execute(
+            "SELECT name FROM agents WHERE project = ? AND name != ? "
+            "AND status = 'online' ORDER BY name",
+            (project, exclude_agent),
+        ).fetchall()
+        return "\n".join(r["name"] for r in rows)
+
+    @mcp.tool()
+    def memory_put(project: str, filename: str, content: str, from_agent: str = "") -> str:
+        """Stage one Claude memory file for transfer to this project's twins.
+
+        The hub is a TRANSFER store, not the system of record — the file's
+        home remains each machine's ~/.claude/projects/<dir>/memory. One row
+        per (project, filename), last write wins. Driven by
+        `mcp-hub memory-export`; twins pull with `mcp-hub memory-import`.
+
+        Args:
+            project: Derived project key ('org/repo').
+            filename: Memory file name, preserved verbatim (e.g. 'topic.md').
+            content: Full file content.
+            from_agent: Exporting agent's name (provenance).
+        """
+        if not project or not filename:
+            return "memory_put requires project and filename"
+        if "/" in filename or "\\" in filename or filename in (".", ".."):
+            return f"invalid filename '{filename}' — bare names only"
+        conn = _get_db(db_path)
+        conn.execute(
+            """INSERT INTO memory_files (project, filename, content, updated_ts, origin_agent)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(project, filename) DO UPDATE SET
+                   content=excluded.content,
+                   updated_ts=excluded.updated_ts,
+                   origin_agent=excluded.origin_agent""",
+            (project, filename, content, time.time(), from_agent),
+        )
+        conn.commit()
+        return f"staged {project}/{filename} ({len(content)} chars)"
+
+    @mcp.tool()
+    def memory_list(project: str) -> str:
+        """List memory files staged for `project` (one per line:
+        `filename\\tsize\\torigin_agent\\tupdated_iso`), or '' if none."""
+        conn = _get_db(db_path)
+        rows = conn.execute(
+            "SELECT filename, LENGTH(content) AS size, origin_agent, updated_ts "
+            "FROM memory_files WHERE project = ? ORDER BY filename",
+            (project,),
+        ).fetchall()
+        return "\n".join(
+            f"{r['filename']}\t{r['size']}\t{r['origin_agent']}\t"
+            + time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(r["updated_ts"]))
+            for r in rows
+        )
+
+    @mcp.tool()
+    def memory_get(project: str, filename: str) -> str:
+        """Fetch one staged memory file's content (raw). Empty string if the
+        (project, filename) pair isn't staged."""
+        conn = _get_db(db_path)
+        row = conn.execute(
+            "SELECT content FROM memory_files WHERE project = ? AND filename = ?",
+            (project, filename),
+        ).fetchone()
+        return row["content"] if row else ""
+
+    @mcp.tool()
     def hub_status() -> str:
         """Get hub statistics — agents online, channels, message counts."""
         conn = _get_db(db_path)
@@ -1551,6 +1661,8 @@ _CLI_SUBCOMMANDS = {
     "session-rewake",
     "heartbeat-daemon",
     "onboard",
+    "memory-export",
+    "memory-import",
 }
 
 

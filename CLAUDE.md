@@ -53,6 +53,10 @@ Or for stdio (single session):
 - `post(from_agent, channel, message, priority="normal")` — post to a named channel
 - `get_channel_messages(channel, limit, since_minutes, since_id, from_agent, format)` — read posts in a channel; pass `since_id` for cursor-based pagination, `from_agent` to filter to one agent's contributions (dedup-on-re-asks pattern), and `format="json"` for structured records (lossless extraction)
 
+**Twin pairing + memory transfer**
+- `list_twins(project, exclude_agent)` — online clones of one repo on other machines (same derived project). `register()` also announces your twins.
+- `memory_put(project, filename, content, from_agent)` / `memory_list(project)` / `memory_get(project, filename)` — the hub-side staging store behind `mcp-hub memory-export` / `memory-import` (see **Memory transfer** below). The hub stages; the files' home is each machine's Claude memory dir.
+
 **Other**
 - `get_history(agent_or_channel)` — full history (use `#general` for the broadcast feed)
 - `ping(from_agent)` — interactive heartbeat (refreshes binding via touch_session)
@@ -97,6 +101,24 @@ The global hooks fire in every project on the box; only repos whose derived `org
 **Legacy fallback:** the cli still reads `<cwd>/.claude/hub-agent.json` when derivation doesn't apply (not a git repo, or not opted in) so unmigrated agents keep working. Derived wins when both are present — a stale committed marker can't drag a migrated machine back. Never commit the marker (it's gitignored here); migrate a repo by opting it into `config.json` and deleting the marker.
 
 The sanitize rule is mirrored in `statusline/statusline-command.js` — change both or neither.
+
+## Memory transfer between clones
+
+Paired clones (same repo, different machines — see **Identity**) can move their Claude memory through the hub, so a new machine inherits what its twin already learned:
+
+```bash
+# on the machine that HAS the memory (inside the repo):
+mcp-hub memory-export
+
+# on the receiving machine (inside its clone of the same repo):
+mcp-hub memory-import            # --dry-run to preview, --force to overwrite
+```
+
+- **Filenames preserved verbatim**; files land as real local files in the receiving machine's `~/.claude/projects/<encoded-path>/memory/` — picked up by Claude at its next session in that repo, like any locally-written memory.
+- **`MEMORY.md` (the index) is merged, never clobbered** — staged lines are appended only for files that were actually imported and aren't already indexed locally.
+- **Existing local files are kept** by default (reported as skipped); `--force` overwrites.
+- **Twins are auto-notified**: export DMs every online clone of the project ("run memory-import"), riding the normal wake path.
+- The hub is a *staging* store (last-write-wins per project+filename), not the system of record.
 
 ## Stop hook — auto-surface queued messages
 
