@@ -1566,6 +1566,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows consoles default to cp1252, which can't encode ✓/⚡/emoji in
+    # our output — an unhandled UnicodeEncodeError turned memory-verify's
+    # result line into a traceback on fireblade (found by the first live
+    # ceremony). Force UTF-8 on the std streams; errors='replace' so even a
+    # truly broken console degrades to '?' instead of crashing. Fail-soft:
+    # exotic stdout replacements without reconfigure() are left alone.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):
+            pass
+
     parser = build_parser()
     args = parser.parse_args(argv)
 

@@ -234,3 +234,19 @@ def test_replace_index_semantics(tmp_path: Path):
     assert added == 0 and merged == local
     # Replace mode is a verbatim adoption — by definition staged text itself.
     assert staged != local  # the divergence --replace-index exists to resolve
+
+
+def test_main_survives_streams_without_reconfigure(monkeypatch, capsys):
+    """cp1252-crash fix must be fail-soft: a stdout replacement lacking
+    .reconfigure() (pytest capture, pipes on old runtimes) must not break
+    the CLI entrypoint."""
+    import io
+
+    from mcp_hub import cli
+
+    class _Plain(io.StringIO):
+        pass  # no reconfigure()
+
+    monkeypatch.setattr("sys.stdout", _Plain())
+    monkeypatch.setattr("sys.stderr", _Plain())
+    assert cli.main([]) == 0  # bare invocation prints help, exits 0
