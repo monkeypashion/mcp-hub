@@ -121,15 +121,16 @@ pull_local() {
 # Mirror of cli.py _sanitize_ident: lowercase, non [a-z0-9_-] -> '-', trim '-'.
 sanitize_ident() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9_-]/-/g' -e 's/^-*//' -e 's/-*$//'; }
 
-# Opt org/repo into ~/.mcp-hub/config.json's projects list (idempotent).
+# Opt org/repo in/out of ~/.mcp-hub/config.json's projects list (idempotent).
 # Identity is DERIVED by the hub cli (repo-hostname / org/repo from the git
 # remote); this machine-local list is the only thing that opts a repo in.
+# Users never edit it — add/rm maintain it.
 optin_project() {
-  local proj="$1" cfg="$HOME/.mcp-hub/config.json"
+  local verb="$1" proj="$2" cfg="$HOME/.mcp-hub/config.json"
   mkdir -p "$HOME/.mcp-hub"
-  python3 - "$cfg" "$proj" <<'PYEOF'
+  python3 - "$cfg" "$verb" "$proj" <<'PYEOF'
 import json, pathlib, sys
-cfg, proj = pathlib.Path(sys.argv[1]), sys.argv[2]
+cfg, verb, proj = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 try:
     data = json.loads(cfg.read_text(encoding="utf-8"))
     assert isinstance(data, dict)
@@ -138,32 +139,76 @@ except Exception:
 projects = data.get("projects")
 if not isinstance(projects, list):
     projects = []
-if proj not in projects:
-    projects.append(proj)
+changed = False
+if verb == "add" and proj not in projects:
+    projects.append(proj); changed = True
+    print(f"hub opt-in: {proj}")
+elif verb == "remove" and proj in projects:
+    projects.remove(proj); changed = True
+    print(f"hub opt-out: {proj}")
+if changed:
     data["projects"] = projects
     cfg.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    print(f"opted in: {proj}  ({cfg})")
-else:
-    print(f"already opted in: {proj}")
 PYEOF
 }
 
-add_agent() {  # squad add <org>/<repo> — clone/pull, opt in, enroll under the DERIVED name
+# org/repo derived from a worktree's git remote (empty on failure) — mirrors
+# cli.py _parse_org_repo (URL path only, so SSH aliases resolve identically).
+worktree_project() {
+  local url
+  url="$(git -C "$1" remote get-url origin 2>/dev/null)" || return 0
+  printf '%s\n' "$url" | sed -e 's/\.git$//' -e 's#/$##' \
+    | awk '{ if (match($0, "://")) { sub(".*://[^/]*/", "") } else if (match($0, ":")) { sub("[^:]*:", "") } n=split($0, p, "/"); if (n>=2) print p[n-1] "/" p[n] }'
+}
+
+# Migrate a legacy roster line: same worktree enrolled under a different
+# (pre-derived-identity) name -> rename the line and any live tmux session.
+migrate_roster_name() {
+  local dest="$1" derived="$2" old
+  old="$(rows | awk -F'|' -v d="$dest" '$2==d && $1!="" {print $1; exit}')"
+  [ -n "$old" ] && [ "$old" != "$derived" ] || return 0
+  tmp="$(mktemp)"; awk -F'|' -v o="$old" -v n="$derived" 'BEGIN{OFS="|"} $1==o{$1=n} {print}' "$CONF" > "$tmp" && mv "$tmp" "$CONF"
+  tm rename-session -t "=$old" "$derived" 2>/dev/null && echo "renamed live session: $old -> $derived"
+  # retire old-name daemon state; the Stop-hook self-heal starts the new one
+  local safe; safe="$(printf '%s' "$old" | sed 's/[^A-Za-z0-9_-]/_/g')"
+  [ -f "$HOME/.mcp-hub/heartbeat-$safe.pid" ] && kill "$(cat "$HOME/.mcp-hub/heartbeat-$safe.pid" 2>/dev/null)" 2>/dev/null
+  rm -f "$HOME/.mcp-hub/heartbeat-$safe.pid" "$HOME/.mcp-hub/status-$safe.json"
+  echo "migrated roster: $old -> $derived"
+}
+
+add_agent() {  # squad add <org>/<repo> — clone/pull, opt in, enroll/migrate under the DERIVED name
   local spec="$1" out dest name
   [[ "$spec" == ?*/?* ]] || { echo "usage: $CMD add <org>/<repo>"; return 1; }
-  [ -z "${2:-}" ] || echo "note: identity is now derived (<repo>-<hostname>); extra args ignored"
+  [ -z "${2:-}" ] || echo "note: identity is derived (<repo>-<hostname>); extra args ignored"
   out="$(pull_local "$spec")" || return 1          # clones/pulls; last line is the dest path
   dest="$(printf '%s\n' "$out" | tail -1)"
   [ -d "$dest" ] || { echo "!! clone failed for $spec"; return 1; }
   # derived identity: name = <repo>-<hostname>, project = <org>/<repo>
   name="$(sanitize_ident "$(basename "$dest")-$(hostname)")"
-  optin_project "${spec%.git}"
-  # enroll in the roster
-  if agents | grep -qxF -- "$name"; then echo "'$name' already in $CONF — roster unchanged"; return 0; fi
+  optin_project add "${spec%.git}"
+  migrate_roster_name "$dest" "$name"              # legacy-name line for this worktree -> derived
+  if agents | grep -qxF -- "$name"; then echo "'$name' enrolled -> $dest"; return 0; fi
   mkdir -p "$(dirname "$CONF")"
   printf '%s|%s||--dangerously-load-development-channels server:hub\n' "$name" "$dest" >> "$CONF"
   echo "enrolled '$name' -> $dest"
   echo "  run: $CMD restart $name   (or $CMD up)  to launch it"
+}
+
+rm_agent() {   # squad rm [agent] — exact inverse of add: session, roster, opt-in, daemon state
+  local a="$1" dir proj safe
+  dir="$(untilde "$(field "$a" 2)")"
+  tm kill-session -t "=$a" 2>/dev/null || true
+  tmp="$(mktemp)"; awk -F'|' -v a="$a" '$1!=a' "$CONF" > "$tmp" && mv "$tmp" "$CONF"
+  # opt the project back out so hooks go silent for this repo again
+  if [ -d "$dir" ]; then
+    proj="$(worktree_project "$dir")"
+    [ -n "$proj" ] && optin_project remove "$proj"
+  fi
+  # retire daemon + state files
+  safe="$(printf '%s' "$a" | sed 's/[^A-Za-z0-9_-]/_/g')"
+  [ -f "$HOME/.mcp-hub/heartbeat-$safe.pid" ] && kill "$(cat "$HOME/.mcp-hub/heartbeat-$safe.pid" 2>/dev/null)" 2>/dev/null
+  rm -f "$HOME/.mcp-hub/heartbeat-$safe.pid" "$HOME/.mcp-hub/status-$safe.json"
+  echo "removed '$a' (session, roster, hub opt-in, daemon) — repo left in place"
 }
 
 handoff() {
@@ -229,11 +274,22 @@ case "${1:-help}" in
             else
               exec tmux -L "$SOCK" attach -t "=$a"
             fi ;;
-  ls)       for a in $(agents); do
+  ls)       # tmux liveness + hub presence (from the daemon's status snapshot)
+            hub_state() {
+              local safe sf
+              safe="$(printf '%s' "$1" | sed 's/[^A-Za-z0-9_-]/_/g')"; sf="$HOME/.mcp-hub/status-$safe.json"
+              [ -f "$sf" ] || { printf -- '-'; return; }
+              [ -n "$(find "$sf" -mmin -3 2>/dev/null)" ] || { printf 'hub?'; return; }
+              if grep -q '"online"[[:space:]]*:[[:space:]]*true' "$sf"; then
+                if grep -q '"wakeable"[[:space:]]*:[[:space:]]*true' "$sf"; then printf '⚡ online'; else printf 'online'; fi
+              else printf '✖ offline'; fi
+            }
+            printf '%-26s %-10s %-11s %s\n' 'AGENT' 'TMUX' 'HUB' ''
+            for a in $(agents); do
               if tm has-session -t "=$a" 2>/dev/null; then
-                if pane_alive "$a"; then printf '%-26s up        (%s)\n' "$a" "$(pane_cmd "$a")"
-                else printf '%-26s DEGRADED  session up, claude not running\n' "$a"; fi
-              else printf '%-26s down\n' "$a"; fi
+                if pane_alive "$a"; then printf '%-26s %-10s %-11s (%s)\n' "$a" up "$(hub_state "$a")" "$(pane_cmd "$a")"
+                else printf '%-26s %-10s %-11s session up, claude not running — try: %s restart %s\n' "$a" DEGRADED "$(hub_state "$a")" "$CMD" "$a"; fi
+              else printf '%-26s %-10s %-11s\n' "$a" down "$(hub_state "$a")"; fi
             done ;;
   args)     if [ -n "${2:-}" ] && agents | grep -qxF -- "${2:-}"; then a="$2"; shift 2
             else a="$(need_agent "")" || exit 1; shift; fi
@@ -241,30 +297,39 @@ case "${1:-help}" in
             echo "next launch of $a: $*" ;;
   handoff)  a="$(need_agent "${2:-}")" || exit 1; handoff "$a" ;;
   add)      add_agent "${2:-}" "${3:-}" "${4:-}" ;;
-  rm)       a="$(need_agent "${2:-}")" || exit 1; tm kill-session -t "=$a" 2>/dev/null || true
-            tmp="$(mktemp)"; awk -F'|' -v a="$a" '$1!=a' "$CONF" > "$tmp" && mv "$tmp" "$CONF"
-            echo "removed '$a' from $CONF (worktree + marker left in place)" ;;
+  rm)       a="$(need_agent "${2:-}")" || exit 1; rm_agent "$a" ;;
   pull-local) pull_local "${2:-}" ;;
   *) cat <<EOF
-$CMD up                       start the whole squad (idempotent)
-$CMD down                     stop everything
-$CMD restart [agent]          cycle one agent with its current squad.conf entry
-$CMD ls                       squad status (DEGRADED = session up but claude dead)
-$CMD heal                     nudge UP-but-offline agents to re-register (post hub-redeploy recovery)
-$CMD attach [agent]           attach (starts/restarts it if down/degraded); Ctrl-b d detaches
-$CMD cmd [agent|all] "..."    type text + Enter into session(s)   e.g. $CMD cmd all "/compact"
-$CMD key [agent] <keys>       raw tmux send-keys (tmux key names allowed, no Enter appended)
-$CMD args [agent] "..."       set next-launch claude args (col 4 of squad.conf)
-$CMD handoff [agent]          commit WIP to wip/<agent>-<date> + push (before switching machines)
-$CMD add <org>/<repo>         clone/pull + opt in (~/.mcp-hub/config.json) + enroll as <repo>-<hostname>
-$CMD rm [agent]               unenroll: kill session + remove from squad.conf (keeps the repo + marker)
-$CMD pull-local <org>/<repo>  clone/pull into the correct account folder (org derives the alias)
+squad — run a fleet of Claude Code agents in tmux, wired to the mcp-hub.
 
-[agent] defaults to the agent whose worktree is your current directory ($PWD),
-so from inside a repo you can just: $CMD attach   /   $CMD restart   /   $CMD cmd "/compact"
+enroll (identity is derived: name = <repo>-<hostname>, project = <org>/<repo>)
+  $CMD add <org>/<repo>         clone/pull + hub opt-in + enroll (idempotent; migrates legacy names)
+  $CMD rm  [agent]              inverse of add: session, roster, hub opt-in, daemon (repo kept)
 
-config: $CONF
-format: agent | worktree | gh_config_dir (may be empty) | claude_args
+run
+  $CMD up                       start every enrolled agent (idempotent)
+  $CMD down                     stop everything (tmux server + keep-alive daemons)
+  $CMD restart [agent]          cycle one agent
+  $CMD attach  [agent]          attach, starting/repairing it first if needed; Ctrl-b d detaches
+
+watch + repair
+  $CMD ls                       status: tmux liveness + hub presence per agent
+  $CMD heal                     nudge UP-but-offline agents to re-register (post hub-redeploy)
+
+interact
+  $CMD cmd [agent|all] "..."    type text + Enter into session(s)   e.g. $CMD cmd all "/compact"
+  $CMD key [agent] <keys>       raw tmux send-keys (no Enter appended)
+  $CMD args [agent] "..."       set next-launch claude args
+  $CMD handoff [agent]          commit WIP to wip/<agent>-<date> + push (before switching machines)
+
+helpers
+  $CMD pull-local <org>/<repo>  clone/pull into the right account folder, no enrollment
+
+[agent] defaults to the repo you're standing in, so from inside a worktree:
+  $CMD attach   /   $CMD restart   /   $CMD cmd "/compact"
+
+roster: $CONF   (agent | worktree | gh_config_dir | claude_args)
+hub opt-in list: ~/.mcp-hub/config.json — maintained by add/rm, never edit by hand
 EOF
   ;;
 esac

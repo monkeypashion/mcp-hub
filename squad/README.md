@@ -18,12 +18,12 @@ cp squad/squad.conf.example ~/.config/squad/squad.conf   # then edit the roster
 
 ```bash
 squad up                    # start the whole squad
-squad ls                    # status (DEGRADED = tmux session up but claude died)
+squad ls                    # status: tmux liveness + hub presence per agent
 squad attach [agent]        # attach (starts/restarts if down/degraded); Ctrl-b d to detach; agent keeps running
 squad cmd all "/compact"    # inject a slash-command into every agent
 squad cmd [agent] "carry on"
 squad restart [agent]
-squad rm [agent]            # unenroll: kill session + remove from roster (keeps the repo)
+squad rm [agent]            # inverse of add: kills session, unenrolls, opts the repo out, retires its daemon
 squad heal                  # nudge UP-but-offline agents to re-register (post hub-redeploy recovery)
 squad down                  # stop the whole squad (kills the tmux server + keep-alive daemons)
 ```
@@ -43,9 +43,13 @@ squad add dreamteam-ai-labs/browser-agent      # clone/pull + opt in + enroll
 squad restart browser-agent-$(hostname)        # launch it (name is derived)
 ```
 
-`squad add` does three things: clones/pulls the repo into the right account folder, **opts the
-project into `~/.mcp-hub/config.json`** (the machine-local participation list), and appends the
-roster line (default hub args).
+`squad add` is the whole onboarding — and it's idempotent, so re-running it is always safe. It
+clones/pulls the repo into the right account folder, opts the project into the hub (the
+machine-local `~/.mcp-hub/config.json` list — maintained by `add`/`rm`, never edited by hand),
+**migrates any legacy-named roster entry** for that worktree (renames the line, the live tmux
+session, and retires the old daemon state), and appends the roster line if missing. `squad rm`
+is the exact inverse. On machines without squad (e.g. Windows), `mcp-hub onboard` from inside
+the repo does the opt-in half.
 
 **Identity is derived, not configured** — nothing identity-related is written into the repo:
 

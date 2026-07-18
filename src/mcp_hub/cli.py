@@ -369,6 +369,56 @@ def _derive_agent_identity(cwd: str | None) -> tuple[str | None, str | None]:
     return name, project
 
 
+def onboard_command(args: argparse.Namespace) -> int:
+    """`mcp-hub onboard` — opt the cwd's repo into hub participation.
+
+    Cross-platform (this is the Windows story; Linux squad hosts can use
+    `squad add`, which does the same opt-in). Derives org/repo from the git
+    remote, appends it to ~/.mcp-hub/config.json, prints the derived
+    identity. Idempotent. This is the ONLY per-repo step a machine needs —
+    the hooks + Stop-hook self-heal handle daemon + register from the next
+    turn/relaunch onward.
+    """
+    cwd = args.path or os.getcwd()
+    url = _git_remote_url(cwd)
+    if not url:
+        print(f"!! {cwd} is not a git repo with an 'origin' remote", file=sys.stderr)
+        return 1
+    parsed = _parse_org_repo(url)
+    if not parsed:
+        print(f"!! couldn't parse org/repo from remote URL: {url}", file=sys.stderr)
+        return 1
+    org, repo = parsed
+    project = f"{org}/{repo}"
+    cfg = _load_hub_config()
+    projects = cfg.get("projects")
+    if not isinstance(projects, list):
+        projects = []
+    if project in projects:
+        print(f"already opted in: {project}")
+    else:
+        projects.append(project)
+        cfg["projects"] = projects
+        _HUB_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _HUB_CONFIG_PATH.write_text(
+            json.dumps(cfg, indent=2) + "\n", encoding="utf-8"
+        )
+        print(f"opted in: {project}  ({_HUB_CONFIG_PATH})")
+    host = _sanitize_ident(platform.node() or "unknown-host")
+    print(f"derived identity: name={_sanitize_ident(f'{repo}-{host}')}  project={project}")
+    marker = pathlib.Path(cwd) / AGENT_MARKER_PATH
+    if marker.exists():
+        print(
+            f"note: legacy marker {marker} still present — derived identity "
+            "overrides it, delete at leisure"
+        )
+    print(
+        "next: relaunch this repo's Claude Code session (or just finish a "
+        "turn — the Stop hook self-heals the daemon and prompts register)"
+    )
+    return 0
+
+
 def _discover_agent_from_marker(cwd: str | None) -> tuple[str | None, str | None]:
     """LEGACY fallback: read identity from `<cwd>/.claude/hub-agent.json`.
 
@@ -1056,6 +1106,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Project name override (otherwise auto-discovered from marker).",
     )
 
+    onboard = sub.add_parser(
+        "onboard",
+        help="Opt this repo into hub participation (derived identity; cross-platform)",
+        description=(
+            "Adds the cwd repo's <org>/<repo> (from `git remote get-url "
+            "origin`) to ~/.mcp-hub/config.json's projects list and prints "
+            "the derived identity (<repo>-<hostname>). Idempotent. The only "
+            "per-repo step a machine needs — hooks and the Stop-hook "
+            "self-heal take it from there."
+        ),
+    )
+    onboard.add_argument(
+        "--path",
+        default=None,
+        help="Repo path to onboard (default: current directory).",
+    )
+
     heartbeat = sub.add_parser(
         "heartbeat-daemon",
         help="Long-running per-minute heartbeat to the hub (for SessionStart hooks)",
@@ -1104,6 +1171,8 @@ def main(argv: list[str] | None = None) -> int:
         return session_rewake_command(args)
     if args.subcommand == "heartbeat-daemon":
         return heartbeat_daemon_command(args)
+    if args.subcommand == "onboard":
+        return onboard_command(args)
 
     parser.print_help()
     return 0

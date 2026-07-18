@@ -642,6 +642,44 @@ def test_resolve_identity_derived_beats_marker(tmp_path, monkeypatch):
     assert project == "acme/widgets"
 
 
+def test_onboard_adds_project_and_prints_identity(tmp_path, monkeypatch, capsys):
+    """`mcp-hub onboard` appends org/repo to the machine config and prints
+    the derived identity — the one-command Windows onboarding path."""
+    from mcp_hub.cli import onboard_command
+
+    cfg = tmp_path / "config.json"
+    monkeypatch.setattr("mcp_hub.cli._HUB_CONFIG_PATH", cfg)
+    monkeypatch.setattr(
+        "mcp_hub.cli._git_remote_url", lambda _cwd: "git@github.com:acme/widgets.git"
+    )
+    monkeypatch.setattr("mcp_hub.cli.platform.node", lambda: "Win-Box")
+
+    args = argparse.Namespace(path=str(tmp_path))
+    assert onboard_command(args) == 0
+    assert json.loads(cfg.read_text())["projects"] == ["acme/widgets"]
+    out = capsys.readouterr().out
+    assert "opted in: acme/widgets" in out
+    assert "name=widgets-win-box" in out
+
+    # Idempotent: second run changes nothing, reports already opted in.
+    assert onboard_command(args) == 0
+    assert json.loads(cfg.read_text())["projects"] == ["acme/widgets"]
+    assert "already opted in" in capsys.readouterr().out
+
+
+def test_onboard_fails_cleanly_outside_git(tmp_path, monkeypatch, capsys):
+    """Not a git repo → error message + exit 1, config untouched."""
+    from mcp_hub.cli import onboard_command
+
+    cfg = tmp_path / "config.json"
+    monkeypatch.setattr("mcp_hub.cli._HUB_CONFIG_PATH", cfg)
+    monkeypatch.setattr("mcp_hub.cli._git_remote_url", lambda _cwd: None)
+
+    assert onboard_command(argparse.Namespace(path=str(tmp_path))) == 1
+    assert not cfg.exists()
+    assert "not a git repo" in capsys.readouterr().err
+
+
 def test_resolve_identity_marker_fallback_when_not_opted_in(tmp_path, monkeypatch):
     """Legacy agents (marker present, machine not opted in) keep working."""
     (tmp_path / ".claude").mkdir()

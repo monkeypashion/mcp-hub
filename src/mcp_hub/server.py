@@ -1529,7 +1529,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 # CLI
 # ---------------------------------------------------------------------------
 
-_CLI_SUBCOMMANDS = {"stop-hook", "session-start", "session-rewake", "heartbeat-daemon"}
+_CLI_SUBCOMMANDS = {
+    "stop-hook",
+    "session-start",
+    "session-rewake",
+    "heartbeat-daemon",
+    "onboard",
+}
 
 
 def main():
