@@ -280,6 +280,10 @@ case "${1:-help}" in
               # stored path (2026-07-19: parallel-attach race crossed two
               # sessions' names/paths; explicit -c makes restarts self-healing).
               tm respawn-pane -k -c "$(untilde "$(field "$a" 2)")" -t "$a"
+              # pane titles are sticky — clear the dead claude's last words so
+              # the tab doesn't impersonate the old conversation until the new
+              # claude speaks (looked like --fresh hadn't worked)
+              tm select-pane -t "$a" -T '' 2>/dev/null || true
               sleep 0.5
               if [ -n "$mode" ]; then launch_agent_cmd "$a" "$rargs"; else launch_agent_cmd "$a"; fi
             else
