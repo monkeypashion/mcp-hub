@@ -488,16 +488,20 @@ case "${1:-help}" in
               #    fresh window needs a push before it shows anything.
               # 2. OSC 9;4 progress straight to the client tty (rendered by
               #    ${progress} where supported; harmless where not).
-              # Trailing-space alternation on EVERY state: per-session
-              # set-titles-string shadows the global, so this loop is the only
-              # thing guaranteeing re-pushes — tmux transmits only on change,
-              # and a fresh VSCode window shows nothing until a push arrives.
               # The short agent label is baked into the title because the
               # VSCode terminals are UNNAMED (a fixed name suppresses live
-              # titles) — the title IS the tab name: "dt · ✳ <status>".
-              local a tty seq ts sp='' hostsafe short g
+              # titles) — the title IS the tab name: "dt ⚡ · ✳ <status>".
+              # Re-push discipline: tmux transmits only on change; content
+              # changes (#T, state, glyph) push themselves. A trailing-space
+              # jiggle forces a push ONLY when a new client appears (fresh
+              # window needs a backfill) or on a slow ~60s heartbeat —
+              # constant alternation made tabs visibly flicker every pass.
+              local a tty seq ts sp='' hostsafe short g cur jig=''
               hostsafe="$(sanitize_ident "$(hostname)")"
-              [ $(( $(date +%s) / 2 % 2 )) = 0 ] && sp=' '
+              cur="$(tm list-clients -F '#{client_tty}' 2>/dev/null | sort | paste -sd, -)"
+              [ "$cur" != "$WHO_LAST" ] && jig=1; WHO_LAST="$cur"
+              WHO_PASS=$((WHO_PASS+1)); [ $(( WHO_PASS % 30 )) = 0 ] && jig=1
+              [ -n "$jig" ] && sp=' '
               for a in $(agents); do
                 short="${a%-$hostsafe}"
                 g="$(hub_glyph "$a")"; short="$short${g:+ $g}"
@@ -514,10 +518,11 @@ case "${1:-help}" in
                 done
               done
             }
+            WHO_PASS=0; WHO_LAST=''
             if [ -n "$wmode" ]; then
               while true; do
                 printf '\033[2J\033[H'
-                printf 'squad who — %s   (🔴 needs you · 🟢 working · 💤 idle)\n\n' "$(date +%H:%M:%S)"
+                printf 'squad who — %s   (🔴 needs you · 🟢 working · 💤 idle · ⚡ wakeable)\n\n' "$(date +%H:%M:%S)"
                 who_board; who_paint; who_badge; sleep 2
               done
             else who_board; who_paint; who_badge; fi ;;
