@@ -476,13 +476,17 @@ case "${1:-help}" in
               #    fresh window needs a push before it shows anything.
               # 2. OSC 9;4 progress straight to the client tty (rendered by
               #    ${progress} where supported; harmless where not).
-              local a tty seq ts
+              # Trailing-space alternation on EVERY state: per-session
+              # set-titles-string shadows the global, so this loop is the only
+              # thing guaranteeing re-pushes — tmux transmits only on change,
+              # and fresh VSCode windows show nothing until a push arrives.
+              local a tty seq ts sp=''
+              [ $(( $(date +%s) / 2 % 2 )) = 0 ] && sp=' '
               for a in $(agents); do
                 case "${WST[$a]:-}" in
-                  waiting) ts='🔴 #T'; [ $(( $(date +%s) / 2 % 2 )) = 0 ] && ts='🔴 #T '
-                           seq='\033]9;4;2;0\a' ;;
-                  working) ts='#T'; seq='\033]9;4;3;0\a' ;;
-                  *)       ts='#T'; seq='\033]9;4;0;0\a' ;;
+                  waiting) ts="🔴 #T$sp"; seq='\033]9;4;2;0\a' ;;
+                  working) ts="#T$sp";    seq='\033]9;4;3;0\a' ;;
+                  *)       ts="#T$sp";    seq='\033]9;4;0;0\a' ;;
                 esac
                 [ "$(tm show -t "=$a" -v set-titles-string 2>/dev/null)" = "$ts" ] \
                   || tm set -t "=$a" set-titles-string "$ts" 2>/dev/null || true
