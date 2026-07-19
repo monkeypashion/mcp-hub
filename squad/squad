@@ -441,17 +441,29 @@ case "${1:-help}" in
             # the dash doubles as the needs-me board.
             wmode=""; case "${2:-}" in -w|--watch) wmode=1 ;; esac
             declare -A WST   # agent -> state, one classify pass per refresh
+            # Compact hub-presence glyph from the daemon's status cache (same
+            # source as the statusline / `ls` HUB column):
+            #   ⚡ wakeable · ⚠ online but unwakeable · ✖ offline · ? stale · '' no data
+            hub_glyph() {
+              local sf; sf="$(status_file "$1")"
+              [ -f "$sf" ] || { printf ''; return; }
+              [ -n "$(find "$sf" -mmin -3 2>/dev/null)" ] || { printf '?'; return; }
+              if grep -q '"online"[[:space:]]*:[[:space:]]*true' "$sf"; then
+                if grep -q '"wakeable"[[:space:]]*:[[:space:]]*true' "$sf"; then printf '⚡'; else printf '⚠'; fi
+              else printf '✖'; fi
+            }
             who_board() {
-              local a st
+              local a st g
               for a in $(agents); do
                 if ! tm has-session -t "=$a" 2>/dev/null || ! pane_alive "$a"; then st="down"
                 else st="$(classify_agent "$a")"; fi
                 WST[$a]="$st"
+                g="$(hub_glyph "$a")"
                 case "$st" in
-                  waiting) printf '  \033[1;31m🔴 %-28s WAITING ON YOU\033[0m\n' "$a" ;;
-                  working) printf '  \033[32m🟢 %-28s working\033[0m\n' "$a" ;;
-                  idle)    printf '  \033[2m💤 %-28s idle\033[0m\n' "$a" ;;
-                  down)    printf '  ⚫ %-28s down\n' "$a" ;;
+                  waiting) printf '  \033[1;31m🔴 %-28s %-2s WAITING ON YOU\033[0m\n' "$a" "$g" ;;
+                  working) printf '  \033[32m🟢 %-28s %-2s working\033[0m\n' "$a" "$g" ;;
+                  idle)    printf '  \033[2m💤 %-28s %-2s idle\033[0m\n' "$a" "$g" ;;
+                  down)    printf '  ⚫ %-28s %-2s down\n' "$a" "$g" ;;
                 esac
               done
             }
@@ -483,11 +495,12 @@ case "${1:-help}" in
               # The short agent label is baked into the title because the
               # VSCode terminals are UNNAMED (a fixed name suppresses live
               # titles) — the title IS the tab name: "dt · ✳ <status>".
-              local a tty seq ts sp='' hostsafe short
+              local a tty seq ts sp='' hostsafe short g
               hostsafe="$(sanitize_ident "$(hostname)")"
               [ $(( $(date +%s) / 2 % 2 )) = 0 ] && sp=' '
               for a in $(agents); do
                 short="${a%-$hostsafe}"
+                g="$(hub_glyph "$a")"; short="$short${g:+ $g}"
                 case "${WST[$a]:-}" in
                   waiting) ts="🔴 $short · #T$sp"; seq='\033]9;4;2;0\a' ;;
                   working) ts="$short · #T$sp";    seq='\033]9;4;3;0\a' ;;
