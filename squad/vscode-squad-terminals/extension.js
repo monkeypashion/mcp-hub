@@ -162,6 +162,34 @@ function activate(context) {
           agents.forEach((a) => squadExec(["cmd", a, text], a));
       })
     ),
+    vscode.commands.registerCommand("squad.dmVia", (...args) => {
+      // sender = the clicked tab (multi-select doesn't apply: one courier)
+      const sender = resolveAgent(args[0]);
+      if (!sender) {
+        vscode.window.showWarningMessage("Squad: this terminal isn't a squad agent.");
+        return;
+      }
+      (async () => {
+        const others = rosterAgents()
+          .filter((a) => a !== sender)
+          .map((a) => ({ label: shortLabel(a), agent: a }));
+        const picks = await vscode.window.showQuickPick(others, {
+          canPickMany: true,
+          placeHolder: `Recipients — message goes via ${shortLabel(sender)} over the hub`,
+        });
+        if (!picks || !picks.length) return;
+        const msg = await vscode.window.showInputBox({
+          prompt: `From ${shortLabel(sender)} to ${picks.map((p) => p.label).join(", ")}`,
+          placeHolder: "the message to deliver",
+        });
+        if (!msg) return;
+        const names = picks.map((p) => p.agent).join(", ");
+        squadExec(
+          ["cmd", sender, `Please send this message via the hub to ${names}: ${msg}`],
+          sender
+        );
+      })();
+    }),
     vscode.commands.registerCommand("squad.compact", (...args) =>
       withAgents(args, (agents) => agents.forEach((a) => squadExec(["cmd", a, "/compact"], a)))
     ),
