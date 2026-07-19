@@ -75,45 +75,60 @@ function squadExec(args, agent) {
   });
 }
 
-function withAgent(terminal, fn) {
-  const agent = resolveAgent(terminal);
-  if (!agent) {
-    vscode.window.showWarningMessage("Squad: this terminal isn't a squad agent.");
+// Context-menu commands may be invoked as (clickedTerminal) or — when tabs
+// are multi-selected — as (clickedTerminal, selectedTerminals[]). Resolve
+// every selected agent so actions apply to the whole selection.
+function resolveAgents(args) {
+  const list = Array.isArray(args[1]) && args[1].length ? args[1] : [args[0]];
+  const agents = [];
+  for (const t of list) {
+    const a = resolveAgent(t);
+    if (a) agents.push(a);
+  }
+  return [...new Set(agents)];
+}
+
+function withAgents(args, fn) {
+  const agents = resolveAgents(args);
+  if (!agents.length) {
+    vscode.window.showWarningMessage("Squad: no squad agent in the selection.");
     return;
   }
-  fn(agent);
+  fn(agents);
 }
+
+const labels = (agents) => agents.map(shortLabel).join(", ");
 
 function activate(context) {
   // ---- context-menu commands (registered in every window; they no-op
   // politely on non-agent terminals) ----
   context.subscriptions.push(
-    vscode.commands.registerCommand("squad.sendPrompt", (t) =>
-      withAgent(t, async (agent) => {
+    vscode.commands.registerCommand("squad.sendPrompt", (...args) =>
+      withAgents(args, async (agents) => {
         const text = await vscode.window.showInputBox({
-          prompt: `Prompt to ${shortLabel(agent)}`,
-          placeHolder: "typed into that agent's claude input, Enter included",
+          prompt: `Prompt to ${labels(agents)}`,
+          placeHolder: "typed into each agent's claude input, Enter included",
         });
-        if (text) squadExec(["cmd", agent, text], agent);
+        if (text) agents.forEach((a) => squadExec(["cmd", a, text], a));
       })
     ),
-    vscode.commands.registerCommand("squad.compact", (t) =>
-      withAgent(t, (agent) => squadExec(["cmd", agent, "/compact"], agent))
+    vscode.commands.registerCommand("squad.compact", (...args) =>
+      withAgents(args, (agents) => agents.forEach((a) => squadExec(["cmd", a, "/compact"], a)))
     ),
-    vscode.commands.registerCommand("squad.interrupt", (t) =>
-      withAgent(t, (agent) => squadExec(["key", agent, "Escape"], agent))
+    vscode.commands.registerCommand("squad.interrupt", (...args) =>
+      withAgents(args, (agents) => agents.forEach((a) => squadExec(["key", a, "Escape"], a)))
     ),
-    vscode.commands.registerCommand("squad.restartResume", (t) =>
-      withAgent(t, (agent) => squadExec(["restart", agent, "--resume"], agent))
+    vscode.commands.registerCommand("squad.restartResume", (...args) =>
+      withAgents(args, (agents) => agents.forEach((a) => squadExec(["restart", a, "--resume"], a)))
     ),
-    vscode.commands.registerCommand("squad.restartFresh", (t) =>
-      withAgent(t, async (agent) => {
+    vscode.commands.registerCommand("squad.restartFresh", (...args) =>
+      withAgents(args, async (agents) => {
         const ok = await vscode.window.showWarningMessage(
-          `Restart ${shortLabel(agent)} with a BLANK conversation?`,
+          `Restart ${labels(agents)} with BLANK conversation(s)?`,
           { modal: true },
           "Fresh restart"
         );
-        if (ok) squadExec(["restart", agent, "--fresh"], agent);
+        if (ok) agents.forEach((a) => squadExec(["restart", a, "--fresh"], a));
       })
     )
   );
@@ -122,30 +137,30 @@ function activate(context) {
   // /clear is destructive (wipes the conversation) -> modal confirm.
   for (const slash of ["context", "cost", "status", "doctor", "mcp", "model", "memory", "todos", "help"]) {
     context.subscriptions.push(
-      vscode.commands.registerCommand(`squad.slash.${slash}`, (t) =>
-        withAgent(t, (agent) => squadExec(["cmd", agent, `/${slash}`], agent))
+      vscode.commands.registerCommand(`squad.slash.${slash}`, (...args) =>
+        withAgents(args, (agents) => agents.forEach((a) => squadExec(["cmd", a, `/${slash}`], a)))
       )
     );
   }
   context.subscriptions.push(
-    vscode.commands.registerCommand("squad.slash.clear", (t) =>
-      withAgent(t, async (agent) => {
+    vscode.commands.registerCommand("squad.slash.clear", (...args) =>
+      withAgents(args, async (agents) => {
         const ok = await vscode.window.showWarningMessage(
-          `/clear wipes ${shortLabel(agent)}'s conversation. Sure?`,
+          `/clear wipes the conversation(s) of: ${labels(agents)}. Sure?`,
           { modal: true },
-          "Clear it"
+          "Clear"
         );
-        if (ok) squadExec(["cmd", agent, "/clear"], agent);
+        if (ok) agents.forEach((a) => squadExec(["cmd", a, "/clear"], a));
       })
     ),
-    vscode.commands.registerCommand("squad.slash.custom", (t) =>
-      withAgent(t, async (agent) => {
+    vscode.commands.registerCommand("squad.slash.custom", (...args) =>
+      withAgents(args, async (agents) => {
         const cmd = await vscode.window.showInputBox({
-          prompt: `Slash command for ${shortLabel(agent)}`,
+          prompt: `Slash command for ${labels(agents)}`,
           placeHolder: "/memory-sync, /review, …",
           validateInput: (v) => (v.startsWith("/") ? undefined : "must start with /"),
         });
-        if (cmd) squadExec(["cmd", agent, cmd], agent);
+        if (cmd) agents.forEach((a) => squadExec(["cmd", a, cmd], a));
       })
     )
   );
