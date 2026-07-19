@@ -112,6 +112,39 @@ function activate(context) {
         if (text) agents.forEach((a) => squadExec(["cmd", a, text], a));
       })
     ),
+    vscode.commands.registerCommand("squad.stockPrompt", (...args) =>
+      withAgents(args, async (agents) => {
+        const file = path.join(os.homedir(), ".config", "squad", "prompts.txt");
+        let prompts = [];
+        try {
+          prompts = fs
+            .readFileSync(file, "utf8")
+            .split("\n")
+            .map((s) => s.trim())
+            .filter((s) => s && !s.startsWith("#"));
+        } catch {}
+        if (!prompts.length) {
+          vscode.window.showWarningMessage("No stock prompts — add lines to ~/.config/squad/prompts.txt");
+          return;
+        }
+        const pick = await vscode.window.showQuickPick(prompts, {
+          placeHolder: `Stock prompt for ${labels(agents)}`,
+        });
+        if (pick) agents.forEach((a) => squadExec(["cmd", a, pick], a));
+      })
+    ),
+    vscode.commands.registerCommand("squad.broadcast", (...args) =>
+      withAgents(args, async (agents) => {
+        const prefix = "Please broadcast a message to the team saying: ";
+        const text = await vscode.window.showInputBox({
+          prompt: `Broadcast via ${labels(agents)}`,
+          value: prefix,
+          valueSelection: [prefix.length, prefix.length],
+        });
+        if (text && text.trim() !== prefix.trim())
+          agents.forEach((a) => squadExec(["cmd", a, text], a));
+      })
+    ),
     vscode.commands.registerCommand("squad.compact", (...args) =>
       withAgents(args, (agents) => agents.forEach((a) => squadExec(["cmd", a, "/compact"], a)))
     ),

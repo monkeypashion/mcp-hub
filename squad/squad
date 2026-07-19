@@ -526,12 +526,12 @@ case "${1:-help}" in
                 g="$(hub_glyph "$a")"
                 ctx="${WCTX[$a]:-}"
                 # context-pressure tiers (titles can't carry ANSI colour):
-                # plain <70 · 🟡 70-84 · 🔥 85+  (🔴 stays "waiting", ⚠ stays hub)
+                # operator clears context before 50% — plain <40 · 🟡 40-49 ·
+                # 🔥 50+  (🔴 stays "waiting", ⚠ stays hub)
                 if [ -n "$ctx" ]; then
-                  case "${ctx%\%}" in
-                    (8[5-9]|9[0-9]|100) ctx="🔥$ctx" ;;
-                    (7[0-9]|8[0-4])     ctx="🟡$ctx" ;;
-                  esac
+                  n="${ctx%\%}"
+                  if   [ "$n" -ge 50 ] 2>/dev/null; then ctx="🔥$ctx"
+                  elif [ "$n" -ge 40 ] 2>/dev/null; then ctx="🟡$ctx"; fi
                 fi
                 case "${WST[$a]:-}" in
                   waiting) ts="$g 🔴 $short${ctx:+ $ctx} · #T$sp"; seq='\033]9;4;2;0\a' ;;
