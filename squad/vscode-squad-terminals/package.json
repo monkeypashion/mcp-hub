@@ -2,7 +2,7 @@
   "name": "squad-terminals",
   "displayName": "Squad Terminals",
   "description": "Auto-opens one plain terminal per squad agent (squad attach) with icon+color, and adds per-agent squad actions to the terminal tab context menu.",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "publisher": "monkeypashion",
   "engines": { "vscode": "^1.90.0" },
   "main": "./extension.js",
@@ -41,9 +41,8 @@
       ],
       "squad.agentMenu": [
         { "command": "squad.sendPrompt", "group": "1_talk@1" },
-        { "command": "squad.compact", "group": "1_talk@2" },
-        { "command": "squad.interrupt", "group": "1_talk@3" },
-        { "submenu": "squad.slashMenu", "group": "1_talk@4" },
+        { "command": "squad.interrupt", "group": "1_talk@2" },
+        { "submenu": "squad.slashMenu", "group": "1_talk@3" },
         { "command": "squad.restartResume", "group": "2_lifecycle@1" },
         { "command": "squad.restartFresh", "group": "2_lifecycle@2" }
       ],
@@ -55,8 +54,9 @@
         { "command": "squad.slash.mcp", "group": "1_info@5" },
         { "command": "squad.slash.doctor", "group": "1_info@6" },
         { "command": "squad.slash.help", "group": "1_info@7" },
-        { "command": "squad.slash.model", "group": "2_change@1" },
-        { "command": "squad.slash.memory", "group": "2_change@2" },
+        { "command": "squad.compact", "group": "2_change@1" },
+        { "command": "squad.slash.model", "group": "2_change@2" },
+        { "command": "squad.slash.memory", "group": "2_change@3" },
         { "command": "squad.slash.clear", "group": "3_danger@1" },
         { "command": "squad.slash.custom", "group": "4_custom@1" }
       ]
