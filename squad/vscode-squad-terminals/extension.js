@@ -61,6 +61,23 @@ function activate() {
       .filter(Boolean)
       .map((args) => args[1])
   );
+  // who + dash monitors: NAMED terminals (pinned tab names are a feature
+  // here — no live titles wanted). Replaces the workspace tasks, whose
+  // terminals carried VSCode's unremovable "... — Task" suffix.
+  const existingNames = new Set(vscode.window.terminals.map((t) => t.name));
+  for (const [name, icon, color, cmd] of [
+    ["who",  "eye",    "terminal.ansiBrightRed",   "squad who --watch"],
+    ["dash", "layout", "terminal.ansiBrightGreen", "squad dash"],
+  ]) {
+    if (existingNames.has(name)) continue;
+    const t = vscode.window.createTerminal({
+      name,
+      iconPath: new vscode.ThemeIcon(icon),
+      color: new vscode.ThemeColor(color),
+    });
+    t.sendText(cmd);
+  }
+
   for (const agent of rosterAgents()) {
     if (attached.has(agent)) continue; // don't duplicate on window reloads
     const label = shortLabel(agent);
