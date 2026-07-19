@@ -1,13 +1,39 @@
 {
   "name": "squad-terminals",
   "displayName": "Squad Terminals",
-  "description": "Auto-opens one plain terminal per squad agent (squad attach) with icon+color. Plain terminals — unlike task terminals — render live ${sequence} tab descriptions.",
-  "version": "0.1.0",
+  "description": "Auto-opens one plain terminal per squad agent (squad attach) with icon+color, and adds per-agent squad actions to the terminal tab context menu.",
+  "version": "0.2.0",
   "publisher": "monkeypashion",
   "engines": { "vscode": "^1.90.0" },
   "main": "./extension.js",
   "activationEvents": [
     "onStartupFinished"
   ],
-  "contributes": {}
+  "contributes": {
+    "commands": [
+      { "command": "squad.sendPrompt", "title": "Send prompt…", "category": "Squad" },
+      { "command": "squad.compact", "title": "/compact", "category": "Squad" },
+      { "command": "squad.interrupt", "title": "Interrupt (Esc)", "category": "Squad" },
+      { "command": "squad.restartResume", "title": "Restart (resume conversation)", "category": "Squad" },
+      { "command": "squad.restartFresh", "title": "Restart (fresh conversation)", "category": "Squad" }
+    ],
+    "submenus": [
+      { "id": "squad.agentMenu", "label": "Squad" }
+    ],
+    "menus": {
+      "terminal/title/context": [
+        { "submenu": "squad.agentMenu", "group": "2_squad" }
+      ],
+      "terminal/context": [
+        { "submenu": "squad.agentMenu", "group": "2_squad" }
+      ],
+      "squad.agentMenu": [
+        { "command": "squad.sendPrompt", "group": "1_talk@1" },
+        { "command": "squad.compact", "group": "1_talk@2" },
+        { "command": "squad.interrupt", "group": "1_talk@3" },
+        { "command": "squad.restartResume", "group": "2_lifecycle@1" },
+        { "command": "squad.restartFresh", "group": "2_lifecycle@2" }
+      ]
+    }
+  }
 }
