@@ -479,14 +479,19 @@ case "${1:-help}" in
               # Trailing-space alternation on EVERY state: per-session
               # set-titles-string shadows the global, so this loop is the only
               # thing guaranteeing re-pushes — tmux transmits only on change,
-              # and fresh VSCode windows show nothing until a push arrives.
-              local a tty seq ts sp=''
+              # and a fresh VSCode window shows nothing until a push arrives.
+              # The short agent label is baked into the title because the
+              # VSCode terminals are UNNAMED (a fixed name suppresses live
+              # titles) — the title IS the tab name: "dt · ✳ <status>".
+              local a tty seq ts sp='' hostsafe short
+              hostsafe="$(sanitize_ident "$(hostname)")"
               [ $(( $(date +%s) / 2 % 2 )) = 0 ] && sp=' '
               for a in $(agents); do
+                short="${a%-$hostsafe}"
                 case "${WST[$a]:-}" in
-                  waiting) ts="🔴 #T$sp"; seq='\033]9;4;2;0\a' ;;
-                  working) ts="#T$sp";    seq='\033]9;4;3;0\a' ;;
-                  *)       ts="#T$sp";    seq='\033]9;4;0;0\a' ;;
+                  waiting) ts="🔴 $short · #T$sp"; seq='\033]9;4;2;0\a' ;;
+                  working) ts="$short · #T$sp";    seq='\033]9;4;3;0\a' ;;
+                  *)       ts="$short · #T$sp";    seq='\033]9;4;0;0\a' ;;
                 esac
                 # NB: show/set-option reject the "=" prefix too — bare name
                 [ "$(tm show -t "$a" -v set-titles-string 2>/dev/null)" = "$ts" ] \

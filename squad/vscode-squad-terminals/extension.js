@@ -51,13 +51,21 @@ function activate() {
   const wf = vscode.workspace.workspaceFile;
   if (!wf || !wf.path.endsWith("squad.code-workspace")) return;
 
-  const existing = new Set(vscode.window.terminals.map((t) => t.name));
+  // NO `name:` property — a fixed name pins the tab and suppresses live
+  // ${sequence} titles (empirically: unnamed terminals rename themselves from
+  // the OSC title, named ones never do). Identity comes from the title
+  // itself: `squad who` sets each session's title to "<label> · <status>".
+  const attached = new Set(
+    vscode.window.terminals
+      .map((t) => t.creationOptions && t.creationOptions.shellArgs)
+      .filter(Boolean)
+      .map((args) => args[1])
+  );
   for (const agent of rosterAgents()) {
+    if (attached.has(agent)) continue; // don't duplicate on window reloads
     const label = shortLabel(agent);
-    if (existing.has(label)) continue; // don't duplicate on window reloads
     const [icon, color] = THEME[label] || FALLBACK;
     vscode.window.createTerminal({
-      name: label,
       iconPath: new vscode.ThemeIcon(icon),
       color: new vscode.ThemeColor(color),
       shellPath: path.join(os.homedir(), ".local", "bin", "squad"),
