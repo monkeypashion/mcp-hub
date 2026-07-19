@@ -440,17 +440,18 @@ case "${1:-help}" in
             # every 2s and also paints dash tile borders (red/green/grey) so
             # the dash doubles as the needs-me board.
             wmode=""; case "${2:-}" in -w|--watch) wmode=1 ;; esac
+            declare -A WST   # agent -> state, one classify pass per refresh
             who_board() {
               local a st
               for a in $(agents); do
-                if ! tm has-session -t "=$a" 2>/dev/null || ! pane_alive "$a"; then
-                  printf '  ⚫ %-28s down\n' "$a"; continue
-                fi
-                st="$(classify_agent "$a")"
+                if ! tm has-session -t "=$a" 2>/dev/null || ! pane_alive "$a"; then st="down"
+                else st="$(classify_agent "$a")"; fi
+                WST[$a]="$st"
                 case "$st" in
                   waiting) printf '  \033[1;31m🔴 %-28s WAITING ON YOU\033[0m\n' "$a" ;;
                   working) printf '  \033[32m🟢 %-28s working\033[0m\n' "$a" ;;
                   idle)    printf '  \033[2m💤 %-28s idle\033[0m\n' "$a" ;;
+                  down)    printf '  ⚫ %-28s down\n' "$a" ;;
                 esac
               done
             }
@@ -460,20 +461,36 @@ case "${1:-help}" in
               for p in $(tm list-panes -t dash -F '#{pane_id}'); do
                 ag="$(tm display -p -t "$p" '#{@agent}' 2>/dev/null)"
                 [ -n "$ag" ] || continue
-                case "$(classify_agent "$ag")" in
+                case "${WST[$ag]:-}" in
                   waiting) tm select-pane -t "$p" -P 'fg=red,bold' ;;
                   working) tm select-pane -t "$p" -P 'fg=green' ;;
                   *)       tm select-pane -t "$p" -P 'fg=colour240' ;;
                 esac
               done
             }
+            who_badge() {   # OSC 9;4 progress -> VSCode tab (rendered by the
+              # ${progress} variable in tabs.title/description). Written straight
+              # to each agent's VSCode client tty — bypasses tmux entirely.
+              #   waiting -> state 2 (error)   working -> 3 (indeterminate)   else -> 0 (clear)
+              local a tty seq
+              for a in $(agents); do
+                case "${WST[$a]:-}" in
+                  waiting) seq='\033]9;4;2;0\a' ;;
+                  working) seq='\033]9;4;3;0\a' ;;
+                  *)       seq='\033]9;4;0;0\a' ;;
+                esac
+                for tty in $(tm list-clients -t "=$a" -F '#{?#{==:#{client_termname},xterm-256color},#{client_tty},}' 2>/dev/null); do
+                  [ -w "$tty" ] && printf '%b' "$seq" > "$tty" 2>/dev/null || true
+                done
+              done
+            }
             if [ -n "$wmode" ]; then
               while true; do
                 printf '\033[2J\033[H'
                 printf 'squad who — %s   (🔴 needs you · 🟢 working · 💤 idle)\n\n' "$(date +%H:%M:%S)"
-                who_board; who_paint; sleep 2
+                who_board; who_paint; who_badge; sleep 2
               done
-            else who_board; who_paint; fi ;;
+            else who_board; who_paint; who_badge; fi ;;
   handoff)  a="$(need_agent "${2:-}")" || exit 1; handoff "$a" ;;
   add)      add_agent "${2:-}" "${3:-}" "${4:-}" ;;
   rm)       a="$(need_agent "${2:-}")" || exit 1; rm_agent "$a" ;;
