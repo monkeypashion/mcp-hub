@@ -347,6 +347,40 @@ case "${1:-help}" in
             else a="$(need_agent "")" || exit 1; shift; fi
             tmp="$(mktemp)"; awk -F'|' -v a="$a" -v n="$*" 'BEGIN{OFS="|"} $1==a{$4=n} {print}' "$CONF" > "$tmp" && mv "$tmp" "$CONF"
             echo "next launch of $a: $*" ;;
+  dash)     # The whole-squad monitor: ONE window, one live pane per agent, tiled.
+            # Recreates the old "seven VSCode windows on one monitor" view in a
+            # single command. Each pane is a nested tmux client attached to that
+            # agent's session on this same server — so it's the agent's REAL pane
+            # (type into it to talk to that agent), not a read-only copy.
+            # "dash" is a reserved session name (like "ops") — don't name an agent dash.
+            d="dash"
+            # With several clients on one session (a dash pane + a direct attach),
+            # follow the most recently active client's size instead of clamping
+            # every view to the smallest one.
+            tm set -g window-size latest 2>/dev/null || true
+            for a in $(agents); do tm has-session -t "=$a" 2>/dev/null || up_one "$a"; done
+            tm kill-session -t "=$d" 2>/dev/null || true
+            first=""
+            for a in $(agents); do
+              if [ -z "$first" ]; then
+                # -x/-y: generous canvas so all splits fit while detached; the
+                # window re-sizes to the real client on attach (window-size latest).
+                tm new-session -d -s "$d" -x 220 -y 60 "TMUX= exec tmux -L $SOCK attach -t '=$a'"
+                first="$a"
+              else
+                # NB: split-window/select-layout are pane-target commands — no "=" prefix (see top note)
+                tm split-window -t "$d" -d "TMUX= exec tmux -L $SOCK attach -t '=$a'"
+                tm select-layout -t "$d" tiled >/dev/null
+              fi
+            done
+            tm select-layout -t "$d" tiled >/dev/null
+            echo "dash: $(agents | wc -l) agents tiled — Ctrl-b z zooms a pane, Ctrl-b arrows move focus"
+            if [ -n "${TMUX:-}" ]; then
+              tmux -L "$SOCK" switch-client -t "=$d" 2>/dev/null \
+                || echo "attach with: $CMD dash   (or Ctrl-b s and pick 'dash')"
+            else
+              exec tmux -L "$SOCK" attach -t "=$d"
+            fi ;;
   handoff)  a="$(need_agent "${2:-}")" || exit 1; handoff "$a" ;;
   add)      add_agent "${2:-}" "${3:-}" "${4:-}" ;;
   rm)       a="$(need_agent "${2:-}")" || exit 1; rm_agent "$a" ;;
@@ -370,6 +404,10 @@ run
   $CMD attach  [agent]          attach, starting/repairing it first if needed; Ctrl-b d detaches
 
 watch + repair
+  $CMD dash                     the whole squad in ONE window — a live tiled pane per agent
+                                (starts any agent that's down). type into a pane to talk to
+                                that agent · Ctrl-b z zoom/unzoom · Ctrl-b arrows move focus
+                                Ctrl-b Ctrl-b passes a Ctrl-b through to the focused agent
   $CMD ls                       status: tmux liveness + hub presence per agent
   $CMD heal                     fix agents that are up in tmux but broken on the hub:
                                 first pass nudges the agent to re-register; if still broken
