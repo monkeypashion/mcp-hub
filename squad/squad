@@ -280,10 +280,11 @@ case "${1:-help}" in
               # stored path (2026-07-19: parallel-attach race crossed two
               # sessions' names/paths; explicit -c makes restarts self-healing).
               tm respawn-pane -k -c "$(untilde "$(field "$a" 2)")" -t "$a"
-              # pane titles are sticky — clear the dead claude's last words so
-              # the tab doesn't impersonate the old conversation until the new
-              # claude speaks (looked like --fresh hadn't worked)
+              # pane title and scrollback are sticky — clear both so the dead
+              # conversation can't impersonate the new one (stale title +
+              # scroll-up history made --fresh look like it hadn't worked)
               tm select-pane -t "$a" -T '' 2>/dev/null || true
+              tm clear-history -t "$a" 2>/dev/null || true
               sleep 0.5
               if [ -n "$mode" ]; then launch_agent_cmd "$a" "$rargs"; else launch_agent_cmd "$a"; fi
             else
@@ -501,8 +502,12 @@ case "${1:-help}" in
                 WST[$a]="$st"
                 # sticky: a capture racing the agent's redraw sometimes misses
                 # the statusline — keep the last reading rather than blinking
-                # the % out of the title (title churn = visible tab flicker)
-                if [ -n "$ctx" ]; then WCTX[$a]="$ctx"; elif [ "$st" = "down" ]; then WCTX[$a]=""; fi
+                # the % out of the title (title churn = visible tab flicker).
+                # BUT an empty pane title means a just-restarted claude
+                # (restart clears it) — drop the dead session's cached %.
+                if [ -n "$ctx" ]; then WCTX[$a]="$ctx"
+                elif [ "$st" = "down" ] || [ -z "$(tm display -p -t "$a" '#{pane_title}' 2>/dev/null)" ]; then WCTX[$a]=""
+                fi
                 g="$(hub_glyph "$a")"
                 case "$st" in
                   waiting) printf '  \033[1;31m🔴 %-28s %-2s %-4s WAITING ON YOU\033[0m\n' "$a" "$g" "$ctx" ;;
