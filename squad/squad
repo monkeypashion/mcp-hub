@@ -276,7 +276,10 @@ case "${1:-help}" in
               # Respawn IN PLACE: kills the pane's process and gives it a fresh
               # shell, but the session survives — attached viewers keep watching
               # instead of being dumped to their own shell mid-restart.
-              tm respawn-pane -k -t "$a"
+              # -c: ALWAYS the roster worktree — never trust the session's
+              # stored path (2026-07-19: parallel-attach race crossed two
+              # sessions' names/paths; explicit -c makes restarts self-healing).
+              tm respawn-pane -k -c "$(untilde "$(field "$a" 2)")" -t "$a"
               sleep 0.5
               if [ -n "$mode" ]; then launch_agent_cmd "$a" "$rargs"; else launch_agent_cmd "$a"; fi
             else
@@ -311,7 +314,7 @@ case "${1:-help}" in
               args="$(field "$a" 4)"
               if [ -n "$(find "$flag" -mmin -10 2>/dev/null)" ] && [[ "$args" == *--continue* ]]; then
                 echo "$a: STILL $state after a nudge — restarting in place (--continue keeps context)"
-                tm respawn-pane -k -t "$a"; sleep 0.5; launch_agent_cmd "$a"
+                tm respawn-pane -k -c "$(untilde "$(field "$a" 2)")" -t "$a"; sleep 0.5; launch_agent_cmd "$a"
                 rm -f "$flag"
               else
                 echo "$a: $state on hub — nudging re-register"
@@ -444,14 +447,18 @@ case "${1:-help}" in
             a="$(need_agent "${2:-}")" || exit 1
             intent="${3:-yes}"
             # NB: capture-pane is a pane-target command — no "=" prefix
-            lines="$(tm capture-pane -p -t "$a" 2>/dev/null | tail -25 | grep -E '^[[:space:]]*(❯[[:space:]]*)?[0-9]+\.')"
+            # every grep shielded with `|| true` — under set -e a no-match grep
+            # in a $() assignment kills the script before the fail-closed
+            # message can print. "ask again" (not "don't") dodges the curly
+            # apostrophe the dialogs actually use.
+            lines="$(tm capture-pane -p -t "$a" 2>/dev/null | tail -25 | grep -E '^[[:space:]]*(❯[[:space:]]*)?[0-9]+\.' || true)"
             case "$intent" in
-              yes)    line="$(printf '%s\n' "$lines" | grep -iE '[0-9]+\.[[:space:]]*yes' | grep -ivE "don.t ask|always" | head -1)" ;;
-              always) line="$(printf '%s\n' "$lines" | grep -iE "don.t ask again|yes.*always" | head -1)" ;;
-              no)     line="$(printf '%s\n' "$lines" | grep -iE '[0-9]+\.[[:space:]]*no' | head -1)" ;;
+              yes)    line="$(printf '%s\n' "$lines" | grep -iE '[0-9]+\.[[:space:]]*yes' | grep -ivE "ask again|always" | head -1 || true)" ;;
+              always) line="$(printf '%s\n' "$lines" | grep -iE "ask again|yes.*always" | head -1 || true)" ;;
+              no)     line="$(printf '%s\n' "$lines" | grep -iE '[0-9]+\.[[:space:]]*no' | head -1 || true)" ;;
               *) echo "usage: $CMD answer [agent] yes|always|no" >&2; exit 1 ;;
             esac
-            num="$(printf '%s\n' "$line" | grep -oE '[0-9]+' | head -1)"
+            num="$(printf '%s\n' "$line" | grep -oE '[0-9]+' | head -1 || true)"
             [ -n "$num" ] || { echo "!! $a: no '$intent' option on screen — not waiting, or dialog has no such choice" >&2; exit 1; }
             tm send-keys -t "$a" "$num"
             echo "$a: answered '$intent' (option $num: $(printf '%s' "$line" | sed 's/^[[:space:]❯]*//'))" ;;
