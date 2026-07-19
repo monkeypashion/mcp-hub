@@ -525,6 +525,14 @@ case "${1:-help}" in
                 # after the label: "⚡ dt 44% · ✳ <status>".
                 g="$(hub_glyph "$a")"
                 ctx="${WCTX[$a]:-}"
+                # context-pressure tiers (titles can't carry ANSI colour):
+                # plain <70 · 🟡 70-84 · 🔥 85+  (🔴 stays "waiting", ⚠ stays hub)
+                if [ -n "$ctx" ]; then
+                  case "${ctx%\%}" in
+                    (8[5-9]|9[0-9]|100) ctx="🔥$ctx" ;;
+                    (7[0-9]|8[0-4])     ctx="🟡$ctx" ;;
+                  esac
+                fi
                 case "${WST[$a]:-}" in
                   waiting) ts="$g 🔴 $short${ctx:+ $ctx} · #T$sp"; seq='\033]9;4;2;0\a' ;;
                   working) ts="$g $short${ctx:+ $ctx} · #T$sp";    seq='\033]9;4;3;0\a' ;;
