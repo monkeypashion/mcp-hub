@@ -446,7 +446,7 @@ case "${1:-help}" in
             #   ⚡ wakeable · ⚠ online but unwakeable · ✖ offline · ? stale · '' no data
             hub_glyph() {
               local sf; sf="$(status_file "$1")"
-              [ -f "$sf" ] || { printf ''; return; }
+              [ -f "$sf" ] || { printf '?'; return; }
               [ -n "$(find "$sf" -mmin -3 2>/dev/null)" ] || { printf '?'; return; }
               if grep -q '"online"[[:space:]]*:[[:space:]]*true' "$sf"; then
                 if grep -q '"wakeable"[[:space:]]*:[[:space:]]*true' "$sf"; then printf '⚡'; else printf '⚠'; fi
@@ -504,11 +504,14 @@ case "${1:-help}" in
               [ -n "$jig" ] && sp=' '
               for a in $(agents); do
                 short="${a%-$hostsafe}"
-                g="$(hub_glyph "$a")"; short="$short${g:+ $g}"
+                # glyph FIRST (right after the tab icon) so the status column
+                # lines up; 🔴 slots in after it when waiting — the name
+                # jumping right is deliberate attention-grabbing
+                g="$(hub_glyph "$a")"
                 case "${WST[$a]:-}" in
-                  waiting) ts="🔴 $short · #T$sp"; seq='\033]9;4;2;0\a' ;;
-                  working) ts="$short · #T$sp";    seq='\033]9;4;3;0\a' ;;
-                  *)       ts="$short · #T$sp";    seq='\033]9;4;0;0\a' ;;
+                  waiting) ts="$g 🔴 $short · #T$sp"; seq='\033]9;4;2;0\a' ;;
+                  working) ts="$g $short · #T$sp";    seq='\033]9;4;3;0\a' ;;
+                  *)       ts="$g $short · #T$sp";    seq='\033]9;4;0;0\a' ;;
                 esac
                 # NB: show/set-option reject the "=" prefix too — bare name
                 [ "$(tm show -t "$a" -v set-titles-string 2>/dev/null)" = "$ts" ] \
