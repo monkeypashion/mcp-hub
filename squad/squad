@@ -467,7 +467,11 @@ case "${1:-help}" in
                   else st="idle"; fi
                   ctx="$(printf '%s\n' "$tail" | grep -oE '[c]tx \[[^]]*\][[:space:]]*[0-9]+%' | tail -1 | grep -oE '[0-9]+%' || true)"
                 fi
-                WST[$a]="$st"; WCTX[$a]="$ctx"
+                WST[$a]="$st"
+                # sticky: a capture racing the agent's redraw sometimes misses
+                # the statusline — keep the last reading rather than blinking
+                # the % out of the title (title churn = visible tab flicker)
+                if [ -n "$ctx" ]; then WCTX[$a]="$ctx"; elif [ "$st" = "down" ]; then WCTX[$a]=""; fi
                 g="$(hub_glyph "$a")"
                 case "$st" in
                   waiting) printf '  \033[1;31m🔴 %-28s %-2s %-4s WAITING ON YOU\033[0m\n' "$a" "$g" "$ctx" ;;
