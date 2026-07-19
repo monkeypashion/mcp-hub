@@ -452,18 +452,28 @@ case "${1:-help}" in
                 if grep -q '"wakeable"[[:space:]]*:[[:space:]]*true' "$sf"; then printf '⚡'; else printf '⚠'; fi
               else printf '✖'; fi
             }
+            declare -A WCTX  # agent -> context % (scraped from its own statusline)
             who_board() {
-              local a st g
+              local a st g tail ctx
               for a in $(agents); do
+                ctx=""
                 if ! tm has-session -t "=$a" 2>/dev/null || ! pane_alive "$a"; then st="down"
-                else st="$(classify_agent "$a")"; fi
-                WST[$a]="$st"
+                else
+                  # one capture, two harvests: waiting/working state AND the
+                  # ctx % the agent's own statusline already renders on screen
+                  tail="$(tm capture-pane -p -t "$a" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -20)"
+                  if   printf '%s\n' "$tail" | grep -qE '❯ 1\. [Y]es|[D]o you want to|[N]o, and tell Claude|requires [a]pproval'; then st="waiting"
+                  elif printf '%s\n' "$tail" | grep -qE '[e]sc to interrupt'; then st="working"
+                  else st="idle"; fi
+                  ctx="$(printf '%s\n' "$tail" | grep -oE '[c]tx \[[^]]*\][[:space:]]*[0-9]+%' | tail -1 | grep -oE '[0-9]+%' || true)"
+                fi
+                WST[$a]="$st"; WCTX[$a]="$ctx"
                 g="$(hub_glyph "$a")"
                 case "$st" in
-                  waiting) printf '  \033[1;31m🔴 %-28s %-2s WAITING ON YOU\033[0m\n' "$a" "$g" ;;
-                  working) printf '  \033[32m🟢 %-28s %-2s working\033[0m\n' "$a" "$g" ;;
-                  idle)    printf '  \033[2m💤 %-28s %-2s idle\033[0m\n' "$a" "$g" ;;
-                  down)    printf '  ⚫ %-28s %-2s down\n' "$a" "$g" ;;
+                  waiting) printf '  \033[1;31m🔴 %-28s %-2s %-4s WAITING ON YOU\033[0m\n' "$a" "$g" "$ctx" ;;
+                  working) printf '  \033[32m🟢 %-28s %-2s %-4s working\033[0m\n' "$a" "$g" "$ctx" ;;
+                  idle)    printf '  \033[2m💤 %-28s %-2s %-4s idle\033[0m\n' "$a" "$g" "$ctx" ;;
+                  down)    printf '  ⚫ %-28s %-2s %-4s down\n' "$a" "$g" "$ctx" ;;
                 esac
               done
             }
@@ -502,16 +512,19 @@ case "${1:-help}" in
               [ "$cur" != "$WHO_LAST" ] && jig=1; WHO_LAST="$cur"
               WHO_PASS=$((WHO_PASS+1)); [ $(( WHO_PASS % 30 )) = 0 ] && jig=1
               [ -n "$jig" ] && sp=' '
+              local ctx
               for a in $(agents); do
                 short="${a%-$hostsafe}"
                 # glyph FIRST (right after the tab icon) so the status column
                 # lines up; 🔴 slots in after it when waiting — the name
-                # jumping right is deliberate attention-grabbing
+                # jumping right is deliberate attention-grabbing. ctx % rides
+                # after the label: "⚡ dt 44% · ✳ <status>".
                 g="$(hub_glyph "$a")"
+                ctx="${WCTX[$a]:-}"
                 case "${WST[$a]:-}" in
-                  waiting) ts="$g 🔴 $short · #T$sp"; seq='\033]9;4;2;0\a' ;;
-                  working) ts="$g $short · #T$sp";    seq='\033]9;4;3;0\a' ;;
-                  *)       ts="$g $short · #T$sp";    seq='\033]9;4;0;0\a' ;;
+                  waiting) ts="$g 🔴 $short${ctx:+ $ctx} · #T$sp"; seq='\033]9;4;2;0\a' ;;
+                  working) ts="$g $short${ctx:+ $ctx} · #T$sp";    seq='\033]9;4;3;0\a' ;;
+                  *)       ts="$g $short${ctx:+ $ctx} · #T$sp";    seq='\033]9;4;0;0\a' ;;
                 esac
                 # NB: show/set-option reject the "=" prefix too — bare name
                 [ "$(tm show -t "$a" -v set-titles-string 2>/dev/null)" = "$ts" ] \
