@@ -422,7 +422,8 @@ case "${1:-help}" in
   rm)       a="$(need_agent "${2:-}")" || exit 1; rm_agent "$a" ;;
   pull-local) pull_local "${2:-}" ;;
   *) cat <<EOF
-squad — run a fleet of Claude Code agents in tmux, wired to the mcp-hub.
+squad — run this machine's squad of Claude Code agents in tmux, wired to the mcp-hub.
+(terminology: a "squad" is one machine's agents; the "fleet" is every agent on the hub, all machines.)
 
 enroll (identity is derived: name = <repo>-<hostname>, project = <org>/<repo>)
   $CMD add <org>/<repo>         clone/pull + hub opt-in + enroll (idempotent; migrates legacy names)
