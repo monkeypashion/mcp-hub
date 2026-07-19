@@ -468,17 +468,24 @@ case "${1:-help}" in
                 esac
               done
             }
-            who_badge() {   # OSC 9;4 progress -> VSCode tab (rendered by the
-              # ${progress} variable in tabs.title/description). Written straight
-              # to each agent's VSCode client tty — bypasses tmux entirely.
-              #   waiting -> state 2 (error)   working -> 3 (indeterminate)   else -> 0 (clear)
-              local a tty seq
+            who_badge() {   # State -> VSCode tab, two channels per agent:
+              # 1. per-session set-titles-string prefix: 🔴 lands INSIDE the
+              #    grey ${sequence} text (proven to render in plain terminals).
+              #    Waiting agents alternate a trailing space so the title
+              #    CHANGES every pass — tmux only re-pushes on change, and a
+              #    fresh window needs a push before it shows anything.
+              # 2. OSC 9;4 progress straight to the client tty (rendered by
+              #    ${progress} where supported; harmless where not).
+              local a tty seq ts
               for a in $(agents); do
                 case "${WST[$a]:-}" in
-                  waiting) seq='\033]9;4;2;0\a' ;;
-                  working) seq='\033]9;4;3;0\a' ;;
-                  *)       seq='\033]9;4;0;0\a' ;;
+                  waiting) ts='🔴 #T'; [ $(( $(date +%s) / 2 % 2 )) = 0 ] && ts='🔴 #T '
+                           seq='\033]9;4;2;0\a' ;;
+                  working) ts='#T'; seq='\033]9;4;3;0\a' ;;
+                  *)       ts='#T'; seq='\033]9;4;0;0\a' ;;
                 esac
+                [ "$(tm show -t "=$a" -v set-titles-string 2>/dev/null)" = "$ts" ] \
+                  || tm set -t "=$a" set-titles-string "$ts" 2>/dev/null || true
                 for tty in $(tm list-clients -t "=$a" -F '#{?#{==:#{client_termname},xterm-256color},#{client_tty},}' 2>/dev/null); do
                   [ -w "$tty" ] && printf '%b' "$seq" > "$tty" 2>/dev/null || true
                 done
