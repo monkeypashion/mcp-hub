@@ -377,27 +377,30 @@ case "${1:-help}" in
             # every view to the smallest one.
             tm set -g window-size latest 2>/dev/null || true
             for a in "$@"; do tm has-session -t "=$a" 2>/dev/null || up_one "$a"; done
-            # Remember who's watching the dash so a rebuild can put them back on
-            # it (kill-session shunts attached clients to another session).
-            watchers="$(tm list-clients -t "=$d" -F '#{client_name}' 2>/dev/null || true)"
-            tm kill-session -t "=$d" 2>/dev/null || true
-            first=""
+            # Rebuild IN PLACE — never kill the dash session. Attached viewers
+            # must survive a re-scope, and the Ctrl-b g picker popup literally
+            # lives on this session: kill-session would detach the viewer
+            # ("[exited]", via detach-on-destroy) and SIGHUP the picker script
+            # mid-rebuild, leaving a dead or half-built dash.
+            # NB: kill-pane/respawn-pane/split-window/select-layout are
+            # pane-target commands — no "=" prefix (see top note).
+            if tm has-session -t "=$d" 2>/dev/null; then
+              tm kill-pane -a -t "$d" 2>/dev/null || true     # prune to the active pane
+              tm respawn-pane -k -t "$d" "TMUX= exec tmux -L $SOCK attach -t '=$1'"
+            else
+              # -x/-y: generous canvas so all splits fit while detached; the
+              # window re-sizes to the real client on attach (window-size latest).
+              tm new-session -d -s "$d" -x 220 -y 60 "TMUX= exec tmux -L $SOCK attach -t '=$1'"
+            fi
+            first=1
             for a in "$@"; do
-              if [ -z "$first" ]; then
-                # -x/-y: generous canvas so all splits fit while detached; the
-                # window re-sizes to the real client on attach (window-size latest).
-                tm new-session -d -s "$d" -x 220 -y 60 "TMUX= exec tmux -L $SOCK attach -t '=$a'"
-                first="$a"
-              else
-                # NB: split-window/select-layout are pane-target commands — no "=" prefix (see top note)
-                tm split-window -t "$d" -d "TMUX= exec tmux -L $SOCK attach -t '=$a'"
-                tm select-layout -t "$d" tiled >/dev/null
-              fi
+              [ -n "$first" ] && { first=""; continue; }      # $1 already placed above
+              tm split-window -t "$d" -d "TMUX= exec tmux -L $SOCK attach -t '=$a'"
+              tm select-layout -t "$d" tiled >/dev/null
             done
             tm select-layout -t "$d" tiled >/dev/null
             # Ctrl-b g: popup picker to re-scope the dash live from inside it
             tm bind-key g display-popup -E -w 44 -h 60% "'$SELF' dash --pick" 2>/dev/null || true
-            for c in $watchers; do tm switch-client -c "$c" -t "=$d" 2>/dev/null || true; done
             echo "dash: $# agent(s) tiled — Ctrl-b z zoom · Ctrl-b g pick agents · Ctrl-b arrows move focus"
             if [ -n "${TMUX:-}" ]; then
               tmux -L "$SOCK" switch-client -t "=$d" 2>/dev/null \
