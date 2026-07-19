@@ -2,7 +2,7 @@
   "name": "squad-terminals",
   "displayName": "Squad Terminals",
   "description": "Auto-opens one plain terminal per squad agent (squad attach) with icon+color, and adds per-agent squad actions to the terminal tab context menu.",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "publisher": "monkeypashion",
   "engines": { "vscode": "^1.90.0" },
   "main": "./extension.js",
@@ -11,6 +11,9 @@
   ],
   "contributes": {
     "commands": [
+      { "command": "squad.answerYes", "title": "Answer: Yes", "category": "Squad" },
+      { "command": "squad.answerAlways", "title": "Answer: Yes, don't ask again", "category": "Squad" },
+      { "command": "squad.answerNo", "title": "Answer: No", "category": "Squad" },
       { "command": "squad.sendPrompt", "title": "Send prompt…", "category": "Squad" },
       { "command": "squad.stockPrompt", "title": "Stock prompt…", "category": "Squad" },
       { "command": "squad.broadcast", "title": "Broadcast to team via agent…", "category": "Squad" },
@@ -42,6 +45,9 @@
         { "submenu": "squad.agentMenu", "group": "2_squad" }
       ],
       "squad.agentMenu": [
+        { "command": "squad.answerYes", "group": "0_answer@1" },
+        { "command": "squad.answerAlways", "group": "0_answer@2" },
+        { "command": "squad.answerNo", "group": "0_answer@3" },
         { "command": "squad.sendPrompt", "group": "1_talk@1" },
         { "command": "squad.stockPrompt", "group": "1_talk@2" },
         { "command": "squad.broadcast", "group": "1_talk@3" },

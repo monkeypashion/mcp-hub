@@ -435,6 +435,26 @@ case "${1:-help}" in
             else
               exec tmux -L "$SOCK" attach -t "=$d"
             fi ;;
+  answer)   # squad answer [agent] yes|always|no — answer the approval dialog
+            # on that agent's screen with one keystroke. SAFE: parses the
+            # dialog's actual numbered options and presses the digit whose
+            # label matches the intent; numbering shifts between dialogs
+            # (2 can be "always" or "No"), so blind digits are never sent.
+            # Fail-closed: no visible matching option -> error, no keypress.
+            a="$(need_agent "${2:-}")" || exit 1
+            intent="${3:-yes}"
+            # NB: capture-pane is a pane-target command — no "=" prefix
+            lines="$(tm capture-pane -p -t "$a" 2>/dev/null | tail -25 | grep -E '^[[:space:]]*(❯[[:space:]]*)?[0-9]+\.')"
+            case "$intent" in
+              yes)    line="$(printf '%s\n' "$lines" | grep -iE '[0-9]+\.[[:space:]]*yes' | grep -ivE "don.t ask|always" | head -1)" ;;
+              always) line="$(printf '%s\n' "$lines" | grep -iE "don.t ask again|yes.*always" | head -1)" ;;
+              no)     line="$(printf '%s\n' "$lines" | grep -iE '[0-9]+\.[[:space:]]*no' | head -1)" ;;
+              *) echo "usage: $CMD answer [agent] yes|always|no" >&2; exit 1 ;;
+            esac
+            num="$(printf '%s\n' "$line" | grep -oE '[0-9]+' | head -1)"
+            [ -n "$num" ] || { echo "!! $a: no '$intent' option on screen — not waiting, or dialog has no such choice" >&2; exit 1; }
+            tm send-keys -t "$a" "$num"
+            echo "$a: answered '$intent' (option $num: $(printf '%s' "$line" | sed 's/^[[:space:]❯]*//'))" ;;
   who)      # Who needs YOU? Reads every agent's screen and reports: 🔴 waiting
             # on operator input · 🟢 working · 💤 idle. With -w/--watch, loops
             # every 2s and also paints dash tile borders (red/green/grey) so
@@ -587,6 +607,10 @@ watch + repair
                                   Ctrl-b z                zoom/unzoom the focused agent
                                   Ctrl-b arrows           move focus  (mouse works too)
                                   Ctrl-b Ctrl-b           pass a Ctrl-b through to the agent
+  $CMD answer [agent] yes|always|no
+                                answer the approval dialog on an agent's screen — parses the
+                                visible options and presses the matching digit (fail-closed:
+                                refuses when no matching option is on screen)
   $CMD who [-w]                 who needs YOU: 🔴 waiting on your input · 🟢 working · 💤 idle
                                 (reads each agent's screen). -w: refresh every 2s and paint
                                 dash tile borders to match — red border = agent is blocked on you

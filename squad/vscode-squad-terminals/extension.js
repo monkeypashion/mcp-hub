@@ -102,6 +102,23 @@ const labels = (agents) => agents.map(shortLabel).join(", ");
 function activate(context) {
   // ---- context-menu commands (registered in every window; they no-op
   // politely on non-agent terminals) ----
+  // one-click answers to the approval dialog — `squad answer` parses the
+  // dialog's visible options and presses the matching digit (fail-closed,
+  // so a stale 🔴 or a mismatched intent errors instead of guessing)
+  for (const [cmd, intent] of [
+    ["squad.answerYes", "yes"],
+    ["squad.answerAlways", "always"],
+    ["squad.answerNo", "no"],
+  ]) {
+    context.subscriptions.push(
+      vscode.commands.registerCommand(cmd, (...args) =>
+        withAgents(args, (agents) =>
+          agents.forEach((a) => squadExec(["answer", a, intent], a))
+        )
+      )
+    );
+  }
+
   context.subscriptions.push(
     vscode.commands.registerCommand("squad.sendPrompt", (...args) =>
       withAgents(args, async (agents) => {
