@@ -118,6 +118,38 @@ function activate(context) {
     )
   );
 
+  // ---- standard claude slash commands (typed into the agent's pane) ----
+  // /clear is destructive (wipes the conversation) -> modal confirm.
+  for (const slash of ["context", "cost", "status", "doctor", "mcp", "model", "memory", "todos", "help"]) {
+    context.subscriptions.push(
+      vscode.commands.registerCommand(`squad.slash.${slash}`, (t) =>
+        withAgent(t, (agent) => squadExec(["cmd", agent, `/${slash}`], agent))
+      )
+    );
+  }
+  context.subscriptions.push(
+    vscode.commands.registerCommand("squad.slash.clear", (t) =>
+      withAgent(t, async (agent) => {
+        const ok = await vscode.window.showWarningMessage(
+          `/clear wipes ${shortLabel(agent)}'s conversation. Sure?`,
+          { modal: true },
+          "Clear it"
+        );
+        if (ok) squadExec(["cmd", agent, "/clear"], agent);
+      })
+    ),
+    vscode.commands.registerCommand("squad.slash.custom", (t) =>
+      withAgent(t, async (agent) => {
+        const cmd = await vscode.window.showInputBox({
+          prompt: `Slash command for ${shortLabel(agent)}`,
+          placeHolder: "/memory-sync, /review, …",
+          validateInput: (v) => (v.startsWith("/") ? undefined : "must start with /"),
+        });
+        if (cmd) squadExec(["cmd", agent, cmd], agent);
+      })
+    )
+  );
+
   // ---- cockpit terminals: only in the squad workspace ----
   const wf = vscode.workspace.workspaceFile;
   if (!wf || !wf.path.endsWith("squad.code-workspace")) return;
