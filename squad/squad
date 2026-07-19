@@ -359,7 +359,15 @@ case "${1:-help}" in
             # Ctrl-b g reopens the picker from inside the dash (bound on build).
             # "dash" is a reserved session name (like "ops") — don't name an agent dash.
             shift
-            if [ "${1:-}" = "--pick" ]; then
+            pick=""; noattach=""
+            while [ $# -gt 0 ]; do case "$1" in
+              --pick)      pick=1; shift ;;
+              --no-attach) noattach=1; shift ;;   # internal (Ctrl-b g binding): rebuild only —
+                                                  # attaching from inside the popup would add a
+                                                  # popup-sized client and shrink the whole dash
+              *) break ;;
+            esac; done
+            if [ -n "$pick" ]; then
               command -v fzf >/dev/null 2>&1 || { echo "!! dash --pick needs fzf (apt install fzf)" >&2; exit 1; }
               sel="$(agents | fzf --multi --reverse --prompt='dash agents> ' \
                      --header='TAB marks/unmarks agents · Enter builds the dash · Esc cancels')" || exit 0
@@ -400,8 +408,9 @@ case "${1:-help}" in
             done
             tm select-layout -t "$d" tiled >/dev/null
             # Ctrl-b g: popup picker to re-scope the dash live from inside it
-            tm bind-key g display-popup -E -w 44 -h 60% "'$SELF' dash --pick" 2>/dev/null || true
+            tm bind-key g display-popup -E -w 44 -h 60% "'$SELF' dash --pick --no-attach" 2>/dev/null || true
             echo "dash: $# agent(s) tiled — Ctrl-b z zoom · Ctrl-b g pick agents · Ctrl-b arrows move focus"
+            [ -n "$noattach" ] && exit 0
             if [ -n "${TMUX:-}" ]; then
               tmux -L "$SOCK" switch-client -t "=$d" 2>/dev/null \
                 || echo "attach with: $CMD dash   (or Ctrl-b s and pick 'dash')"
