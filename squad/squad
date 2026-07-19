@@ -18,6 +18,7 @@ SOCK="${SQUAD_SOCKET:-squad}"            # dedicated tmux socket (namespaces the
 SLICE="${SQUAD_SLICE:-}"                 # optional systemd user slice for ceilings; empty = none
 OPS_DIR="$HOME/SoftwareProjects"
 CMD="$(basename "$0")"                   # whatever you symlinked this as (help text only)
+SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"   # real script path (for tmux key bindings)
 
 tm() { command tmux -L "$SOCK" "$@"; }   # NB: never a var named TMUX (tmux reserves it)
 
@@ -352,16 +353,36 @@ case "${1:-help}" in
             # single command. Each pane is a nested tmux client attached to that
             # agent's session on this same server — so it's the agent's REAL pane
             # (type into it to talk to that agent), not a read-only copy.
+            #   dash              -> every enrolled agent
+            #   dash a b c        -> ad-hoc mini-squad of just those agents
+            #   dash --pick       -> popup multi-select list (TAB marks, Enter builds)
+            # Ctrl-b g reopens the picker from inside the dash (bound on build).
             # "dash" is a reserved session name (like "ops") — don't name an agent dash.
+            shift
+            if [ "${1:-}" = "--pick" ]; then
+              command -v fzf >/dev/null 2>&1 || { echo "!! dash --pick needs fzf (apt install fzf)" >&2; exit 1; }
+              sel="$(agents | fzf --multi --reverse --prompt='dash agents> ' \
+                     --header='TAB marks/unmarks agents · Enter builds the dash · Esc cancels')" || exit 0
+              [ -n "$sel" ] || exit 0
+              # shellcheck disable=SC2086 — agent names are sanitized, never contain spaces
+              set -- $sel
+            elif [ $# -gt 0 ]; then
+              for t in "$@"; do agents | grep -qxF -- "$t" || { echo "!! unknown agent '$t' (see $CONF)" >&2; exit 1; }; done
+            else
+              set -- $(agents)
+            fi
             d="dash"
             # With several clients on one session (a dash pane + a direct attach),
             # follow the most recently active client's size instead of clamping
             # every view to the smallest one.
             tm set -g window-size latest 2>/dev/null || true
-            for a in $(agents); do tm has-session -t "=$a" 2>/dev/null || up_one "$a"; done
+            for a in "$@"; do tm has-session -t "=$a" 2>/dev/null || up_one "$a"; done
+            # Remember who's watching the dash so a rebuild can put them back on
+            # it (kill-session shunts attached clients to another session).
+            watchers="$(tm list-clients -t "=$d" -F '#{client_name}' 2>/dev/null || true)"
             tm kill-session -t "=$d" 2>/dev/null || true
             first=""
-            for a in $(agents); do
+            for a in "$@"; do
               if [ -z "$first" ]; then
                 # -x/-y: generous canvas so all splits fit while detached; the
                 # window re-sizes to the real client on attach (window-size latest).
@@ -374,7 +395,10 @@ case "${1:-help}" in
               fi
             done
             tm select-layout -t "$d" tiled >/dev/null
-            echo "dash: $(agents | wc -l) agents tiled — Ctrl-b z zooms a pane, Ctrl-b arrows move focus"
+            # Ctrl-b g: popup picker to re-scope the dash live from inside it
+            tm bind-key g display-popup -E -w 44 -h 60% "'$SELF' dash --pick" 2>/dev/null || true
+            for c in $watchers; do tm switch-client -c "$c" -t "=$d" 2>/dev/null || true; done
+            echo "dash: $# agent(s) tiled — Ctrl-b z zoom · Ctrl-b g pick agents · Ctrl-b arrows move focus"
             if [ -n "${TMUX:-}" ]; then
               tmux -L "$SOCK" switch-client -t "=$d" 2>/dev/null \
                 || echo "attach with: $CMD dash   (or Ctrl-b s and pick 'dash')"
@@ -404,10 +428,15 @@ run
   $CMD attach  [agent]          attach, starting/repairing it first if needed; Ctrl-b d detaches
 
 watch + repair
-  $CMD dash                     the whole squad in ONE window — a live tiled pane per agent
-                                (starts any agent that's down). type into a pane to talk to
-                                that agent · Ctrl-b z zoom/unzoom · Ctrl-b arrows move focus
-                                Ctrl-b Ctrl-b passes a Ctrl-b through to the focused agent
+  $CMD dash [agent...|--pick]   the squad in ONE window — a live tiled pane per agent
+                                (starts any that are down). no args: everyone; name agents
+                                for an ad-hoc mini-squad; --pick: multi-select list
+                                (TAB marks, Enter builds). inside the dash:
+                                  type into a pane        talk to that agent
+                                  Ctrl-b g                reopen the agent picker (popup)
+                                  Ctrl-b z                zoom/unzoom the focused agent
+                                  Ctrl-b arrows           move focus  (mouse works too)
+                                  Ctrl-b Ctrl-b           pass a Ctrl-b through to the agent
   $CMD ls                       status: tmux liveness + hub presence per agent
   $CMD heal                     fix agents that are up in tmux but broken on the hub:
                                 first pass nudges the agent to re-register; if still broken
