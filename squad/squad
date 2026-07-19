@@ -456,7 +456,10 @@ case "${1:-help}" in
             # in a $() assignment kills the script before the fail-closed
             # message can print. "ask again" (not "don't") dodges the curly
             # apostrophe the dialogs actually use.
-            lines="$(tm capture-pane -p -t "$a" 2>/dev/null | tail -25 | grep -E '^[[:space:]]*(❯[[:space:]]*)?[0-9]+\.' || true)"
+            # strip blank lines BEFORE tail — first-run dialogs (trust,
+            # channels, register-approval) draw high on a mostly-empty
+            # screen, so raw `tail -25` sees only trailing blanks
+            lines="$(tm capture-pane -p -t "$a" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -25 | grep -E '^[[:space:]]*(❯[[:space:]]*)?[0-9]+\.' || true)"
             case "$intent" in
               yes)    line="$(printf '%s\n' "$lines" | grep -iE '[0-9]+\.[[:space:]]*yes' | grep -ivE "ask again|always" | head -1 || true)" ;;
               always) line="$(printf '%s\n' "$lines" | grep -iE "ask again|yes.*always" | head -1 || true)" ;;
