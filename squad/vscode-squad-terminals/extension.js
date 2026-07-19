@@ -169,22 +169,9 @@ function activate(context) {
   const wf = vscode.workspace.workspaceFile;
   if (!wf || !wf.path.endsWith("squad.code-workspace")) return;
 
-  // dash monitor: a NAMED terminal (pinned tab name is a feature here — no
-  // live title wanted). No "who" terminal: the who engine runs headless as
-  // squad-who.service and its signal lives in the tab titles + dash borders;
-  // `squad who` remains for on-demand CLI checks.
-  const existingNames = new Set(vscode.window.terminals.map((t) => t.name));
-  for (const [name, icon, color, cmd] of [
-    ["dash", "layout", "terminal.ansiBrightGreen", "squad dash"],
-  ]) {
-    if (existingNames.has(name)) continue;
-    const t = vscode.window.createTerminal({
-      name,
-      iconPath: new vscode.ThemeIcon(icon),
-      color: new vscode.ThemeColor(color),
-    });
-    t.sendText(cmd);
-  }
+  // No monitor terminals: the who engine runs headless as squad-who.service
+  // and its signal lives in the tab titles; `squad who` (board) and
+  // `squad dash` (tiled wall) remain one command away in any shell.
 
   // agent terminals: UNNAMED default-profile bash + typed attach
   for (const agent of rosterAgents()) {
