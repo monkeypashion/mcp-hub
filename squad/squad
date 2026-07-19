@@ -88,6 +88,27 @@ safe_name()    { printf '%s' "$1" | sed 's/[^A-Za-z0-9_-]/_/g'; }
 status_file()  { printf '%s\n' "$HOME/.mcp-hub/status-$(safe_name "$1").json"; }
 pidfile()      { printf '%s\n' "$HOME/.mcp-hub/heartbeat-$(safe_name "$1").pid"; }
 
+# The mcp-hub cli — repo venv next to this script, else PATH.
+hub_bin() {
+  local d; d="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+  if [ -x "$d/.venv/bin/mcp-hub" ]; then printf '%s' "$d/.venv/bin/mcp-hub"
+  else command -v mcp-hub 2>/dev/null; fi
+}
+
+# Revive an agent's heartbeat daemon (safe to call redundantly — the daemon's
+# pidfile singleton stands a second copy down). heal runs from a systemd
+# oneshot unit whose cgroup is killed when it exits, so a plain child would
+# die with it — systemd-run escapes the cgroup; setsid is the non-systemd
+# fallback.
+spawn_daemon() {
+  local a="$1" bin; bin="$(hub_bin)" || return 1
+  [ -n "$bin" ] || return 1
+  if command -v systemd-run >/dev/null 2>&1; then
+    systemd-run --user --quiet --collect "$bin" heartbeat-daemon --name "$a" 2>/dev/null && return 0
+  fi
+  setsid nohup "$bin" heartbeat-daemon --name "$a" >/dev/null 2>&1 &
+}
+
 # Remove --continue from an args string (one-off --fresh restarts).
 strip_continue() { printf '%s\n' "$1" | sed -E 's/(^|[[:space:]])--continue([[:space:]]+|$)/\1/g; s/^[[:space:]]+//; s/[[:space:]]+$//'; }
 
@@ -298,26 +319,39 @@ case "${1:-help}" in
               [ -f "$pf" ] && kill "$(cat "$pf" 2>/dev/null)" 2>/dev/null && rm -f "$pf"
             done ;;
   heal)     # Recovery for agents that are UP in tmux but broken on the hub:
+            #   no-signal   -> status cache stale/missing: its WRITER (the
+            #                  heartbeat daemon) is dead — respawn the daemon;
+            #                  its next beats repaint the cache and later
+            #                  passes see hub truth again. (Daemon death must
+            #                  never mean invisibility: 2026-07-19 deploy churn
+            #                  killed dreamteam's daemon — hub said offline,
+            #                  heal said "all healthy".)
             #   offline     -> binding lost (redeploy/reconnect): nudge register()
             #   unwakeable  -> online but wake-stream dead: nudge, and if STILL
             #                  bad on the next heal pass (flag file <10m) AND the
             #                  agent launches with --continue (restart preserves
             #                  its conversation), RESTART it in place.
-            # Fresh snapshots only (<3m) so a stale/missing cache never triggers.
             healed=0
             for a in $(agents); do
               tm has-session -t "=$a" 2>/dev/null || continue
               pane_alive "$a" || continue
               sf="$(status_file "$a")"
               flag="$HOME/.mcp-hub/heal-flag-$(safe_name "$a")"
-              [ -n "$(find "$sf" -mmin -3 2>/dev/null)" ] || continue   # snapshot fresh (<3m)?
               state=""
-              if grep -q '"online"[[:space:]]*:[[:space:]]*false' "$sf" 2>/dev/null; then state="offline"
+              if [ -z "$(find "$sf" -mmin -3 2>/dev/null)" ]; then state="no-signal"
+              elif grep -q '"online"[[:space:]]*:[[:space:]]*false' "$sf" 2>/dev/null; then state="offline"
               elif grep -q '"wakeable"[[:space:]]*:[[:space:]]*false' "$sf" 2>/dev/null; then state="unwakeable"
               fi
               if [ -z "$state" ]; then rm -f "$flag"; continue; fi   # healthy — clear strikes
               args="$(field "$a" 4)"
-              if [ -n "$(find "$flag" -mmin -10 2>/dev/null)" ] && [[ "$args" == *--continue* ]]; then
+              if [ "$state" = "no-signal" ] && [ -z "$(find "$flag" -mmin -10 2>/dev/null)" ]; then
+                # first strike: revive the daemon quietly — no agent turn spent.
+                # If the binding is also gone, the revived daemon writes an
+                # offline cache and the next pass takes the nudge path below.
+                echo "$a: no status signal — heartbeat daemon presumed dead; respawning it"
+                spawn_daemon "$a" || echo "!! $a: daemon respawn failed (mcp-hub binary not found?)" >&2
+                touch "$flag"
+              elif [ -n "$(find "$flag" -mmin -10 2>/dev/null)" ] && [[ "$args" == *--continue* ]]; then
                 echo "$a: STILL $state after a nudge — restarting in place (--continue keeps context)"
                 tm respawn-pane -k -c "$(untilde "$(field "$a" 2)")" -t "$a"; sleep 0.5; launch_agent_cmd "$a"
                 rm -f "$flag"
@@ -635,9 +669,10 @@ watch + repair
                                 dash tile borders to match — red border = agent is blocked on you
   $CMD ls                       status: tmux liveness + hub presence per agent
   $CMD heal                     fix agents that are up in tmux but broken on the hub:
-                                first pass nudges the agent to re-register; if still broken
-                                on the next pass it auto-restarts — but ONLY agents whose
-                                roster args include --continue (so no conversation is lost).
+                                a dead heartbeat daemon (stale status) is respawned quietly;
+                                offline/unwakeable agents get nudged to re-register; if still
+                                broken on the next pass they auto-restart — but ONLY agents
+                                whose roster args include --continue (no conversation lost).
                                 a systemd user timer (squad-heal.timer) runs this every 2 min.
 
 interact
