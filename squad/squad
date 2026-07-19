@@ -488,8 +488,9 @@ case "${1:-help}" in
                   working) ts="#T$sp";    seq='\033]9;4;3;0\a' ;;
                   *)       ts="#T$sp";    seq='\033]9;4;0;0\a' ;;
                 esac
-                [ "$(tm show -t "=$a" -v set-titles-string 2>/dev/null)" = "$ts" ] \
-                  || tm set -t "=$a" set-titles-string "$ts" 2>/dev/null || true
+                # NB: show/set-option reject the "=" prefix too — bare name
+                [ "$(tm show -t "$a" -v set-titles-string 2>/dev/null)" = "$ts" ] \
+                  || tm set -t "$a" set-titles-string "$ts" 2>/dev/null || true
                 for tty in $(tm list-clients -t "=$a" -F '#{?#{==:#{client_termname},xterm-256color},#{client_tty},}' 2>/dev/null); do
                   [ -w "$tty" ] && printf '%b' "$seq" > "$tty" 2>/dev/null || true
                 done
