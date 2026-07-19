@@ -29,6 +29,8 @@ const THEME = {
   "reliable-ai":        ["shield",    "terminal.ansiBlue"],
   "factory-data-model": ["database",  "terminal.ansiMagenta"],
   "factory-operations": ["gear",      "terminal.ansiWhite"],
+  "factory-fleet":      ["organization", "terminal.ansiBrightMagenta"],
+  "spike":              ["beaker",    "terminal.ansiBrightGreen"],
 };
 const FALLBACK = ["terminal", "terminal.ansiBrightBlack"];
 
