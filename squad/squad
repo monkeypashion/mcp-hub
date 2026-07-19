@@ -72,12 +72,17 @@ safe_name()    { printf '%s' "$1" | sed 's/[^A-Za-z0-9_-]/_/g'; }
 status_file()  { printf '%s\n' "$HOME/.mcp-hub/status-$(safe_name "$1").json"; }
 pidfile()      { printf '%s\n' "$HOME/.mcp-hub/heartbeat-$(safe_name "$1").pid"; }
 
+# Remove --continue from an args string (one-off --fresh restarts).
+strip_continue() { printf '%s\n' "$1" | sed -E 's/(^|[[:space:]])--continue([[:space:]]+|$)/\1/g; s/^[[:space:]]+//; s/[[:space:]]+$//'; }
+
 # Type the launch sequence (GH env + claude + channels confirm-dance) into an
 # agent's existing pane. Shared by up_one (fresh session) and restart (respawn
-# in place).
+# in place). An optional 2nd arg overrides the roster's claude_args for THIS
+# launch only (restart --fresh/--resume); the roster is never touched.
 launch_agent_cmd() {
   local a="$1" ghdir args
-  ghdir="$(untilde "$(field "$a" 3)")"; args="$(field "$a" 4)"
+  ghdir="$(untilde "$(field "$a" 3)")"
+  if [ $# -ge 2 ]; then args="$2"; else args="$(field "$a" 4)"; fi
   [ -n "$ghdir" ] && type_line "$a" "export GH_CONFIG_DIR=\"$ghdir\""
   type_line "$a" "claude $args"
   echo "started $a  ($args)"
@@ -105,7 +110,7 @@ up_one() {
   else
     tm new-session -d -s "$a" -c "$dir"
   fi
-  launch_agent_cmd "$a"
+  if [ $# -ge 2 ]; then launch_agent_cmd "$a" "$2"; else launch_agent_cmd "$a"; fi
 }
 
 org_alias() {
@@ -237,16 +242,29 @@ handoff() {
 # name (or `all`); otherwise it's treated as payload and the agent is $PWD's.
 case "${1:-help}" in
   up)       for a in $(agents); do up_one "$a"; done ;;
-  restart)  a="$(need_agent "${2:-}")" || exit 1
+  restart)  shift; mode=""; a_arg=""
+            for t in "$@"; do case "$t" in
+              --fresh)  mode=fresh ;;
+              --resume) mode=resume ;;
+              -*) echo "!! unknown restart flag '$t' (valid: --fresh, --resume)" >&2; exit 1 ;;
+              *)  a_arg="$t" ;;
+            esac; done
+            a="$(need_agent "$a_arg")" || exit 1
+            # One-off launch-args override — the roster is never modified here.
+            rargs="$(field "$a" 4)"
+            case "$mode" in
+              fresh)  rargs="$(strip_continue "$rargs")" ;;
+              resume) case "$rargs" in *--continue*) ;; *) rargs="--continue $rargs" ;; esac ;;
+            esac
             if tm has-session -t "=$a" 2>/dev/null; then
               # Respawn IN PLACE: kills the pane's process and gives it a fresh
               # shell, but the session survives — attached viewers keep watching
               # instead of being dumped to their own shell mid-restart.
               tm respawn-pane -k -t "$a"
               sleep 0.5
-              launch_agent_cmd "$a"
+              if [ -n "$mode" ]; then launch_agent_cmd "$a" "$rargs"; else launch_agent_cmd "$a"; fi
             else
-              up_one "$a"
+              if [ -n "$mode" ]; then up_one "$a" "$rargs"; else up_one "$a"; fi
             fi ;;
   down)     tm kill-server 2>/dev/null || true
             # The keep-alive daemons are detached (they outlive tmux), so kill
@@ -343,17 +361,26 @@ enroll (identity is derived: name = <repo>-<hostname>, project = <org>/<repo>)
 run
   $CMD up                       start every enrolled agent (idempotent)
   $CMD down                     stop everything (tmux server + keep-alive daemons)
-  $CMD restart [agent]          cycle one agent
+  $CMD restart [agent] [--fresh|--resume]
+                                relaunch claude in place (attached viewers keep watching)
+                                  no flag:   launch with the agent's roster args as-is
+                                  --resume:  add --continue this once (resume last conversation)
+                                  --fresh:   drop --continue this once (start a blank conversation)
+                                the roster is never modified — use 'args' to change the default
   $CMD attach  [agent]          attach, starting/repairing it first if needed; Ctrl-b d detaches
 
 watch + repair
   $CMD ls                       status: tmux liveness + hub presence per agent
-  $CMD heal                     nudge UP-but-offline agents to re-register (post hub-redeploy)
+  $CMD heal                     fix agents that are up in tmux but broken on the hub:
+                                first pass nudges the agent to re-register; if still broken
+                                on the next pass it auto-restarts — but ONLY agents whose
+                                roster args include --continue (so no conversation is lost).
+                                a systemd user timer (squad-heal.timer) runs this every 2 min.
 
 interact
   $CMD cmd [agent|all] "..."    type text + Enter into session(s)   e.g. $CMD cmd all "/compact"
   $CMD key [agent] <keys>       raw tmux send-keys (no Enter appended)
-  $CMD args [agent] "..."       set next-launch claude args
+  $CMD args [agent] "..."       set the agent's DEFAULT launch args (roster; used by up/restart/heal)
   $CMD handoff [agent]          commit WIP to wip/<agent>-<date> + push (before switching machines)
 
 helpers
