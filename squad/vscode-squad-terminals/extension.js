@@ -65,12 +65,16 @@ function activate() {
     if (attached.has(agent)) continue; // don't duplicate on window reloads
     const label = shortLabel(agent);
     const [icon, color] = THEME[label] || FALLBACK;
-    vscode.window.createTerminal({
+    // Default-profile bash + typed command — NOT shellPath. This replicates
+    // the one configuration proven to render live titles: a real interactive
+    // shell (with VSCode's shell-integration bootstrap) that then runs the
+    // attach. Direct shellPath spawns skip the bootstrap and their tabs
+    // never track titles.
+    const t = vscode.window.createTerminal({
       iconPath: new vscode.ThemeIcon(icon),
       color: new vscode.ThemeColor(color),
-      shellPath: path.join(os.homedir(), ".local", "bin", "squad"),
-      shellArgs: ["attach", agent],
     });
+    t.sendText(`squad attach ${agent}`);
   }
 }
 
