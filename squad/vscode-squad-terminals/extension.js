@@ -213,6 +213,34 @@ function activate(context) {
     )
   );
 
+  // ---- slash commands that take an OPTION ----
+  // Set the same model/effort/voice mode across a multi-selection in two
+  // clicks, instead of opening claude's picker in each agent by hand.
+  // /model goes through `squad model` because an actual switch raises a
+  // cache-invalidation confirm dialog that has to be answered; /effort and
+  // /voice apply straight from the argument with no prompt.
+  for (const m of ["default", "opus", "fable", "sonnet", "haiku"]) {
+    context.subscriptions.push(
+      vscode.commands.registerCommand(`squad.model.${m}`, (...args) =>
+        withAgents(args, (agents) => agents.forEach((a) => squadExec(["model", a, m], a)))
+      )
+    );
+  }
+  for (const e of ["low", "medium", "high", "xhigh", "max"]) {
+    context.subscriptions.push(
+      vscode.commands.registerCommand(`squad.effort.${e}`, (...args) =>
+        withAgents(args, (agents) => agents.forEach((a) => squadExec(["cmd", a, `/effort ${e}`], a)))
+      )
+    );
+  }
+  for (const v of ["hold", "tap", "off"]) {
+    context.subscriptions.push(
+      vscode.commands.registerCommand(`squad.voice.${v}`, (...args) =>
+        withAgents(args, (agents) => agents.forEach((a) => squadExec(["cmd", a, `/voice ${v}`], a)))
+      )
+    );
+  }
+
   // ---- standard claude slash commands (typed into the agent's pane) ----
   // /clear is destructive (wipes the conversation) -> modal confirm.
   for (const slash of ["context", "cost", "status", "doctor", "mcp", "model", "memory", "todos", "help"]) {

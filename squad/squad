@@ -15,6 +15,9 @@ set -euo pipefail
 
 CONF="${SQUAD_CONF:-$HOME/.config/squad/squad.conf}"
 SOCK="${SQUAD_SOCKET:-squad}"            # dedicated tmux socket (namespaces the whole squad)
+# Most one auto-relaunch per agent per this many minutes (heal's deaf sweep) —
+# stops a flapping hub from turning "relaunch the deaf" into a restart storm.
+RELAUNCH_COOLDOWN_MIN="${SQUAD_RELAUNCH_COOLDOWN_MIN:-30}"
 SLICE="${SQUAD_SLICE:-}"                 # optional systemd user slice for ceilings; empty = none
 OPS_DIR="$HOME/SoftwareProjects"
 CMD="$(basename "$0")"                   # whatever you symlinked this as (help text only)
@@ -406,6 +409,19 @@ case "${1:-help}" in
                   echo "!! $a: DEAF (predates hub disruption) but roster lacks --continue — not restarting; conversation would be lost" >&2
                   continue ;;
                 esac
+                # COOLDOWN — the storm guard. Each disruption stamp makes every
+                # older process "deaf", so a hub that drops connections
+                # repeatedly (observed 2026-07-20: all clients dropped
+                # simultaneously every ~12 min) would relaunch the whole squad
+                # on every drop, forever. One relaunch per agent per cooldown
+                # window instead: a flapping hub then degrades to "deaf but
+                # stable" (Stop-hook queue pulls still deliver) rather than a
+                # restart storm. Deafness is annoying; thrashing is worse.
+                rl="$HOME/.mcp-hub/heal-relaunch-$(safe_name "$a")"
+                if [ -n "$(find "$rl" -mmin -"$RELAUNCH_COOLDOWN_MIN" 2>/dev/null)" ]; then
+                  echo "$a: deaf again but relaunched <${RELAUNCH_COOLDOWN_MIN}m ago — holding off (hub may be flapping)"
+                  continue
+                fi
                 # Never interrupt real work: a relaunch mid-turn loses it, and
                 # a 🔴 dialog is the operator's to answer. Deafness is not
                 # urgent enough to trample either — catch them on a later pass.
@@ -415,6 +431,7 @@ case "${1:-help}" in
                   continue
                 fi
                 echo "$a: DEAF — process predates the last hub disruption; relaunching (conversation preserved)"
+                touch "$rl"
                 relaunch_agent "$a"
                 healed=$((healed+1))
               done
@@ -462,6 +479,36 @@ case "${1:-help}" in
               healed=$((healed+1))
             done
             [ "$healed" = 0 ] && echo "all up agents healthy — nothing to heal" || true ;;
+  model)    # squad model [agent] default|opus|fable|sonnet|haiku — switch an
+            # agent's model without opening claude's picker. `/model <name>`
+            # takes the name directly; the only wrinkle is that an actual
+            # switch raises a confirm dialog (switching invalidates the prompt
+            # cache, so claude asks first). The operator already made that
+            # choice in the menu, so confirm it for them — through the same
+            # fail-closed parser `answer` uses, never a blind digit.
+            a="$(need_agent "${2:-}")" || exit 1
+            m="${3:-}"
+            case "$m" in
+              default|opus|fable|sonnet|haiku) ;;
+              *) echo "usage: $CMD model [agent] default|opus|fable|sonnet|haiku" >&2; exit 1 ;;
+            esac
+            type_line "$a" "/model $m"
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+              sleep 1
+              # only the LIVE bottom of the screen — an older "Kept model as"
+              # left in view by a previous /model would otherwise look like
+              # this call's verdict and break the loop BEFORE the confirm
+              # dialog renders, leaving it unanswered on the operator's screen.
+              scr="$(tm capture-pane -p -t "$a" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -12 || true)"
+              if printf '%s\n' "$scr" | grep -q '[Y]es, switch to'; then
+                "$0" answer "$a" yes; break
+              fi
+              # settled with no dialog (already on that model). Give the dialog
+              # a few seconds to appear first, and only trust the last lines.
+              if [ "$i" -ge 4 ] && printf '%s\n' "$scr" | tail -3 | grep -qE '[K]ept model as|[S]et model'; then
+                echo "$a: model already $m (no switch needed)"; break
+              fi
+            done ;;
   cmd)      if [ "${2:-}" = all ]; then shift 2; for a in $(agents); do type_line "$a" "$@"; done
             elif [ -n "${2:-}" ] && agents | grep -qxF -- "${2:-}"; then a="$2"; shift 2; type_line "$a" "$@"
             else a="$(need_agent "")" || exit 1; shift
@@ -775,6 +822,9 @@ watch + repair
 interact
   $CMD cmd [agent|all] "..."    type text + Enter into session(s)   e.g. $CMD cmd all "/compact"
   $CMD key [agent] <keys>       raw tmux send-keys (no Enter appended)
+  $CMD model [agent] <name>     switch model: default|opus|fable|sonnet|haiku — sends
+                                /model <name> and confirms the cache-invalidation prompt
+                                for you (via answer's fail-closed parser)
   $CMD args [agent] "..."       set the agent's DEFAULT launch args (roster; used by up/restart/heal)
   $CMD handoff [agent]          commit WIP to wip/<agent>-<date> + push (before switching machines)
 
