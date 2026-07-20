@@ -751,18 +751,22 @@ case "${1:-help}" in
                 # after the label: "⚡ dt 44% · ✳ <status>".
                 g="$(hub_glyph "$a")"
                 ctx="${WCTX[$a]:-}"
+                # model + ctx are ONE field — "mcp-hub F-39%" — so the tab stays
+                # narrow and a mis-set model is obvious at a glance. Joined
+                # BEFORE the tier emoji so that still leads: "🔥F-52%".
+                m="${WMOD[$a]:-}"
+                label="$short"
                 # context-pressure tiers (titles can't carry ANSI colour):
                 # operator clears context before 50% — plain <40 · 🟡 40-49 ·
                 # 🔥 50+  (🔴 stays "waiting", ⚠ stays hub)
                 if [ -n "$ctx" ]; then
                   n="${ctx%\%}"
+                  ctx="${m:+$m-}$ctx"
                   if   [ "$n" -ge 50 ] 2>/dev/null; then ctx="🔥$ctx"
                   elif [ "$n" -ge 40 ] 2>/dev/null; then ctx="🟡$ctx"; fi
+                else
+                  ctx="$m"     # model known but ctx not scraped yet: just "F"
                 fi
-                # model rides ON the name as a single letter — "mcp-hub[F] 39%"
-                # keeps the tab narrow while making a mis-set model obvious
-                m="${WMOD[$a]:-}"
-                label="$short${m:+[$m]}"
                 case "${WST[$a]:-}" in
                   waiting) ts="$g 🔴 $label${ctx:+ $ctx} · #T$sp"; seq='\033]9;4;2;0\a' ;;
                   working) ts="$g $label${ctx:+ $ctx} · #T$sp";    seq='\033]9;4;3;0\a' ;;
