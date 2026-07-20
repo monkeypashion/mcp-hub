@@ -70,15 +70,32 @@ type_line() { local t="$1"; shift; tm send-keys -t "$t" -l "$*"; sleep 0.2; tm s
 # the permission dialog / input prompt is on screen when claude is blocked, so
 # the screen is the source of truth no notification channel can lie about.
 #   waiting = a dialog/prompt needs the operator   working = mid-turn   idle = between turns
-classify_agent() {
-  local tail
-  # NB: capture-pane is a pane-target command — no "=" prefix (see top note)
-  tail="$(tm capture-pane -p -t "$1" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -20)"
+# SINGLE SOURCE OF TRUTH for reading claude's state out of captured pane text.
+# `who` needs the same verdict but from a capture it already took (it harvests
+# ctx% from the same text), so the patterns live here and BOTH callers use
+# them. They were duplicated until 2026-07-20 and silently drifted apart —
+# that drift is why working agents read as idle and the tab dots went stale.
+classify_text() {
+  local t="$1"
   # [X] char-class trick: these patterns must never match their own source
   # (the hub agent edits this file — its pane shows these lines mid-diff)
-  if   printf '%s\n' "$tail" | grep -qE '❯ 1\. [Y]es|[D]o you want to|[N]o, and tell Claude|requires [a]pproval'; then printf 'waiting'
-  elif printf '%s\n' "$tail" | grep -qE '[e]sc to interrupt'; then printf 'working'
+  if   printf '%s\n' "$t" | grep -qE '❯ 1\. [Y]es|[D]o you want to|[N]o, and tell Claude|requires [a]pproval'; then printf 'waiting'
+  # WORKING: the live spinner / tool line is PRESENT-tense with a running
+  # elapsed timer in parens — "Nucleating… (1m 55s · ↓ 6.4k tokens)",
+  # "Running… (5s · timeout 1m)". The finished line is PAST-tense with no
+  # parens — "✻ Worked for 17s" — so the "… (<n><unit>" shape is what
+  # separates mid-turn from between-turns.
+  # 2026-07-20: "esc to interrupt" ALONE was the old test and it silently
+  # stopped matching in this build (2.1.215) — every working agent read as
+  # idle, so `who` under-reported and heal's don't-interrupt-real-work guard
+  # was inert. Keep the legacy pattern as a fallback for builds that show it.
+  elif printf '%s\n' "$t" | grep -qE '[e]sc to interrupt|…[[:space:]]*\([0-9]+[hms]'; then printf 'working'
   else printf 'idle'; fi
+}
+
+classify_agent() {
+  # NB: capture-pane is a pane-target command — no "=" prefix (see top note)
+  classify_text "$(tm capture-pane -p -t "$1" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -20)"
 }
 
 # Per-agent hub state files under ~/.mcp-hub, named with the same sanitisation
@@ -93,6 +110,33 @@ hub_bin() {
   local d; d="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
   if [ -x "$d/.venv/bin/mcp-hub" ]; then printf '%s' "$d/.venv/bin/mcp-hub"
   else command -v mcp-hub 2>/dev/null; fi
+}
+
+# Epoch seconds when this agent's claude process started (empty if not found).
+# etimes = seconds alive, so start = now - etimes (integer math beats parsing
+# ps lstart date strings).
+agent_started() {
+  local pp cp et
+  pp="$(tm display-message -p -t "$1" '#{pane_pid}' 2>/dev/null)" || return 1
+  [ -n "$pp" ] || return 1
+  cp="$(pgrep -P "$pp" -f claude 2>/dev/null | head -1)"
+  [ -n "$cp" ] || return 1
+  et="$(ps -o etimes= -p "$cp" 2>/dev/null | tr -d ' ')"
+  [ -n "$et" ] || return 1
+  printf '%s' "$(( $(date +%s) - et ))"
+}
+
+# Restart an agent's claude in place, conversation intact (roster args carry
+# --continue). Always respawns with the ROSTER worktree (-c) so a session whose
+# path drifted self-heals, and clears the two ghosts a respawn leaves behind:
+# the sticky pane title and the dead session's scrollback.
+relaunch_agent() {
+  local a="$1"
+  tm respawn-pane -k -c "$(untilde "$(field "$a" 2)")" -t "$a"
+  tm select-pane -t "$a" -T '' 2>/dev/null || true
+  tm clear-history -t "$a" 2>/dev/null || true
+  sleep 0.5
+  launch_agent_cmd "$a"
 }
 
 # Revive an agent's heartbeat daemon (safe to call redundantly — the daemon's
@@ -331,7 +375,50 @@ case "${1:-help}" in
             #                  bad on the next heal pass (flag file <10m) AND the
             #                  agent launches with --continue (restart preserves
             #                  its conversation), RESTART it in place.
+            #   DEAF        -> the silent one, and the reason this runs at all:
+            #                  a process that lived through a hub disconnect
+            #                  keeps a fresh binding and reports ⚡ while its
+            #                  wake-receive stream is dead. Presence cannot see
+            #                  it; only a relaunch cures it. The daemon stamps
+            #                  every disconnect (hub-reconnect.stamp), so any
+            #                  agent older than that stamp is deaf by
+            #                  construction. 2026-07-19: 5 of 9 agents sat deaf
+            #                  overnight at a confident ⚡ 9/9 — heal "fixed"
+            #                  them by nudging re-register, which is precisely
+            #                  the non-cure.
             healed=0
+            # --- deaf sweep: agents that predate the last hub disruption ---
+            # Settle window: act only once the disruption is >=3min old, so we
+            # relaunch into a hub that's actually back (restarting mid-outage
+            # just produces agents that can't register).
+            stamp="$HOME/.mcp-hub/hub-reconnect.stamp"
+            disrupt="$(cat "$stamp" 2>/dev/null || echo 0)"
+            now="$(date +%s)"
+            if [ "${disrupt:-0}" -gt 0 ] && [ $((now - disrupt)) -ge 180 ]; then
+              for a in $(agents); do
+                tm has-session -t "=$a" 2>/dev/null || continue
+                pane_alive "$a" || continue
+                started="$(agent_started "$a")" || continue
+                [ -n "$started" ] || continue
+                [ "$started" -lt "$disrupt" ] || continue      # postdates it — stream is fine
+                args="$(field "$a" 4)"
+                case "$args" in *--continue*) ;; *)
+                  echo "!! $a: DEAF (predates hub disruption) but roster lacks --continue — not restarting; conversation would be lost" >&2
+                  continue ;;
+                esac
+                # Never interrupt real work: a relaunch mid-turn loses it, and
+                # a 🔴 dialog is the operator's to answer. Deafness is not
+                # urgent enough to trample either — catch them on a later pass.
+                st="$(classify_agent "$a")"
+                if [ "$st" != "idle" ]; then
+                  echo "$a: deaf but $st — deferring relaunch until idle"
+                  continue
+                fi
+                echo "$a: DEAF — process predates the last hub disruption; relaunching (conversation preserved)"
+                relaunch_agent "$a"
+                healed=$((healed+1))
+              done
+            fi
             for a in $(agents); do
               tm has-session -t "=$a" 2>/dev/null || continue
               pane_alive "$a" || continue
@@ -344,6 +431,16 @@ case "${1:-help}" in
               fi
               if [ -z "$state" ]; then rm -f "$flag"; continue; fi   # healthy — clear strikes
               args="$(field "$a" 4)"
+              # Every intervention below TOUCHES THE PANE, so none may run
+              # unless the agent is idle:
+              #   - the nudge TYPES text + Enter. At a "1. Yes / 2. No" dialog
+              #     that ANSWERS IT on the operator's behalf — an unattended
+              #     approval, the worst thing this tool could do.
+              #   - the restart kills the process, destroying an in-flight turn.
+              # Only the daemon respawn is pane-free, so it stays unguarded.
+              # (2026-07-20: learned the hard way — this path restarted the hub
+              # agent mid-turn while it was building this very feature.)
+              st="$(classify_agent "$a")"
               if [ "$state" = "no-signal" ] && [ -z "$(find "$flag" -mmin -10 2>/dev/null)" ]; then
                 # first strike: revive the daemon quietly — no agent turn spent.
                 # If the binding is also gone, the revived daemon writes an
@@ -351,9 +448,11 @@ case "${1:-help}" in
                 echo "$a: no status signal — heartbeat daemon presumed dead; respawning it"
                 spawn_daemon "$a" || echo "!! $a: daemon respawn failed (mcp-hub binary not found?)" >&2
                 touch "$flag"
+              elif [ "$st" != "idle" ]; then
+                echo "$a: $state but $st — deferring (never type over a dialog or kill a live turn)"
               elif [ -n "$(find "$flag" -mmin -10 2>/dev/null)" ] && [[ "$args" == *--continue* ]]; then
                 echo "$a: STILL $state after a nudge — restarting in place (--continue keeps context)"
-                tm respawn-pane -k -c "$(untilde "$(field "$a" 2)")" -t "$a"; sleep 0.5; launch_agent_cmd "$a"
+                relaunch_agent "$a"
                 rm -f "$flag"
               else
                 echo "$a: $state on hub — nudging re-register"
@@ -531,9 +630,7 @@ case "${1:-help}" in
                   # one capture, two harvests: waiting/working state AND the
                   # ctx % the agent's own statusline already renders on screen
                   tail="$(tm capture-pane -p -t "$a" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -20)"
-                  if   printf '%s\n' "$tail" | grep -qE '❯ 1\. [Y]es|[D]o you want to|[N]o, and tell Claude|requires [a]pproval'; then st="waiting"
-                  elif printf '%s\n' "$tail" | grep -qE '[e]sc to interrupt'; then st="working"
-                  else st="idle"; fi
+                  st="$(classify_text "$tail")"   # shared patterns — never re-implement here
                   ctx="$(printf '%s\n' "$tail" | grep -oE '[c]tx \[[^]]*\][[:space:]]*[0-9]+%' | tail -1 | grep -oE '[0-9]+%' || true)"
                 fi
                 WST[$a]="$st"

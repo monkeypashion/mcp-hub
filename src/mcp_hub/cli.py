@@ -1302,6 +1302,33 @@ def _write_status_cache(agent_name: str, agents_text: str) -> None:
         pass
 
 
+def _mark_hub_disruption() -> None:
+    """Record that the hub connection just broke, fleet-wide.
+
+    A client's wake-receive stream does not survive a hub disconnect: after a
+    redeploy / network flap / box sleep the agent reconnects and still reports
+    ⚡, but pushes silently stop arriving — only a process relaunch reopens the
+    stream (proven repeatedly; see the wake-stream memories). The daemon is the
+    one component that *witnesses* the disconnect, so it leaves a breadcrumb
+    `squad heal` can act on: any agent process older than this timestamp lived
+    through the disruption and must be relaunched, not merely re-registered.
+
+    One shared file (not per-agent) — a hub restart hits every agent, and the
+    first daemon to notice speaks for the fleet. Written on every retry so the
+    stamp advances to the END of an outage: a process must postdate the
+    recovery, not just the first failed beat. Fail-soft: never disturb the
+    heartbeat loop.
+    """
+    try:
+        path = _PIDFILE_DIR / "hub-reconnect.stamp"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(str(int(time.time())), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def _heartbeat_loop(hub_url: str, agent_name: str) -> None:
     """Long-lived loop: connect to hub, ping `heartbeat(agent_name)` every
     HEARTBEAT_INTERVAL_SECONDS. On any connection error, sleep and reconnect.
@@ -1343,6 +1370,9 @@ async def _heartbeat_loop(hub_url: str, agent_name: str) -> None:
         except Exception as exc:  # noqa: BLE001
             # Connection / init / call failure — log and reconnect after a
             # delay. Fail-open: heartbeat outages don't crash the daemon.
+            # Leave the fleet-wide breadcrumb first: this disconnect is also
+            # when every agent's wake-receive stream died.
+            _mark_hub_disruption()
             print(
                 f"[mcp-hub heartbeat] connection error ({type(exc).__name__}: "
                 f"{exc}); retrying in {HEARTBEAT_RETRY_DELAY_SECONDS}s",
