@@ -668,17 +668,21 @@ case "${1:-help}" in
               else printf '✖'; fi
             }
             declare -A WCTX  # agent -> context % (scraped from its own statusline)
+            declare -A WMOD  # agent -> model initial (O/F/S/H), same scrape
             who_board() {
-              local a st g tail ctx
+              local a st g tail ctx mod
               for a in $(agents); do
-                ctx=""
+                ctx=""; mod=""
                 if ! tm has-session -t "=$a" 2>/dev/null || ! pane_alive "$a"; then st="down"
                 else
-                  # one capture, two harvests: waiting/working state AND the
-                  # ctx % the agent's own statusline already renders on screen
+                  # one capture, three harvests: waiting/working state, the
+                  # ctx % AND the model — all already rendered by the agent's
+                  # own statusline ("⚡ 9/9 · Fable5 high · ctx [..] 14% · …")
                   tail="$(tm capture-pane -p -t "$a" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -20)"
                   st="$(classify_text "$tail")"   # shared patterns — never re-implement here
                   ctx="$(printf '%s\n' "$tail" | grep -oE '[c]tx \[[^]]*\][[:space:]]*[0-9]+%' | tail -1 | grep -oE '[0-9]+%' || true)"
+                  # first letter only — tab space is precious: O/F/S/H
+                  mod="$(printf '%s\n' "$tail" | grep -oE '[O]pus|[F]able|[S]onnet|[H]aiku' | tail -1 | cut -c1 || true)"
                 fi
                 WST[$a]="$st"
                 # sticky: a capture racing the agent's redraw sometimes misses
@@ -688,6 +692,11 @@ case "${1:-help}" in
                 # (restart clears it) — drop the dead session's cached %.
                 if [ -n "$ctx" ]; then WCTX[$a]="$ctx"
                 elif [ "$st" = "down" ] || [ -z "$(tm display -p -t "$a" '#{pane_title}' 2>/dev/null)" ]; then WCTX[$a]=""
+                fi
+                # model is sticky on the same terms (scrape misses shouldn't
+                # blink the tag out; a restart clears it like the ctx cache)
+                if [ -n "$mod" ]; then WMOD[$a]="$mod"
+                elif [ "$st" = "down" ] || [ -z "$(tm display -p -t "$a" '#{pane_title}' 2>/dev/null)" ]; then WMOD[$a]=""
                 fi
                 g="$(hub_glyph "$a")"
                 case "$st" in
@@ -727,7 +736,7 @@ case "${1:-help}" in
               # jiggle forces a push ONLY when a new client appears (fresh
               # window needs a backfill) or on a slow ~60s heartbeat —
               # constant alternation made tabs visibly flicker every pass.
-              local a tty seq ts sp='' hostsafe short g cur jig=''
+              local a tty seq ts sp='' hostsafe short g cur jig='' m label ctx n
               hostsafe="$(sanitize_ident "$(hostname)")"
               cur="$(tm list-clients -F '#{client_tty}' 2>/dev/null | sort | paste -sd, -)"
               [ "$cur" != "$WHO_LAST" ] && jig=1; WHO_LAST="$cur"
@@ -750,10 +759,14 @@ case "${1:-help}" in
                   if   [ "$n" -ge 50 ] 2>/dev/null; then ctx="🔥$ctx"
                   elif [ "$n" -ge 40 ] 2>/dev/null; then ctx="🟡$ctx"; fi
                 fi
+                # model rides ON the name as a single letter — "mcp-hub[F] 39%"
+                # keeps the tab narrow while making a mis-set model obvious
+                m="${WMOD[$a]:-}"
+                label="$short${m:+[$m]}"
                 case "${WST[$a]:-}" in
-                  waiting) ts="$g 🔴 $short${ctx:+ $ctx} · #T$sp"; seq='\033]9;4;2;0\a' ;;
-                  working) ts="$g $short${ctx:+ $ctx} · #T$sp";    seq='\033]9;4;3;0\a' ;;
-                  *)       ts="$g $short${ctx:+ $ctx} · #T$sp";    seq='\033]9;4;0;0\a' ;;
+                  waiting) ts="$g 🔴 $label${ctx:+ $ctx} · #T$sp"; seq='\033]9;4;2;0\a' ;;
+                  working) ts="$g $label${ctx:+ $ctx} · #T$sp";    seq='\033]9;4;3;0\a' ;;
+                  *)       ts="$g $label${ctx:+ $ctx} · #T$sp";    seq='\033]9;4;0;0\a' ;;
                 esac
                 # NB: show/set-option reject the "=" prefix too — bare name
                 [ "$(tm show -t "$a" -v set-titles-string 2>/dev/null)" = "$ts" ] \
