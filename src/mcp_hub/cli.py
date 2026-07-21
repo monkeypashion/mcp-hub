@@ -98,10 +98,22 @@ async def _query_hub(
             # Case 1 wake-on-low-prio path — a peer's low-prio DM to an
             # idle recipient fires a wake (drain-batched) instead of just
             # queuing.
-            messages_result = await session.call_tool(
-                "get_messages",
-                {"agent_name": agent_name, "bind": False, "mark_idle": True},
-            )
+            # compact=True: summarise anything the agent already saw live and
+            # cap the bulk (see get_messages). Retried without the flag so a
+            # newer CLI still works against a hub that predates it — during a
+            # deploy the two versions coexist for a few minutes, and a hard
+            # failure there would silently stop surfacing messages entirely.
+            msg_args = {
+                "agent_name": agent_name,
+                "bind": False,
+                "mark_idle": True,
+                "compact": True,
+            }
+            try:
+                messages_result = await session.call_tool("get_messages", msg_args)
+            except Exception:  # noqa: BLE001
+                msg_args.pop("compact")
+                messages_result = await session.call_tool("get_messages", msg_args)
             broadcasts_result = await session.call_tool(
                 "get_broadcasts_for_agent",
                 {"agent_name": agent_name, "bind": False},
@@ -1314,10 +1326,16 @@ def _mark_hub_disruption() -> None:
     through the disruption and must be relaunched, not merely re-registered.
 
     One shared file (not per-agent) — a hub restart hits every agent, and the
-    first daemon to notice speaks for the fleet. Written on every retry so the
-    stamp advances to the END of an outage: a process must postdate the
-    recovery, not just the first failed beat. Fail-soft: never disturb the
+    first daemon to notice speaks for the fleet. Fail-soft: never disturb the
     heartbeat loop.
+
+    ONLY called when the hub has demonstrably LOST OUR BINDING after a
+    connection break (see the caller) — i.e. the hub process itself restarted.
+    It is deliberately NOT called for a bare transport error: a client-side
+    network blip that the hub sat through leaves every binding intact, and
+    stamping on those made a 5-second hiccup relaunch the entire squad
+    (2026-07-20: a 15:46 blip restarted all 9 agents at 15:51, killing
+    in-flight work and leaving one agent dead on a corrupted launch line).
     """
     try:
         path = _PIDFILE_DIR / "hub-reconnect.stamp"
@@ -1348,6 +1366,15 @@ async def _heartbeat_loop(hub_url: str, agent_name: str) -> None:
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
 
+    # Set by the reconnect handler; checked by the next heartbeat. The pair
+    # "connection broke" AND "hub no longer knows our binding" is the
+    # signature of a HUB RESTART — the case where every client's wake-receive
+    # stream is definitively dead and only a relaunch cures it. Either signal
+    # alone is not: a transport blip breaks the connection while the hub sits
+    # there with bindings intact, and the deliverability reaper can drop ONE
+    # agent's binding with no hub restart at all. Only the conjunction stamps.
+    broke = False
+
     while True:
         try:
             async with streamablehttp_client(hub_url, timeout=10) as (read, write, _):
@@ -1357,9 +1384,16 @@ async def _heartbeat_loop(hub_url: str, agent_name: str) -> None:
                     since_heartbeat = HEARTBEAT_INTERVAL_SECONDS
                     while True:
                         if since_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
-                            await session.call_tool(
+                            hb = await session.call_tool(
                                 "heartbeat", {"agent_name": agent_name}
                             )
+                            if broke:
+                                # First beat after a break. "no binding" here
+                                # means the hub came back up without us — it
+                                # restarted, so the fleet's streams are dead.
+                                if "no binding" in _extract_text(hb):
+                                    _mark_hub_disruption()
+                                broke = False
                             since_heartbeat = 0
                         agents_result = await session.call_tool("list_agents", {})
                         _write_status_cache(
@@ -1370,9 +1404,10 @@ async def _heartbeat_loop(hub_url: str, agent_name: str) -> None:
         except Exception as exc:  # noqa: BLE001
             # Connection / init / call failure — log and reconnect after a
             # delay. Fail-open: heartbeat outages don't crash the daemon.
-            # Leave the fleet-wide breadcrumb first: this disconnect is also
-            # when every agent's wake-receive stream died.
-            _mark_hub_disruption()
+            # Don't stamp here: arm the check instead, and let the first
+            # heartbeat after reconnect decide whether the hub actually
+            # restarted (binding gone) or merely blinked (binding intact).
+            broke = True
             print(
                 f"[mcp-hub heartbeat] connection error ({type(exc).__name__}: "
                 f"{exc}); retrying in {HEARTBEAT_RETRY_DELAY_SECONDS}s",

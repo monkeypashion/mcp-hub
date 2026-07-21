@@ -87,6 +87,23 @@ class _ChannelNotification(BaseModel):
 _VALID_PRIORITIES = {"low", "normal", "urgent"}
 _NO_WAKE_PRIORITIES = {"low"}
 
+# Stop-hook (compact) rendering budget. The Stop hook fires at EVERY turn
+# boundary and its output lands verbatim in the agent's context, so an
+# unbounded dump is a recurring context tax paid by every agent all day.
+# Render this many bodies in full; summarise the rest.
+COMPACT_FULL_MESSAGES = 2
+COMPACT_SUMMARY_CHARS = 220
+
+
+def _summarise(body: str, limit: int = 120) -> str:
+    """First line of `body`, clipped to `limit` chars. Never empty for a
+    non-empty body — the point is a recognisable handle, not a précis."""
+    first = body.strip().splitlines()[0] if body.strip() else ""
+    first = first.strip()
+    if len(first) <= limit:
+        return first
+    return first[: limit - 1].rstrip() + "…"
+
 # Case 1 — wake-on-low-prio for idle DM recipients.
 #
 # Liveness gate: we use the registry binding itself as the "is this agent
@@ -195,6 +212,18 @@ def init_db(db_path: Path = DB_PATH) -> None:
     # Migrate: add bio column for existing databases
     try:
         conn.execute("ALTER TABLE agents ADD COLUMN bio TEXT NOT NULL DEFAULT ''")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    # Migrate: record WHICH binding generation a message was pushed to, so the
+    # Stop hook can tell "you already saw this live" from "this may have gone
+    # into a dead stream". Empty string = never pushed live (or pushed by a
+    # pre-migration hub) -> always rendered in full.
+    try:
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN pushed_gen TEXT NOT NULL DEFAULT ''"
+        )
         conn.commit()
     except sqlite3.OperationalError:
         pass  # Column already exists
@@ -579,6 +608,32 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # active set — the underlying session_id has been DELETEd/crashed.
         return False
 
+    def _stamp_pushed(conn: Any, ids: list[int], agent: str) -> None:
+        """Record the recipient's CURRENT binding generation on messages we
+        just pushed live to them.
+
+        Read back by get_messages(compact=True): if the token still matches at
+        pull time, the agent is holding the same stream that received the push,
+        so the Stop hook can summarise instead of reprinting the whole body.
+        A mismatch (rebind / unbind / hub restart) reprints in full — that's
+        the case where the push may have died in a stale stream, and silently
+        summarising it away would recreate the message-loss bug of PR #8.
+
+        Fail-soft: this is a display optimisation, never worth failing a send.
+        """
+        gen = registry.generation(agent)
+        if not gen or not ids:
+            return
+        try:
+            placeholders = ",".join("?" * len(ids))
+            conn.execute(
+                f"UPDATE messages SET pushed_gen = ? WHERE id IN ({placeholders})",
+                [gen, *ids],
+            )
+            conn.commit()
+        except Exception:  # noqa: BLE001
+            logger.debug("pushed_gen stamp failed for %s", agent, exc_info=True)
+
     async def push_channel(agent: str, content: str, meta: dict[str, str]) -> bool:
         """Push a channel notification to `agent` via the live session registry.
 
@@ -901,6 +956,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                     "UPDATE agents SET is_idle = 0 WHERE name = ?", (to,)
                 )
                 conn.commit()
+                _stamp_pushed(conn, [r["id"] for r in unread], to)
                 return (
                     f"Message sent to '{to}' (priority={priority}; idle wake "
                     f"fired, drain batch of {len(unread)} item(s))."
@@ -918,6 +974,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             # duplicate `source=` attribute on the rendered <channel> tag.
             meta={"from_agent": from_agent, "kind": "dm", "priority": priority},
         )
+
+        if pushed:
+            _stamp_pushed(conn, [message_id], to)
 
         # Do NOT mark the message read on push success. push_channel returning
         # True only means the notification was written to the bound stream — NOT
@@ -1315,6 +1374,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         limit: int = 20,
         bind: bool = True,
         mark_idle: bool = False,
+        compact: bool = False,
         ctx: Context | None = None,
     ) -> str:
         """Get unread direct messages for this agent. Marks them as read.
@@ -1364,7 +1424,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         conn.execute("UPDATE agents SET last_seen = ? WHERE name = ?", (now, agent_name))
 
         rows = conn.execute(
-            """SELECT id, ts, from_agent, body, priority FROM messages
+            """SELECT id, ts, from_agent, body, priority, pushed_gen FROM messages
                WHERE to_agent = ? AND read = 0
                ORDER BY ts ASC LIMIT ?""",
             (agent_name, limit),
@@ -1379,14 +1439,47 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         conn.execute(f"UPDATE messages SET read = 1 WHERE id IN ({placeholders})", ids)
         conn.commit()
 
-        lines = []
+        # compact mode (Stop hook): two independent economies.
+        #  1. ALREADY-SEEN — the message was pushed to the very binding the
+        #     agent still holds, so it was rendered live in their context.
+        #     Reprinting the whole body is pure duplication; one line is
+        #     enough to confirm it's now marked read.
+        #  2. BULK CAP — beyond the first few, bodies are summarised. A
+        #     Stop-hook dump of a dozen long messages costs more context than
+        #     the messages are worth, and the agent can always pull the full
+        #     text with get_messages().
+        # Both degrade to full text whenever there's any doubt: no message is
+        # ever dropped, only ever shortened.
+        gen_now = registry.generation(agent_name)
+        lines: list[str] = []
+        seen_live = 0
+        full_budget = COMPACT_FULL_MESSAGES
         for r in rows:
             ts = time.strftime("%H:%M:%S", time.localtime(r["ts"]))
             # Show priority tag for non-normal messages so retrospective
             # readers can triage without losing the cue from the live wake.
             prio = r["priority"] if r["priority"] != "normal" else ""
             prio_tag = f" [{prio}]" if prio else ""
-            lines.append(f"[{ts}] **{r['from_agent']}**{prio_tag}: {r['body']}")
+            body = r["body"]
+            if compact:
+                pushed_gen = r["pushed_gen"] if "pushed_gen" in r.keys() else ""
+                if pushed_gen and gen_now and pushed_gen == gen_now:
+                    seen_live += 1
+                    lines.append(
+                        f"[{ts}] **{r['from_agent']}**{prio_tag}: "
+                        f"(already delivered live — {_summarise(body)})"
+                    )
+                    continue
+                if full_budget > 0:
+                    full_budget -= 1
+                else:
+                    body = _summarise(body, COMPACT_SUMMARY_CHARS)
+            lines.append(f"[{ts}] **{r['from_agent']}**{prio_tag}: {body}")
+        if compact and seen_live:
+            lines.append(
+                f"({seen_live} already surfaced live this session — "
+                f"summarised to save context; call get_messages() for full text)"
+            )
         return "\n".join(lines)
 
     @mcp.tool()

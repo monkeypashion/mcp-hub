@@ -50,6 +50,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import uuid
 from typing import Any, Callable
 
 import anyio
@@ -202,6 +203,20 @@ class SessionRegistry:
         # marking the whole fleet offline if left idle past the timeout. Kept
         # injected so the registry stays transport-agnostic.
         self._liveness_probe = liveness_probe
+        # Binding-generation tokens: agent name -> "<boot>:<n>", minted afresh
+        # every time a name binds to a DIFFERENT session. A push records the
+        # recipient's token of the moment; the inbox pull compares it against
+        # the token that's current then. Equal means the push went to the very
+        # stream the agent is STILL holding — positive evidence it surfaced, so
+        # the Stop hook can say "already delivered" instead of reprinting the
+        # whole message. Any inequality (rebound, unbound, or hub restarted)
+        # fails safe to a full reprint, because that is exactly the case where
+        # a push may have vanished into a dead stream. `_boot` makes tokens
+        # unique per hub PROCESS, so a restart can never accidentally match a
+        # pre-restart token whose stream died with the old process.
+        self._boot = uuid.uuid4().hex[:8]
+        self._gen_seq = 0
+        self._generation: dict[str, str] = {}
         # Forward index: agent name -> session
         self._by_name: dict[str, ServerSession] = {}
         # Reverse index: id(session) -> set of names bound to it. One session
@@ -272,6 +287,11 @@ class SessionRegistry:
 
             self._by_name[name] = session
             self._by_session_id.setdefault(id(session), set()).add(name)
+            # New session for this name -> new generation token. Only minted
+            # here: the same-session refresh above returns early, so a token
+            # survives as long as the underlying stream does.
+            self._gen_seq += 1
+            self._generation[name] = f"{self._boot}:{self._gen_seq}"
             self._last_activity[name] = now
             # A fresh binding starts with a clean undeliverable-beat slate,
             # and any interactive bind is also a wake-ack (the agent acted).
@@ -405,6 +425,9 @@ class SessionRegistry:
         self._undeliverable_beats.pop(name, None)
         self._wake_expect.pop(name, None)
         self._wake_strikes.pop(name, None)
+        # Unbinding invalidates the generation: anything pushed to the stream
+        # we just dropped must be reprinted in full, never summarised away.
+        self._generation.pop(name, None)
         if session is None:
             return
         sid = id(session)
@@ -419,6 +442,16 @@ class SessionRegistry:
     def get(self, name: str) -> ServerSession | None:
         with self._lock:
             return self._by_name.get(name)
+
+    def generation(self, name: str) -> str | None:
+        """Current binding-generation token for `name`, or None if unbound.
+
+        Compare a token recorded at push time against this: equal means the
+        agent still holds the same stream the push was written to. Never
+        reuse-able across hub processes (see `_boot`).
+        """
+        with self._lock:
+            return self._generation.get(name)
 
     def is_bound(self, name: str) -> bool:
         with self._lock:
