@@ -18,7 +18,10 @@ SOCK="${SQUAD_SOCKET:-squad}"            # dedicated tmux socket (namespaces the
 # Most one auto-relaunch per agent per this many minutes (heal's deaf sweep) —
 # stops a flapping hub from turning "relaunch the deaf" into a restart storm.
 RELAUNCH_COOLDOWN_MIN="${SQUAD_RELAUNCH_COOLDOWN_MIN:-30}"
-HEAL_MAX_RELAUNCH="${SQUAD_HEAL_MAX_RELAUNCH:-2}"   # deaf relaunches per heal pass
+HEAL_MAX_RELAUNCH="${SQUAD_HEAL_MAX_RELAUNCH:-2}"   # relaunches per heal pass (both paths)
+# Don't judge an agent younger than this — Claude Code needs to boot and
+# register, and the status cache it's judged on lags by up to 3 min.
+HEAL_GRACE_SECONDS="${SQUAD_HEAL_GRACE_SECONDS:-180}"
 SLICE="${SQUAD_SLICE:-}"                 # optional systemd user slice for ceilings; empty = none
 OPS_DIR="$HOME/SoftwareProjects"
 CMD="$(basename "$0")"                   # whatever you symlinked this as (help text only)
@@ -136,6 +139,11 @@ agent_started() {
 # the sticky pane title and the dead session's scrollback.
 relaunch_agent() {
   local a="$1"
+  # Launch marker: heal's grace window reads this so nothing judges an agent
+  # whose claude hasn't finished booting (there is no process to measure yet,
+  # and its status cache still describes the process we just killed).
+  mkdir -p "$HOME/.mcp-hub" 2>/dev/null
+  touch "$HOME/.mcp-hub/heal-launched-$(safe_name "$a")" 2>/dev/null || true
   tm respawn-pane -k -c "$(untilde "$(field "$a" 2)")" -t "$a"
   tm select-pane -t "$a" -T '' 2>/dev/null || true
   tm clear-history -t "$a" 2>/dev/null || true
@@ -410,6 +418,13 @@ case "${1:-help}" in
             #                  the non-cure.
             healed=0
             relaunched=0
+            # Agents this pass has already relaunched. The two recovery loops
+            # below iterate the SAME roster with no shared state, so without
+            # this the escalation loop restarts an agent the deaf sweep just
+            # relaunched seconds earlier — observed 2026-07-21: vps-hetzner
+            # relaunched 16:45:23, restarted again 16:45:25, judged "STILL
+            # unwakeable" two seconds into booting Claude Code.
+            touched=" "
             # --- deaf sweep: agents that predate the last hub disruption ---
             # Settle window: act only once the disruption is >=3min old, so we
             # relaunch into a hub that's actually back (restarting mid-outage
@@ -464,6 +479,7 @@ case "${1:-help}" in
                 echo "$a: DEAF — process predates the last hub disruption; relaunching (conversation preserved)"
                 touch "$rl"
                 relaunch_agent "$a"
+                touched="$touched$a "
                 relaunched=$((relaunched+1))
                 healed=$((healed+1))
               done
@@ -471,6 +487,40 @@ case "${1:-help}" in
             for a in $(agents); do
               tm has-session -t "=$a" 2>/dev/null || continue
               pane_alive "$a" || continue
+              # Already relaunched by the deaf sweep in THIS pass — leave it be.
+              case "$touched" in *" $a "*) continue ;; esac
+              # GRACE WINDOW. Every state below is read from the daemon's status
+              # cache, which lags by up to 3 min, so an agent that just restarted
+              # ALWAYS reads offline/unwakeable — judging it then guarantees a
+              # verdict of "still broken" and another restart. That is a
+              # self-fulfilling loop: the cure manufactures the symptom it
+              # reacts to. Give a new process time to boot, register, and let a
+              # daemon beat land before forming any opinion about it.
+              # Two independent grace signals, because each has a blind spot:
+              #   - the launch marker, written by relaunch_agent. Covers the
+              #     first seconds when there is no claude process to measure.
+              #   - the claude process's own age, for launches this pass didn't
+              #     perform (operator restart, squad up, a previous pass).
+              # `agent_started` returns NOTHING while the pane still has only a
+              # shell — i.e. exactly the window a just-relaunched agent is in.
+              # Treating that as "no info, carry on judging" is what made the
+              # first version of this guard inert at +2s; absence of a process
+              # to measure is itself a reason not to judge.
+              lm="$HOME/.mcp-hub/heal-launched-$(safe_name "$a")"
+              gmin=$(( (HEAL_GRACE_SECONDS + 59) / 60 ))
+              if [ -n "$(find "$lm" -mmin -"$gmin" 2>/dev/null)" ]; then
+                echo "$a: relaunched moments ago — within grace, not judging it yet"
+                continue
+              fi
+              started="$(agent_started "$a")" || started=""
+              if [ -z "$started" ]; then
+                echo "$a: no claude process to measure yet — within grace, not judging it yet"
+                continue
+              fi
+              if [ $(( $(date +%s) - started )) -lt "$HEAL_GRACE_SECONDS" ]; then
+                echo "$a: started $(( $(date +%s) - started ))s ago — within grace, not judging it yet"
+                continue
+              fi
               sf="$(status_file "$a")"
               flag="$HOME/.mcp-hub/heal-flag-$(safe_name "$a")"
               state=""
@@ -500,6 +550,11 @@ case "${1:-help}" in
               elif [ "$st" != "idle" ]; then
                 echo "$a: $state but $st — deferring (never type over a dialog or kill a live turn)"
               elif [ -n "$(find "$flag" -mmin -10 2>/dev/null)" ] && [[ "$args" == *--continue* ]]; then
+                if [ "$relaunched" -ge "$HEAL_MAX_RELAUNCH" ]; then
+                  echo "$a: STILL $state — deferred, $HEAL_MAX_RELAUNCH relaunch(es) already this pass"
+                  continue
+                fi
+                relaunched=$((relaunched+1))
                 echo "$a: STILL $state after a nudge — restarting in place (--continue keeps context)"
                 relaunch_agent "$a"
                 rm -f "$flag"
