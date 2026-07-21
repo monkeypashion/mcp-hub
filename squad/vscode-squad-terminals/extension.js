@@ -284,7 +284,10 @@ function activate(context) {
   // tasks in this folder" permission and silently doesn't start, which is
   // exactly how it failed to appear on first try. The extension already
   // creates the agent terminals reliably; use the same door.
-  const BOARD = "◆ board";
+  // Named for the command that fills it (`squad board`), not just "board":
+  // every other tab in the list is a bare agent name, so an unqualified
+  // "board" reads like one more agent rather than the operator's own view.
+  const BOARD = "squad-board";
   if (![...vscode.window.terminals].some((t) => t.name === BOARD)) {
     const b = vscode.window.createTerminal({
       name: BOARD,
