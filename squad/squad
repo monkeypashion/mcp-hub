@@ -83,10 +83,28 @@ type_line() { local t="$1"; shift; tm send-keys -t "$t" -l "$*"; sleep 0.2; tm s
 # them. They were duplicated until 2026-07-20 and silently drifted apart —
 # that drift is why working agents read as idle and the tab dots went stale.
 classify_text() {
-  local t="$1"
+  local t="$1" below lastline
   # [X] char-class trick: these patterns must never match their own source
   # (the hub agent edits this file — its pane shows these lines mid-diff)
-  if   printf '%s\n' "$t" | grep -qE '❯ 1\. [Y]es|[D]o you want to|[N]o, and tell Claude|requires [a]pproval'; then printf 'waiting'
+  #
+  # WHERE the dialog sits decides whether it's real. Claude Code REPLACES the
+  # input box + statusline with a prompt, so a genuine dialog owns the bottom
+  # of the pane with no chrome beneath it. Dialog text an agent merely PRINTED
+  # — routine for this lane, which inspects other agents' panes — always has
+  # that chrome below it. Matching anywhere on screen made an agent quoting a
+  # dialog flag itself 🔴 (2026-07-21), which is worse than cosmetic: a false
+  # red among real ones is how a real one gets ignored.
+  # So: look for dialog markers only BELOW the last chrome line.
+  below="$(printf '%s\n' "$t" | awk '
+    { l[NR] = $0 }
+    /accept edits on|manual mode on|plan mode on|bypass permissions|for agents|ctx \[/ { last = NR }
+    END { for (i = last + 1; i <= NR; i++) print l[i] }')"
+  # Belt and braces for any build that keeps the statusline visible under a
+  # prompt: a dialog footer as the literal last line is a dialog, wherever the
+  # chrome is. Quoted text is followed by the agent's own UI, never ends there.
+  lastline="$(printf '%s\n' "$t" | tail -1)"
+  if   printf '%s\n' "$below" | grep -qE '❯ 1\. [Y]es|[D]o you want to|[N]o, and tell Claude|requires [a]pproval' \
+    || printf '%s\n' "$lastline" | grep -qE '[E]nter to confirm|[E]sc to cancel|[T]ab to amend'; then printf 'waiting'
   # WORKING: the live spinner / tool line is PRESENT-tense with a running
   # elapsed timer in parens — "Nucleating… (1m 55s · ↓ 6.4k tokens)",
   # "Running… (5s · timeout 1m)". The finished line is PAST-tense with no
