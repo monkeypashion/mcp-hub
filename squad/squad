@@ -18,6 +18,7 @@ SOCK="${SQUAD_SOCKET:-squad}"            # dedicated tmux socket (namespaces the
 # Most one auto-relaunch per agent per this many minutes (heal's deaf sweep) —
 # stops a flapping hub from turning "relaunch the deaf" into a restart storm.
 RELAUNCH_COOLDOWN_MIN="${SQUAD_RELAUNCH_COOLDOWN_MIN:-30}"
+HEAL_MAX_RELAUNCH="${SQUAD_HEAL_MAX_RELAUNCH:-2}"   # deaf relaunches per heal pass
 SLICE="${SQUAD_SLICE:-}"                 # optional systemd user slice for ceilings; empty = none
 OPS_DIR="$HOME/SoftwareProjects"
 CMD="$(basename "$0")"                   # whatever you symlinked this as (help text only)
@@ -138,8 +139,26 @@ relaunch_agent() {
   tm respawn-pane -k -c "$(untilde "$(field "$a" 2)")" -t "$a"
   tm select-pane -t "$a" -T '' 2>/dev/null || true
   tm clear-history -t "$a" 2>/dev/null || true
-  sleep 0.5
+  wait_shell_ready "$a"
   launch_agent_cmd "$a"
+}
+
+# respawn-pane returns as soon as the pane has a shell — NOT when that shell is
+# ready to read a command (~/.bashrc has to run first). A fixed sleep is a race,
+# and losing it is silent and total: on 2026-07-20 a squad-wide heal relaunch
+# typed the launch line into a not-yet-ready shell, it landed appended to stray
+# input as `we claude --continue …`, bash said "command not found", and that
+# agent sat at a bare prompt with no claude at all until a human noticed.
+# So: wait for the prompt to actually appear, then C-u to kill anything already
+# on the line. Bounded (~5s) and fail-open — if the prompt never shows we type
+# anyway, which is no worse than the old behaviour.
+wait_shell_ready() {
+  local t="$1" i
+  for i in $(seq 1 20); do
+    tm capture-pane -p -t "$t" 2>/dev/null | tail -1 | grep -q '\$[[:space:]]*$' && break
+    sleep 0.25
+  done
+  tm send-keys -t "$t" C-u 2>/dev/null || true
 }
 
 # Revive an agent's heartbeat daemon (safe to call redundantly — the daemon's
@@ -353,7 +372,7 @@ case "${1:-help}" in
               # scroll-up history made --fresh look like it hadn't worked)
               tm select-pane -t "$a" -T '' 2>/dev/null || true
               tm clear-history -t "$a" 2>/dev/null || true
-              sleep 0.5
+              wait_shell_ready "$a"
               if [ -n "$mode" ]; then launch_agent_cmd "$a" "$rargs"; else launch_agent_cmd "$a"; fi
             else
               if [ -n "$mode" ]; then up_one "$a" "$rargs"; else up_one "$a"; fi
@@ -390,6 +409,7 @@ case "${1:-help}" in
             #                  them by nudging re-register, which is precisely
             #                  the non-cure.
             healed=0
+            relaunched=0
             # --- deaf sweep: agents that predate the last hub disruption ---
             # Settle window: act only once the disruption is >=3min old, so we
             # relaunch into a hub that's actually back (restarting mid-outage
@@ -430,9 +450,21 @@ case "${1:-help}" in
                   echo "$a: deaf but $st — deferring relaunch until idle"
                   continue
                 fi
+                # BLAST-RADIUS CAP. A real hub restart makes EVERY older
+                # process deaf at once, so an uncapped sweep restarts the whole
+                # squad in one pass — nine sessions and any in-flight typing,
+                # gone together. Relaunch a few per pass instead; heal runs
+                # every 2 min, so the rest follow shortly and the operator sees
+                # a rolling recovery rather than a cliff. Never silent: the
+                # deferred agents are named.
+                if [ "$relaunched" -ge "$HEAL_MAX_RELAUNCH" ]; then
+                  echo "$a: DEAF — deferred, $HEAL_MAX_RELAUNCH relaunch(es) already this pass (next pass in ~2min)"
+                  continue
+                fi
                 echo "$a: DEAF — process predates the last hub disruption; relaunching (conversation preserved)"
                 touch "$rl"
                 relaunch_agent "$a"
+                relaunched=$((relaunched+1))
                 healed=$((healed+1))
               done
             fi
@@ -640,9 +672,18 @@ case "${1:-help}" in
             # channels, register-approval) draw high on a mostly-empty
             # screen, so raw `tail -25` sees only trailing blanks
             lines="$(tm capture-pane -p -t "$a" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -25 | grep -E '^[[:space:]]*(❯[[:space:]]*)?[0-9]+\.' || true)"
+            # The "grant beyond this one call" labels, harvested from the CC
+            # binary — they drift, so match the family, not one phrasing:
+            #   "Yes, and don't ask again for <cmd>" · "Yes, allow all edits
+            #   in <dir>" · "Yes, allow reading from <dir>" · "Yes, for this
+            #   session" · "Yes, and remember this directory"
+            sticky="ask again|yes.*always|allow all|allow reading from|(for|during) this session|remember this directory"
+            # NEVER reachable via answer — these change the permission MODE for
+            # the rest of the session, not just this call. Operator-only, by hand.
+            danger="bypass permissions|auto mode|auto-accept|own settings"
             case "$intent" in
-              yes)    line="$(printf '%s\n' "$lines" | grep -iE '[0-9]+\.[[:space:]]*yes' | grep -ivE "ask again|always" | head -1 || true)" ;;
-              always) line="$(printf '%s\n' "$lines" | grep -iE "ask again|yes.*always" | head -1 || true)" ;;
+              yes)    line="$(printf '%s\n' "$lines" | grep -iE '[0-9]+\.[[:space:]]*yes' | grep -ivE "$sticky|$danger" | head -1 || true)" ;;
+              always) line="$(printf '%s\n' "$lines" | grep -iE "$sticky" | grep -ivE "$danger" | head -1 || true)" ;;
               no)     line="$(printf '%s\n' "$lines" | grep -iE '[0-9]+\.[[:space:]]*no' | head -1 || true)" ;;
               *) echo "usage: $CMD answer [agent] yes|always|no" >&2; exit 1 ;;
             esac

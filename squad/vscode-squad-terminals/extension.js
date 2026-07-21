@@ -31,6 +31,7 @@ const THEME = {
   "factory-operations": ["gear",      "terminal.ansiWhite"],
   "factory-fleet":      ["organization", "terminal.ansiBrightMagenta"],
   "spike":              ["beaker",    "terminal.ansiBrightGreen"],
+  "pm":                 ["checklist", "terminal.ansiBrightCyan"],
 };
 const FALLBACK = ["terminal", "terminal.ansiBrightBlack"];
 
