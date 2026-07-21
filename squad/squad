@@ -966,16 +966,68 @@ case "${1:-help}" in
               done
               mv -f "$tmp" "$c" 2>/dev/null || rm -f "$tmp"
             }
+            # --- slowest tier: token usage per agent --------------------------
+            # Answers "who is burning the budget" while there's still budget to
+            # protect. On 2026-07-21 pm took 53% of fleet output on its first
+            # day and the only way to find out was to go parsing transcripts
+            # after the limit hit 67%. Read from Claude Code's own transcripts,
+            # so it costs the agents nothing and cannot be gamed or forgotten.
+            # Heaviest scan on the board (62MB today), hence the longest TTL.
+            BOARD_USAGE_TTL="${SQUAD_BOARD_USAGE_TTL:-60}"
+            usage_refresh() {
+              local c="$HOME/.mcp-hub/board-usage.cache" a w
+              if [ -f "$c" ] && [ $(( $(date +%s) - $(stat -c %Y "$c" 2>/dev/null || echo 0) )) -lt "$BOARD_USAGE_TTL" ]; then
+                return 0
+              fi
+              { for a in $(agents); do printf '%s\t%s\n' "$a" "$(untilde "$(field "$a" 2)")"; done; } \
+                | python3 -c '
+import sys, os, json, glob, time, datetime
+# agent -> transcript dir: Claude Code encodes the worktree path with / -> -
+rows = [l.rstrip("\n").split("\t") for l in sys.stdin if l.strip()]
+day = datetime.date.today().isoformat()
+hour_ago = time.time() - 3600
+out = []
+for agent, wt in rows:
+    d = os.path.expanduser("~/.claude/projects/" + wt.replace("/", "-"))
+    tot = hr = 0
+    for f in glob.glob(os.path.join(d, "*.jsonl")):
+        try: fh = open(f, errors="ignore")
+        except OSError: continue
+        with fh:
+            for line in fh:
+                if "\"usage\"" not in line: continue
+                try: rec = json.loads(line)
+                except Exception: continue
+                ts = rec.get("timestamp") or ""
+                if not ts.startswith(day): continue
+                u = (rec.get("message") or {}).get("usage") or {}
+                o = u.get("output_tokens", 0)
+                tot += o
+                try:
+                    if datetime.datetime.fromisoformat(ts.replace("Z","+00:00")).timestamp() >= hour_ago: hr += o
+                except Exception: pass
+    out.append((agent, tot, hr))
+sys.stdout.write("".join("%s\x1f%d\x1f%d\n" % r for r in out))
+' > "$c.$$" 2>/dev/null && mv -f "$c.$$" "$c" 2>/dev/null || rm -f "$c.$$"
+            }
+            usage_for() {   # -> today<US>last_hour  (output tokens)
+              local line; line="$(grep -m1 -F "$1$(printf '\037')" "$HOME/.mcp-hub/board-usage.cache" 2>/dev/null || true)"
+              printf '%s' "${line#*$(printf '\037')}"
+            }
+            human_tok() { local n="${1:-0}"
+              if   [ "$n" -ge 1000000 ]; then printf '%d.%dM' $((n/1000000)) $(((n%1000000)/100000))
+              elif [ "$n" -ge 1000 ]   ; then printf '%dk' $((n/1000))
+              else printf '%d' "$n"; fi; }
             git_for() {   # -> dirty<US>unpushed<US>branch  (empty if not a repo)
               local line; line="$(grep -m1 -F "$1$(printf '\037')" "$HOME/.mcp-hub/board-git.cache" 2>/dev/null || true)"
               printf '%s' "${line#*$(printf '\037')}"
             }
             board_scan() {   # one US-separated row per agent, one capture each
               local a tail st ctx mod g q act el gi
-              git_refresh
+              git_refresh; usage_refresh
               for a in $(agents); do
                 if ! tm has-session -t "=$a" 2>/dev/null || ! pane_alive "$a"; then
-                  printf '%s\037%s\037\037\037\0370\037\037\037%s\n' "$a" "down" "$(git_for "$a")"; continue
+                  printf '%s\037%s\037\037\037\0370\037\037\037%s\037%s\n' "$a" "down" "$(git_for "$a")" "$(usage_for "$a")"; continue
                 fi
                 tail="$(tm capture-pane -p -t "$a" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -20)"
                 st="$(classify_text "$tail")"      # shared patterns — never re-implement
@@ -997,13 +1049,13 @@ case "${1:-help}" in
                 # seconds old. Anchor on the ellipsis, same shape classify uses.
                 el="$(printf '%s\n' "$tail" | grep -E '…[[:space:]]*\([0-9]+[hms]' | tail -1 \
                       | grep -oE '\([0-9]+[hms][^·)]*' | head -1 | tr -d '(' | sed 's/[[:space:]]*$//' || true)"
-                printf '%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n' \
-                  "$a" "$st" "$g" "$mod" "$ctx" "$(wait_since "$a" "$st")" "${el:-}${el:+ }$act" "$q" "$(git_for "$a")"
+                printf '%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n' \
+                  "$a" "$st" "$g" "$mod" "$ctx" "$(wait_since "$a" "$st")" "${el:-}${el:+ }$act" "$q" "$(git_for "$a")" "$(usage_for "$a")"
               done
             }
             board_json() {
               local first=1; printf '{"generated":"%s","agents":[' "$(date -Is)"
-              while IFS=$'\037' read -r a st g mod ctx w act q dirty ahead branch; do
+              while IFS=$'\037' read -r a st g mod ctx w act q dirty ahead branch utot uhr; do
                 [ -n "$a" ] || continue
                 [ "$first" = 1 ] || printf ','; first=0
                 printf '{"agent":"%s","state":"%s","hub":"%s","model":"%s","ctx":"%s","waiting_seconds":%s,"action":"%s","question":"%s","dirty":%s,"unpushed":%s,"branch":"%s"}' \
@@ -1019,7 +1071,7 @@ case "${1:-help}" in
               out="$(printf '%s\n' "$rows" | awk -F'\037' '$2=="waiting"')"
               if [ -n "$out" ]; then
                 printf '\n\033[1;31m▌NEEDS YOU\033[0m\n'
-                while IFS=$'\037' read -r a st g mod ctx w act q dirty ahead branch; do
+                while IFS=$'\037' read -r a st g mod ctx w act q dirty ahead branch utot uhr; do
                   [ -n "$a" ] || continue
                   printf '  \033[1;31m🔴 %-26s\033[0m waiting \033[1m%s\033[0m\n' "$a" "$(hms "${w:-0}")"
                   [ -n "$q" ] && printf '     \033[2m%s\033[0m\n' "$q"
@@ -1032,7 +1084,7 @@ case "${1:-help}" in
               out="$(printf '%s\n' "$rows" | awk -F'\037' '$2=="working"')"
               printf '\n\033[1m▌WORKING NOW\033[0m\n'
               if [ -n "$out" ]; then
-                while IFS=$'\037' read -r a st g mod ctx w act q dirty ahead branch; do
+                while IFS=$'\037' read -r a st g mod ctx w act q dirty ahead branch utot uhr; do
                   [ -n "$a" ] || continue
                   printf '  \033[32m🟢 %-26s\033[0m %-2s %-6s %-5s %s\n' "$a" "$g" "${mod:0:6}" "$ctx" "$act"
                 done <<< "$out"
@@ -1046,13 +1098,25 @@ case "${1:-help}" in
               out="$(printf '%s\n' "$rows" | awk -F'\037' '($9+0)>0 || ($10+0)>0')"
               if [ -n "$out" ]; then
                 printf '\n\033[1;35m▌UNSHIPPED\033[0m\n'
-                while IFS=$'\037' read -r a st g mod ctx w act q dirty ahead branch; do
+                while IFS=$'\037' read -r a st g mod ctx w act q dirty ahead branch utot uhr; do
                   [ -n "$a" ] || continue
                   printf '  \033[35m%-26s\033[0m %s%s%s \033[2m%s\033[0m\n' "$a" \
                     "$( [ "${dirty:-0}" -gt 0 ] && printf '%s dirty' "$dirty" || printf '' )" \
                     "$( [ "${dirty:-0}" -gt 0 ] && [ "${ahead:-0}" -gt 0 ] && printf ' · ' || printf '' )" \
                     "$( [ "${ahead:-0}" -gt 0 ] && printf '%s unpushed' "$ahead" || printf '' )" \
                     "${branch}"
+                done <<< "$out"
+              fi
+              # --- who is spending the budget (output tokens today / last hour)
+              out="$(printf '%s\n' "$rows" | awk -F'\037' '($12+0)>0' | sort -t$'\037' -k12,12nr | head -5)"
+              if [ -n "$out" ]; then
+                fleet=$(printf '%s\n' "$rows" | awk -F'\037' '{s+=$12} END{print s+0}')
+                printf '\n\033[1;36m▌USAGE today\033[0m \033[2m(output tokens · fleet %s)\033[0m\n' "$(human_tok "$fleet")"
+                while IFS=$'\037' read -r a st g mod ctx w act q dirty ahead branch utot uhr; do
+                  [ -n "$a" ] || continue
+                  printf '  \033[36m%-26s\033[0m %-7s %3s%%  \033[2mlast hr %s\033[0m\n' \
+                    "$a" "$(human_tok "${utot:-0}")" \
+                    "$(( fleet > 0 ? (${utot:-0} * 100 / fleet) : 0 ))" "$(human_tok "${uhr:-0}")"
                 done <<< "$out"
               fi
               n_wait=$(printf '%s\n' "$rows" | awk -F'\037' '$2=="waiting"' | grep -c . || true)
