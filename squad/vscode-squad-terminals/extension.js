@@ -278,9 +278,24 @@ function activate(context) {
   const wf = vscode.workspace.workspaceFile;
   if (!wf || !wf.path.endsWith("squad.code-workspace")) return;
 
-  // No monitor terminals: the who engine runs headless as squad-who.service
-  // and its signal lives in the tab titles; `squad who` (board) and
-  // `squad dash` (tiled wall) remain one command away in any shell.
+  // The OPERATOR's own terminal, first in the list: what's blocking you,
+  // what's running in parallel, what's idle. Created here rather than as a
+  // workspace task — an auto-run task sits behind VSCode's "allow automatic
+  // tasks in this folder" permission and silently doesn't start, which is
+  // exactly how it failed to appear on first try. The extension already
+  // creates the agent terminals reliably; use the same door.
+  const BOARD = "◆ board";
+  if (![...vscode.window.terminals].some((t) => t.name === BOARD)) {
+    const b = vscode.window.createTerminal({
+      name: BOARD,
+      iconPath: new vscode.ThemeIcon("dashboard"),
+      color: new vscode.ThemeColor("terminal.ansiYellow"),
+    });
+    b.sendText(`${SQUAD} board -w`);
+  }
+
+  // The who engine runs headless as squad-who.service and its signal lives in
+  // the tab titles; `squad dash` (tiled wall) remains one command away.
 
   // agent terminals: UNNAMED default-profile bash + typed attach
   for (const agent of rosterAgents()) {
