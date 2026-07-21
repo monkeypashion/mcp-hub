@@ -160,6 +160,41 @@ async def test_compact_off_is_byte_for_byte_unchanged(server):
     assert "already delivered live" not in out
 
 
+async def test_footer_advice_actually_retrieves_the_body(server):
+    """The footer tells the agent where to get the full text. FOLLOW it and
+    assert the body comes back.
+
+    The first version pointed at get_messages() — which returns nothing,
+    because the compact pull marked these very rows read. A test asserting
+    only that read-semantics hold (below) passed happily alongside advice it
+    disproved. Assert the ADVICE, not just the mechanics.
+    """
+    await _setup(server)
+    await _send(server)
+
+    out = await _call_tool(
+        server, "get_messages", {"agent_name": "bob", "bind": False, "compact": True}
+    )
+    assert "get_history" in out, "footer must name the tool that still has the body"
+    assert "get_messages" not in out, "get_messages returns nothing once read"
+
+    recovered = await _call_tool(server, "get_history", {"agent_or_channel": "bob"})
+    assert "line two" in recovered, "following the footer must yield the full body"
+
+
+async def test_capped_bulk_also_gets_a_footer(server):
+    """Bulk-capped bodies were summarised with no pointer at all — an agent
+    had no way to know text had been dropped, or where to find it."""
+    await _setup(server, bind=False)
+    for i in range(COMPACT_FULL_MESSAGES + 2):
+        await _send(server, body=f"msg{i} first\nmsg{i} second", pushed=False)
+
+    out = await _call_tool(
+        server, "get_messages", {"agent_name": "bob", "bind": False, "compact": True}
+    )
+    assert "cap" in out and "get_history" in out
+
+
 async def test_messages_are_still_marked_read_when_summarised(server):
     """Summarising must not change read semantics: the row is consumed, so the
     next pull is empty rather than repeating forever."""

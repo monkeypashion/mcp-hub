@@ -1453,6 +1453,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         gen_now = registry.generation(agent_name)
         lines: list[str] = []
         seen_live = 0
+        capped = 0
         full_budget = COMPACT_FULL_MESSAGES
         for r in rows:
             ts = time.strftime("%H:%M:%S", time.localtime(r["ts"]))
@@ -1473,12 +1474,22 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 if full_budget > 0:
                     full_budget -= 1
                 else:
+                    capped += 1
                     body = _summarise(body, COMPACT_SUMMARY_CHARS)
             lines.append(f"[{ts}] **{r['from_agent']}**{prio_tag}: {body}")
-        if compact and seen_live:
+        if compact and (seen_live or capped):
+            # Point at get_history, NOT get_messages: this very call marked
+            # these rows read, so a follow-up get_messages returns nothing.
+            # (The first version of this footer said get_messages — advice
+            # that the read-semantics test in this repo already disproved.)
+            what = []
+            if seen_live:
+                what.append(f"{seen_live} already surfaced live")
+            if capped:
+                what.append(f"{capped} past the {COMPACT_FULL_MESSAGES}-message cap")
             lines.append(
-                f"({seen_live} already surfaced live this session — "
-                f"summarised to save context; call get_messages() for full text)"
+                f"({' and '.join(what)} — shortened to save context, and now "
+                f"marked read. Full text: get_history('{agent_name}'))"
             )
         return "\n".join(lines)
 
