@@ -871,8 +871,11 @@ case "${1:-help}" in
                 g="$(hub_glyph "$a")"
                 ctx="${WCTX[$a]:-}"
                 # model + ctx are ONE field — "mcp-hub F-39%" — so the tab stays
-                # narrow and a mis-set model is obvious at a glance. Joined
-                # BEFORE the tier emoji so that still leads: "🔥F-52%".
+                # narrow and a mis-set model is obvious at a glance. The tier
+                # emoji TRAILS it — "mcp-hub F-52%🔥" — so the model letter and
+                # the number stay in the same column whether or not an emoji is
+                # present; a leading emoji shunted them right on exactly the
+                # agents you most want to read quickly.
                 m="${WMOD[$a]:-}"
                 label="$short"
                 # context-pressure tiers (titles can't carry ANSI colour):
@@ -881,8 +884,8 @@ case "${1:-help}" in
                 if [ -n "$ctx" ]; then
                   n="${ctx%\%}"
                   ctx="${m:+$m-}$ctx"
-                  if   [ "$n" -ge 50 ] 2>/dev/null; then ctx="🔥$ctx"
-                  elif [ "$n" -ge 40 ] 2>/dev/null; then ctx="🟡$ctx"; fi
+                  if   [ "$n" -ge 50 ] 2>/dev/null; then ctx="$ctx🔥"
+                  elif [ "$n" -ge 40 ] 2>/dev/null; then ctx="$ctx🟡"; fi
                 else
                   ctx="$m"     # model known but ctx not scraped yet: just "F"
                 fi
