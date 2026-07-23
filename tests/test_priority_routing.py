@@ -514,6 +514,12 @@ async def test_touch_session_clears_is_idle(server):
 
 async def test_send_normal_priority_pushes_with_meta(server):
     registry = server._hub_registry  # type: ignore[attr-defined]
+
+    class _FakeSess:
+        async def send_ping(self): ...
+        async def send_notification(self, _n): ...
+
+    registry.bind("bob", _FakeSess())
     with patch.object(registry, "push", AsyncMock(return_value=True)) as push:
         await _call_tool(
             server, "send",
@@ -529,6 +535,12 @@ async def test_send_normal_priority_pushes_with_meta(server):
 
 async def test_send_urgent_priority_pushes_with_urgent_in_meta(server):
     registry = server._hub_registry  # type: ignore[attr-defined]
+
+    class _FakeSess:
+        async def send_ping(self): ...
+        async def send_notification(self, _n): ...
+
+    registry.bind("bob", _FakeSess())
     with patch.object(registry, "push", AsyncMock(return_value=True)) as push:
         await _call_tool(
             server, "send",
@@ -752,9 +764,6 @@ async def test_auto_bind_rebinds_drifted_agent_on_tool_call(server):
     # auto-rebind. We can't easily go through call_tool with a real Context,
     # so we directly invoke the underlying function via FastMCP's tool
     # registry.
-    fake_session = _FakeSession()
-    fake_ctx = _FakeContext(fake_session)
-
     # Pull the registered ping tool — its handler accepts ctx via FastMCP injection.
     # Direct invocation: emulate a call with the fake context.
     tool = server._tool_manager.get_tool("ping")
@@ -776,7 +785,7 @@ async def test_auto_bind_skips_unregistered_names(server):
     the registry."""
     registry = server._hub_registry  # type: ignore[attr-defined]
     # No registration for "ghost-typo" — just call a tool with that name
-    out = await _call_tool(
+    await _call_tool(
         server, "send",
         {"from_agent": "ghost-typo", "to": "alice", "message": "anyone home?"},
     )
@@ -957,9 +966,6 @@ async def test_broadcast_successful_push_advances_recipient_cursor(server):
     registry.bind("bob", _FakeSess())
 
     # Patch push to succeed for bob, fail for alice
-    from unittest.mock import AsyncMock
-    real_push = registry.push
-
     async def selective_push(name, notif):
         if name == "bob":
             return True

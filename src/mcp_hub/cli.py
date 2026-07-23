@@ -1491,7 +1491,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     session_start = sub.add_parser(
         "session-start",
-        help="Inject auto-register instruction into the agent's first turn (for SessionStart hooks)",
+        help="Inject auto-register instruction into the agent's first turn "
+             "(for SessionStart hooks)",
         description=(
             "Reads <cwd>/.claude/hub-agent.json and emits SessionStart hook "
             "JSON with `additionalContext` telling the agent to call "

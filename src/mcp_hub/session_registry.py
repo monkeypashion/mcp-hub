@@ -217,8 +217,23 @@ class SessionRegistry:
         self._boot = uuid.uuid4().hex[:8]
         self._gen_seq = 0
         self._generation: dict[str, str] = {}
-        # Forward index: agent name -> session
+        # Forward index: agent name -> PRIMARY session (most-recently-active).
+        # The primary carries ALL the lifecycle machinery below (reaper,
+        # heartbeat-drop, wake-ack, generation) exactly as it did when this
+        # was strictly 1:1 — every prior incident fix is preserved untouched.
         self._by_name: dict[str, ServerSession] = {}
+        # EXTRA sessions for a name — the other live conversations that share
+        # one derived identity (e.g. a tmux session AND a Co-work session in
+        # the same repo on the same host both derive `pm-dev-vm-1`). Before
+        # this, a second register() EVICTED the first (silent clobber → the
+        # loser went deaf while ⚡ still showed). Now the incumbent is DEMOTED
+        # here instead of evicted, and wakes fan out to primary + all extras.
+        # Extras are lighter-weight than the primary: they get delivery +
+        # push-time pruning, not the full heartbeat/reaper verification. A dead
+        # extra is dropped on the next wake (its send fails the deliverability
+        # gate) or on session-close; between wakes it only inflates the count.
+        # name -> {id(session): session}
+        self._extra_sessions: dict[str, dict[int, ServerSession]] = {}
         # Reverse index: id(session) -> set of names bound to it. One session
         # bound to multiple names is unusual but legal (e.g., aliases).
         self._by_session_id: dict[int, set[str]] = {}
@@ -259,12 +274,20 @@ class SessionRegistry:
     # -- mutation ------------------------------------------------------------
 
     def bind(self, name: str, session: ServerSession) -> None:
-        """Bind `name` to `session`, replacing any prior binding for `name`.
+        """Bind `name` to `session`, making it the PRIMARY for `name`.
 
         Re-binding the same name to the same session is a no-op for the
         index but still refreshes the activity timestamp — that's the
         signal the reaper uses to distinguish active agents from
         truly-abandoned bindings.
+
+        Multi-session: if `name` already has a DIFFERENT primary, that
+        incumbent is DEMOTED into `_extra_sessions` (not evicted) — the two
+        conversations share one derived identity and both stay wakeable.
+        The most-recently-active session is always the primary, so the full
+        lifecycle machinery (reaper / heartbeat / wake-ack / generation)
+        tracks whichever session last acted. If `session` was already a
+        known extra of this name, it is promoted out of the extras set.
         """
         now = time.time()
         with self._lock:
@@ -277,19 +300,29 @@ class SessionRegistry:
                 self._wake_expect.pop(name, None)
                 self._wake_strikes.pop(name, None)
                 return
+
+            # `session` may already be a KNOWN extra of this name (a second
+            # conversation that registered earlier and is now the one acting).
+            # Promote it out of the extras set — it becomes primary below.
+            extras = self._extra_sessions.get(name)
+            if extras is not None:
+                extras.pop(id(session), None)
+                if not extras:
+                    del self._extra_sessions[name]
+
             if old is not None:
-                old_id = id(old)
-                names = self._by_session_id.get(old_id)
-                if names is not None:
-                    names.discard(name)
-                    if not names:
-                        del self._by_session_id[old_id]
+                # DEMOTE the incumbent primary into extras instead of evicting
+                # it. It stays in `_by_session_id` (so session-close still
+                # cleans it up) and keeps receiving fanned-out wakes. This is
+                # the whole point: a second register() no longer silently
+                # blinds the first conversation.
+                self._extra_sessions.setdefault(name, {})[id(old)] = old
 
             self._by_name[name] = session
             self._by_session_id.setdefault(id(session), set()).add(name)
-            # New session for this name -> new generation token. Only minted
+            # New primary for this name -> new generation token. Only minted
             # here: the same-session refresh above returns early, so a token
-            # survives as long as the underlying stream does.
+            # survives as long as the underlying stream stays primary.
             self._gen_seq += 1
             self._generation[name] = f"{self._boot}:{self._gen_seq}"
             self._last_activity[name] = now
@@ -392,12 +425,26 @@ class SessionRegistry:
                 return "refreshed" if name in self._by_name else "unbound"
             beats = self._undeliverable_beats.get(name, 0) + 1
             if beats >= self.UNDELIVERABLE_BEATS_TO_DROP:
-                logger.info(
-                    "heartbeat: dropping %s after %d consecutive "
-                    "undeliverable beats (stale binding)", name, beats,
-                )
-                self._unbind_name_locked(name)
-                dropped = True
+                # Drop the stale primary. If another live conversation is
+                # bound under this name, it's promoted to primary and the
+                # agent stays online — the heartbeat then reports "refreshed"
+                # (the new primary is trusted like a fresh bind, re-probed
+                # next beat). Only a name with no survivor is truly dropped.
+                fully_offline = self._drop_primary_locked(name)
+                if fully_offline:
+                    logger.info(
+                        "heartbeat: dropping %s after %d consecutive "
+                        "undeliverable beats (stale binding, no other "
+                        "session)", name, beats,
+                    )
+                    dropped = True
+                else:
+                    logger.info(
+                        "heartbeat: %s primary undeliverable after %d beats "
+                        "— promoted an extra session to primary; agent stays "
+                        "online", name, beats,
+                    )
+                    return "refreshed"
             else:
                 self._undeliverable_beats[name] = beats
                 logger.info(
@@ -419,6 +466,9 @@ class SessionRegistry:
         return "undeliverable"
 
     def _unbind_name_locked(self, name: str) -> None:
+        """Take `name` FULLY offline — primary AND every extra. Callers that
+        want to keep the agent alive via a survivor must use
+        `_drop_primary_locked` instead; this is the terminal drop."""
         session = self._by_name.pop(name, None)
         # Drop activity timestamp — a future re-bind starts fresh.
         self._last_activity.pop(name, None)
@@ -428,20 +478,136 @@ class SessionRegistry:
         # Unbinding invalidates the generation: anything pushed to the stream
         # we just dropped must be reprinted in full, never summarised away.
         self._generation.pop(name, None)
-        if session is None:
-            return
-        sid = id(session)
-        names = self._by_session_id.get(sid)
-        if names is not None:
-            names.discard(name)
-            if not names:
-                del self._by_session_id[sid]
+
+        def _drop_from_reverse(sess: ServerSession) -> None:
+            sid = id(sess)
+            names = self._by_session_id.get(sid)
+            if names is not None:
+                names.discard(name)
+                if not names:
+                    del self._by_session_id[sid]
+
+        if session is not None:
+            _drop_from_reverse(session)
+        # Purge extras too, so "fully offline" leaves no orphan in
+        # _extra_sessions / _by_session_id / sessions(). Without this a direct
+        # unbind_name() on a multi-session agent would leave extras reachable
+        # via sessions() while is_bound() reported False — an inconsistent
+        # half-offline state.
+        extras = self._extra_sessions.pop(name, None)
+        if extras:
+            for sess in extras.values():
+                _drop_from_reverse(sess)
+
+    def _drop_primary_locked(self, name: str) -> bool:
+        """Drop the current PRIMARY session for `name`, promoting a live extra
+        if one exists. Returns True iff `name` is now FULLY offline (no session
+        of any kind left), False if an extra was promoted to primary.
+
+        This is what the drop paths (heartbeat / wake-ack / reaper / session-
+        close) call INSTEAD of `_unbind_name_locked` now that a name can carry
+        more than one session. The invariant those paths relied on — "drop the
+        binding == agent offline" — only holds when there are no extras; with
+        extras, dropping the unhealthy primary must hand off to a survivor, not
+        take the agent offline.
+
+        The promoted extra is trusted the same way a fresh `bind()` trusts a
+        new session: clean verification slate, fresh activity, new generation.
+        If it too is dead, the next heartbeat / wake-ack / reaper cycle drops
+        it in turn, walking down the extras until none remain — at which point
+        this returns True and the caller fires `on_reap` (agent → offline).
+        """
+        extras = self._extra_sessions.get(name)
+        if not extras:
+            self._unbind_name_locked(name)
+            return True
+        # Promote the most-recently-demoted extra (dicts preserve insertion
+        # order; the newest extra is the freshest conversation).
+        promoted_id = next(reversed(extras))
+        promoted = extras.pop(promoted_id)
+        if not extras:
+            del self._extra_sessions[name]
+        # Retire the outgoing primary from the reverse index — its session is
+        # being dropped. (If a caller already popped its sid, the guard is a
+        # no-op.)
+        old = self._by_name.get(name)
+        if old is not None:
+            old_id = id(old)
+            names = self._by_session_id.get(old_id)
+            if names is not None:
+                names.discard(name)
+                if not names:
+                    del self._by_session_id[old_id]
+        # Install the promoted extra as primary, treated as a fresh binding.
+        self._by_name[name] = promoted
+        self._by_session_id.setdefault(promoted_id, set()).add(name)
+        self._gen_seq += 1
+        self._generation[name] = f"{self._boot}:{self._gen_seq}"
+        self._last_activity[name] = time.time()
+        self._undeliverable_beats.pop(name, None)
+        self._wake_expect.pop(name, None)
+        self._wake_strikes.pop(name, None)
+        return False
+
+    def _unbind_session_locked(self, name: str, session: ServerSession) -> bool:
+        """Drop ONE specific `session` from `name` (primary or extra). If it
+        was the primary, promote an extra / fully unbind via
+        `_drop_primary_locked`. Returns True iff `name` is now fully offline.
+
+        Used to prune a dead EXTRA at push time (its send failed / it's no
+        longer deliverable) without disturbing a healthy primary.
+        """
+        if self._by_name.get(name) is session:
+            return self._drop_primary_locked(name)
+        extras = self._extra_sessions.get(name)
+        if extras is not None and id(session) in extras:
+            del extras[id(session)]
+            if not extras:
+                del self._extra_sessions[name]
+            sid = id(session)
+            names = self._by_session_id.get(sid)
+            if names is not None:
+                names.discard(name)
+                if not names:
+                    del self._by_session_id[sid]
+        return name not in self._by_name
 
     # -- query ---------------------------------------------------------------
 
     def get(self, name: str) -> ServerSession | None:
         with self._lock:
             return self._by_name.get(name)
+
+    def sessions(self, name: str) -> list[ServerSession]:
+        """All live sessions for `name` — primary first, then extras in
+        demotion order. Wakes fan out across this list; an empty list means
+        the agent has no binding at all."""
+        with self._lock:
+            result: list[ServerSession] = []
+            primary = self._by_name.get(name)
+            if primary is not None:
+                result.append(primary)
+            extras = self._extra_sessions.get(name)
+            if extras:
+                result.extend(extras.values())
+            return result
+
+    def session_count(self, name: str) -> int:
+        """Number of live sessions bound to `name` (primary + extras)."""
+        with self._lock:
+            n = 1 if name in self._by_name else 0
+            extras = self._extra_sessions.get(name)
+            if extras:
+                n += len(extras)
+            return n
+
+    def unbind_session(self, name: str, session: ServerSession) -> bool:
+        """Public: drop one specific session from `name`. Returns True iff
+        `name` is now fully offline. Fires no callbacks — the caller decides
+        (push-time pruning of a dead extra must NOT mark the agent offline;
+        that's owned by the reaper / wake-ack paths)."""
+        with self._lock:
+            return self._unbind_session_locked(name, session)
 
     def generation(self, name: str) -> str | None:
         """Current binding-generation token for `name`, or None if unbound.
@@ -467,16 +633,30 @@ class SessionRegistry:
     # -- lifecycle hook ------------------------------------------------------
 
     def _on_session_close(self, session: BaseSession) -> None:
-        """Drop every name bound to `session`. Called by the global hook."""
+        """Drop `session` from every name it's bound to. Called by the global
+        hook. Multi-session aware: where `session` is a name's PRIMARY, a live
+        extra is promoted so the other conversation stays online; where it's an
+        EXTRA, it's simply removed. No offline callback fires here (this hook
+        is opt-in and historically never marked agents offline — the reaper /
+        wake-ack paths own that)."""
         sid = id(session)
         with self._lock:
-            dropped = self._by_session_id.pop(sid, None)
-            if not dropped:
+            names = self._by_session_id.pop(sid, None)
+            if not names:
                 return
-            for name in dropped:
-                self._by_name.pop(name, None)
+            for name in list(names):
+                if self._by_name.get(name) is session:
+                    # sid already popped above, so _drop_primary_locked's
+                    # reverse-index cleanup for the outgoing primary no-ops.
+                    self._drop_primary_locked(name)
+                else:
+                    extras = self._extra_sessions.get(name)
+                    if extras is not None:
+                        extras.pop(sid, None)
+                        if not extras:
+                            del self._extra_sessions[name]
         logger.info(
-            "session closed; dropped bindings: %s", sorted(dropped)
+            "session closed; dropped bindings: %s", sorted(names)
         )
 
     def close(self) -> None:
@@ -533,15 +713,23 @@ class SessionRegistry:
         session = self.get(name)
         if session is None:
             return False
+        return await self.push_to_session(name, session, notification)
 
+    async def push_to_session(
+        self, name: str, session: ServerSession, notification: Any
+    ) -> bool:
+        """Send `notification` to one SPECIFIC session of `name`. Returns True
+        on a successful send, False on failure. Does NOT unbind on failure —
+        the caller decides (the fan-out prunes dead EXTRAS but leaves the
+        primary for the reaper/wake-ack paths). `name` is for logging only."""
         try:
             await session.send_notification(notification)
             return True
         except Exception as exc:  # noqa: BLE001
             logger.info(
-                "push %s: send failed (%s: %s); binding kept "
-                "(activity reaper owns lifecycle)",
-                name, type(exc).__name__, exc,
+                "push %s: send to session %d failed (%s: %s); "
+                "caller owns lifecycle",
+                name, id(session), type(exc).__name__, exc,
             )
             return False
 
@@ -581,13 +769,25 @@ class SessionRegistry:
                 del self._wake_expect[name]
                 strikes = self._wake_strikes.get(name, 0) + 1
                 if strikes >= self.WAKE_STRIKES_TO_DROP and name in self._by_name:
-                    logger.info(
-                        "wake-ack: dropping %s after %d unacked wakes "
-                        "(stream presumed dead behind live binding)",
-                        name, strikes,
-                    )
-                    self._unbind_name_locked(name)
-                    dropped.append(name)
+                    # Drop the primary whose stream never acked. If a second
+                    # conversation is bound under this name, promote it and
+                    # keep the agent online (its slate is cleared by
+                    # _drop_primary_locked, so it isn't charged the dead
+                    # primary's strikes). Only fire the offline callbacks when
+                    # no session survives.
+                    if self._drop_primary_locked(name):
+                        logger.info(
+                            "wake-ack: dropping %s after %d unacked wakes "
+                            "(stream presumed dead, no other session)",
+                            name, strikes,
+                        )
+                        dropped.append(name)
+                    else:
+                        logger.info(
+                            "wake-ack: %s primary unacked after %d wakes — "
+                            "promoted an extra session; agent stays online",
+                            name, strikes,
+                        )
                 else:
                     self._wake_strikes[name] = strikes
                     logger.info(
@@ -676,12 +876,23 @@ class SessionRegistry:
                 return False
             if time.time() - last <= self.ACTIVITY_TIMEOUT_SECONDS:
                 return True
-            logger.info(
-                "reaper: dropping %s after %.0fs of inactivity (not deliverable)",
-                name, time.time() - last,
-            )
-            self._unbind_name_locked(name)
-            dropped = True
+            # Drop the silent+undeliverable primary. If another live session is
+            # bound under this name (e.g. an idle --channels conversation still
+            # holding a GET stream), promote it and keep the agent online; only
+            # fire on_reap when nothing survives.
+            fully_offline = self._drop_primary_locked(name)
+            if fully_offline:
+                logger.info(
+                    "reaper: dropping %s after %.0fs of inactivity (not "
+                    "deliverable, no other session)", name, time.time() - last,
+                )
+                dropped = True
+            else:
+                logger.info(
+                    "reaper: %s primary stale+undeliverable — promoted an "
+                    "extra session; agent stays online", name,
+                )
+                return True
         # Fire the offline callback OUTSIDE the lock — it may do a DB write,
         # which we don't want to hold the registry lock across.
         if dropped and self._on_reap is not None:

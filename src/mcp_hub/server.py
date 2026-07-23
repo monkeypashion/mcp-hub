@@ -19,7 +19,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import anyio
 from mcp.server.fastmcp import Context, FastMCP
@@ -72,6 +72,19 @@ class _ChannelNotification(BaseModel):
 
     method: str = "notifications/claude/channel"
     params: dict[str, Any]
+
+
+class _PushOutcome(NamedTuple):
+    """Result of a fanned-out channel push.
+
+    `delivered` — reached ≥1 live session (drives woke-reporting / wake-ack).
+    `primary`   — the PRIMARY session specifically got it (the ONLY signal that
+                  may gate the compact-render generation stamp, which is keyed
+                  to the primary's stream). See push_channel for why.
+    """
+
+    delivered: bool
+    primary: bool
 
 
 # Allowed priority values for send/broadcast. The hub uses priority to decide
@@ -634,49 +647,79 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         except Exception:  # noqa: BLE001
             logger.debug("pushed_gen stamp failed for %s", agent, exc_info=True)
 
-    async def push_channel(agent: str, content: str, meta: dict[str, str]) -> bool:
+    async def push_channel(agent: str, content: str, meta: dict[str, str]) -> _PushOutcome:
         """Push a channel notification to `agent` via the live session registry.
 
-        Returns True only if the recipient has a verifiably-live session and
-        the send succeeded. False means the recipient is offline / unbound /
-        the connection was a zombie (and is now dropped from the registry).
-        Either way the message has already been persisted in SQLite by the
-        caller, so a False here is not message loss — the recipient picks
-        it up on next register() or get_messages().
+        Returns a `_PushOutcome(delivered, primary)`:
+        - `delivered` — reached at least one live session. Drives the "woke"
+          reporting and the wake-ack expectation. False means the recipient is
+          offline / unbound / every session was a zombie. Either way the caller
+          has already persisted the message in SQLite, so False is not message
+          loss — the recipient picks it up on next register() / get_messages().
+        - `primary` — the PRIMARY session specifically got the live push. ONLY
+          this gates the compact-render generation stamp (`_stamp_pushed`),
+          because that token is the primary's: stamping it when an EXTRA (not
+          the primary) delivered would let the primary conversation summarise a
+          message it never received — the "push success ≠ seen" mistake in a
+          new disguise.
         """
-        # Gate the silent-drop case: if there's a binding but its transport
-        # has no GET /mcp listener (or the transport is no longer in the
-        # manager's active set), the send would silently succeed and the
-        # hub would lie in its `woke` count. Catch it here and report False
-        # so the recipient picks the message up via Stop-hook auto-pull.
+        # Fan the wake out to EVERY live session bound to this name. One
+        # derived identity can carry more than one conversation (e.g. a tmux
+        # session AND a Co-work session in the same repo on the same host both
+        # derive the same name) — before multi-session support, the second
+        # register() evicted the first and only one conversation ever woke.
         #
-        # Done as a pre-check rather than inside registry.push so the
-        # registry stays transport-agnostic. Unbound names still flow
-        # through registry.push (which returns False) — that's the
-        # "never bound" branch and doesn't need the gate.
-        session = registry.get(agent)
-        if session is not None and not _can_deliver_push(session):
+        # Delivery per session gates on the same silent-drop check as a 1:1
+        # push: `_can_deliver_push` is False when a binding exists but its
+        # transport has no GET /mcp listener (closed on /compact, cycled out,
+        # never reopened after a redeploy), where the send would succeed into
+        # a black hole and the hub would lie in its `woke` count.
+        #
+        # Primary vs extras differ ONLY in lifecycle on failure: a dead extra
+        # is pruned right here (extras get opportunistic verification only),
+        # while the primary is left untouched for the reaper / wake-ack paths
+        # that own its lifecycle — dropping it on a transient push failure is
+        # the exact mistake the mark-read-on-push incident warned against.
+        sessions = registry.sessions(agent)
+        if not sessions:
+            return _PushOutcome(False, False)  # never bound
+        notification = _ChannelNotification(params={"content": content, "meta": meta})
+        primary, extras = sessions[0], sessions[1:]
+
+        primary_delivered = False
+        if _can_deliver_push(primary):
+            if await registry.push(agent, notification):
+                primary_delivered = True
+        else:
             logger.info(
-                "push %s: gated — no GET /mcp listener (would be silent drop)",
-                agent,
+                "push %s: primary gated — no GET /mcp listener "
+                "(would be silent drop)", agent,
             )
-            return False
-        pushed = await registry.push(
-            agent,
-            _ChannelNotification(params={"content": content, "meta": meta}),
-        )
-        if pushed:
+        delivered = primary_delivered
+        for extra in extras:
+            if not _can_deliver_push(extra):
+                registry.unbind_session(agent, extra)
+                continue
+            if await registry.push_to_session(agent, extra, notification):
+                delivered = True
+            else:
+                registry.unbind_session(agent, extra)
+
+        if delivered:
             # Arm the wake-ack expectation: a delivered wake must produce
             # SOME agent activity (bind or message drain) within the ack
             # window, else the stream is presumed dead behind the live
             # binding — the one state transport introspection can't see.
             registry.expect_wake_ack(agent)
-        return pushed
+        return _PushOutcome(delivered, primary_delivered)
 
     # -- Presence --
 
     @mcp.tool()
-    def register(name: str, project: str = "", bio: str = "", meta: str = "{}", ctx: Context | None = None) -> str:
+    def register(
+        name: str, project: str = "", bio: str = "", meta: str = "{}",
+        ctx: Context | None = None,
+    ) -> str:
         """Register this agent session with the hub.
 
         Call this when your session starts. Sets you as 'online' and binds
@@ -712,7 +755,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         ).fetchone()["m"]
 
         conn.execute(
-            """INSERT INTO agents (name, project, bio, status, registered, last_seen, meta, last_broadcast_seen_id)
+            """INSERT INTO agents (name, project, bio, status, registered,
+                                   last_seen, meta, last_broadcast_seen_id)
                VALUES (?, ?, ?, 'online', ?, ?, ?, ?)
                ON CONFLICT(name) DO UPDATE SET
                    project=excluded.project,
@@ -820,8 +864,24 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             # bound. `_can_deliver_push` is the same gate push_channel uses, so
             # ⚡ now means exactly "a push would land". A bound-but-undeliverable
             # agent shows 🟢 without ⚡ — the visible "needs relaunch" signal.
-            sess = registry.get(r["name"])
-            wake = " ⚡" if (sess is not None and _can_deliver_push(sess)) else ""
+            # ⚡ means "a wake would land on ≥1 live session RIGHT NOW". With
+            # multi-session, more than one conversation can share this derived
+            # name (e.g. tmux + Co-work) and a wake fans out to all of them —
+            # so we probe EVERY session and show the count of genuinely-
+            # deliverable ones (⚡×2). Counting raw membership instead would
+            # let a silently-dead extra (pruned only at push time) inflate the
+            # number into a wakeability lie — the exact thing ⚡ exists to
+            # prevent. Zero deliverable → no ⚡ (bound-but-unreachable = the
+            # visible "needs relaunch" signal), unchanged for single sessions.
+            wakeable = sum(
+                1 for s in registry.sessions(r["name"]) if _can_deliver_push(s)
+            )
+            if wakeable > 1:
+                wake = f" ⚡×{wakeable}"
+            elif wakeable == 1:
+                wake = " ⚡"
+            else:
+                wake = ""
             # 💤 marks agents currently idle (Stop hook flipped them at last
             # turn end, no tool call has cleared it since). Combined with
             # ⚡, this is the state where a low-prio DM fires a live wake
@@ -840,7 +900,10 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     # -- Direct messaging --
 
     @mcp.tool()
-    async def send(from_agent: str, to: str, message: str, priority: str = "normal", ctx: Context | None = None) -> str:
+    async def send(
+        from_agent: str, to: str, message: str, priority: str = "normal",
+        ctx: Context | None = None,
+    ) -> str:
         """Send a direct message to another agent.
 
         Priority controls whether the recipient is woken from idle:
@@ -931,7 +994,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 )
             content = "\n".join(content_lines)
 
-            pushed = await push_channel(
+            outcome = await push_channel(
                 agent=to,
                 content=content,
                 meta={
@@ -942,7 +1005,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 },
             )
 
-            if pushed:
+            if outcome.delivered:
                 # Do NOT mark the batch read on push. push_channel returning
                 # True only means the notification was written to the bound
                 # stream — not that the recipient surfaced it (a stale/
@@ -956,7 +1019,11 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                     "UPDATE agents SET is_idle = 0 WHERE name = ?", (to,)
                 )
                 conn.commit()
-                _stamp_pushed(conn, [r["id"] for r in unread], to)
+                # Stamp ONLY if the primary got it — the generation token is the
+                # primary's stream. An extra-only delivery must fall through to
+                # a full reprint (fail-safe), never a summary.
+                if outcome.primary:
+                    _stamp_pushed(conn, [r["id"] for r in unread], to)
                 return (
                     f"Message sent to '{to}' (priority={priority}; idle wake "
                     f"fired, drain batch of {len(unread)} item(s))."
@@ -966,7 +1033,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 f"push failed, will surface via Stop-hook auto-pull)."
             )
 
-        pushed = await push_channel(
+        outcome = await push_channel(
             agent=to,
             content=f"DM from {from_agent}: {message}",
             # `source` is reserved by Claude Code's channel layer (it's the
@@ -975,7 +1042,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             meta={"from_agent": from_agent, "kind": "dm", "priority": priority},
         )
 
-        if pushed:
+        # Stamp only on PRIMARY delivery (the token is the primary's stream) —
+        # an extra-only delivery fails safe to a full reprint.
+        if outcome.primary:
             _stamp_pushed(conn, [message_id], to)
 
         # Do NOT mark the message read on push success. push_channel returning
@@ -990,7 +1059,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 
         return (
             f"Message sent to '{to}' (priority={priority})."
-            if pushed
+            if outcome.delivered
             else (
                 f"Message sent to '{to}' (priority={priority}; recipient "
                 f"offline — will see on next register/get_messages)."
@@ -1000,7 +1069,10 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     # -- Broadcast --
 
     @mcp.tool()
-    async def broadcast(from_agent: str, message: str, priority: str = "normal", ctx: Context | None = None) -> str:
+    async def broadcast(
+        from_agent: str, message: str, priority: str = "normal",
+        ctx: Context | None = None,
+    ) -> str:
         """Post a broadcast every agent will see.
 
         Broadcasts are global — they hit every connected agent regardless
@@ -1079,7 +1151,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # drops it to ≈ the MAX (slowest single recipient). Results land in
         # a dict keyed by agent name — anyio task groups run cooperatively
         # on one event loop, so concurrent writes to the dict are safe.
-        push_results: dict[str, bool] = {}
+        push_results: dict[str, _PushOutcome] = {}
 
         async def _push_one(agent: str) -> None:
             push_results[agent] = await push_channel(
@@ -1096,11 +1168,16 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             for agent in recipients:
                 tg.start_soon(_push_one, agent)
 
-        # Successful pushes — advance each recipient's cursor in one batched
-        # UPDATE so Stop-hook auto-pull doesn't re-surface the same item.
-        # Failed pushes leave the cursor alone; those agents catch up via
-        # Stop hook on their next turn boundary.
-        successes = [a for a, pushed in push_results.items() if pushed]
+        # Advance each recipient's cursor ONLY when the PRIMARY session got the
+        # live push. The cursor is per-agent (one row), so marking it "seen"
+        # silences the Stop-hook catch-up for EVERY session under that name —
+        # advancing it on an extra-only delivery would let the primary (or a
+        # gated session) permanently miss a broadcast it never received. Tying
+        # the advance to the primary mirrors the DM generation stamp: worst
+        # case a session that DID see it live sees it once more via Stop hook
+        # (a harmless dup), never silent loss. Single-session is unchanged
+        # (primary == the only session).
+        successes = [a for a, o in push_results.items() if o.primary]
         if successes:
             placeholders = ",".join("?" * len(successes))
             conn.execute(
@@ -1110,9 +1187,12 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             )
             conn.commit()
 
+        # Honest woke count — anyone we delivered a live wake to (primary or an
+        # extra), distinct from the cursor-advance set above.
+        woke = sum(1 for o in push_results.values() if o.delivered)
         return (
             f"Broadcast posted (priority={priority}; "
-            f"woke {len(successes)}/{len(recipients)} connected agents)."
+            f"woke {woke}/{len(recipients)} connected agents)."
         )
 
     # -- Channels (topical, named, posted-to via `post`) ---------------------
@@ -1243,7 +1323,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # Parallel fan-out — same rationale as broadcast(). Posts have no
         # per-recipient cursor to advance, so the post-loop simply counts
         # successful pushes.
-        push_results: dict[str, bool] = {}
+        push_results: dict[str, _PushOutcome] = {}
 
         async def _push_one(agent: str) -> None:
             push_results[agent] = await push_channel(
@@ -1261,7 +1341,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             for agent in recipients:
                 tg.start_soon(_push_one, agent)
 
-        woke = sum(1 for pushed in push_results.values() if pushed)
+        woke = sum(1 for o in push_results.values() if o.delivered)
         return (
             f"Posted to #{channel} (priority={priority}; "
             f"woke {woke}/{len(recipients)} connected agents)."
