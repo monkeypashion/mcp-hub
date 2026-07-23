@@ -1479,6 +1479,18 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         now = time.time()
         conn = _get_db(db_path)
 
+        # Capture BEFORE the drain-ack below clears it: was a delivered wake
+        # still awaiting an INDEPENDENT ack when this drain began? If so, the
+        # recipient's stream never proved it rendered — a half-dead deaf-⚡
+        # binding (bound + ⚡ after a redeploy reconnect, before a process
+        # relaunch) passes every server-side deliverability check yet shows the
+        # agent nothing (proven live: fireblade, Windows, 2026-07-23). The
+        # compact "already delivered live" claim MUST fail safe to a full
+        # reprint in that state, or every post-redeploy wave truncates messages
+        # on a false "you saw this". push success ≠ render; the drain itself is
+        # NOT render evidence — it's how a deaf agent DISCOVERS what it missed.
+        wake_render_unproven = registry.has_pending_wake_ack(agent_name)
+
         # Draining messages is a wake-ack regardless of bind: the agent's
         # process is demonstrably alive and reading — even the Stop hook's
         # bind=False pull proves the wake pipeline's PURPOSE (delivery) was
@@ -1544,7 +1556,17 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             body = r["body"]
             if compact:
                 pushed_gen = r["pushed_gen"] if "pushed_gen" in r.keys() else ""
-                if pushed_gen and gen_now and pushed_gen == gen_now:
+                # "already delivered live" needs BOTH: the push hit the binding
+                # the agent still holds (generation match) AND that binding's
+                # render is not in doubt (no wake left unacked before this
+                # drain). The second gate is the deaf-⚡ fix — without it, a
+                # bound-but-non-rendering stream gets its messages truncated on
+                # a false live-delivery claim (worst fleet-wide right after a
+                # redeploy). Doubt → fall through to full text.
+                if (
+                    pushed_gen and gen_now and pushed_gen == gen_now
+                    and not wake_render_unproven
+                ):
                     seen_live += 1
                     lines.append(
                         f"[{ts}] **{r['from_agent']}**{prio_tag}: "

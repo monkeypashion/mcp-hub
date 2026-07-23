@@ -754,6 +754,27 @@ class SessionRegistry:
             self._wake_expect.pop(name, None)
             self._wake_strikes.pop(name, None)
 
+    def has_pending_wake_ack(self, name: str) -> bool:
+        """True if a wake was pushed to `name` and NOT yet acked by anything.
+
+        This is the render-liveness gate for the compact "already delivered
+        live" claim. `_can_deliver_push` proves a GET stream is PRESENT, but a
+        half-dead stream (bound + ⚡ after a redeploy reconnect, before a
+        process relaunch) passes presence while rendering nothing — proven
+        live on Windows 2026-07-23: a delivered push was falsely stamped
+        "delivered live" and truncated on a stream that showed the agent
+        nothing. Push-success ≠ render.
+
+        A still-pending expectation means the last delivered wake produced NO
+        independent ack (no interactive tool call, no reply) — so we have zero
+        positive evidence the stream rendered. Callers must fail SAFE: full
+        reprint, never a "you already saw this" claim. The claim is only safe
+        once the recipient has independently acked (an interactive bind /
+        reply) BEFORE the Stop-hook drain — the drain itself is NOT render
+        evidence, it's how a deaf agent DISCOVERS what it missed."""
+        with self._lock:
+            return name in self._wake_expect
+
     def sweep_wake_acks(self) -> list[str]:
         """Expire overdue expectations; drop bindings past the strike limit.
 

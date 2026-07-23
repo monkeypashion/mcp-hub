@@ -75,9 +75,17 @@ async def _send(server, body: str = BODY, pushed: bool = True):
 
 async def test_live_delivered_message_is_summarised_not_reprinted(server):
     """The complaint: a DM the agent already saw live gets reprinted in full
-    at the next Stop boundary. Compact mode must collapse it to one line."""
-    await _setup(server)
+    at the next Stop boundary. Compact mode must collapse it to one line —
+    but ONLY when there's positive evidence the stream actually rendered it.
+    A genuine live-render is modelled by an INDEPENDENT ack (the agent reacted
+    to the wake with a tool call) before the Stop-hook drain."""
+    registry = await _setup(server)
     await _send(server)
+    # The agent saw the wake and reacted — an interactive ack that clears the
+    # expectation before its Stop drain. THIS is what proves render (a deaf
+    # stream never produces it). Without it we must fail safe (see the deaf
+    # test below).
+    registry.wake_ack("bob")
 
     out = await _call_tool(
         server, "get_messages", {"agent_name": "bob", "bind": False, "compact": True}
@@ -86,6 +94,28 @@ async def test_live_delivered_message_is_summarised_not_reprinted(server):
     assert "already delivered live" in out
     assert "line two" not in out, "full body was reprinted despite live delivery"
     assert "alice" in out, "sender must still be identifiable"
+
+
+async def test_deaf_delivered_push_is_not_falsely_compacted(server):
+    """Regression for the 2026-07-23 deaf-⚡ bug (fireblade, proven on Windows):
+    a push that SUCCEEDED server-side (delivered, binding still held) but was
+    never actually rendered — because the stream was half-dead after a redeploy
+    reconnect — must NOT be claimed "already delivered live" and truncated.
+
+    Modelled by the wake-ack expectation still being PENDING at drain time: the
+    delivered wake produced no independent ack, so render is unproven. This is
+    exactly the fleet-wide post-redeploy window. Fail safe → full reprint."""
+    await _setup(server)
+    await _send(server)  # push succeeds + arms expect_wake_ack, NO ack follows
+
+    out = await _call_tool(
+        server, "get_messages", {"agent_name": "bob", "bind": False, "compact": True}
+    )
+
+    assert "already delivered live" not in out, (
+        "a delivered-but-unrendered push was falsely claimed seen-live"
+    )
+    assert "line two" in out, "unrendered message must be reprinted in FULL"
 
 
 async def test_rebind_forces_full_reprint(server):
@@ -169,8 +199,9 @@ async def test_footer_advice_actually_retrieves_the_body(server):
     only that read-semantics hold (below) passed happily alongside advice it
     disproved. Assert the ADVICE, not just the mechanics.
     """
-    await _setup(server)
+    registry = await _setup(server)
     await _send(server)
+    registry.wake_ack("bob")  # independent ack → genuine live-render → compacted
 
     out = await _call_tool(
         server, "get_messages", {"agent_name": "bob", "bind": False, "compact": True}
