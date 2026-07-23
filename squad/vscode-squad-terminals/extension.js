@@ -38,17 +38,36 @@ const FALLBACK = ["terminal", "terminal.ansiBrightBlack"];
 // Terminal -> agent name, for context-menu target resolution
 const agentOf = new Map();
 
-function rosterAgents() {
+function rosterRows() {
   const conf = path.join(os.homedir(), ".config", "squad", "squad.conf");
   try {
     return fs
       .readFileSync(conf, "utf8")
       .split("\n")
       .filter((l) => l.trim() && !l.trim().startsWith("#"))
-      .map((l) => l.split("|")[0].trim())
-      .filter(Boolean);
+      .map((l) => l.split("|"))
+      .filter((f) => f[0] && f[0].trim() && f[1] && f[1].trim())
+      .map((f) => ({
+        agent: f[0].trim(),
+        worktree: f[1].trim().replace(/^~(?=$|[/\\])/, os.homedir()),
+      }));
   } catch {
     return [];
+  }
+}
+
+function rosterAgents() {
+  return rosterRows().map((r) => r.agent);
+}
+
+// Canonical form for path equality: realpath (symlink-proof — the whole tree
+// moved once already), falling back to a plain resolve for paths that don't
+// exist yet.
+function canon(p) {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return path.resolve(p);
   }
 }
 
@@ -274,9 +293,20 @@ function activate(context) {
     )
   );
 
-  // ---- cockpit terminals: only in the squad workspace ----
+  // ---- cockpit terminals: any workspace containing roster worktrees ----
+  // Gate on FOLDER MEMBERSHIP, not the workspace filename (pre-0.9 this was
+  // squad.code-workspace only): a terminal opens for each roster agent whose
+  // worktree IS one of the current workspace's folders. One roster, and each
+  // workspace (squad / general / windows) shows exactly its own agents.
+  // Plain folder windows (no .code-workspace file) get no auto-terminals —
+  // the context-menu commands above still work everywhere.
   const wf = vscode.workspace.workspaceFile;
-  if (!wf || !wf.path.endsWith("squad.code-workspace")) return;
+  if (!wf) return;
+  const wsDirs = new Set(
+    (vscode.workspace.workspaceFolders || []).map((f) => canon(f.uri.fsPath))
+  );
+  const mine = rosterRows().filter((r) => wsDirs.has(canon(r.worktree)));
+  if (!mine.length) return;
 
   // The OPERATOR's own terminal, first in the list: what's blocking you,
   // what's running in parallel, what's idle. Created here rather than as a
@@ -300,8 +330,12 @@ function activate(context) {
   // The who engine runs headless as squad-who.service and its signal lives in
   // the tab titles; `squad dash` (tiled wall) remains one command away.
 
-  // agent terminals: UNNAMED default-profile bash + typed attach
-  for (const agent of rosterAgents()) {
+  // agent terminals: UNNAMED default-profile bash + typed attach.
+  // --no-start is load-bearing: these attaches fire at window-open, and
+  // start-if-down semantics here would mass-launch every rostered agent in
+  // the workspace (14 for general) and re-run the 2026-07-19 up_one race.
+  // A down agent's terminal shows how to start it; nothing launches itself.
+  for (const { agent } of mine) {
     if ([...agentOf.values()].includes(agent)) continue;
     const label = shortLabel(agent);
     const [icon, color] = THEME[label] || FALLBACK;
@@ -310,7 +344,7 @@ function activate(context) {
       color: new vscode.ThemeColor(color),
     });
     agentOf.set(t, agent);
-    t.sendText(`squad attach ${agent}`);
+    t.sendText(`squad attach --no-start ${agent}`);
   }
 
   // keep the map tidy as terminals close

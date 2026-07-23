@@ -10,7 +10,10 @@
 #
 # The --dangerously-load-development-channels server:hub flag enables live channel-push wake.
 # The hub MCP tools (list_agents/send/...) come from ~/.claude.json (user-scope) — already set up.
-# Add --continue per agent (via `squad args <agent> "..."`) if you want it to resume its last thread.
+# Add --continue per agent (via `squad args <agent> "..."`) if you want every (re)launch
+# to resume its last thread. NB the flag names differ by layer: --continue is CLAUDE's
+# arg (lives here in the roster); `squad restart` takes --resume / --fresh, which add or
+# strip --continue for that one restart. `squad restart <a> --continue` is NOT a thing.
 
 mcp-hub-dev|~/SoftwareProjects/monkeypashion/mcp-hub||--dangerously-load-development-channels server:hub
 

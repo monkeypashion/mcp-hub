@@ -124,7 +124,7 @@ classify_text() {
   # prompt: a dialog footer as the literal last line is a dialog, wherever the
   # chrome is. Quoted text is followed by the agent's own UI, never ends there.
   lastline="$(printf '%s\n' "$t" | tail -1)"
-  if   printf '%s\n' "$below" | grep -qE '❯ 1\. [Y]es|[D]o you want to|[N]o, and tell Claude|requires [a]pproval' \
+  if   printf '%s\n' "$below" | grep -qE '❯ 1\. [Y]es|[D]o you want to|[D]o you trust|[N]o, and tell Claude|requires [a]pproval' \
     || printf '%s\n' "$lastline" | grep -qE '[E]nter to confirm|[E]sc to cancel|[T]ab to amend'; then printf 'waiting'
   # WORKING: the live spinner / tool line is PRESENT-tense with a running
   # elapsed timer in parens — "Nucleating… (1m 55s · ↓ 6.4k tokens)",
@@ -265,11 +265,18 @@ launch_agent_cmd() {
   echo "started $a  ($args)"
   # --dangerously-load-development-channels pops a confirm prompt on launch; auto-accept it
   # (server:hub is your own hub = the "local development" case; option 1 is the default → Enter).
+  # if-form, not `grep && {...}`: when the prompt never shows (already
+  # accepted, or hidden behind a trust dialog), the &&-list left the loop —
+  # and this function — with a failing status, which set -e turned into
+  # "up dies after starting one agent" (2026-07-23 migration).
   case "$args" in *dangerously-load-development-channels*)
     for _ in $(seq 1 10); do sleep 1
-      tm capture-pane -t "$a" -p 2>/dev/null | grep -qi 'channel development' && { tm send-keys -t "$a" Enter; break; }
+      if tm capture-pane -t "$a" -p 2>/dev/null | grep -qi 'channel development'; then
+        tm send-keys -t "$a" Enter; break
+      fi
     done ;;
   esac
+  return 0
 }
 
 up_one() {
@@ -418,7 +425,13 @@ handoff() {
 # For cmd/key/args the first token is the agent ONLY if it's a known roster
 # name (or `all`); otherwise it's treated as payload and the agent is $PWD's.
 case "${1:-help}" in
-  up)       for a in $(agents); do up_one "$a"; done ;;
+  up)       # One bad agent must cost ONE line, not the rest of the sweep:
+            # under set -e a single up_one failure (missing worktree, launch
+            # hiccup) killed the whole loop — observed 2026-07-23 during the
+            # Projects migration as "up starts exactly one agent per run".
+            for a in $(agents); do
+              up_one "$a" || echo "!! $a: failed to come up — continuing with the rest" >&2
+            done ;;
   restart)  shift; mode=""; a_arg=""
             for t in "$@"; do case "$t" in
               --fresh)  mode=fresh ;;
@@ -675,11 +688,32 @@ case "${1:-help}" in
             else t="$(need_agent "")" || exit 1; shift
                  [ -n "${1:-}" ] || { echo "usage: $CMD key [agent] <keys>" >&2; exit 1; }
                  tm send-keys -t "$t" "$@"; fi ;;
-  attach)   a="$(need_agent "${2:-}")" || exit 1
+  attach)   # --no-start: attach ONLY if the session exists — never launch.
+            # Built for the cockpit extension, whose terminals attach at
+            # window-open: with auto-start, opening a workspace mass-launches
+            # every rostered agent in it (and races up_one — the 2026-07-19
+            # session-cross incident was seven of those at once). Interactive
+            # use keeps the start-if-down convenience by default.
+            shift; nostart=""; a_arg=""
+            for t in "$@"; do case "$t" in
+              --no-start) nostart=1 ;;
+              -*) echo "!! unknown attach flag '$t' (valid: --no-start)" >&2; exit 1 ;;
+              *)  a_arg="$t" ;;
+            esac; done
+            a="$(need_agent "$a_arg")" || exit 1
             if ! tm has-session -t "=$a" 2>/dev/null; then
+              if [ -n "$nostart" ]; then
+                echo "$a is down (--no-start: not launching). Start it with: $CMD up   or: $CMD restart $a"
+                exit 0
+              fi
               echo "$a not running — starting it..."; up_one "$a"; sleep 1
             elif ! pane_alive "$a"; then
-              echo "$a was degraded — restarting claude..."; tm kill-session -t "=$a" 2>/dev/null || true; up_one "$a"; sleep 1
+              # --no-start still attaches to a degraded session (viewer can
+              # inspect the dead pane and restart from there) — it only
+              # refuses to CREATE processes.
+              if [ -z "$nostart" ]; then
+                echo "$a was degraded — restarting claude..."; tm kill-session -t "=$a" 2>/dev/null || true; up_one "$a"; sleep 1
+              fi
             fi
             if [ -n "${TMUX:-}" ]; then           # already inside tmux — switch, don't nest
               tmux -L "$SOCK" switch-client -t "=$a" 2>/dev/null \
@@ -1199,7 +1233,10 @@ run
                                   --resume:  add --continue this once (resume last conversation)
                                   --fresh:   drop --continue this once (start a blank conversation)
                                 the roster is never modified — use 'args' to change the default
-  $CMD attach  [agent]          attach, starting/repairing it first if needed; Ctrl-b d detaches
+  $CMD attach  [agent] [--no-start]
+                                attach, starting/repairing it first if needed; Ctrl-b d detaches
+                                --no-start: attach only if already up (cockpit terminals use
+                                this so opening a workspace never mass-launches agents)
 
 watch + repair
   $CMD dash [agent...|--pick]   the squad in ONE window — a live tiled pane per agent

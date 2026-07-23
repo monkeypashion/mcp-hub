@@ -126,9 +126,9 @@ mcp-hub memory-import            # --dry-run to preview, --force to overwrite
 **Install per machine as a LINK, never a copy** (the repo is the single version; `git pull` updates every machine — no drift). User-scope, so `/memory-sync` is available in every project on the box:
 ```bash
 # Linux
-ln -sfn ~/SoftwareProjects/monkeypashion/mcp-hub/skills/memory-sync ~/.claude/skills/memory-sync
+ln -sfn ~/Projects/code/monkeypashion/mcp-hub/skills/memory-sync ~/.claude/skills/memory-sync
 # Windows (no admin needed — directory junction)
-mklink /J %USERPROFILE%\.claude\skills\memory-sync D:\SoftwareProjects\monkeypashion\mcp-hub\skills\memory-sync
+mklink /J %USERPROFILE%\.claude\skills\memory-sync D:\Projects\code\monkeypashion\mcp-hub\skills\memory-sync
 ```
 
 ### The sync ceremony (full reconciliation, per project)
@@ -158,7 +158,7 @@ The hook command is args-free in `~/.claude/settings.json`. The cli derives each
       "matcher": "*",
       "hooks": [{
         "type": "command",
-        "command": "D:/SoftwareProjects/monkeypashion/mcp-hub/.venv/Scripts/mcp-hub.exe stop-hook"
+        "command": "D:/Projects/code/monkeypashion/mcp-hub/.venv/Scripts/mcp-hub.exe stop-hook"
       }]
     }]
   }
@@ -208,7 +208,7 @@ The two-piece split is deliberate: only the agent's interactive session can esta
       "matcher": "*",
       "hooks": [{
         "type": "command",
-        "command": "D:/SoftwareProjects/monkeypashion/mcp-hub/.venv/Scripts/mcp-hub.exe stop-hook"
+        "command": "D:/Projects/code/monkeypashion/mcp-hub/.venv/Scripts/mcp-hub.exe stop-hook"
       }]
     }],
     "SessionStart": [{
@@ -216,11 +216,11 @@ The two-piece split is deliberate: only the agent's interactive session can esta
       "hooks": [
         {
           "type": "command",
-          "command": "D:/SoftwareProjects/monkeypashion/mcp-hub/.venv/Scripts/mcp-hub.exe session-start"
+          "command": "D:/Projects/code/monkeypashion/mcp-hub/.venv/Scripts/mcp-hub.exe session-start"
         },
         {
           "type": "command",
-          "command": "D:/SoftwareProjects/monkeypashion/mcp-hub/.venv/Scripts/mcp-hub.exe heartbeat-daemon",
+          "command": "D:/Projects/code/monkeypashion/mcp-hub/.venv/Scripts/mcp-hub.exe heartbeat-daemon",
           "async": true
         }
       ]
