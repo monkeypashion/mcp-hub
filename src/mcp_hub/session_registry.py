@@ -619,6 +619,19 @@ class SessionRegistry:
         with self._lock:
             return self._generation.get(name)
 
+    @property
+    def boot_id(self) -> str:
+        """This hub PROCESS's nonce — a fresh uuid per registry (per
+        `create_server`, i.e. per hub start). Stable for the life of the
+        process, guaranteed to differ across a restart. The heartbeat exposes
+        it so the daemon can tell a genuine hub RESTART (nonce changed → every
+        wake stream is dead) from a mere client-side blip or a reaper-dropped
+        binding (nonce unchanged → hub sat there fine). See the disruption
+        stamp: inferring "restarted" from "no binding" false-positived and
+        mass-restarted the fleet on a wifi flap (2026-07-20 / reproved
+        2026-07-23); the nonce is the positive evidence that replaces it."""
+        return self._boot
+
     def is_bound(self, name: str) -> bool:
         with self._lock:
             return name in self._by_name

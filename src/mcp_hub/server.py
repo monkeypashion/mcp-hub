@@ -1778,9 +1778,20 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             agent_name: The agent name from the project's hub-agent.json
                 marker. Daemon reads it and passes it here.
         """
+        # Every reply carries this hub PROCESS's nonce so the heartbeat daemon
+        # can detect a genuine hub RESTART (nonce changed across a reconnect →
+        # every wake stream is dead → stamp for squad-heal) vs a mere blip or a
+        # reaper-dropped binding (nonce unchanged → hub never restarted → must
+        # NOT stamp). This replaces the old "no binding ⇒ restarted" inference,
+        # which false-positived and mass-restarted the fleet on a wifi flap
+        # (2026-07-20; reproved 2026-07-23). Present on ALL return paths —
+        # including "no binding" — because the daemon needs the nonce exactly
+        # when the binding is gone. Structured `hub_boot=<id>` so the daemon
+        # parses a token, not prose.
+        boot_tag = f" [hub_boot={registry.boot_id}]"
         outcome = registry.heartbeat_touch(agent_name)
         if outcome == "unbound":
-            return f"heartbeat ignored — '{agent_name}' has no binding"
+            return f"heartbeat ignored — '{agent_name}' has no binding{boot_tag}"
         if outcome == "undeliverable":
             # Binding exists but a push would not land (stale after a client
             # reconnect). NOT refreshed — repeated failures drop the binding
@@ -1790,12 +1801,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 f"heartbeat noted — '{agent_name}' binding is not "
                 "push-deliverable; not refreshed (drops after "
                 f"{registry.UNDELIVERABLE_BEATS_TO_DROP} consecutive misses)"
+                f"{boot_tag}"
             )
         if outcome == "dropped":
             return (
                 f"heartbeat: dropped stale binding for '{agent_name}' "
                 "(undeliverable); agent marked offline — the interactive "
-                "session must register() to rebind"
+                f"session must register() to rebind{boot_tag}"
             )
         # refreshed — keep last_seen in sync for list_agents ordering.
         conn = _get_db(db_path)
@@ -1804,7 +1816,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             (time.time(), agent_name),
         )
         conn.commit()
-        return f"heartbeat ok ({time.strftime('%H:%M:%S')})"
+        return f"heartbeat ok ({time.strftime('%H:%M:%S')}){boot_tag}"
 
     @mcp.tool()
     def list_twins(project: str, exclude_agent: str = "") -> str:

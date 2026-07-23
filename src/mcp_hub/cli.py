@@ -1052,7 +1052,19 @@ STATUS_REFRESH_SECONDS = 15
 # then land on a different temp dir than another context, so the pidfiles
 # wouldn't find each other and dedup would silently fail. The home dir is
 # invariant across however the daemon gets spawned.
-_PIDFILE_DIR = pathlib.Path.home() / ".mcp-hub"
+def _state_dir() -> pathlib.Path:
+    """Per-box daemon state directory — heartbeat pidfiles, statusline cache,
+    the hub-reconnect stamp, and the seen-boot nonce all live here.
+
+    Honors `$MCP_HUB_STATE_DIR` (default `~/.mcp-hub`). The override exists so
+    the disruption/stamp/nonce machinery is testable in ISOLATION without
+    redirecting the whole HOME — without it, automated tests around heal/stamp
+    behaviour clobber the real fleet state (flagged by mcp-hub-fireblade while
+    building the false-positive repro). Read at call-time so a test can set the
+    env after import. The home dir is otherwise invariant across however the
+    daemon gets spawned, which is what the per-box singleton dedup relies on."""
+    override = os.environ.get("MCP_HUB_STATE_DIR")
+    return pathlib.Path(override) if override else (pathlib.Path.home() / ".mcp-hub")
 
 
 def _heartbeat_pidfile(agent_name: str) -> pathlib.Path:
@@ -1062,7 +1074,7 @@ def _heartbeat_pidfile(agent_name: str) -> pathlib.Path:
     single daemon — the claim only ever considers the same agent's daemon.
     """
     safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in agent_name)
-    return _PIDFILE_DIR / f"heartbeat-{safe}.pid"
+    return _state_dir() / f"heartbeat-{safe}.pid"
 
 
 def _is_live_daemon(pid: int) -> bool:
@@ -1290,7 +1302,7 @@ def _parse_status_from_agents(agents_text: str, agent_name: str) -> dict[str, An
 def _status_cache_path(agent_name: str) -> pathlib.Path:
     """Per-agent status snapshot path under ~/.mcp-hub (alongside pidfiles)."""
     safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in agent_name)
-    return _PIDFILE_DIR / f"status-{safe}.json"
+    return _state_dir() / f"status-{safe}.json"
 
 
 def _write_status_cache(agent_name: str, agents_text: str) -> None:
@@ -1338,13 +1350,85 @@ def _mark_hub_disruption() -> None:
     in-flight work and leaving one agent dead on a corrupted launch line).
     """
     try:
-        path = _PIDFILE_DIR / "hub-reconnect.stamp"
+        path = _state_dir() / "hub-reconnect.stamp"
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(str(int(time.time())), encoding="utf-8")
         tmp.replace(path)
     except Exception:  # noqa: BLE001
         pass
+
+
+# The hub stamps every heartbeat reply with `hub_boot=<nonce>` — a fresh id per
+# hub PROCESS. A change across a reconnect is POSITIVE evidence the hub
+# restarted (so every wake stream is dead); an unchanged value means the hub
+# sat there fine, whatever else broke. This replaces the old "no binding ⇒
+# restarted" inference, which the reaper could satisfy without any restart —
+# mass-restarting the fleet on a wifi flap (2026-07-20; reproved 2026-07-23).
+_HUB_BOOT_RE = re.compile(r"hub_boot=([0-9a-f]+)")
+
+
+def _parse_hub_boot(reply: str) -> str | None:
+    """The hub's process nonce from a heartbeat reply, or None if the reply
+    carries no marker (an OLD hub predating the nonce — no positive evidence)."""
+    m = _HUB_BOOT_RE.search(reply or "")
+    return m.group(1) if m else None
+
+
+def _seen_boot_path() -> pathlib.Path:
+    return _state_dir() / "hub-boot.seen"
+
+
+def _read_seen_boot() -> str | None:
+    try:
+        val = _seen_boot_path().read_text(encoding="utf-8").strip()
+        return val or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _write_seen_boot(nonce: str) -> None:
+    # Persisted to disk (not just process memory) so the comparison is "last
+    # nonce this BOX saw", not "this PROCESS saw" — a hub restart that happens
+    # while the daemon is itself down is then still caught on its next connect,
+    # instead of becoming an invisible false-negative (mcp-hub-fireblade's
+    # edge case 2). Shared per-box like the stamp; atomic tmp+replace so racing
+    # daemons never write a torn value.
+    try:
+        path = _seen_boot_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(nonce, encoding="utf-8")
+        tmp.replace(path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _maybe_stamp_hub_restart(reply: str) -> bool:
+    """Detect a genuine hub RESTART from a heartbeat reply's process nonce and
+    leave the squad-heal breadcrumb if so. Returns True iff it stamped.
+
+    Safe to call on EVERY heartbeat (the nonce is persisted per-box), so a
+    restart during this daemon's own downtime is still caught on reconnect.
+    Every branch fails toward NOT stamping — a false stamp mass-restarts the
+    whole fleet, a missed one is per-agent-recoverable:
+      * no nonce in reply (old hub)        -> no stamp, state untouched
+      * no prior nonce on this box (first)  -> record baseline, no stamp
+      * nonce unchanged                     -> no-op
+      * nonce CHANGED                        -> STAMP + record the new nonce
+    """
+    curr = _parse_hub_boot(reply)
+    if curr is None:
+        return False
+    prev = _read_seen_boot()
+    if prev is None:
+        _write_seen_boot(curr)  # first sighting on this box — baseline only
+        return False
+    if curr == prev:
+        return False
+    _mark_hub_disruption()
+    _write_seen_boot(curr)
+    return True
 
 
 async def _heartbeat_loop(hub_url: str, agent_name: str) -> None:
@@ -1366,15 +1450,15 @@ async def _heartbeat_loop(hub_url: str, agent_name: str) -> None:
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
 
-    # Set by the reconnect handler; checked by the next heartbeat. The pair
-    # "connection broke" AND "hub no longer knows our binding" is the
-    # signature of a HUB RESTART — the case where every client's wake-receive
-    # stream is definitively dead and only a relaunch cures it. Either signal
-    # alone is not: a transport blip breaks the connection while the hub sits
-    # there with bindings intact, and the deliverability reaper can drop ONE
-    # agent's binding with no hub restart at all. Only the conjunction stamps.
-    broke = False
-
+    # Disruption detection is now driven by the hub's process nonce carried in
+    # every heartbeat reply (see _maybe_stamp_hub_restart), NOT by inferring a
+    # restart from "no binding". The old inference false-positived: a blip long
+    # enough for the reaper to drop the binding made the post-reconnect beat
+    # report "no binding" with the SAME hub still running, and squad heal then
+    # mass-restarted the whole fleet for a wifi flap (2026-07-20; reproved
+    # 2026-07-23). The nonce is checked every beat (not just after a witnessed
+    # break) and persisted per-box, so a restart during the daemon's own
+    # downtime is still caught on reconnect.
     while True:
         try:
             async with streamablehttp_client(hub_url, timeout=10) as (read, write, _):
@@ -1387,13 +1471,7 @@ async def _heartbeat_loop(hub_url: str, agent_name: str) -> None:
                             hb = await session.call_tool(
                                 "heartbeat", {"agent_name": agent_name}
                             )
-                            if broke:
-                                # First beat after a break. "no binding" here
-                                # means the hub came back up without us — it
-                                # restarted, so the fleet's streams are dead.
-                                if "no binding" in _extract_text(hb):
-                                    _mark_hub_disruption()
-                                broke = False
+                            _maybe_stamp_hub_restart(_extract_text(hb))
                             since_heartbeat = 0
                         agents_result = await session.call_tool("list_agents", {})
                         _write_status_cache(
@@ -1403,11 +1481,10 @@ async def _heartbeat_loop(hub_url: str, agent_name: str) -> None:
                         since_heartbeat += STATUS_REFRESH_SECONDS
         except Exception as exc:  # noqa: BLE001
             # Connection / init / call failure — log and reconnect after a
-            # delay. Fail-open: heartbeat outages don't crash the daemon.
-            # Don't stamp here: arm the check instead, and let the first
-            # heartbeat after reconnect decide whether the hub actually
-            # restarted (binding gone) or merely blinked (binding intact).
-            broke = True
+            # delay. Fail-open: heartbeat outages don't crash the daemon. No
+            # stamp here — the next heartbeat's nonce check decides whether the
+            # hub actually restarted, which is robust to reaper-dropped
+            # bindings that merely look like a restart.
             print(
                 f"[mcp-hub heartbeat] connection error ({type(exc).__name__}: "
                 f"{exc}); retrying in {HEARTBEAT_RETRY_DELAY_SECONDS}s",
