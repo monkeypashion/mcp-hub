@@ -1431,9 +1431,44 @@ def _maybe_stamp_hub_restart(reply: str) -> bool:
     return True
 
 
-async def _heartbeat_loop(hub_url: str, agent_name: str) -> None:
+def _source_head(src_dir: pathlib.Path | None = None) -> str | None:
+    """HEAD of the git checkout this module runs from, or None when that can't
+    be established (non-editable install, git missing/slow, not a repo).
+
+    None disables the staleness check entirely — fail-open, the daemon must
+    never crash or churn over an unreadable tree. HEAD, not file mtime: mtime
+    fires DURING a `git pull` while the tree is half-old/half-new (respawning
+    then = a crash loop mid-deploy); HEAD moves once, atomically, after the
+    checkout completes.
+    """
+    if src_dir is None:
+        src_dir = pathlib.Path(__file__).resolve().parent
+    try:
+        out = subprocess.run(  # noqa: S603, S607
+            ["git", "-C", str(src_dir), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=_NO_WINDOW_FLAG,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    head = out.stdout.strip()
+    return head if out.returncode == 0 and head else None
+
+
+async def _heartbeat_loop(hub_url: str, agent_name: str) -> bool:
     """Long-lived loop: connect to hub, ping `heartbeat(agent_name)` every
     HEARTBEAT_INTERVAL_SECONDS. On any connection error, sleep and reconnect.
+
+    Returns True when the source checkout's HEAD has moved under the running
+    process — the code on disk is newer than the code in memory, and the
+    caller should respawn a successor from the new tree. A long-lived daemon
+    that never re-reads its code is how a shipped fix sits inert fleet-wide:
+    the singleton is old-wins, so across session relaunches the SURVIVING
+    daemon is always the oldest one (2026-07-23: the hub-restart nonce
+    detector shipped and not one daemon ran it). Checked once per heartbeat
+    (~60s) — cheap, and a minute of lag on code adoption is nothing.
 
     Single MCP session is held open across heartbeats — this is the right
     shape because heartbeat doesn't bind, so the session lifetime is just
@@ -1459,6 +1494,7 @@ async def _heartbeat_loop(hub_url: str, agent_name: str) -> None:
     # 2026-07-23). The nonce is checked every beat (not just after a witnessed
     # break) and persisted per-box, so a restart during the daemon's own
     # downtime is still caught on reconnect.
+    baseline_head = _source_head()
     while True:
         try:
             async with streamablehttp_client(hub_url, timeout=10) as (read, write, _):
@@ -1473,6 +1509,19 @@ async def _heartbeat_loop(hub_url: str, agent_name: str) -> None:
                             )
                             _maybe_stamp_hub_restart(_extract_text(hb))
                             since_heartbeat = 0
+                            if baseline_head is not None:
+                                head_now = _source_head()
+                                if (
+                                    head_now is not None
+                                    and head_now != baseline_head
+                                ):
+                                    print(
+                                        "[mcp-hub heartbeat] source HEAD moved "
+                                        f"({baseline_head[:8]} -> {head_now[:8]});"
+                                        " respawning on the new tree",
+                                        file=sys.stderr,
+                                    )
+                                    return True
                         agents_result = await session.call_tool("list_agents", {})
                         _write_status_cache(
                             agent_name, _extract_text(agents_result)
@@ -1517,12 +1566,22 @@ def heartbeat_daemon_command(args: argparse.Namespace) -> int:
         # A live daemon already owns this agent — stand down rather than
         # leak a second one. This is the fix for the daemon accumulation.
         return 0
+    respawn = False
     try:
-        asyncio.run(_heartbeat_loop(args.hub_url, name))
+        respawn = asyncio.run(_heartbeat_loop(args.hub_url, name))
     except KeyboardInterrupt:
         return 0
     finally:
         _release_singleton(pidfile)
+    if respawn:
+        # The finally above already released the pidfile, so the successor's
+        # singleton claim finds it free (old-wins would otherwise make the
+        # successor stand down against us). Brief grace so a checkout that
+        # JUST finished moving HEAD has flushed the tree before the successor
+        # imports from it. If the spawn fails, the Stop-hook self-heal
+        # respawns a daemon at the agent's next turn boundary — fail-open.
+        time.sleep(3)
+        _spawn_daemon_detached(name, args.hub_url)
     return 0
 
 

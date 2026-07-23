@@ -26,8 +26,29 @@ SLICE="${SQUAD_SLICE:-}"                 # optional systemd user slice for ceili
 OPS_DIR="$HOME/SoftwareProjects"
 CMD="$(basename "$0")"                   # whatever you symlinked this as (help text only)
 SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"   # real script path (for tmux key bindings)
+SELF_DIR="$(dirname "$SELF")"
 
 tm() { command tmux -L "$SOCK" "$@"; }   # NB: never a var named TMUX (tmux reserves it)
+# Bounded tmux for anything that TYPES into a pane: one wedged pane must never
+# hang a whole pass. 2026-07-23: heal sat 2h28m on a single send-keys to a
+# wedged pane with the entire post-deploy fleet recovery queued behind it.
+# 10s is an eternity for a healthy tmux server — a timeout here is a wedge.
+tmt() { timeout "${SQUAD_TM_TIMEOUT:-10}" tmux -L "$SOCK" "$@"; }
+
+# Code-staleness guard for the long-lived watch loops (who -w, board -w): a
+# loop snapshots this file at launch and never re-reads it, so after a `git
+# pull` painters keep running old code indefinitely (2026-07-21: the watch
+# painter emitted a layout retired 1.5 days earlier). Loops call self_stale at
+# a QUIESCENT point (top of a pass, never mid-paint/mid-sweep) and re-exec
+# when the repo HEAD has moved. HEAD, not file mtime: mtime fires DURING a
+# pull while the tree is half-old/half-new (re-exec then = crash loop); HEAD
+# moves once, atomically, after checkout completes.
+SRC_HEAD="$(git -C "$SELF_DIR" rev-parse HEAD 2>/dev/null || true)"
+self_stale() {
+  [ -n "$SRC_HEAD" ] || return 1     # not a git checkout — guard disabled
+  local h; h="$(git -C "$SELF_DIR" rev-parse HEAD 2>/dev/null || true)"
+  [ -n "$h" ] && [ "$h" != "$SRC_HEAD" ]
+}
 
 # ---- config (agent|worktree|gh_config_dir|claude_args ; gh_config_dir may be empty) ----
 rows()   { grep -vE '^[[:space:]]*(#|$)' "$CONF" 2>/dev/null || true; }
@@ -71,7 +92,7 @@ need_agent() {
 pane_cmd()   { tm display-message -p -t "$1" '#{pane_current_command}' 2>/dev/null || true; }
 pane_alive() { local c; c="$(pane_cmd "$1")"; [ -n "$c" ] && [ "$c" != bash ] && [ "$c" != sh ] && [ "$c" != zsh ]; }
 
-type_line() { local t="$1"; shift; tm send-keys -t "$t" -l "$*"; sleep 0.2; tm send-keys -t "$t" Enter; }
+type_line() { local t="$1"; shift; tmt send-keys -t "$t" -l "$*" || return 1; sleep 0.2; tmt send-keys -t "$t" Enter; }
 
 # What is this agent's claude doing RIGHT NOW? Reads the pane's visible text —
 # the permission dialog / input prompt is on screen when claude is blocked, so
@@ -164,12 +185,26 @@ agent_started() {
   printf '%s' "$(( $(date +%s) - et ))"
 }
 
+# Retire an agent's heartbeat daemon so its successor runs CURRENT code. The
+# daemon singleton is old-wins, so across a relaunch the surviving daemon is
+# the OLD one — that's how a client-side fix can ship fleet-wide yet sit inert
+# in every running daemon (2026-07-23: the hub-restart nonce detector). A
+# relaunch is the natural moment to retire it: the fresh claude's SessionStart
+# hook spawns a successor from the tree as it is NOW, within seconds.
+kill_daemon() {
+  local pf; pf="$(pidfile "$1")"
+  [ -f "$pf" ] || return 0
+  kill "$(cat "$pf" 2>/dev/null)" 2>/dev/null || true
+  rm -f "$pf"
+}
+
 # Restart an agent's claude in place, conversation intact (roster args carry
 # --continue). Always respawns with the ROSTER worktree (-c) so a session whose
 # path drifted self-heals, and clears the two ghosts a respawn leaves behind:
 # the sticky pane title and the dead session's scrollback.
 relaunch_agent() {
   local a="$1"
+  kill_daemon "$a"
   # Launch marker: heal's grace window reads this so nothing judges an agent
   # whose claude hasn't finished booting (there is no process to measure yet,
   # and its status cache still describes the process we just killed).
@@ -392,6 +427,9 @@ case "${1:-help}" in
               *)  a_arg="$t" ;;
             esac; done
             a="$(need_agent "$a_arg")" || exit 1
+            # Same daemon retirement as relaunch_agent — an operator restart
+            # must also land daemon code, not just the agent's.
+            kill_daemon "$a"
             # One-off launch-args override — the roster is never modified here.
             rargs="$(field "$a" 4)"
             case "$mode" in
@@ -419,10 +457,7 @@ case "${1:-help}" in
   down)     tm kill-server 2>/dev/null || true
             # The keep-alive daemons are detached (they outlive tmux), so kill
             # them explicitly via their pidfiles and clear the stale claim.
-            for a in $(agents); do
-              pf="$(pidfile "$a")"
-              [ -f "$pf" ] && kill "$(cat "$pf" 2>/dev/null)" 2>/dev/null && rm -f "$pf"
-            done ;;
+            for a in $(agents); do kill_daemon "$a"; done ;;
   heal)     # Recovery for agents that are UP in tmux but broken on the hub:
             #   no-signal   -> status cache stale/missing: its WRITER (the
             #                  heartbeat daemon) is dead — respawn the daemon;
@@ -591,7 +626,11 @@ case "${1:-help}" in
                 rm -f "$flag"
               else
                 echo "$a: $state on hub — nudging re-register"
-                type_line "$a" "hub: your session shows $state. Call register() now to rebind. If this recurs, your wake-stream is dead — re-register won't fix it; a relaunch will (squad restart resumes your conversation)."
+                # A wedged pane must cost this ONE nudge, not the whole pass
+                # (2026-07-23: an unbounded send-keys here hung heal 2h28m and
+                # blocked all post-deploy recovery behind it).
+                type_line "$a" "hub: your session shows $state. Call register() now to rebind. If this recurs, your wake-stream is dead — re-register won't fix it; a relaunch will (squad restart resumes your conversation)." \
+                  || echo "!! $a: nudge send-keys failed/timed out (pane wedged?) — skipping" >&2
                 touch "$flag"
               fi
               healed=$((healed+1))
@@ -905,6 +944,8 @@ case "${1:-help}" in
             WHO_PASS=0; WHO_LAST=''
             if [ -n "$wmode" ]; then
               while true; do
+                # top of a pass = quiescent — safe to swap in new code here
+                if self_stale; then exec "$SELF" who --watch; fi
                 printf '\033[2J\033[H'
                 printf 'squad who — %s   (🔴 needs you · 🟢 working · 💤 idle · ⚡ wakeable)\n\n' "$(date +%H:%M:%S)"
                 who_board; who_paint; who_badge; sleep 2
@@ -1131,7 +1172,11 @@ sys.stdout.write("".join("%s\x1f%d\x1f%d\n" % r for r in out))
             }
             if [ -n "$bjson" ]; then board_json "$(board_scan)"
             elif [ -n "$bwatch" ]; then
-              while true; do rows="$(board_scan)"; printf '\033[2J\033[H'; board_paint "$rows"; sleep 3; done
+              while true; do
+                # top of a pass = quiescent — safe to swap in new code here
+                if self_stale; then exec "$SELF" board -w; fi
+                rows="$(board_scan)"; printf '\033[2J\033[H'; board_paint "$rows"; sleep 3
+              done
             else board_paint "$(board_scan)"; fi ;;
   handoff)  a="$(need_agent "${2:-}")" || exit 1; handoff "$a" ;;
   add)      add_agent "${2:-}" "${3:-}" "${4:-}" ;;
