@@ -456,6 +456,13 @@ function activate(context) {
     sendWhenReady(t, `squad attach --no-start ${agent}; clear`);
   }
 
+  // hideOnStartup keeps VSCode from spawning a filler terminal into a
+  // restored-open empty panel (the recurring "bash <first-folder>" ghost
+  // tab) — which means revealing the panel is OUR job now: once the cockpit
+  // is built, show it with the board on top, without stealing focus.
+  const boardTerm = [...vscode.window.terminals].find((t) => t.name === BOARD);
+  if (boardTerm) boardTerm.show(true);
+
   // Focusing a DOWN agent's terminal means "I want claude HERE" — offer (or
   // perform) the start right then, instead of leaving the operator at a bare
   // shell with instructions. Modes (squadTerminals.autoStart):
