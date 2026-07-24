@@ -2,7 +2,7 @@
   "name": "squad-terminals",
   "displayName": "Squad Terminals",
   "description": "Auto-opens one plain terminal per squad agent (squad attach) with icon+color, and adds per-agent squad actions to the terminal tab context menu.",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "publisher": "monkeypashion",
   "engines": {
     "vscode": "^1.90.0"
@@ -419,10 +419,10 @@
             "focus",
             "off"
           ],
-          "default": "confirm",
+          "default": "focus",
           "enumDescriptions": [
-            "Focusing a down agent's terminal shows a one-click 'Start & attach' prompt (default).",
-            "Focusing a down agent's terminal starts claude immediately — zero-click, but window-restore/panel-reveal focus events can start an agent from a glance.",
+            "Focusing a down agent's terminal shows a one-click 'Start & attach' prompt.",
+            "Focusing a down agent's terminal starts claude immediately — zero-click (default).",
             "Never auto-start; use the tab context menu (Squad → Start & attach)."
           ],
           "description": "What happens when you focus the terminal of an agent that is down."

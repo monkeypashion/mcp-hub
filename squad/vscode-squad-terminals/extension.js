@@ -32,6 +32,21 @@ const THEME = {
   "factory-fleet":      ["organization", "terminal.ansiBrightMagenta"],
   "spike":              ["beaker",    "terminal.ansiBrightGreen"],
   "pm":                 ["checklist", "terminal.ansiBrightCyan"],
+  // faculty (general workspace) — same visual weight as the squad
+  "homeassistant":        ["home",          "terminal.ansiGreen"],
+  "weathercomp":          ["cloud",         "terminal.ansiBrightBlue"],
+  "blendingvalverl":      ["flame",         "terminal.ansiRed"],
+  "mindconnect-iot2050":  ["circuit-board", "terminal.ansiCyan"],
+  "node-red-mvp":         ["credit-card",   "terminal.ansiBrightRed"],
+  "dt-vm-spec":           ["vm",            "terminal.ansiMagenta"],
+  "unifrog":              ["mortar-board",  "terminal.ansiBrightGreen"],
+  "sam":                  ["graph",         "terminal.ansiYellow"],
+  "health":               ["heart",         "terminal.ansiBrightMagenta"],
+  "financial-planning":   ["graph-line",    "terminal.ansiBrightCyan"],
+  "money-talks":          ["megaphone",     "terminal.ansiBrightYellow"],
+  "subscriptions":        ["sync",          "terminal.ansiBlue"],
+  "transport":            ["compass",       "terminal.ansiWhite"],
+  "get-my-shit-in-order": ["tasklist",      "terminal.ansiBrightWhite"],
 };
 const FALLBACK = ["terminal", "terminal.ansiBrightBlack"];
 
@@ -416,16 +431,21 @@ function activate(context) {
       cwd: worktree,
     });
     agentOf.set(t, agent);
-    sendWhenReady(t, `squad attach --no-start ${agent}`);
+    // `; clear` — the operator should never study a shell transcript in a
+    // cockpit tab: for a down agent this leaves a titled tab with a bare
+    // prompt (the OSC title survives clear), and after a later detach/stop
+    // it wipes the dead session's scrollback the same way restart does.
+    sendWhenReady(t, `squad attach --no-start ${agent}; clear`);
   }
 
   // Focusing a DOWN agent's terminal means "I want claude HERE" — offer (or
   // perform) the start right then, instead of leaving the operator at a bare
   // shell with instructions. Modes (squadTerminals.autoStart):
-  //   confirm (default) — one-click toast: focus, click Start & attach, done.
-  //   focus             — starts immediately on focus. Zero-click, but VSCode
-  //                       also fires this event on window-restore and panel
-  //                       reveal, so an agent can start from a glance.
+  //   focus (default)   — starts immediately on focus. Zero-click — the
+  //                       operator's call: a cockpit terminal you click on
+  //                       should BE claude, not instructions for getting it.
+  //   confirm           — one-click toast instead (window-restore/panel-
+  //                       reveal focus events can't start anything).
   //   off               — context menu only.
   // Guards: an arming delay swallows the window-restore burst, an inflight
   // window stops a double-send while tmux is still booting (a second attach
@@ -437,7 +457,7 @@ function activate(context) {
     vscode.window.onDidChangeActiveTerminal((t) => {
       const mode = vscode.workspace
         .getConfiguration("squadTerminals")
-        .get("autoStart", "confirm");
+        .get("autoStart", "focus");
       if (mode === "off" || !t || Date.now() < armedAt) return;
       const a = agentOf.get(t);
       if (!a) return;
