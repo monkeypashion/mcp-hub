@@ -419,6 +419,53 @@ function activate(context) {
     sendWhenReady(t, `squad attach --no-start ${agent}`);
   }
 
+  // Focusing a DOWN agent's terminal means "I want claude HERE" — offer (or
+  // perform) the start right then, instead of leaving the operator at a bare
+  // shell with instructions. Modes (squadTerminals.autoStart):
+  //   confirm (default) — one-click toast: focus, click Start & attach, done.
+  //   focus             — starts immediately on focus. Zero-click, but VSCode
+  //                       also fires this event on window-restore and panel
+  //                       reveal, so an agent can start from a glance.
+  //   off               — context menu only.
+  // Guards: an arming delay swallows the window-restore burst, an inflight
+  // window stops a double-send while tmux is still booting (a second attach
+  // line after the first takes over would land in claude's input), and the
+  // tmux down-check means an up agent is never touched.
+  const armedAt = Date.now() + 5000;
+  const inflight = new Map(); // terminal -> last prompt/start ts
+  context.subscriptions.push(
+    vscode.window.onDidChangeActiveTerminal((t) => {
+      const mode = vscode.workspace
+        .getConfiguration("squadTerminals")
+        .get("autoStart", "confirm");
+      if (mode === "off" || !t || Date.now() < armedAt) return;
+      const a = agentOf.get(t);
+      if (!a) return;
+      if (inflight.get(t) && Date.now() - inflight.get(t) < 15000) return;
+      cp.execFile("tmux", ["-L", "squad", "has-session", "-t", "=" + a], (err) => {
+        if (!err) return; // up — already attached, or detached on purpose
+        const go = () => {
+          inflight.set(t, Date.now());
+          t.show(false);
+          t.sendText(`squad attach ${a}`);
+        };
+        if (mode === "focus") {
+          go();
+          return;
+        }
+        inflight.set(t, Date.now()); // also throttles repeat toasts
+        vscode.window
+          .showInformationMessage(
+            `Squad: ${shortLabel(a)} is down — start claude and attach?`,
+            "Start & attach"
+          )
+          .then((pick) => {
+            if (pick === "Start & attach") go();
+          });
+      });
+    })
+  );
+
   // keep the map tidy as terminals close
   context.subscriptions.push(
     vscode.window.onDidCloseTerminal((t) => agentOf.delete(t))
