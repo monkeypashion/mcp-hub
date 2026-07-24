@@ -737,7 +737,10 @@ case "${1:-help}" in
                 if [ -t 1 ]; then
                   printf '\033]0;%s · ⏻ down\a' "${a%-$(sanitize_ident "$(hostname)")}"
                 fi
-                echo "$a is down (--no-start: not launching). Start it with: $CMD up   or: $CMD restart $a"
+                # `start`, not `up`: up deliberately skips faculty-class
+                # agents, so for exactly the terminals that show this message
+                # most, "run up" would be advice that does nothing.
+                echo "$a is down (--no-start: not launching). Start it with: $CMD start $a   (or right-click the tab: Squad → Start & attach)"
                 exit 0
               fi
               echo "$a not running — starting it..."; up_one "$a"; sleep 1
