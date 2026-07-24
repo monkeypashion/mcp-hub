@@ -23,7 +23,6 @@ HEAL_MAX_RELAUNCH="${SQUAD_HEAL_MAX_RELAUNCH:-2}"   # relaunches per heal pass (
 # register, and the status cache it's judged on lags by up to 3 min.
 HEAL_GRACE_SECONDS="${SQUAD_HEAL_GRACE_SECONDS:-180}"
 SLICE="${SQUAD_SLICE:-}"                 # optional systemd user slice for ceilings; empty = none
-OPS_DIR="$HOME/SoftwareProjects"
 CMD="$(basename "$0")"                   # whatever you symlinked this as (help text only)
 SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"   # real script path (for tmux key bindings)
 SELF_DIR="$(dirname "$SELF")"
@@ -322,7 +321,7 @@ pull_local() {
   org="${spec%%/*}"; repo="${spec#*/}"; repo="${repo%.git}"
   [ "$org" != "$spec" ] && [ -n "$repo" ] || { echo "usage: $CMD pull-local <org>/<repo>"; return 1; }
   alias="$(org_alias "$org")" || { echo "!! unknown org '$org'"; return 1; }
-  parent="$HOME/SoftwareProjects/$org"; dest="$parent/$repo"; mkdir -p "$parent"
+  parent="$HOME/Projects/code/$org"; dest="$parent/$repo"; mkdir -p "$parent"
   if [ -d "$dest/.git" ]; then git -C "$dest" pull --ff-only; else git clone "git@$alias:$org/$repo.git" "$dest"; fi
   echo "$dest"
 }

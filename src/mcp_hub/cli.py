@@ -465,10 +465,10 @@ def _claude_project_dirname(cwd: str) -> str:
     """Encode an absolute project path the way Claude Code names its
     per-project state dir: every path separator (and drive colon) becomes
     '-'. Examples:
-      /home/monke/SoftwareProjects/monkeypashion/mcp-hub
-        -> -home-monke-SoftwareProjects-monkeypashion-mcp-hub
-      D:\\SoftwareProjects\\monkeypashion\\mcp-hub
-        -> D--SoftwareProjects-monkeypashion-mcp-hub
+      /home/monke/Projects/code/monkeypashion/mcp-hub
+        -> -home-monke-Projects-code-monkeypashion-mcp-hub
+      D:\\Projects\\code\\monkeypashion\\mcp-hub
+        -> D--Projects-code-monkeypashion-mcp-hub
     """
     return "".join("-" if c in "/\\:" else c for c in cwd.rstrip("/\\"))
 

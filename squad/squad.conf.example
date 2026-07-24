@@ -22,8 +22,8 @@
 # Faculty rows usually omit the channels flag (no hub comms) — add it later if wanted:
 # health-myhost|~/Projects/health|||faculty
 
-mcp-hub-dev|~/SoftwareProjects/monkeypashion/mcp-hub||--dangerously-load-development-channels server:hub
+mcp-hub-dev|~/Projects/code/monkeypashion/mcp-hub||--dangerously-load-development-channels server:hub
 
 # --- add more agents as the squad grows (uncomment + edit) ---
-# agent-name|~/SoftwareProjects/dreamteam-ai-labs/some-repo||--dangerously-load-development-channels server:hub
-# agent-name|~/SoftwareProjects/monkeypashion/some-repo||--dangerously-load-development-channels server:hub
+# agent-name|~/Projects/code/dreamteam-ai-labs/some-repo||--dangerously-load-development-channels server:hub
+# agent-name|~/Projects/code/monkeypashion/some-repo||--dangerously-load-development-channels server:hub

@@ -128,15 +128,15 @@ async def test_register_announces_paired_clones(tmp_path: Path):
 
 def test_claude_project_dirname_posix():
     assert (
-        _claude_project_dirname("/home/monke/SoftwareProjects/monkeypashion/mcp-hub")
-        == "-home-monke-SoftwareProjects-monkeypashion-mcp-hub"
+        _claude_project_dirname("/home/monke/Projects/code/monkeypashion/mcp-hub")
+        == "-home-monke-Projects-code-monkeypashion-mcp-hub"
     )
 
 
 def test_claude_project_dirname_windows():
     assert (
-        _claude_project_dirname("D:\\SoftwareProjects\\monkeypashion\\mcp-hub")
-        == "D--SoftwareProjects-monkeypashion-mcp-hub"
+        _claude_project_dirname("D:\\Projects\\code\\monkeypashion\\mcp-hub")
+        == "D--Projects-code-monkeypashion-mcp-hub"
     )
 
 
