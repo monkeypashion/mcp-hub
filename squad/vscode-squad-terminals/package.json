@@ -2,7 +2,7 @@
   "name": "squad-terminals",
   "displayName": "Squad Terminals",
   "description": "Auto-opens one plain terminal per squad agent (squad attach) with icon+color, and adds per-agent squad actions to the terminal tab context menu.",
-  "version": "0.12.5",
+  "version": "0.13.0",
   "publisher": "monkeypashion",
   "engines": {
     "vscode": "^1.90.0"
@@ -115,11 +115,21 @@
       },
       {
         "command": "squad.model.default",
-        "title": "Default (Opus 4.8)",
+        "title": "Default",
         "category": "Squad"
       },
       {
         "command": "squad.model.opus",
+        "title": "Opus 5",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.model.opus1m",
+        "title": "Opus 5 (1M context)",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.model.opus48",
         "title": "Opus 4.8",
         "category": "Squad"
       },
@@ -360,16 +370,24 @@
           "group": "1_model@2"
         },
         {
-          "command": "squad.model.fable",
+          "command": "squad.model.opus1m",
           "group": "1_model@3"
         },
         {
-          "command": "squad.model.sonnet",
+          "command": "squad.model.opus48",
           "group": "1_model@4"
         },
         {
-          "command": "squad.model.haiku",
+          "command": "squad.model.fable",
           "group": "1_model@5"
+        },
+        {
+          "command": "squad.model.sonnet",
+          "group": "1_model@6"
+        },
+        {
+          "command": "squad.model.haiku",
+          "group": "1_model@7"
         }
       ],
       "squad.effortMenu": [

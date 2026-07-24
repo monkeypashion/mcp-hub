@@ -674,18 +674,29 @@ case "${1:-help}" in
               healed=$((healed+1))
             done
             [ "$healed" = 0 ] && echo "all up agents healthy — nothing to heal" || true ;;
-  model)    # squad model [agent] default|opus|fable|sonnet|haiku — switch an
-            # agent's model without opening claude's picker. `/model <name>`
-            # takes the name directly; the only wrinkle is that an actual
-            # switch raises a confirm dialog (switching invalidates the prompt
-            # cache, so claude asks first). The operator already made that
-            # choice in the menu, so confirm it for them — through the same
-            # fail-closed parser `answer` uses, never a blind digit.
+  model)    # squad model [agent] <name> — switch an agent's model without
+            # opening claude's picker. `/model <name>` takes the name directly;
+            # the only wrinkle is that an actual switch raises a confirm dialog
+            # (switching invalidates the prompt cache, so claude asks first).
+            # The operator already made that choice in the menu, so confirm it
+            # for them — through the same fail-closed parser `answer` uses,
+            # never a blind digit.
+            #
+            # Accepted: the bare aliases (each = the LATEST model of that line,
+            # so they survive a model launch untouched), their [1m] long-context
+            # variants, and any full `claude-*` id for pinning a specific older
+            # model — e.g. claude-opus-4-8. Full ids are passed through rather
+            # than enumerated: a new model must not require a squad edit.
             a="$(need_agent "${2:-}")" || exit 1
             m="${3:-}"
+            # The [1m] patterns MUST stay quoted: unquoted, bash reads [1m] as
+            # a bracket expression matching one char of "1" or "m", so it would
+            # accept opus1/opusm and reject the literal the menu sends.
             case "$m" in
               default|opus|fable|sonnet|haiku) ;;
-              *) echo "usage: $CMD model [agent] default|opus|fable|sonnet|haiku" >&2; exit 1 ;;
+              'opus[1m]'|'fable[1m]'|'sonnet[1m]') ;;
+              claude-*) ;;
+              *) echo "usage: $CMD model [agent] default|opus|fable|sonnet|haiku|<alias>[1m]|claude-<full-id>" >&2; exit 1 ;;
             esac
             type_line "$a" "/model $m"
             for i in 1 2 3 4 5 6 7 8 9 10; do

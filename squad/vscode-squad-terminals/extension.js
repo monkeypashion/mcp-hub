@@ -312,10 +312,25 @@ function activate(context) {
   // /model goes through `squad model` because an actual switch raises a
   // cache-invalidation confirm dialog that has to be answered; /effort and
   // /voice apply straight from the argument with no prompt.
-  for (const m of ["default", "opus", "fable", "sonnet", "haiku"]) {
+  // The command id can't be the /model token verbatim — `opus[1m]` and full
+  // ids like `claude-opus-4-8` aren't legal id suffixes — so each entry is
+  // [id suffix, token claude actually accepts]. Bare aliases (opus, fable,
+  // sonnet) always mean the LATEST model of that line, so an alias entry
+  // needs no edit when a new model ships; pinning an older one takes its
+  // full id.
+  const MODELS = [
+    ["default", "default"],
+    ["opus", "opus"],
+    ["opus1m", "opus[1m]"],
+    ["opus48", "claude-opus-4-8"],
+    ["fable", "fable"],
+    ["sonnet", "sonnet"],
+    ["haiku", "haiku"],
+  ];
+  for (const [id, token] of MODELS) {
     context.subscriptions.push(
-      vscode.commands.registerCommand(`squad.model.${m}`, (...args) =>
-        withAgents(args, (agents) => agents.forEach((a) => squadExec(["model", a, m], a)))
+      vscode.commands.registerCommand(`squad.model.${id}`, (...args) =>
+        withAgents(args, (agents) => agents.forEach((a) => squadExec(["model", a, token], a)))
       )
     );
   }
