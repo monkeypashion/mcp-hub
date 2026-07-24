@@ -729,6 +729,14 @@ case "${1:-help}" in
             a="$(need_agent "$a_arg")" || exit 1
             if ! tm has-session -t "=$a" 2>/dev/null; then
               if [ -n "$nostart" ]; then
+                # Name the tab ourselves: a down agent has no tmux to push
+                # titles, so without this every cockpit terminal in the
+                # workspace reads as an anonymous "bash" tab (2026-07-24).
+                # Same short-label rule as who_badge; ⏻ = down, matching the
+                # live-title look. Only when stdout is a real terminal.
+                if [ -t 1 ]; then
+                  printf '\033]0;%s · ⏻ down\a' "${a%-$(sanitize_ident "$(hostname)")}"
+                fi
                 echo "$a is down (--no-start: not launching). Start it with: $CMD up   or: $CMD restart $a"
                 exit 0
               fi

@@ -354,6 +354,14 @@ function activate(context) {
       name: BOARD,
       iconPath: new vscode.ThemeIcon("dashboard"),
       color: new vscode.ThemeColor("terminal.ansiYellow"),
+      // neutral cwd — otherwise the tab's description names whatever the
+      // workspace's first folder happens to be, which reads as an agent.
+      // Guarded: ~/Projects is a Linux-box convention (fireblade's tree is
+      // D:\Projects, not under the profile) — a missing cwd must fall back
+      // to VSCode's default, not break the board terminal.
+      cwd: fs.existsSync(path.join(os.homedir(), "Projects"))
+        ? path.join(os.homedir(), "Projects")
+        : undefined,
     });
     b.sendText(`${SQUAD} board -w`);
   }
@@ -366,13 +374,19 @@ function activate(context) {
   // start-if-down semantics here would mass-launch every rostered agent in
   // the workspace (14 for general) and re-run the 2026-07-19 up_one race.
   // A down agent's terminal shows how to start it; nothing launches itself.
-  for (const { agent } of mine) {
+  for (const { agent, worktree } of mine) {
     if ([...agentOf.values()].includes(agent)) continue;
     const label = shortLabel(agent);
     const [icon, color] = THEME[label] || FALLBACK;
     const t = vscode.window.createTerminal({
       iconPath: new vscode.ThemeIcon(icon),
       color: new vscode.ThemeColor(color),
+      // The agent's OWN worktree, not VSCode's default (the workspace's
+      // first folder): the tab's dimmed description shows the cwd folder,
+      // so without this every tab in the panel described the same project
+      // (2026-07-24) — and a shell left after a --no-start attach should
+      // already be standing in the right repo anyway.
+      cwd: worktree,
     });
     agentOf.set(t, agent);
     t.sendText(`squad attach --no-start ${agent}`);
