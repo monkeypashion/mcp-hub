@@ -381,6 +381,22 @@ function activate(context) {
   const mine = rosterRows().filter((r) => wsDirs.has(canon(r.worktree)));
   if (!mine.length) return;
 
+  // The whole cockpit look rides on pushed titles, and that needs the
+  // workspace to render sequences: with VSCode's DEFAULT tabs.title
+  // (${process}) every glyph/model/ctx% the painter pushes is silently
+  // ignored and tabs read "tmux homeassistant" (2026-07-24: the general
+  // workspace was created without the settings squad always had — took a
+  // day of ghost-chasing to spot). Warn once instead of letting the next
+  // workspace repeat it.
+  const tabsCfg = vscode.workspace.getConfiguration("terminal.integrated.tabs");
+  if (tabsCfg.get("title") !== "${sequence}") {
+    vscode.window.showWarningMessage(
+      'Squad: this workspace does not set terminal.integrated.tabs.title = "${sequence}" — ' +
+        "agent tabs will show process names instead of live status. Add it (and " +
+        'tabs.description = "${progress}") to the workspace settings.'
+    );
+  }
+
   // The OPERATOR's own terminal, first in the list: what's blocking you,
   // what's running in parallel, what's idle. Created here rather than as a
   // workspace task — an auto-run task sits behind VSCode's "allow automatic
