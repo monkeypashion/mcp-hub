@@ -34,7 +34,7 @@ const THEME = {
   "pm":                 ["checklist", "terminal.ansiBrightCyan"],
   // faculty (general workspace) — same visual weight as the squad
   "homeassistant":        ["home",          "terminal.ansiGreen"],
-  "weathercomp":          ["cloud",         "terminal.ansiBrightBlue"],
+  "weather-comp":         ["cloud",         "terminal.ansiBrightBlue"],
   "blendingvalverl":      ["flame",         "terminal.ansiRed"],
   "mindconnect-iot2050":  ["circuit-board", "terminal.ansiCyan"],
   "node-red-mvp":         ["credit-card",   "terminal.ansiBrightRed"],
@@ -427,8 +427,10 @@ function activate(context) {
       // first folder): the tab's dimmed description shows the cwd folder,
       // so without this every tab in the panel described the same project
       // (2026-07-24) — and a shell left after a --no-start attach should
-      // already be standing in the right repo anyway.
-      cwd: worktree,
+      // already be standing in the right repo anyway. Guarded: a renamed/
+      // moved folder must degrade to the default cwd, not kill the terminal
+      // ("Starting directory does not exist", 2026-07-24 WeatherComp).
+      cwd: fs.existsSync(worktree) ? worktree : undefined,
     });
     agentOf.set(t, agent);
     // `; clear` — the operator should never study a shell transcript in a
