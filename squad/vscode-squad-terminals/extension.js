@@ -35,7 +35,7 @@ const THEME = {
   // faculty (general workspace) — same visual weight as the squad
   "homeassistant":        ["home",          "terminal.ansiGreen"],
   "weather-comp":         ["cloud",         "terminal.ansiBrightBlue"],
-  "blendingvalverl":      ["flame",         "terminal.ansiRed"],
+  "blending-valve-rl-controller": ["flame", "terminal.ansiRed"],
   "mindconnect-iot2050":  ["circuit-board", "terminal.ansiCyan"],
   "node-red-mvp":         ["credit-card",   "terminal.ansiBrightRed"],
   "dt-vm-spec":           ["vm",            "terminal.ansiMagenta"],
