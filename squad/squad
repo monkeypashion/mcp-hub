@@ -899,6 +899,7 @@ case "${1:-help}" in
             #   ⚡ wakeable · ⚠ online but unwakeable · ✖ offline · ? stale · '' no data
             declare -A WCTX  # agent -> context % (scraped from its own statusline)
             declare -A WMOD  # agent -> model initial (O/F/S/H), same scrape
+            declare -A WGH   # agent -> repo marker (🐙 = GitHub remote), computed once
             who_board() {
               local a st g tail ctx mod
               for a in $(agents); do
@@ -989,6 +990,21 @@ case "${1:-help}" in
                 # jumping right is deliberate attention-grabbing. ctx % rides
                 # after the label: "⚡ dt 44% · ✳ <status>".
                 if is_faculty "$a"; then g='▶'; else g="$(hub_glyph "$a")"; fi
+                # repo marker, faculty only (squad repos are ALL GitHub —
+                # implied, so the glyph only earns tab space where it
+                # varies). Cached for the painter's lifetime: repo-ness
+                # doesn't change mid-session, and a git call per agent per
+                # 2s pass would be pure waste. Trailing, like the ctx emoji
+                # (137374f), so the name column stays put.
+                if [ -z "${WGH[$a]+x}" ]; then
+                  ghm=""
+                  if is_faculty "$a"; then
+                    case "$(git -C "$(untilde "$(field "$a" 2)")" remote get-url origin 2>/dev/null || true)" in
+                      *github.com*|*github-*) ghm="🐙" ;;
+                    esac
+                  fi
+                  WGH[$a]="$ghm"
+                fi
                 ctx="${WCTX[$a]:-}"
                 # model + ctx are ONE field — "mcp-hub F-39%" — so the tab stays
                 # narrow and a mis-set model is obvious at a glance. The tier
@@ -997,7 +1013,7 @@ case "${1:-help}" in
                 # present; a leading emoji shunted them right on exactly the
                 # agents you most want to read quickly.
                 m="${WMOD[$a]:-}"
-                label="$short"
+                label="$short${WGH[$a]:-}"
                 # context-pressure tiers (titles can't carry ANSI colour):
                 # operator clears context before 50% — plain <40 · 🟡 40-49 ·
                 # 🔥 50+  (🔴 stays "waiting", ⚠ stays hub)
