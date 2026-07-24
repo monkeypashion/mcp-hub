@@ -54,6 +54,17 @@ self_stale() {
 rows()   { grep -vE '^[[:space:]]*(#|$)' "$CONF" 2>/dev/null || true; }
 agents() { rows | cut -d'|' -f1; }
 field()  { rows | awk -F'|' -v a="$1" -v n="$2" '$1==a {print $n; exit}'; }
+# Roster CLASS (5th field, optional): "" / "squad" = core squad — always-on
+# colleagues, swept by up/heal/cmd-all/dash and always visible on who/board.
+# "faculty" = on-demand specialist (the general-workspace projects): NEVER
+# auto-started or healed (heal would spawn pointless hub daemons and type
+# re-register nags into hubless panes), started/stopped explicitly, and shown
+# on who/board only while actually running — 14 permanent grey "down" rows
+# would bury the squad signal. Anything that isn't exactly "faculty" is
+# treated as squad: a typo'd class must fail toward "still swept and healed",
+# never toward silently dropping a real agent from recovery.
+is_faculty()   { [ "$(field "$1" 5 | tr -d '[:space:]')" = faculty ]; }
+squad_agents() { rows | awk -F'|' '{gsub(/[[:space:]]/,"",$5)} $5!="faculty" {print $1}'; }
 untilde(){ printf '%s\n' "${1/#\~/$HOME}"; }
 # Resolve an agent name: an explicit arg always wins; otherwise derive it from
 # $PWD by matching against each agent's worktree — so running a verb from inside
@@ -429,7 +440,7 @@ case "${1:-help}" in
             # under set -e a single up_one failure (missing worktree, launch
             # hiccup) killed the whole loop — observed 2026-07-23 during the
             # Projects migration as "up starts exactly one agent per run".
-            for a in $(agents); do
+            for a in $(squad_agents); do
               up_one "$a" || echo "!! $a: failed to come up — continuing with the rest" >&2
             done ;;
   restart)  shift; mode=""; a_arg=""
@@ -467,6 +478,21 @@ case "${1:-help}" in
             else
               if [ -n "$mode" ]; then up_one "$a" "$rargs"; else up_one "$a"; fi
             fi ;;
+  start)    # explicit single-agent start (idempotent — up_one no-ops when up).
+            # The faculty verb: `up` deliberately skips faculty, so this is how
+            # an on-demand agent comes to life (the cockpit's Start action).
+            a="$(need_agent "${2:-}")" || exit 1
+            up_one "$a" ;;
+  stop)     # explicit single-agent stop — the inverse of start. Kills the tmux
+            # session (attached cockpit terminals drop back to their shell) and
+            # retires the daemon so nothing keeps beating for a stopped agent.
+            # The conversation is not lost: restart --resume / --continue picks
+            # it back up.
+            a="$(need_agent "${2:-}")" || exit 1
+            if ! tm has-session -t "=$a" 2>/dev/null; then echo "$a already down"; exit 0; fi
+            tm kill-session -t "=$a"
+            kill_daemon "$a"
+            echo "stopped $a (conversation kept — resume with: $CMD start $a  or  $CMD restart $a --resume)" ;;
   down)     tm kill-server 2>/dev/null || true
             # The keep-alive daemons are detached (they outlive tmux), so kill
             # them explicitly via their pidfiles and clear the stale claim.
@@ -512,7 +538,7 @@ case "${1:-help}" in
             disrupt="$(cat "$stamp" 2>/dev/null || echo 0)"
             now="$(date +%s)"
             if [ "${disrupt:-0}" -gt 0 ] && [ $((now - disrupt)) -ge 180 ]; then
-              for a in $(agents); do
+              for a in $(squad_agents); do
                 tm has-session -t "=$a" 2>/dev/null || continue
                 pane_alive "$a" || continue
                 started="$(agent_started "$a")" || continue
@@ -563,7 +589,7 @@ case "${1:-help}" in
                 healed=$((healed+1))
               done
             fi
-            for a in $(agents); do
+            for a in $(squad_agents); do
               tm has-session -t "=$a" 2>/dev/null || continue
               pane_alive "$a" || continue
               # Already relaunched by the deaf sweep in THIS pass — leave it be.
@@ -679,7 +705,7 @@ case "${1:-help}" in
                 echo "$a: model already $m (no switch needed)"; break
               fi
             done ;;
-  cmd)      if [ "${2:-}" = all ]; then shift 2; for a in $(agents); do type_line "$a" "$@"; done
+  cmd)      if [ "${2:-}" = all ]; then shift 2; for a in $(squad_agents); do type_line "$a" "$@"; done
             elif [ -n "${2:-}" ] && agents | grep -qxF -- "${2:-}"; then a="$2"; shift 2; type_line "$a" "$@"
             else a="$(need_agent "")" || exit 1; shift
                  [ -n "${1:-}" ] || { echo "usage: $CMD cmd [agent|all] \"text\"" >&2; exit 1; }
@@ -771,7 +797,7 @@ case "${1:-help}" in
             elif [ $# -gt 0 ]; then
               for t in "$@"; do agents | grep -qxF -- "$t" || { echo "!! unknown agent '$t' (see $CONF)" >&2; exit 1; }; done
             else
-              set -- $(agents)
+              set -- $(squad_agents)
             fi
             d="dash"
             # With several clients on one session (a dash pane + a direct attach),
@@ -865,7 +891,11 @@ case "${1:-help}" in
               local a st g tail ctx mod
               for a in $(agents); do
                 ctx=""; mod=""
-                if ! tm has-session -t "=$a" 2>/dev/null || ! pane_alive "$a"; then st="down"
+                if ! tm has-session -t "=$a" 2>/dev/null || ! pane_alive "$a"; then
+                  # down faculty is invisible here (14 grey rows would bury
+                  # the squad signal); it reappears the moment it runs
+                  if is_faculty "$a"; then WST[$a]=""; continue; fi
+                  st="down"
                 else
                   # one capture, three harvests: waiting/working state, the
                   # ctx % AND the model — all already rendered by the agent's
@@ -936,6 +966,8 @@ case "${1:-help}" in
               [ -n "$jig" ] && sp=' '
               local ctx
               for a in $(agents); do
+                # down faculty: no session, no clients, nothing to badge
+                if is_faculty "$a" && ! tm has-session -t "=$a" 2>/dev/null; then continue; fi
                 short="${a%-$hostsafe}"
                 # glyph FIRST (right after the tab icon) so the status column
                 # lines up; 🔴 slots in after it when waiting — the name
@@ -971,7 +1003,14 @@ case "${1:-help}" in
                 [ "$(tm show -t "$a" -v set-titles-string 2>/dev/null)" = "$ts" ] \
                   || tm set -t "$a" set-titles-string "$ts" 2>/dev/null || true
                 for tty in $(tm list-clients -t "=$a" -F '#{?#{==:#{client_termname},xterm-256color},#{client_tty},}' 2>/dev/null); do
-                  [ -w "$tty" ] && printf '%b' "$seq" > "$tty" 2>/dev/null || true
+                  # BOUNDED write. A client whose reader died (VSCode window
+                  # closed uncleanly) stays "attached" in tmux, and a raw
+                  # printf into its pty blocks FOREVER once the buffer fills —
+                  # 2026-07-24: the who engine sat wedged on one zombie tty
+                  # for hours, titles frozen fleet-wide. A blocked loop can't
+                  # reach its own re-exec guard, so bounding this write is the
+                  # prerequisite for every other self-heal in this script.
+                  [ -w "$tty" ] && timeout 2 sh -c 'printf %b "$1" > "$2"' _ "$seq" "$tty" 2>/dev/null || true
                 done
               done
             }
@@ -1105,6 +1144,8 @@ sys.stdout.write("".join("%s\x1f%d\x1f%d\n" % r for r in out))
               git_refresh; usage_refresh
               for a in $(agents); do
                 if ! tm has-session -t "=$a" 2>/dev/null || ! pane_alive "$a"; then
+                  # down faculty is invisible on the board too — same rule as who
+                  is_faculty "$a" && continue
                   printf '%s\037%s\037\037\037\0370\037\037\037%s\037%s\n' "$a" "down" "$(git_for "$a")" "$(usage_for "$a")"; continue
                 fi
                 tail="$(tm capture-pane -p -t "$a" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -20)"
@@ -1225,7 +1266,9 @@ enroll (identity is derived: name = <repo>-<hostname>, project = <org>/<repo>)
   $CMD rm  [agent]              inverse of add: session, roster, hub opt-in, daemon (repo kept)
 
 run
-  $CMD up                       start every enrolled agent (idempotent)
+  $CMD up                       start every SQUAD-class agent (idempotent; faculty is skipped)
+  $CMD start [agent]            start ONE agent (how on-demand faculty agents come up)
+  $CMD stop  [agent]            stop ONE agent (session killed, conversation kept)
   $CMD down                     stop everything (tmux server + keep-alive daemons)
   $CMD restart [agent] [--fresh|--resume]
                                 relaunch claude in place (attached viewers keep watching)
@@ -1278,7 +1321,10 @@ helpers
 [agent] defaults to the repo you're standing in, so from inside a worktree:
   $CMD attach   /   $CMD restart   /   $CMD cmd "/compact"
 
-roster: $CONF   (agent | worktree | gh_config_dir | claude_args)
+roster: $CONF   (agent | worktree | gh_config_dir | claude_args | class)
+  class (optional): empty/"squad" = always-on, swept by up/heal, always on who/board.
+  "faculty" = on-demand (general-workspace projects): start/stop it yourself, never
+  healed, visible on who/board only while running. Cockpit terminals appear for both.
 hub opt-in list: ~/.mcp-hub/config.json — maintained by add/rm, never edit by hand
 EOF
   ;;

@@ -218,6 +218,37 @@ function activate(context) {
     vscode.commands.registerCommand("squad.interrupt", (...args) =>
       withAgents(args, (agents) => agents.forEach((a) => squadExec(["key", a, "Escape"], a)))
     ),
+    // Start & attach: the faculty lifecycle action — brings a down agent up
+    // AND attaches THIS terminal to it in one click. The attach line must be
+    // typed into the terminal (attaching is a property of the terminal, not
+    // of the agent), but sendText into a terminal that's ALREADY inside tmux
+    // would land in the agent's claude input as a junk prompt — so gate on
+    // the session actually being down (checked via tmux directly; if it's
+    // up, this terminal either is attached already or the user detached on
+    // purpose — say so instead of typing).
+    vscode.commands.registerCommand("squad.startAttach", (...args) => {
+      const list = Array.isArray(args[1]) && args[1].length ? args[1] : [args[0]];
+      let any = false;
+      for (const t of list) {
+        const a = resolveAgent(t);
+        if (!a || !t || typeof t.sendText !== "function") continue;
+        any = true;
+        cp.execFile("tmux", ["-L", "squad", "has-session", "-t", "=" + a], (err) => {
+          if (err) {
+            t.show(false);
+            t.sendText(`squad attach ${a}`); // down: start-if-down attach — an explicit click, not window-open
+          } else {
+            vscode.window.showInformationMessage(
+              `Squad: ${shortLabel(a)} is already up — this tab is attached, or reattach with: squad attach ${a}`
+            );
+          }
+        });
+      }
+      if (!any) vscode.window.showWarningMessage("Squad: no squad agent in the selection.");
+    }),
+    vscode.commands.registerCommand("squad.stop", (...args) =>
+      withAgents(args, (agents) => agents.forEach((a) => squadExec(["stop", a], a)))
+    ),
     vscode.commands.registerCommand("squad.restartResume", (...args) =>
       withAgents(args, (agents) => agents.forEach((a) => squadExec(["restart", a, "--resume"], a)))
     ),

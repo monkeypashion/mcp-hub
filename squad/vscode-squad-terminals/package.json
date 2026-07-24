@@ -2,113 +2,411 @@
   "name": "squad-terminals",
   "displayName": "Squad Terminals",
   "description": "Auto-opens one plain terminal per squad agent (squad attach) with icon+color, and adds per-agent squad actions to the terminal tab context menu.",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "publisher": "monkeypashion",
-  "engines": { "vscode": "^1.90.0" },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
   "main": "./extension.js",
   "activationEvents": [
     "onStartupFinished"
   ],
   "contributes": {
     "commands": [
-      { "command": "squad.answerYes", "title": "Answer: Yes", "category": "Squad" },
-      { "command": "squad.answerAlways", "title": "Answer: Yes, don't ask again", "category": "Squad" },
-      { "command": "squad.answerNo", "title": "Answer: No", "category": "Squad" },
-      { "command": "squad.sendPrompt", "title": "Send prompt…", "category": "Squad" },
-      { "command": "squad.stockPrompt", "title": "Stock prompt…", "category": "Squad" },
-      { "command": "squad.broadcast", "title": "Broadcast to team via agent…", "category": "Squad" },
-      { "command": "squad.dmVia", "title": "Message agent(s) via this one…", "category": "Squad" },
-      { "command": "squad.compact", "title": "/compact", "category": "Squad" },
-      { "command": "squad.interrupt", "title": "Interrupt (Esc)", "category": "Squad" },
-      { "command": "squad.restartResume", "title": "Restart (resume conversation)", "category": "Squad" },
-      { "command": "squad.restartFresh", "title": "Restart (fresh conversation)", "category": "Squad" },
-      { "command": "squad.slash.clear", "title": "/clear  (wipe conversation)", "category": "Squad" },
-      { "command": "squad.slash.context", "title": "/context", "category": "Squad" },
-      { "command": "squad.slash.cost", "title": "/cost", "category": "Squad" },
-      { "command": "squad.slash.status", "title": "/status", "category": "Squad" },
-      { "command": "squad.slash.doctor", "title": "/doctor", "category": "Squad" },
-      { "command": "squad.slash.mcp", "title": "/mcp", "category": "Squad" },
-      { "command": "squad.slash.model", "title": "/model  (open picker)", "category": "Squad" },
-      { "command": "squad.model.default", "title": "Default (Opus 4.8)", "category": "Squad" },
-      { "command": "squad.model.opus", "title": "Opus 4.8", "category": "Squad" },
-      { "command": "squad.model.fable", "title": "Fable 5", "category": "Squad" },
-      { "command": "squad.model.sonnet", "title": "Sonnet 5", "category": "Squad" },
-      { "command": "squad.model.haiku", "title": "Haiku 4.5", "category": "Squad" },
-      { "command": "squad.effort.low", "title": "low", "category": "Squad" },
-      { "command": "squad.effort.medium", "title": "medium", "category": "Squad" },
-      { "command": "squad.effort.high", "title": "high", "category": "Squad" },
-      { "command": "squad.effort.xhigh", "title": "xhigh", "category": "Squad" },
-      { "command": "squad.effort.max", "title": "max", "category": "Squad" },
-      { "command": "squad.voice.hold", "title": "hold to talk", "category": "Squad" },
-      { "command": "squad.voice.tap", "title": "tap to talk", "category": "Squad" },
-      { "command": "squad.voice.off", "title": "off", "category": "Squad" },
-      { "command": "squad.slash.memory", "title": "/memory", "category": "Squad" },
-      { "command": "squad.slash.todos", "title": "/todos", "category": "Squad" },
-      { "command": "squad.slash.help", "title": "/help", "category": "Squad" },
-      { "command": "squad.slash.custom", "title": "Other /command…", "category": "Squad" }
+      {
+        "command": "squad.answerYes",
+        "title": "Answer: Yes",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.answerAlways",
+        "title": "Answer: Yes, don't ask again",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.answerNo",
+        "title": "Answer: No",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.sendPrompt",
+        "title": "Send prompt…",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.stockPrompt",
+        "title": "Stock prompt…",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.broadcast",
+        "title": "Broadcast to team via agent…",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.dmVia",
+        "title": "Message agent(s) via this one…",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.compact",
+        "title": "/compact",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.interrupt",
+        "title": "Interrupt (Esc)",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.startAttach",
+        "title": "Start & attach",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.stop",
+        "title": "Stop (session ends, conversation kept)",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.restartResume",
+        "title": "Restart (resume conversation)",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.restartFresh",
+        "title": "Restart (fresh conversation)",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.slash.clear",
+        "title": "/clear  (wipe conversation)",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.slash.context",
+        "title": "/context",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.slash.cost",
+        "title": "/cost",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.slash.status",
+        "title": "/status",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.slash.doctor",
+        "title": "/doctor",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.slash.mcp",
+        "title": "/mcp",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.slash.model",
+        "title": "/model  (open picker)",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.model.default",
+        "title": "Default (Opus 4.8)",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.model.opus",
+        "title": "Opus 4.8",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.model.fable",
+        "title": "Fable 5",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.model.sonnet",
+        "title": "Sonnet 5",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.model.haiku",
+        "title": "Haiku 4.5",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.effort.low",
+        "title": "low",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.effort.medium",
+        "title": "medium",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.effort.high",
+        "title": "high",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.effort.xhigh",
+        "title": "xhigh",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.effort.max",
+        "title": "max",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.voice.hold",
+        "title": "hold to talk",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.voice.tap",
+        "title": "tap to talk",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.voice.off",
+        "title": "off",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.slash.memory",
+        "title": "/memory",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.slash.todos",
+        "title": "/todos",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.slash.help",
+        "title": "/help",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.slash.custom",
+        "title": "Other /command…",
+        "category": "Squad"
+      }
     ],
     "submenus": [
-      { "id": "squad.agentMenu", "label": "Squad" },
-      { "id": "squad.slashMenu", "label": "Slash commands" },
-      { "id": "squad.modelMenu", "label": "Model" },
-      { "id": "squad.effortMenu", "label": "Effort" },
-      { "id": "squad.voiceMenu", "label": "Voice" }
+      {
+        "id": "squad.agentMenu",
+        "label": "Squad"
+      },
+      {
+        "id": "squad.slashMenu",
+        "label": "Slash commands"
+      },
+      {
+        "id": "squad.modelMenu",
+        "label": "Model"
+      },
+      {
+        "id": "squad.effortMenu",
+        "label": "Effort"
+      },
+      {
+        "id": "squad.voiceMenu",
+        "label": "Voice"
+      }
     ],
     "menus": {
       "terminal/title/context": [
-        { "submenu": "squad.agentMenu", "group": "2_squad" }
+        {
+          "submenu": "squad.agentMenu",
+          "group": "2_squad"
+        }
       ],
       "terminal/context": [
-        { "submenu": "squad.agentMenu", "group": "2_squad" }
+        {
+          "submenu": "squad.agentMenu",
+          "group": "2_squad"
+        }
       ],
       "squad.agentMenu": [
-        { "command": "squad.answerYes", "group": "0_answer@1" },
-        { "command": "squad.answerAlways", "group": "0_answer@2" },
-        { "command": "squad.answerNo", "group": "0_answer@3" },
-        { "command": "squad.sendPrompt", "group": "1_talk@1" },
-        { "command": "squad.stockPrompt", "group": "1_talk@2" },
-        { "command": "squad.broadcast", "group": "1_talk@3" },
-        { "command": "squad.dmVia", "group": "1_talk@4" },
-        { "command": "squad.interrupt", "group": "1_talk@5" },
-        { "submenu": "squad.slashMenu", "group": "1_talk@6" },
-        { "command": "squad.restartResume", "group": "2_lifecycle@1" },
-        { "command": "squad.restartFresh", "group": "2_lifecycle@2" }
+        {
+          "command": "squad.answerYes",
+          "group": "0_answer@1"
+        },
+        {
+          "command": "squad.answerAlways",
+          "group": "0_answer@2"
+        },
+        {
+          "command": "squad.answerNo",
+          "group": "0_answer@3"
+        },
+        {
+          "command": "squad.sendPrompt",
+          "group": "1_talk@1"
+        },
+        {
+          "command": "squad.stockPrompt",
+          "group": "1_talk@2"
+        },
+        {
+          "command": "squad.broadcast",
+          "group": "1_talk@3"
+        },
+        {
+          "command": "squad.dmVia",
+          "group": "1_talk@4"
+        },
+        {
+          "command": "squad.interrupt",
+          "group": "1_talk@5"
+        },
+        {
+          "submenu": "squad.slashMenu",
+          "group": "1_talk@6"
+        },
+        {
+          "command": "squad.startAttach",
+          "group": "2_lifecycle@0"
+        },
+        {
+          "command": "squad.restartResume",
+          "group": "2_lifecycle@1"
+        },
+        {
+          "command": "squad.restartFresh",
+          "group": "2_lifecycle@2"
+        },
+        {
+          "command": "squad.stop",
+          "group": "2_lifecycle@3"
+        }
       ],
       "squad.slashMenu": [
-        { "command": "squad.slash.context", "group": "1_info@1" },
-        { "command": "squad.slash.cost", "group": "1_info@2" },
-        { "command": "squad.slash.status", "group": "1_info@3" },
-        { "command": "squad.slash.todos", "group": "1_info@4" },
-        { "command": "squad.slash.mcp", "group": "1_info@5" },
-        { "command": "squad.slash.doctor", "group": "1_info@6" },
-        { "command": "squad.slash.help", "group": "1_info@7" },
-        { "command": "squad.compact", "group": "2_change@1" },
-        { "submenu": "squad.modelMenu", "group": "2_change@2" },
-        { "submenu": "squad.effortMenu", "group": "2_change@3" },
-        { "submenu": "squad.voiceMenu", "group": "2_change@4" },
-        { "command": "squad.slash.model", "group": "2_change@5" },
-        { "command": "squad.slash.memory", "group": "2_change@6" },
-        { "command": "squad.slash.clear", "group": "3_danger@1" },
-        { "command": "squad.slash.custom", "group": "4_custom@1" }
+        {
+          "command": "squad.slash.context",
+          "group": "1_info@1"
+        },
+        {
+          "command": "squad.slash.cost",
+          "group": "1_info@2"
+        },
+        {
+          "command": "squad.slash.status",
+          "group": "1_info@3"
+        },
+        {
+          "command": "squad.slash.todos",
+          "group": "1_info@4"
+        },
+        {
+          "command": "squad.slash.mcp",
+          "group": "1_info@5"
+        },
+        {
+          "command": "squad.slash.doctor",
+          "group": "1_info@6"
+        },
+        {
+          "command": "squad.slash.help",
+          "group": "1_info@7"
+        },
+        {
+          "command": "squad.compact",
+          "group": "2_change@1"
+        },
+        {
+          "submenu": "squad.modelMenu",
+          "group": "2_change@2"
+        },
+        {
+          "submenu": "squad.effortMenu",
+          "group": "2_change@3"
+        },
+        {
+          "submenu": "squad.voiceMenu",
+          "group": "2_change@4"
+        },
+        {
+          "command": "squad.slash.model",
+          "group": "2_change@5"
+        },
+        {
+          "command": "squad.slash.memory",
+          "group": "2_change@6"
+        },
+        {
+          "command": "squad.slash.clear",
+          "group": "3_danger@1"
+        },
+        {
+          "command": "squad.slash.custom",
+          "group": "4_custom@1"
+        }
       ],
       "squad.modelMenu": [
-        { "command": "squad.model.default", "group": "1_model@1" },
-        { "command": "squad.model.opus", "group": "1_model@2" },
-        { "command": "squad.model.fable", "group": "1_model@3" },
-        { "command": "squad.model.sonnet", "group": "1_model@4" },
-        { "command": "squad.model.haiku", "group": "1_model@5" }
+        {
+          "command": "squad.model.default",
+          "group": "1_model@1"
+        },
+        {
+          "command": "squad.model.opus",
+          "group": "1_model@2"
+        },
+        {
+          "command": "squad.model.fable",
+          "group": "1_model@3"
+        },
+        {
+          "command": "squad.model.sonnet",
+          "group": "1_model@4"
+        },
+        {
+          "command": "squad.model.haiku",
+          "group": "1_model@5"
+        }
       ],
       "squad.effortMenu": [
-        { "command": "squad.effort.low", "group": "1_effort@1" },
-        { "command": "squad.effort.medium", "group": "1_effort@2" },
-        { "command": "squad.effort.high", "group": "1_effort@3" },
-        { "command": "squad.effort.xhigh", "group": "1_effort@4" },
-        { "command": "squad.effort.max", "group": "1_effort@5" }
+        {
+          "command": "squad.effort.low",
+          "group": "1_effort@1"
+        },
+        {
+          "command": "squad.effort.medium",
+          "group": "1_effort@2"
+        },
+        {
+          "command": "squad.effort.high",
+          "group": "1_effort@3"
+        },
+        {
+          "command": "squad.effort.xhigh",
+          "group": "1_effort@4"
+        },
+        {
+          "command": "squad.effort.max",
+          "group": "1_effort@5"
+        }
       ],
       "squad.voiceMenu": [
-        { "command": "squad.voice.hold", "group": "1_voice@1" },
-        { "command": "squad.voice.tap", "group": "1_voice@2" },
-        { "command": "squad.voice.off", "group": "1_voice@3" }
+        {
+          "command": "squad.voice.hold",
+          "group": "1_voice@1"
+        },
+        {
+          "command": "squad.voice.tap",
+          "group": "1_voice@2"
+        },
+        {
+          "command": "squad.voice.off",
+          "group": "1_voice@3"
+        }
       ]
     }
   }

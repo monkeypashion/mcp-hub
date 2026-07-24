@@ -14,6 +14,13 @@
 # to resume its last thread. NB the flag names differ by layer: --continue is CLAUDE's
 # arg (lives here in the roster); `squad restart` takes --resume / --fresh, which add or
 # strip --continue for that one restart. `squad restart <a> --continue` is NOT a thing.
+#
+# Optional 5th column: CLASS. Empty/"squad" = always-on colleague (swept by up/heal,
+# always visible on who/board). "faculty" = on-demand specialist: `up` skips it, heal
+# never touches it, who/board show it only while running — start/stop explicitly
+# (`squad start <a>` / `squad stop <a>`, or the cockpit's Start & attach / Stop).
+# Faculty rows usually omit the channels flag (no hub comms) — add it later if wanted:
+# health-myhost|~/Projects/health|||faculty
 
 mcp-hub-dev|~/SoftwareProjects/monkeypashion/mcp-hub||--dangerously-load-development-channels server:hub
 
