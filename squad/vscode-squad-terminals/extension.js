@@ -441,11 +441,11 @@ function activate(context) {
   // Focusing a DOWN agent's terminal means "I want claude HERE" — offer (or
   // perform) the start right then, instead of leaving the operator at a bare
   // shell with instructions. Modes (squadTerminals.autoStart):
-  //   focus (default)   — starts immediately on focus. Zero-click — the
-  //                       operator's call: a cockpit terminal you click on
-  //                       should BE claude, not instructions for getting it.
-  //   confirm           — one-click toast instead (window-restore/panel-
-  //                       reveal focus events can't start anything).
+  //   confirm (default) — one-click toast. Operator's pick (2026-07-24,
+  //                       once the tabs opened clean): a glance must never
+  //                       start an agent, a click on the toast is cheap.
+  //   focus             — starts immediately on focus; zero-click, but
+  //                       window-restore/panel-reveal focus events count.
   //   off               — context menu only.
   // Guards: an arming delay swallows the window-restore burst, an inflight
   // window stops a double-send while tmux is still booting (a second attach
@@ -457,7 +457,7 @@ function activate(context) {
     vscode.window.onDidChangeActiveTerminal((t) => {
       const mode = vscode.workspace
         .getConfiguration("squadTerminals")
-        .get("autoStart", "focus");
+        .get("autoStart", "confirm");
       if (mode === "off" || !t || Date.now() < armedAt) return;
       const a = agentOf.get(t);
       if (!a) return;
