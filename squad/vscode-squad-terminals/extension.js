@@ -71,6 +71,33 @@ function canon(p) {
   }
 }
 
+// Type into a terminal only once its shell is actually reading. sendText at
+// creation races bash init: the tty echoes the raw line before the prompt,
+// then readline echoes it again — every cockpit tab opened with a doubled
+// command line at the top (2026-07-24). Shell-integration readiness is the
+// real signal; the timeout is the fallback for shells where integration is
+// off (then we're no worse than the old immediate send).
+function sendWhenReady(t, text) {
+  if (t.shellIntegration) {
+    t.sendText(text);
+    return;
+  }
+  let done = false;
+  const fire = () => {
+    if (done) return;
+    done = true;
+    sub && sub.dispose();
+    t.sendText(text);
+  };
+  let sub;
+  if (typeof vscode.window.onDidChangeTerminalShellIntegration === "function") {
+    sub = vscode.window.onDidChangeTerminalShellIntegration((e) => {
+      if (e.terminal === t) fire();
+    });
+  }
+  setTimeout(fire, 4000);
+}
+
 // short label: strip the derived "-<hostname>" suffix (sanitized like cli.py)
 function shortLabel(agent) {
   const host = os.hostname().toLowerCase().replace(/[^a-z0-9_-]/g, "-");
@@ -363,7 +390,7 @@ function activate(context) {
         ? path.join(os.homedir(), "Projects")
         : undefined,
     });
-    b.sendText(`${SQUAD} board -w`);
+    sendWhenReady(b, `${SQUAD} board -w`);
   }
 
   // The who engine runs headless as squad-who.service and its signal lives in
@@ -389,7 +416,7 @@ function activate(context) {
       cwd: worktree,
     });
     agentOf.set(t, agent);
-    t.sendText(`squad attach --no-start ${agent}`);
+    sendWhenReady(t, `squad attach --no-start ${agent}`);
   }
 
   // keep the map tidy as terminals close
