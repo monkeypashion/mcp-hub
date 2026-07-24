@@ -770,10 +770,11 @@ case "${1:-help}" in
             }
             printf '%-26s %-10s %-11s %s\n' 'AGENT' 'TMUX' 'HUB' ''
             for a in $(agents); do
+              hs="$(hub_state "$a")"; is_faculty "$a" && hs="·"   # faculty: no hub by design
               if tm has-session -t "=$a" 2>/dev/null; then
-                if pane_alive "$a"; then printf '%-26s %-10s %-11s (%s)\n' "$a" up "$(hub_state "$a")" "$(pane_cmd "$a")"
-                else printf '%-26s %-10s %-11s session up, claude not running — try: %s restart %s\n' "$a" DEGRADED "$(hub_state "$a")" "$CMD" "$a"; fi
-              else printf '%-26s %-10s %-11s\n' "$a" down "$(hub_state "$a")"; fi
+                if pane_alive "$a"; then printf '%-26s %-10s %-11s (%s)\n' "$a" up "$hs" "$(pane_cmd "$a")"
+                else printf '%-26s %-10s %-11s session up, claude not running — try: %s restart %s\n' "$a" DEGRADED "$hs" "$CMD" "$a"; fi
+              else printf '%-26s %-10s %-11s\n' "$a" down "$hs"; fi
             done ;;
   args)     if [ -n "${2:-}" ] && agents | grep -qxF -- "${2:-}"; then a="$2"; shift 2
             else a="$(need_agent "")" || exit 1; shift; fi
@@ -931,7 +932,10 @@ case "${1:-help}" in
                 if [ -n "$mod" ]; then WMOD[$a]="$mod"
                 elif [ "$st" = "down" ] || [ -z "$(tm display -p -t "$a" '#{pane_title}' 2>/dev/null)" ]; then WMOD[$a]=""
                 fi
-                g="$(hub_glyph "$a")"
+                # faculty carries no hub daemon by design — hub_glyph's "?"
+                # (= no status data) is a real alarm for squad but pure noise
+                # here; a running faculty agent is simply ▶
+                if is_faculty "$a"; then g='▶'; else g="$(hub_glyph "$a")"; fi
                 case "$st" in
                   waiting) printf '  \033[1;31m🔴 %-28s %-2s %-4s WAITING ON YOU\033[0m\n' "$a" "$g" "$ctx" ;;
                   working) printf '  \033[32m🟢 %-28s %-2s %-4s working\033[0m\n' "$a" "$g" "$ctx" ;;
@@ -984,7 +988,7 @@ case "${1:-help}" in
                 # lines up; 🔴 slots in after it when waiting — the name
                 # jumping right is deliberate attention-grabbing. ctx % rides
                 # after the label: "⚡ dt 44% · ✳ <status>".
-                g="$(hub_glyph "$a")"
+                if is_faculty "$a"; then g='▶'; else g="$(hub_glyph "$a")"; fi
                 ctx="${WCTX[$a]:-}"
                 # model + ctx are ONE field — "mcp-hub F-39%" — so the tab stays
                 # narrow and a mis-set model is obvious at a glance. The tier
