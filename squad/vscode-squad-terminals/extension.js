@@ -47,6 +47,11 @@ const THEME = {
   "subscriptions":        ["sync",          "terminal.ansiBlue"],
   "transport":            ["compass",       "terminal.ansiWhite"],
   "get-my-shit-in-order": ["tasklist",      "terminal.ansiBrightWhite"],
+  // faculty — fireblade windows cockpit
+  "wispr-flow-alternative": ["mic",          "terminal.ansiBrightMagenta"],
+  "pc-cleanup":             ["trash",        "terminal.ansiYellow"],
+  "pc-upgrade":             ["arrow-up",     "terminal.ansiGreen"],
+  "rclone-onedrive":        ["cloud-upload", "terminal.ansiBlue"],
 };
 const FALLBACK = ["terminal", "terminal.ansiBrightBlack"];
 
@@ -152,7 +157,28 @@ function resolveAgents(args) {
   return [...new Set(agents)];
 }
 
+// Auto-start guards, shared between the focus handler and the manual
+// commands so the two paths are mutually aware (2026-07-25, FB gap B):
+//   inflight      — terminal -> last prompt/start ts. Stamped by BOTH the
+//                   focus toast and squad.startAttach, so a manual start
+//                   suppresses the focus toast for that terminal (and vice
+//                   versa) instead of double-prompting.
+//   pendingToasts — terminal -> armed setTimeout handle. The focus toast is
+//                   DELAYED ~600ms and any squad.* command cancels all armed
+//                   toasts: a right-click exists only to reach the context
+//                   menu, and VSCode gives no mouse-button signal, so
+//                   "command ran promptly after focus" is the only observable
+//                   proxy for right-click intent. Right-click + dismiss with
+//                   no pick still toasts after the delay — undetectable.
+const inflight = new Map();
+const pendingToasts = new Map();
+function cancelPendingToasts() {
+  for (const timer of pendingToasts.values()) clearTimeout(timer);
+  pendingToasts.clear();
+}
+
 function withAgents(args, fn) {
+  cancelPendingToasts();
   const agents = resolveAgents(args);
   if (!agents.length) {
     vscode.window.showWarningMessage("Squad: no squad agent in the selection.");
@@ -227,6 +253,7 @@ function activate(context) {
       })
     ),
     vscode.commands.registerCommand("squad.dmVia", (...args) => {
+      cancelPendingToasts();
       // sender = the clicked tab (multi-select doesn't apply: one courier)
       const sender = resolveAgent(args[0]);
       if (!sender) {
@@ -269,6 +296,7 @@ function activate(context) {
     // up, this terminal either is attached already or the user detached on
     // purpose — say so instead of typing).
     vscode.commands.registerCommand("squad.startAttach", (...args) => {
+      cancelPendingToasts();
       const list = Array.isArray(args[1]) && args[1].length ? args[1] : [args[0]];
       let any = false;
       for (const t of list) {
@@ -277,6 +305,7 @@ function activate(context) {
         any = true;
         cp.execFile("tmux", ["-L", "squad", "has-session", "-t", "=" + a], (err) => {
           if (err) {
+            inflight.set(t, Date.now()); // manual start arms the focus-path throttle too
             t.show(false);
             t.sendText(`squad attach ${a}`); // down: start-if-down attach — an explicit click, not window-open
           } else {
@@ -487,12 +516,15 @@ function activate(context) {
   //   focus             — starts immediately on focus; zero-click, but
   //                       window-restore/panel-reveal focus events count.
   //   off               — context menu only.
-  // Guards: an arming delay swallows the window-restore burst, an inflight
-  // window stops a double-send while tmux is still booting (a second attach
-  // line after the first takes over would land in claude's input), and the
-  // tmux down-check means an up agent is never touched.
+  // Guards: an arming delay swallows the window-restore burst, the shared
+  // inflight window stops a double-send while tmux is still booting (a second
+  // attach line after the first takes over would land in claude's input), the
+  // tmux down-check means an up agent is never touched — and the prompt is
+  // DEFERRED ~600ms via pendingToasts so a right-click that only wanted the
+  // context menu never pops it (any squad.* command cancels armed toasts;
+  // see the guard block above withAgents).
   const armedAt = Date.now() + 5000;
-  const inflight = new Map(); // terminal -> last prompt/start ts
+  const TOAST_DELAY_MS = 600;
   context.subscriptions.push(
     vscode.window.onDidChangeActiveTerminal((t) => {
       const mode = vscode.workspace
@@ -502,33 +534,51 @@ function activate(context) {
       const a = agentOf.get(t);
       if (!a) return;
       if (inflight.get(t) && Date.now() - inflight.get(t) < 15000) return;
-      cp.execFile("tmux", ["-L", "squad", "has-session", "-t", "=" + a], (err) => {
-        if (!err) return; // up — already attached, or detached on purpose
-        const go = () => {
-          inflight.set(t, Date.now());
-          t.show(false);
-          t.sendText(`squad attach ${a}`);
-        };
-        if (mode === "focus") {
-          go();
-          return;
-        }
-        inflight.set(t, Date.now()); // also throttles repeat toasts
-        vscode.window
-          .showInformationMessage(
-            `Squad: ${shortLabel(a)} is down — start claude and attach?`,
-            "Start & attach"
-          )
-          .then((pick) => {
-            if (pick === "Start & attach") go();
+      const prev = pendingToasts.get(t);
+      if (prev) clearTimeout(prev);
+      pendingToasts.set(
+        t,
+        setTimeout(() => {
+          pendingToasts.delete(t);
+          // Focus moved on during the delay (tab-walking) — stale, drop it.
+          if (vscode.window.activeTerminal !== t) return;
+          cp.execFile("tmux", ["-L", "squad", "has-session", "-t", "=" + a], (err) => {
+            if (!err) return; // up — already attached, or detached on purpose
+            const go = () => {
+              inflight.set(t, Date.now());
+              t.show(false);
+              t.sendText(`squad attach ${a}`);
+            };
+            if (mode === "focus") {
+              go();
+              return;
+            }
+            inflight.set(t, Date.now()); // also throttles repeat toasts
+            vscode.window
+              .showInformationMessage(
+                `Squad: ${shortLabel(a)} is down — start claude and attach?`,
+                "Start & attach"
+              )
+              .then((pick) => {
+                if (pick === "Start & attach") go();
+              });
           });
-      });
+        }, TOAST_DELAY_MS)
+      );
     })
   );
 
-  // keep the map tidy as terminals close
+  // keep the maps tidy as terminals close
   context.subscriptions.push(
-    vscode.window.onDidCloseTerminal((t) => agentOf.delete(t))
+    vscode.window.onDidCloseTerminal((t) => {
+      agentOf.delete(t);
+      inflight.delete(t);
+      const timer = pendingToasts.get(t);
+      if (timer) {
+        clearTimeout(timer);
+        pendingToasts.delete(t);
+      }
+    })
   );
 }
 
