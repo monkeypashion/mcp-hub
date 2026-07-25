@@ -1210,8 +1210,17 @@ def _spawn_daemon_detached(agent_name: str, hub_url: str) -> None:
     works from any venv layout. The singleton claim inside the daemon makes
     this safe to call redundantly — a second daemon stands down at once.
     """
+    exe = sys.executable
+    if os.name == "nt":
+        # pythonw.exe is GUI-subsystem so it never allocates a console. Plain
+        # python.exe is console-subsystem, and DETACHED_PROCESS makes Windows give
+        # the detached child a fresh VISIBLE console — a window that flashes on
+        # every daemon (re)spawn. pythonw suppresses it. Fall back if absent.
+        _pyw = pathlib.Path(sys.executable).with_name("pythonw.exe")
+        if _pyw.exists():
+            exe = str(_pyw)
     cmd = [
-        sys.executable, "-m", "mcp_hub.cli", "heartbeat-daemon",
+        exe, "-m", "mcp_hub.cli", "heartbeat-daemon",
         "--name", agent_name, "--hub-url", hub_url,
     ]
     kwargs: dict[str, Any] = {
