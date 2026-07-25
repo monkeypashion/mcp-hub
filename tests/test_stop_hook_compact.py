@@ -240,3 +240,45 @@ async def test_messages_are_still_marked_read_when_summarised(server):
         server, "get_messages", {"agent_name": "bob", "bind": False, "compact": True}
     )
     assert second == ""
+
+
+async def test_full_budget_bodies_are_clipped_at_the_char_limit(server):
+    """Even inside the full-message budget, a single long body is clipped to
+    COMPACT_FULL_BODY_CHARS. The 2-message budget was designed for backlog
+    floods; the common real case is ONE long DM per Stop (2026-07-25), which
+    previously landed in context whole at 2-3KB. Clipped, not dropped: the
+    head must survive and the footer must point at get_history."""
+    from mcp_hub.server import COMPACT_FULL_BODY_CHARS
+
+    await _setup(server, bind=False)
+    head = "HEAD-MARKER " + "x" * 100
+    tail = "TAIL-MARKER-THAT-MUST-BE-CLIPPED"
+    body = head + "\n" + ("filler " * ((COMPACT_FULL_BODY_CHARS // 7) + 40)) + "\n" + tail
+    await _send(server, body=body, pushed=False)
+
+    out = await _call_tool(
+        server, "get_messages", {"agent_name": "bob", "bind": False, "compact": True}
+    )
+
+    assert "HEAD-MARKER" in out, "clip must keep the head"
+    assert "TAIL-MARKER-THAT-MUST-BE-CLIPPED" not in out, "clip must cut the tail"
+    assert "[…clipped]" in out
+    assert "get_history" in out, "footer must point at the full-text retrieval"
+
+    # And the advice must actually work: the FULL body is retrievable.
+    hist = await _call_tool(server, "get_history", {"agent_or_channel": "bob"})
+    assert "TAIL-MARKER-THAT-MUST-BE-CLIPPED" in hist
+
+
+async def test_short_bodies_inside_budget_are_untouched(server):
+    """A body under the clip limit renders byte-identical inside the budget —
+    no clip marker, no footer noise for the quiet-day case."""
+    await _setup(server, bind=False)
+    await _send(server, body="short body\nsecond line", pushed=False)
+
+    out = await _call_tool(
+        server, "get_messages", {"agent_name": "bob", "bind": False, "compact": True}
+    )
+    assert "second line" in out
+    assert "[…clipped]" not in out
+    assert "clipped at" not in out

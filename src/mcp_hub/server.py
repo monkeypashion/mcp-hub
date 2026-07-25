@@ -103,9 +103,28 @@ _NO_WAKE_PRIORITIES = {"low"}
 # Stop-hook (compact) rendering budget. The Stop hook fires at EVERY turn
 # boundary and its output lands verbatim in the agent's context, so an
 # unbounded dump is a recurring context tax paid by every agent all day.
-# Render this many bodies in full; summarise the rest.
+# Render this many bodies in full; summarise the rest. "Full" is itself
+# clipped: the 2-message budget was designed for backlog floods, but the
+# common case turned out to be ONE long DM per Stop (operator, 2026-07-25),
+# which sailed through the budget at 2-3KB a pop. Nothing is dropped —
+# clipped bodies point at get_history for the full text.
 COMPACT_FULL_MESSAGES = 2
+COMPACT_FULL_BODY_CHARS = 700
 COMPACT_SUMMARY_CHARS = 220
+
+
+def _clip(body: str, limit: int = COMPACT_FULL_BODY_CHARS) -> str:
+    """Clip `body` to `limit` chars at a line boundary where possible.
+    Returns the body unchanged when it already fits."""
+    if len(body) <= limit:
+        return body
+    cut = body[:limit]
+    # Prefer breaking at the last newline inside the window so the clip
+    # doesn't end mid-sentence more than it has to; fall back to a hard cut.
+    nl = cut.rfind("\n")
+    if nl > limit // 2:
+        cut = cut[:nl]
+    return cut.rstrip() + " […clipped]"
 
 
 def _summarise(body: str, limit: int = 120) -> str:
@@ -1546,6 +1565,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         lines: list[str] = []
         seen_live = 0
         capped = 0
+        clipped = 0
         full_budget = COMPACT_FULL_MESSAGES
         for r in rows:
             ts = time.strftime("%H:%M:%S", time.localtime(r["ts"]))
@@ -1575,11 +1595,15 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                     continue
                 if full_budget > 0:
                     full_budget -= 1
+                    clipped_body = _clip(body)
+                    if clipped_body is not body:
+                        clipped += 1
+                    body = clipped_body
                 else:
                     capped += 1
                     body = _summarise(body, COMPACT_SUMMARY_CHARS)
             lines.append(f"[{ts}] **{r['from_agent']}**{prio_tag}: {body}")
-        if compact and (seen_live or capped):
+        if compact and (seen_live or capped or clipped):
             # Point at get_history, NOT get_messages: this very call marked
             # these rows read, so a follow-up get_messages returns nothing.
             # (The first version of this footer said get_messages — advice
@@ -1589,6 +1613,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 what.append(f"{seen_live} already surfaced live")
             if capped:
                 what.append(f"{capped} past the {COMPACT_FULL_MESSAGES}-message cap")
+            if clipped:
+                what.append(f"{clipped} clipped at {COMPACT_FULL_BODY_CHARS} chars")
             lines.append(
                 f"({' and '.join(what)} — shortened to save context, and now "
                 f"marked read. Full text: get_history('{agent_name}'))"
