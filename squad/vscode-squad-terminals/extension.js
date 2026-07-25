@@ -70,6 +70,10 @@ function rosterRows() {
       .map((f) => ({
         agent: f[0].trim(),
         worktree: f[1].trim().replace(/^~(?=$|[/\\])/, os.homedir()),
+        // field 4 = launch args. Carried so the Launch settings menu can show
+        // only the action that would CHANGE something, instead of offering
+        // both and inviting no-op clicks.
+        args: (f[3] || "").trim(),
       }));
   } catch {
     return [];
@@ -378,6 +382,43 @@ function activate(context) {
     );
   }
 
+  // Launch-settings state -> context keys, so the menu can show ONLY the action
+  // that would change something. Without this the submenu offers on AND off
+  // regardless of the current value, which tells the operator nothing about
+  // what's set and invites applying a setting that's already applied.
+  //
+  // Reads the roster directly (same file `squad` writes) rather than shelling
+  // out per menu-open — a context refresh runs on every terminal focus change,
+  // so a subprocess there would be wasteful and racy.
+  //
+  // Keyed on the ACTIVE terminal only. With a mixed multi-selection the keys
+  // describe the focused agent; the underlying verbs are idempotent, so the
+  // worst case is one no-op for the others rather than anything incorrect.
+  function launchStateOf(agent) {
+    const row = rosterRows().find((r) => r.agent === agent);
+    const args = row ? row.args : "";
+    return {
+      comms: /(^|\s)--(dangerously-load-development-)?channels(\s|$)/.test(args)
+        ? /hub/.test(args)
+        : false,
+      resume: /(^|\s)--continue(\s|$)/.test(args),
+    };
+  }
+  function refreshLaunchContext() {
+    const t = vscode.window.activeTerminal;
+    const a = t ? agentOf.get(t) : null;
+    const s = a ? launchStateOf(a) : { comms: false, resume: false };
+    vscode.commands.executeCommand("setContext", "squad.hasComms", s.comms);
+    vscode.commands.executeCommand("setContext", "squad.hasResume", s.resume);
+    // Only meaningful for a roster agent; without this both "turn on" entries
+    // would show on the operator's own board/shell tabs.
+    vscode.commands.executeCommand("setContext", "squad.isAgent", !!a);
+  }
+  context.subscriptions.push(
+    vscode.window.onDidChangeActiveTerminal(() => refreshLaunchContext())
+  );
+  refreshLaunchContext();
+
   // ---- launch settings: roster edits, NOT slash commands ----
   // Everything above types into the RUNNING claude and takes effect at once.
   // These two rewrite the agent's roster args and land on its NEXT launch, which
@@ -403,6 +444,10 @@ function activate(context) {
           vscode.window.showInformationMessage(
             `Squad: ${verb} ${opt} for ${agents.map(shortLabel).join(", ")} — applies on next launch.`
           );
+          // squadExec is fire-and-forget, so the roster write lands slightly
+          // after this returns. Re-read once it has, or the menu would still
+          // offer the action just taken.
+          setTimeout(refreshLaunchContext, 800);
         })
       )
     );
