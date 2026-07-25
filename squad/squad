@@ -54,16 +54,40 @@ rows()   { grep -vE '^[[:space:]]*(#|$)' "$CONF" 2>/dev/null || true; }
 agents() { rows | cut -d'|' -f1; }
 field()  { rows | awk -F'|' -v a="$1" -v n="$2" '$1==a {print $n; exit}'; }
 # Roster CLASS (5th field, optional): "" / "squad" = core squad — always-on
-# colleagues, swept by up/heal/cmd-all/dash and always visible on who/board.
-# "faculty" = on-demand specialist (the general-workspace projects): NEVER
-# auto-started or healed (heal would spawn pointless hub daemons and type
-# re-register nags into hubless panes), started/stopped explicitly, and shown
-# on who/board only while actually running — 14 permanent grey "down" rows
-# would bury the squad signal. Anything that isn't exactly "faculty" is
-# treated as squad: a typo'd class must fail toward "still swept and healed",
-# never toward silently dropping a real agent from recovery.
+# colleagues, swept by up/cmd-all/dash and always visible on who/board.
+# "faculty" = on-demand specialist (the general-workspace projects): never
+# auto-started, started/stopped explicitly, and shown on who/board only while
+# actually running — 14 permanent grey "down" rows would bury the squad signal.
+# Anything that isn't exactly "faculty" is treated as squad: a typo'd class must
+# fail toward "still swept", never toward silently dropping a real agent.
+#
+# CLASS IS LIFECYCLE ONLY. It used to double as the comms proxy ("faculty = no
+# hub by design"), which broke the day a faculty agent became a real hub member:
+# mcp-hub-fireblade-wsl registered, held a binding, ran a heartbeat daemon and
+# was counted in fleet_total, yet had no channels flag — so it could never hear
+# a wake, and the hub happily claimed "delivered live" to it (2026-07-25).
+# Comms capability is now read from the ARGS field, which is its ground truth.
 is_faculty()   { [ "$(field "$1" 5 | tr -d '[:space:]')" = faculty ]; }
 squad_agents() { rows | awk -F'|' '{gsub(/[[:space:]]/,"",$5)} $5!="faculty" {print $1}'; }
+
+# COMMS capability: does this agent's launch args wire it to the hub's channel
+# push? Only such an agent can receive a live wake — and therefore only such an
+# agent can go deaf, or have meaningful hub state to judge. Matches both the
+# development flag and the eventual plugin form, each with a hub target.
+has_comms() {
+  case "$(field "$1" 4)" in
+    *--dangerously-load-development-channels*hub*|*--channels*hub*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+# heal's iteration set. NOT squad_agents(): an agent with no comms flag has no
+# hub state worth judging — its status cache reads unwakeable forever, so heal
+# would nudge and restart it on a loop while no restart can add a launch flag.
+# Class-blind on purpose: a comms-enabled faculty agent DOES need healing.
+comms_agents() { for a in $(agents); do has_comms "$a" && echo "$a"; done; }
+# The channels flag itself, single-sourced so `comms on` and arm-at-launch can
+# never drift from what has_comms() recognises.
+COMMS_FLAG="--dangerously-load-development-channels server:hub"
 untilde(){ printf '%s\n' "${1/#\~/$HOME}"; }
 # Resolve an agent name: an explicit arg always wins; otherwise derive it from
 # $PWD by matching against each agent's worktree — so running a verb from inside
@@ -269,7 +293,24 @@ strip_continue() { printf '%s\n' "$1" | sed -E 's/(^|[[:space:]])--continue([[:s
 launch_agent_cmd() {
   local a="$1" ghdir args
   ghdir="$(untilde "$(field "$a" 3)")"
-  if [ $# -ge 2 ]; then args="$2"; else args="$(field "$a" 4)"; fi
+  # Arm comms before args are read, so an opted-in agent gains the channels flag
+  # on THIS launch rather than the one after it.
+  arm_comms "$a"
+  if [ $# -ge 2 ]; then
+    # One-off override (restart --fresh/--resume): the roster is not the source
+    # here, so arm_comms's roster write wouldn't reach this launch. Carry the
+    # flag across too — the override exists to add/drop --continue, never to
+    # silently give up comms.
+    args="$2"
+    if has_comms "$a"; then
+      case "$args" in
+        *channels*hub*) ;;   # override already carries comms — leave it alone
+        *) args="$(printf '%s %s' "$args" "$COMMS_FLAG" | sed -e 's/^ *//' -e 's/  */ /g')" ;;
+      esac
+    fi
+  else
+    args="$(field "$a" 4)"
+  fi
   [ -n "$ghdir" ] && type_line "$a" "export GH_CONFIG_DIR=\"$ghdir\""
   type_line "$a" "claude $args"
   echo "started $a  ($args)"
@@ -373,6 +414,47 @@ worktree_project() {
   url="$(git -C "$1" remote get-url origin 2>/dev/null)" || return 0
   printf '%s\n' "$url" | sed -e 's/\.git$//' -e 's#/$##' \
     | awk '{ if (match($0, "://")) { sub(".*://[^/]*/", "") } else if (match($0, ":")) { sub("[^:]*:", "") } n=split($0, p, "/"); if (n>=2) print p[n-1] "/" p[n] }'
+}
+
+# Is this agent's repo opted into the hub? ~/.mcp-hub/config.json's projects
+# list is the operator's own statement of intent, so it — not roster class — is
+# what decides whether an agent should be able to hear a wake.
+hub_optedin() {
+  local proj cfg="$HOME/.mcp-hub/config.json"
+  [ -f "$cfg" ] || return 1
+  proj="$(worktree_project "$(untilde "$(field "$1" 2)")")"
+  [ -n "$proj" ] || return 1
+  python3 - "$cfg" "$proj" <<'PYEOF'
+import json, pathlib, sys
+cfg, proj = pathlib.Path(sys.argv[1]), sys.argv[2]
+try:
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    projects = data.get("projects") or []
+except Exception:
+    sys.exit(1)
+sys.exit(0 if proj in projects else 1)
+PYEOF
+}
+
+# ARM-AT-LAUNCH. A hub-opted-in agent with no channels flag can register, hold a
+# binding and run a heartbeat daemon while being structurally unable to hear a
+# wake — and the hub will still claim "delivered live" to it (proven on
+# mcp-hub-fireblade-wsl 2026-07-25). Rather than make the operator remember a
+# flag per agent, derive it: opted in => wire up comms.
+#
+# Deliberately arms the ROSTER just BEFORE a launch, never mid-session. Comms is
+# a launch-time flag, so "enable it live" would mean killing a running agent's
+# conversation to apply it; doing it pre-launch costs nothing and no session is
+# ever disturbed. Idempotent, and silent when there's nothing to do.
+arm_comms() {
+  local a="$1" cur new
+  has_comms "$a" && return 0
+  hub_optedin "$a" || return 0
+  cur="$(field "$a" 4)"
+  new="$(printf '%s %s' "$cur" "$COMMS_FLAG" | sed -e 's/^ *//' -e 's/  */ /g')"
+  tmp="$(mktemp)"
+  awk -F'|' -v a="$a" -v n="$new" 'BEGIN{OFS="|"} $1==a{$4=n} {print}' "$CONF" > "$tmp" && mv "$tmp" "$CONF"
+  echo "$a: hub-opted-in but had no comms flag — armed for this launch"
 }
 
 # Migrate a legacy roster line: same worktree enrolled under a different
@@ -543,7 +625,7 @@ case "${1:-help}" in
             disrupt="$(cat "$stamp" 2>/dev/null || echo 0)"
             now="$(date +%s)"
             if [ "${disrupt:-0}" -gt 0 ] && [ $((now - disrupt)) -ge 180 ]; then
-              for a in $(squad_agents); do
+              for a in $(comms_agents); do
                 tm has-session -t "=$a" 2>/dev/null || continue
                 pane_alive "$a" || continue
                 started="$(agent_started "$a")" || continue
@@ -594,7 +676,7 @@ case "${1:-help}" in
                 healed=$((healed+1))
               done
             fi
-            for a in $(squad_agents); do
+            for a in $(comms_agents); do
               tm has-session -t "=$a" 2>/dev/null || continue
               pane_alive "$a" || continue
               # Already relaunched by the deaf sweep in THIS pass — leave it be.
@@ -801,7 +883,7 @@ case "${1:-help}" in
             }
             printf '%-26s %-10s %-11s %s\n' 'AGENT' 'TMUX' 'HUB' ''
             for a in $(agents); do
-              hs="$(hub_state "$a")"; is_faculty "$a" && hs="·"   # faculty: no hub by design
+              hs="$(hub_state "$a")"; has_comms "$a" || hs="·"   # no comms flag: no hub state to show
               if tm has-session -t "=$a" 2>/dev/null; then
                 if pane_alive "$a"; then printf '%-26s %-10s %-11s (%s)\n' "$a" up "$hs" "$(pane_cmd "$a")"
                 else printf '%-26s %-10s %-11s session up, claude not running — try: %s restart %s\n' "$a" DEGRADED "$hs" "$CMD" "$a"; fi
@@ -811,6 +893,51 @@ case "${1:-help}" in
             else a="$(need_agent "")" || exit 1; shift; fi
             tmp="$(mktemp)"; awk -F'|' -v a="$a" -v n="$*" 'BEGIN{OFS="|"} $1==a{$4=n} {print}' "$CONF" > "$tmp" && mv "$tmp" "$CONF"
             echo "next launch of $a: $*" ;;
+  comms)    # Turn hub channel-push wake on/off for ONE agent, preserving its
+            # other launch args. A thin wrapper over `args` so there's one
+            # writer of field 4 — and it never touches a running process,
+            # because comms is a LAUNCH flag: it lands on the next start.
+            #   squad comms            -> report this agent's state
+            #   squad comms on  [a]    -> add the channels flag (idempotent)
+            #   squad comms off [a]    -> strip it, keep everything else
+            mode="${2:-}"
+            case "$mode" in
+              on|off) shift 2 ;;
+              "")     mode=show; shift ;;
+              *)      # no mode given, so $2 was an agent name
+                      mode=show; shift ;;
+            esac
+            if [ -n "${1:-}" ] && agents | grep -qxF -- "${1:-}"; then a="$1"
+            else a="$(need_agent "")" || exit 1; fi
+            cur="$(field "$a" 4)"
+            case "$mode" in
+              show) if has_comms "$a"; then echo "$a: comms ON  (args: $cur)"
+                    else echo "$a: comms OFF (args: ${cur:-<none>})"; fi
+                    exit 0 ;;
+              on)   if has_comms "$a"; then echo "$a: comms already on — no change"; exit 0; fi
+                    new="$(printf '%s %s' "$cur" "$COMMS_FLAG" | sed 's/^ *//')" ;;
+              off)  if ! has_comms "$a"; then echo "$a: comms already off — no change"; exit 0; fi
+                    # Drop the channels flag AND its target token (the flag is
+                    # two words: "--...-channels server:hub"), keeping every
+                    # other arg. Leaving an orphaned "server:hub" behind would
+                    # make the next launch fail on an unknown positional.
+                    # `|| true` is load-bearing: with pipefail set (line 14),
+                    # grep -v exits 1 when it filters out EVERY line — which is
+                    # exactly the common case where the channels flag was the
+                    # only arg. Without it, set -e kills `comms off` silently
+                    # and the roster is never written. Empty is a valid result
+                    # here, not a failure.
+                    new="$(printf '%s\n' "$cur" | tr ' ' '\n' \
+                           | grep -vE -- '^--(dangerously-load-development-)?channels$' \
+                           | grep -vE -- '^(server|plugin):hub' \
+                           | tr '\n' ' ' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//' || true)" ;;
+            esac
+            tmp="$(mktemp)"
+            awk -F'|' -v a="$a" -v n="$new" 'BEGIN{OFS="|"} $1==a{$4=n} {print}' "$CONF" > "$tmp" && mv "$tmp" "$CONF"
+            echo "$a: comms $mode — takes effect on next launch (args: ${new:-<none>})"
+            tm has-session -t "=$a" 2>/dev/null && \
+              echo "   it's running now, so relaunch to apply: $CMD restart $a --fresh"
+            exit 0 ;;
   dash)     # The whole-squad monitor: ONE window, one live pane per agent, tiled.
             # Recreates the old "seven VSCode windows on one monitor" view in a
             # single command. Each pane is a nested tmux client attached to that
@@ -964,10 +1091,12 @@ case "${1:-help}" in
                 if [ -n "$mod" ]; then WMOD[$a]="$mod"
                 elif [ "$st" = "down" ] || [ -z "$(tm display -p -t "$a" '#{pane_title}' 2>/dev/null)" ]; then WMOD[$a]=""
                 fi
-                # faculty carries no hub daemon by design — hub_glyph's "?"
-                # (= no status data) is a real alarm for squad but pure noise
-                # here; a running faculty agent is simply ▶
-                if is_faculty "$a"; then g='▶'; else g="$(hub_glyph "$a")"; fi
+                # No comms flag => no hub daemon and no wake path, so hub_glyph's
+                # "?" (= no status data) is a real alarm for a comms agent but
+                # pure noise here; such an agent is simply ▶. Keyed on capability,
+                # not class: a comms-enabled faculty agent shows its REAL hub
+                # glyph, because it now has hub state that can genuinely break.
+                if has_comms "$a"; then g="$(hub_glyph "$a")"; else g='▶'; fi
                 case "$st" in
                   waiting) printf '  \033[1;31m🔴 %-28s %-2s %-4s WAITING ON YOU\033[0m\n' "$a" "$g" "$ctx" ;;
                   working) printf '  \033[32m🟢 %-28s %-2s %-4s working\033[0m\n' "$a" "$g" "$ctx" ;;
@@ -1020,7 +1149,8 @@ case "${1:-help}" in
                 # lines up; 🔴 slots in after it when waiting — the name
                 # jumping right is deliberate attention-grabbing. ctx % rides
                 # after the label: "⚡ dt 44% · ✳ <status>".
-                if is_faculty "$a"; then g='▶'; else g="$(hub_glyph "$a")"; fi
+                # Capability, not class — see the who/board glyph note above.
+                if has_comms "$a"; then g="$(hub_glyph "$a")"; else g='▶'; fi
                 # repo marker, faculty only (squad repos are ALL GitHub —
                 # implied, so the glyph only earns tab space where it
                 # varies). Cached for the painter's lifetime: repo-ness
@@ -1338,6 +1468,11 @@ run
                                   --resume:  add --continue this once (resume last conversation)
                                   --fresh:   drop --continue this once (start a blank conversation)
                                 the roster is never modified — use 'args' to change the default
+  $CMD comms [on|off] [agent]   hub channel-push wake for ONE agent (no args: report state).
+                                comms is a LAUNCH flag, so it applies on next start — never
+                                mid-session. Rarely needed by hand: any agent whose repo is in
+                                the hub opt-in list is armed automatically at launch. Turn it
+                                OFF for an agent you want on the roster but off the hub.
   $CMD attach  [agent] [--no-start]
                                 attach, starting/repairing it first if needed; Ctrl-b d detaches
                                 --no-start: attach only if already up (cockpit terminals use
@@ -1385,9 +1520,14 @@ helpers
 
 roster: $CONF   (agent | worktree | gh_config_dir | claude_args | class)
   class (optional): empty/"squad" = always-on, swept by up/heal, always on who/board.
-  "faculty" = on-demand (general-workspace projects): start/stop it yourself, never
-  healed, visible on who/board only while running. Cockpit terminals appear for both.
-hub opt-in list: ~/.mcp-hub/config.json — maintained by add/rm, never edit by hand
+  "faculty" = on-demand (general-workspace projects): start/stop it yourself,
+  visible on who/board only while running. Cockpit terminals appear for both.
+  CLASS IS LIFECYCLE ONLY — it does not decide hub membership. Healing and the
+  hub glyphs key on COMMS capability (the channels flag in the args field), so a
+  comms-enabled faculty agent is healed and shows its real hub state.
+hub opt-in list: ~/.mcp-hub/config.json — maintained by add/rm, never edit by hand.
+  An opted-in agent is armed with the channels flag automatically at launch; see
+  'comms' to override per agent.
 EOF
   ;;
 esac
