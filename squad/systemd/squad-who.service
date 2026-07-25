@@ -1,0 +1,11 @@
+[Unit]
+Description=squad who — waiting-on-operator watcher: paints dash borders + VSCode tab badges
+
+[Service]
+Type=simple
+ExecStart=%h/Projects/code/monkeypashion/mcp-hub/squad/squad who --watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

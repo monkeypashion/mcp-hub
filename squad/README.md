@@ -73,6 +73,22 @@ agent_name | worktree | gh_config_dir (may be empty) | claude_args
 Env overrides: `SQUAD_CONF` (config path), `SQUAD_SOCKET` (dedicated tmux socket, default
 `squad`), `SQUAD_SLICE` (optional systemd user slice for CPU/RAM ceilings).
 
+## Systemd units (per machine, user scope)
+
+Two units live in `systemd/` — symlink or copy them into `~/.config/systemd/user/` and enable:
+
+```
+ln -s <repo>/squad/systemd/squad-heal.service ~/.config/systemd/user/
+ln -s <repo>/squad/systemd/squad-heal.timer   ~/.config/systemd/user/
+ln -s <repo>/squad/systemd/squad-who.service  ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now squad-heal.timer squad-who.service
+```
+
+`squad-heal` (timer, 2 min) nudges/relaunches up-but-offline agents; `squad-who` is the
+long-running title painter — without it VSCode tabs never badge (status/ctx%/activity).
+Both assume the repo at `~/Projects/code/monkeypashion/mcp-hub`; edit ExecStart if not.
+
 The tmux **session name IS the agent name** (squad runs on its own tmux socket, so no prefix is
 needed). The ops shell session is `ops` — so don't name an agent `ops`.
 

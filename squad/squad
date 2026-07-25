@@ -304,6 +304,12 @@ up_one() {
   else
     tm new-session -d -s "$a" -c "$dir"
   fi
+  # Tab badging depends on tmux EMITTING titles, and the global set-titles
+  # flag defaults OFF — dev only worked via a hand-edited ~/.tmux.conf, and
+  # every fresh box silently lost badging (FB WSL, 2026-07-25). Own it here:
+  # socket-scoped globals, idempotent, can't touch anyone's personal tmux.
+  tm set -g set-titles on 2>/dev/null || true
+  tm set -g set-titles-string '#T' 2>/dev/null || true
   if [ $# -ge 2 ]; then launch_agent_cmd "$a" "$2"; else launch_agent_cmd "$a"; fi
 }
 
@@ -664,10 +670,25 @@ case "${1:-help}" in
                 rm -f "$flag"
               else
                 echo "$a: $state on hub — nudging re-register"
+                # Copy branches on WHY the agent looks offline. The correlation
+                # test (2026-07-25, residual zero) proved every recent "offline"
+                # flap on this box was hub-redeploy churn, not a dead client —
+                # and the old copy's "relaunch will fix it" burned a context per
+                # false alarm (6 in 3 days on vps alone). The detector daemon
+                # stamps hub-reconnect.stamp on every boot-nonce change, so a
+                # fresh stamp = the hub itself just restarted: say so, and
+                # withhold the relaunch advice. Stale/absent stamp = the old
+                # copy stands (dead wake-stream IS real outside that window).
+                stamp="$HOME/.mcp-hub/hub-reconnect.stamp"
+                if [ -n "$(find "$stamp" -mmin -5 2>/dev/null)" ]; then
+                  nudge="hub: your session shows $state because the hub just restarted (redeploy) — this is expected churn, not a fault on your side. Call register() now to rebind; no relaunch needed, and don't diagnose this as a dead wake-stream."
+                else
+                  nudge="hub: your session shows $state. Call register() now to rebind. If this recurs, your wake-stream is dead — re-register won't fix it; a relaunch will (squad restart resumes your conversation)."
+                fi
                 # A wedged pane must cost this ONE nudge, not the whole pass
                 # (2026-07-23: an unbounded send-keys here hung heal 2h28m and
                 # blocked all post-deploy recovery behind it).
-                type_line "$a" "hub: your session shows $state. Call register() now to rebind. If this recurs, your wake-stream is dead — re-register won't fix it; a relaunch will (squad restart resumes your conversation)." \
+                type_line "$a" "$nudge" \
                   || echo "!! $a: nudge send-keys failed/timed out (pane wedged?) — skipping" >&2
                 touch "$flag"
               fi
