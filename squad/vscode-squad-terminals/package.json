@@ -2,7 +2,7 @@
   "name": "squad-terminals",
   "displayName": "Squad Terminals",
   "description": "Auto-opens one plain terminal per squad agent (squad attach) with icon+color, and adds per-agent squad actions to the terminal tab context menu.",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "publisher": "monkeypashion",
   "engines": {
     "vscode": "^1.90.0"
@@ -207,6 +207,26 @@
         "command": "squad.slash.custom",
         "title": "Other /command…",
         "category": "Squad"
+      },
+      {
+        "command": "squad.comms.on",
+        "title": "Comms: on (hub wake)",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.comms.off",
+        "title": "Comms: off",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.resume.on",
+        "title": "Resume conversation on restart: on",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.resume.off",
+        "title": "Resume conversation on restart: off",
+        "category": "Squad"
       }
     ],
     "submenus": [
@@ -229,6 +249,10 @@
       {
         "id": "squad.voiceMenu",
         "label": "Voice"
+      },
+      {
+        "id": "squad.launchMenu",
+        "label": "Launch settings (next launch)"
       }
     ],
     "menus": {
@@ -296,6 +320,10 @@
         {
           "command": "squad.stop",
           "group": "2_lifecycle@3"
+        },
+        {
+          "submenu": "squad.launchMenu",
+          "group": "2_lifecycle@4"
         }
       ],
       "squad.slashMenu": [
@@ -424,6 +452,24 @@
         {
           "command": "squad.voice.off",
           "group": "1_voice@3"
+        }
+      ],
+      "squad.launchMenu": [
+        {
+          "command": "squad.comms.on",
+          "group": "1_comms@1"
+        },
+        {
+          "command": "squad.comms.off",
+          "group": "1_comms@2"
+        },
+        {
+          "command": "squad.resume.on",
+          "group": "2_resume@1"
+        },
+        {
+          "command": "squad.resume.off",
+          "group": "2_resume@2"
         }
       ]
     },

@@ -88,6 +88,35 @@ comms_agents() { for a in $(agents); do has_comms "$a" && echo "$a"; done; }
 # The channels flag itself, single-sourced so `comms on` and arm-at-launch can
 # never drift from what has_comms() recognises.
 COMMS_FLAG="--dangerously-load-development-channels server:hub"
+
+# CONVERSATION CONTINUITY: does a relaunch RESUME this agent's conversation?
+# A separate concern from comms — comms is a capability, this is lifecycle policy
+# — but it lives in the same field and heal reads it: the deaf-sweep refuses to
+# relaunch an agent whose roster lacks --continue, since that would start a blank
+# conversation and silently destroy the running one. So an agent that is
+# wake-capable but NOT resume-capable is detected-deaf-and-unrecoverable: heal
+# nudges it forever with advice that cannot work (proven here 2026-07-25).
+RESUME_FLAG="--continue"
+has_resume() {
+  case " $(field "$1" 4) " in *" $RESUME_FLAG "*) return 0 ;; *) return 1 ;; esac
+}
+
+# Strip whole-word tokens matching an ERE out of an args string.
+# `|| true` is LOAD-BEARING: with pipefail (line 14) grep -v exits 1 when it
+# filters out EVERY line — exactly the case where the flag being removed was the
+# only arg. Without it set -e kills the caller silently and the roster is never
+# written. Empty is a valid result here, not a failure.
+strip_args_tokens() {
+  printf '%s\n' "$1" | tr ' ' '\n' | grep -vE -- "$2" \
+    | tr '\n' ' ' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//' || true
+}
+
+# Single writer for roster field 4 so args/comms/resume/arm_comms can't drift.
+roster_set_args() {
+  local tmp; tmp="$(mktemp)"
+  awk -F'|' -v a="$1" -v n="$2" 'BEGIN{OFS="|"} $1==a{$4=n} {print}' "$CONF" > "$tmp" \
+    && mv "$tmp" "$CONF"
+}
 untilde(){ printf '%s\n' "${1/#\~/$HOME}"; }
 # Resolve an agent name: an explicit arg always wins; otherwise derive it from
 # $PWD by matching against each agent's worktree — so running a verb from inside
@@ -964,24 +993,53 @@ case "${1:-help}" in
               off)  if ! has_comms "$a"; then echo "$a: comms already off — no change"; exit 0; fi
                     # Drop the channels flag AND its target token (the flag is
                     # two words: "--...-channels server:hub"), keeping every
-                    # other arg. Leaving an orphaned "server:hub" behind would
-                    # make the next launch fail on an unknown positional.
-                    # `|| true` is load-bearing: with pipefail set (line 14),
-                    # grep -v exits 1 when it filters out EVERY line — which is
-                    # exactly the common case where the channels flag was the
-                    # only arg. Without it, set -e kills `comms off` silently
-                    # and the roster is never written. Empty is a valid result
-                    # here, not a failure.
-                    new="$(printf '%s\n' "$cur" | tr ' ' '\n' \
-                           | grep -vE -- '^--(dangerously-load-development-)?channels$' \
-                           | grep -vE -- '^(server|plugin):hub' \
-                           | tr '\n' ' ' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//' || true)" ;;
+                    # other arg. An orphaned "server:hub" left behind would make
+                    # the next launch fail on an unknown positional.
+                    new="$(strip_args_tokens "$cur" \
+                           '^--(dangerously-load-development-)?channels$|^(server|plugin):hub')" ;;
             esac
-            tmp="$(mktemp)"
-            awk -F'|' -v a="$a" -v n="$new" 'BEGIN{OFS="|"} $1==a{$4=n} {print}' "$CONF" > "$tmp" && mv "$tmp" "$CONF"
+            roster_set_args "$a" "$new"
             echo "$a: comms $mode — takes effect on next launch (args: ${new:-<none>})"
+            # --resume, NOT --fresh: --fresh drops --continue and starts a blank
+            # conversation, which is a destructive way to apply a settings change.
+            # (The reason --fresh was ever suggested — dodging 2.1.220's
+            # resume-size dialog — died with the wrap-tolerant launch dance.)
             tm has-session -t "=$a" 2>/dev/null && \
-              echo "   it's running now, so relaunch to apply: $CMD restart $a --fresh"
+              echo "   it's running now, so relaunch to apply: $CMD restart $a --resume"
+            exit 0 ;;
+  resume)   # Whether a relaunch RESUMES this agent's conversation (--continue in
+            # the roster). Lifecycle policy, deliberately NOT bundled into comms:
+            # capability and continuity are different questions and conflating
+            # them is the mistake this file already made once with class.
+            # Matters beyond taste: heal's deaf-sweep REFUSES to relaunch an
+            # agent whose roster lacks --continue, so a wake-capable agent
+            # without it can be detected-deaf and still unrecoverable.
+            #   squad resume            -> report state
+            #   squad resume on  [a]    -> relaunches keep the conversation
+            #   squad resume off [a]    -> relaunches start blank
+            mode="${2:-}"
+            case "$mode" in
+              on|off) shift 2 ;;
+              *)      mode=show; shift ;;
+            esac
+            if [ -n "${1:-}" ] && agents | grep -qxF -- "${1:-}"; then a="$1"
+            else a="$(need_agent "")" || exit 1; fi
+            cur="$(field "$a" 4)"
+            case "$mode" in
+              show) if has_resume "$a"; then
+                      echo "$a: resume ON  — relaunches keep the conversation (args: $cur)"
+                    else
+                      echo "$a: resume OFF — relaunches start blank, and heal will REFUSE"
+                      echo "                 to auto-restart it (args: ${cur:-<none>})"
+                    fi
+                    exit 0 ;;
+              on)   if has_resume "$a"; then echo "$a: resume already on — no change"; exit 0; fi
+                    new="$(printf '%s %s' "$RESUME_FLAG" "$cur" | sed -e 's/ *$//' -e 's/^ *//')" ;;
+              off)  if ! has_resume "$a"; then echo "$a: resume already off — no change"; exit 0; fi
+                    new="$(strip_args_tokens "$cur" '^--continue$')" ;;
+            esac
+            roster_set_args "$a" "$new"
+            echo "$a: resume $mode — takes effect on next launch (args: ${new:-<none>})"
             exit 0 ;;
   dash)     # The whole-squad monitor: ONE window, one live pane per agent, tiled.
             # Recreates the old "seven VSCode windows on one monitor" view in a
@@ -1519,6 +1577,12 @@ run
                                 mid-session. Rarely needed by hand: any agent whose repo is in
                                 the hub opt-in list is armed automatically at launch. Turn it
                                 OFF for an agent you want on the roster but off the hub.
+  $CMD resume [on|off] [agent]  whether a relaunch KEEPS the conversation (--continue in the
+                                roster). Also read by heal: it REFUSES to auto-restart a deaf
+                                agent whose roster lacks it, rather than destroy the
+                                conversation — so comms-on + resume-off means heal can detect
+                                the fault and still not fix it. Both are in the cockpit's
+                                right-click menu under "Launch settings".
   $CMD attach  [agent] [--no-start]
                                 attach, starting/repairing it first if needed; Ctrl-b d detaches
                                 --no-start: attach only if already up (cockpit terminals use

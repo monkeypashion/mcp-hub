@@ -378,6 +378,36 @@ function activate(context) {
     );
   }
 
+  // ---- launch settings: roster edits, NOT slash commands ----
+  // Everything above types into the RUNNING claude and takes effect at once.
+  // These two rewrite the agent's roster args and land on its NEXT launch, which
+  // is why they sit beside the lifecycle actions rather than under Slash
+  // commands. Toasted on success because a settings change with no visible
+  // effect on the current session otherwise looks like a no-op click.
+  //   comms  — hub channel-push wake (the --dangerously-load-development-channels
+  //            flag). Normally automatic: any hub-opted-in agent is armed at
+  //            launch. This is the manual override.
+  //   resume — whether a relaunch keeps the conversation (--continue). Also read
+  //            by `squad heal`, which REFUSES to auto-restart a deaf agent
+  //            without it rather than destroy the conversation — so an agent
+  //            with comms on and resume off can be detected-deaf and still
+  //            unrecoverable without a human.
+  for (const [verb, opt] of [
+    ["comms", "on"], ["comms", "off"],
+    ["resume", "on"], ["resume", "off"],
+  ]) {
+    context.subscriptions.push(
+      vscode.commands.registerCommand(`squad.${verb}.${opt}`, (...args) =>
+        withAgents(args, (agents) => {
+          agents.forEach((a) => squadExec([verb, opt, a], a));
+          vscode.window.showInformationMessage(
+            `Squad: ${verb} ${opt} for ${agents.map(shortLabel).join(", ")} — applies on next launch.`
+          );
+        })
+      )
+    );
+  }
+
   // ---- standard claude slash commands (typed into the agent's pane) ----
   // /clear is destructive (wipes the conversation) -> modal confirm.
   for (const slash of ["context", "cost", "status", "doctor", "mcp", "model", "memory", "todos", "help"]) {

@@ -252,6 +252,91 @@ def test_arm_comms_survives_underivable_worktrees(box, worktree_path):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# resume — conversation continuity, a SEPARATE concern from comms
+#
+# heal's deaf-sweep refuses to relaunch an agent whose roster lacks --continue,
+# because that would start a blank conversation and destroy the running one. So
+# an agent with comms ON and resume OFF is detected-deaf and still
+# unrecoverable — heal nudges it forever with advice the hub says cannot work.
+# Deliberately not folded into arm_comms: capability != lifecycle policy.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "args,expected",
+    [
+        ("", False),
+        ("--continue", True),
+        (f"--continue {FLAG}", True),
+        (FLAG, False),
+        ("--continue-on-error", False),  # must match the whole token, not a prefix
+    ],
+)
+def test_has_resume_matches_whole_token_only(box, args, expected):
+    home, worktree, conf = box
+    _roster(conf, [f"a|{worktree}||{args}|faculty"])
+    out = _squad(box, "resume", "a").stdout
+    assert ("resume ON" in out) is expected, out
+
+
+def test_resume_on_preserves_comms_flag(box):
+    home, worktree, conf = box
+    _roster(conf, [f"a|{worktree}||{FLAG}|faculty"])
+    assert _squad(box, "resume", "on", "a").returncode == 0
+    got = _args_of(conf, "a")
+    assert "--continue" in got and FLAG in got
+
+
+def test_resume_off_when_continue_is_the_only_arg(box):
+    """Same set -e/pipefail trap as `comms off`: grep -v exits 1 when it strips
+    every line, which silently aborted the write before the `|| true` guard."""
+    home, worktree, conf = box
+    _roster(conf, [f"a|{worktree}||--continue|faculty"])
+    res = _squad(box, "resume", "off", "a")
+    assert res.returncode == 0, res.stderr
+    assert _args_of(conf, "a") == "", "roster was not written"
+
+
+def test_resume_off_keeps_comms_flag(box):
+    home, worktree, conf = box
+    _roster(conf, [f"a|{worktree}||--continue {FLAG}|faculty"])
+    assert _squad(box, "resume", "off", "a").returncode == 0
+    got = _args_of(conf, "a")
+    assert "--continue" not in got
+    assert FLAG in got, "turning resume off must not disturb comms"
+
+
+def test_resume_toggles_are_idempotent(box):
+    home, worktree, conf = box
+    _roster(conf, [f"a|{worktree}||--continue|faculty"])
+    assert "already on" in _squad(box, "resume", "on", "a").stdout
+    _squad(box, "resume", "off", "a")
+    assert "already off" in _squad(box, "resume", "off", "a").stdout
+
+
+def test_resume_off_warns_that_heal_cannot_restart(box):
+    """The report must name the consequence, not just the state — this is the
+    condition that left a live agent detected-deaf and unrecoverable."""
+    home, worktree, conf = box
+    _roster(conf, [f"a|{worktree}||{FLAG}|faculty"])
+    out = _squad(box, "resume", "a").stdout
+    assert "REFUSE" in out and "heal" in out, out
+
+
+def test_comms_and_resume_are_independent(box):
+    """The two flags must not interfere — the whole point of separating them."""
+    home, worktree, conf = box
+    _roster(conf, [f"a|{worktree}|||faculty"])
+    _squad(box, "comms", "on", "a")
+    _squad(box, "resume", "on", "a")
+    got = _args_of(conf, "a")
+    assert FLAG in got and "--continue" in got
+    _squad(box, "comms", "off", "a")
+    got = _args_of(conf, "a")
+    assert "channels" not in got and "--continue" in got
+
+
 def test_comms_agents_is_the_set_that_can_go_deaf(box):
     """Heal must iterate agents that CAN receive wakes, regardless of class.
 
