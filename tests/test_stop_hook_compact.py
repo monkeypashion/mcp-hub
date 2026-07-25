@@ -118,6 +118,43 @@ async def test_deaf_delivered_push_is_not_falsely_compacted(server):
     assert "line two" in out, "unrendered message must be reprinted in FULL"
 
 
+async def test_deaf_push_still_full_after_wake_ack_expiry(server):
+    """The 2026-07-25 sequel to the test above, proven live on FB WSL.
+
+    The deaf-⚡ gate is only sound while the expectation is PENDING. Once the
+    reaper's sweep_wake_acks() runs (WAKE_ACK_TIMEOUT_SECONDS = 90s), the
+    expired expectation is DELETED and a strike recorded — so
+    has_pending_wake_ack() reverts to False and the gate reports "render not in
+    doubt" for a stream that never rendered anything.
+
+    Real incident: push at 12:21:09, agent deaf, Stop-hook drain ~90 MINUTES
+    later. Long past expiry, so the message was rendered "(already delivered
+    live — ...)" to an agent that had never seen it — it only recovered the
+    message by polling.
+
+    Anything beyond the 90s window must still fail safe → full reprint.
+    """
+    registry = await _setup(server)
+    await _send(server)  # push succeeds + arms expect_wake_ack, NO ack follows
+
+    # The reaper sweeps: expectation expires, strike 1, binding survives.
+    # This is the ⚡-but-deaf steady state — and note a SECOND strike (which
+    # would drop the binding) never comes unless another wake is pushed.
+    with registry._lock:
+        registry._wake_expect["bob"] = 0.0  # force past deadline
+    assert registry.sweep_wake_acks() == [], "strike 1 keeps the binding"
+
+    out = await _call_tool(
+        server, "get_messages", {"agent_name": "bob", "bind": False, "compact": True}
+    )
+
+    assert "already delivered live" not in out, (
+        "an unrendered push was falsely claimed seen-live once its wake-ack "
+        "expectation expired — the 90s window must not become an amnesty"
+    )
+    assert "line two" in out, "unrendered message must be reprinted in FULL"
+
+
 async def test_rebind_forces_full_reprint(server):
     """If the agent rebound after the push, the push may have gone into a
     stream that died — the exact case that silently destroyed messages before.

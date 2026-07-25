@@ -784,9 +784,23 @@ class SessionRegistry:
         reprint, never a "you already saw this" claim. The claim is only safe
         once the recipient has independently acked (an interactive bind /
         reply) BEFORE the Stop-hook drain — the drain itself is NOT render
-        evidence, it's how a deaf agent DISCOVERS what it missed."""
+        evidence, it's how a deaf agent DISCOVERS what it missed.
+
+        Outstanding STRIKES count as unproven too, not just a live expectation.
+        sweep_wake_acks() deletes the expired expectation and records a strike,
+        so gating on `_wake_expect` alone made this claim sound for only
+        WAKE_ACK_TIMEOUT_SECONDS (90s) after the push and then silently
+        inverted — a drain later than that read "no doubt" and truncated on a
+        stream that never rendered (proven on FB WSL 2026-07-25: push 12:21:09,
+        drained ~90 MINUTES later, falsely claimed seen-live). Expiry must not
+        become an amnesty: a missed ack is evidence the stream is deaf, and it
+        only grows staler. Note a second strike — which would drop the binding
+        and end the ambiguity — never arrives unless another wake is pushed, so
+        the ⚡-but-deaf state persists indefinitely on a quiet inbox.
+
+        Only a genuine ack clears this; wake_ack() pops both dicts."""
         with self._lock:
-            return name in self._wake_expect
+            return name in self._wake_expect or self._wake_strikes.get(name, 0) > 0
 
     def sweep_wake_acks(self) -> list[str]:
         """Expire overdue expectations; drop bindings past the strike limit.

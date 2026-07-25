@@ -861,3 +861,36 @@ def test_wake_ack_timely_ack_before_sweep_is_clean():
     reg.wake_ack("alice")
     assert reg.sweep_wake_acks() == []
     assert reg.is_bound("alice")
+
+
+def test_wake_ack_strike_keeps_render_unproven_after_expiry():
+    """A missed ack must stay VISIBLE to the render gate after the sweeper runs.
+
+    Proven live on mcp-hub-fireblade-wsl 2026-07-25: sweep_wake_acks() deletes
+    the expired expectation and records a strike, so has_pending_wake_ack() —
+    which only consults _wake_expect — flips back to False ~90s after the push.
+    A drain later than that reads "render is not in doubt" and falsely claims
+    "already delivered live" on a stream that rendered nothing (the deaf agent
+    had drained 90 MINUTES after the push).
+
+    The strike IS the negative evidence: one unacked wake is already proof the
+    stream didn't render. Only a genuine ack may clear it.
+    """
+    reaped, wake_dead = [], []
+    reg = _ack_registry(reaped, wake_dead)
+    reg.bind("alice", FakeSession())
+
+    reg.expect_wake_ack("alice")
+    assert reg.has_pending_wake_ack("alice"), "pending pre-sweep (already passed)"
+
+    _expire(reg, "alice")
+    assert reg.sweep_wake_acks() == []  # strike 1 — binding survives, deaf + ⚡
+
+    assert reg.has_pending_wake_ack("alice"), (
+        "after the sweeper expired an unacked wake, render is STILL unproven — "
+        "the strike is the evidence and the gate must not lose it"
+    )
+
+    # ...and a real ack is still the only thing that clears it.
+    reg.wake_ack("alice")
+    assert not reg.has_pending_wake_ack("alice")
