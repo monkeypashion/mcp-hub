@@ -453,6 +453,58 @@ function activate(context) {
     );
   }
 
+  // ---- transport: clone this agent into another VSCode workspace ----
+  // The operator's model: pick the agent's tab, pick a TARGET WORKSPACE, and
+  // the whole agent (code, memory, conversation, launch args, its own hub
+  // identity) appears there ready to start. Workspaces are discovered rather
+  // than configured — a .code-workspace file IS the target, so there is no
+  // second registry to keep in sync with reality.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("squad.transport", (...args) =>
+      withAgents(args, async (agents) => {
+        if (agents.length !== 1) {
+          vscode.window.showWarningMessage("Squad: transport one agent at a time.");
+          return;
+        }
+        const agent = agents[0];
+        const found = new Set();
+        for (const dir of [path.join(os.homedir(), "Projects"), os.homedir()]) {
+          try {
+            for (const f of fs.readdirSync(dir)) {
+              if (f.endsWith(".code-workspace")) found.add(path.join(dir, f));
+            }
+          } catch { /* dir absent — fine */ }
+        }
+        // Never offer the workspace this agent already lives in.
+        const here = vscode.workspace.workspaceFile;
+        const picks = [...found]
+          .filter((f) => !here || canon(f) !== canon(here.fsPath))
+          .map((f) => ({ label: path.basename(f, ".code-workspace"), description: f }));
+        if (!picks.length) {
+          vscode.window.showWarningMessage(
+            "Squad: no other .code-workspace files found in ~/Projects or ~."
+          );
+          return;
+        }
+        const pick = await vscode.window.showQuickPick(picks, {
+          title: `Transport ${shortLabel(agent)} to which workspace?`,
+          placeHolder: "The agent is CLONED — the source keeps running",
+        });
+        if (!pick) return;
+        // Runs in a visible terminal rather than fire-and-forget: transport
+        // REFUSES on a dirty or unpushed tree, and that refusal is something
+        // the operator must read, not a silently-swallowed exit code.
+        const t = vscode.window.createTerminal({
+          name: `transport → ${pick.label}`,
+          iconPath: new vscode.ThemeIcon("arrow-right"),
+          color: new vscode.ThemeColor("terminal.ansiCyan"),
+        });
+        t.show(true);
+        sendWhenReady(t, `${SQUAD} transport ${agent} --to ${JSON.stringify(pick.description)}`);
+      })
+    )
+  );
+
   // ---- standard claude slash commands (typed into the agent's pane) ----
   // /clear is destructive (wipes the conversation) -> modal confirm.
   for (const slash of ["context", "cost", "status", "doctor", "mcp", "model", "memory", "todos", "help"]) {
@@ -492,6 +544,12 @@ function activate(context) {
   // workspace (squad / general / windows) shows exactly its own agents.
   // Plain folder windows (no .code-workspace file) get no auto-terminals —
   // the context-menu commands above still work everywhere.
+  // Re-runnable: the roster and the workspace's folder list both change
+  // UNDER a live window (transport adds a folder entry and a roster row to a
+  // workspace that is already open), and terminal creation is idempotent —
+  // every branch below skips what already exists. Called once at activation
+  // and again from the watchers wired at the end of activate().
+  const buildCockpit = () => {
   const wf = vscode.workspace.workspaceFile;
   if (!wf) return;
   const wsDirs = new Set(
@@ -581,6 +639,33 @@ function activate(context) {
   // is built, show it with the board on top, without stealing focus.
   const boardTerm = [...vscode.window.terminals].find((t) => t.name === BOARD);
   if (boardTerm) boardTerm.show(true);
+  };
+
+  buildCockpit();
+
+  // Roster + folder watchers. Registered UNCONDITIONALLY — and deliberately
+  // after buildCockpit()'s first call rather than behind it, because the case
+  // that needs them most is a workspace with NO matching rows yet: transport
+  // writes the folder entry and the roster row into an already-open window,
+  // and without these the agent only appears after a manual reload. The old
+  // code returned early when there was nothing to build, which is exactly
+  // when a watcher matters.
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeWorkspaceFolders(() => buildCockpit())
+  );
+  try {
+    const confDir = path.join(os.homedir(), ".config", "squad");
+    const confWatcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(vscode.Uri.file(confDir), "squad.conf")
+    );
+    // change AND create: `squad transport` appends to the roster, but a fresh
+    // machine may not have the file at all when the window opens.
+    confWatcher.onDidChange(() => buildCockpit());
+    confWatcher.onDidCreate(() => buildCockpit());
+    context.subscriptions.push(confWatcher);
+  } catch {
+    /* watcher unavailable (remote/virtual FS) — reload still works */
+  }
 
   // Focusing a DOWN agent's terminal means "I want claude HERE" — offer (or
   // perform) the start right then, instead of leaving the operator at a bare

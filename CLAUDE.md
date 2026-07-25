@@ -141,6 +141,69 @@ mklink /J %USERPROFILE%\.claude\skills\memory-sync D:\Projects\code\monkeypashio
 
 **Three or more clones**: same ceremony, star-shaped. Each spoke exports **in turn** with the canonical machine importing between exports (staging is last-write-wins per filename — draining between exports means the curator sees every divergent version instead of only the last). Then one curation, one publish, all spokes force-import + verify. Linear cost, single curation point, no pairwise sync.
 
+## Transport — clone an agent into another workspace
+
+`squad transport <agent> --to <file.code-workspace>` moves a whole agent, not
+just its repo: code, memory, conversation history, launch args and its own hub
+identity. In the cockpit it's the agent tab's **Transport to workspace…** entry,
+which lists the `.code-workspace` files it finds in `~/Projects` and `~`.
+
+```bash
+squad transport mcp-hub-fireblade-wsl --to ~/Projects/xport.code-workspace
+# optional: --dest <dir>   (default: <workspace-dir>/<workspace-name>/<repo>)
+```
+
+The agent lands **stopped** — starting it is the operator's call.
+
+**A "target workspace" is a `.code-workspace` file.** The extension gates
+terminals on folder membership, so transport writes the folder entry into that
+file (a surgical JSONC insert — these files carry comments and hand-formatting
+that a load-and-dump would destroy).
+
+**The gate.** Transport refuses unless the source is reconstructible from the
+remote: git repo with an `origin`, no uncommitted changes, no unpushed commits,
+no untracked files. What travels is what's *pushed*, so the destination is
+provably identical rather than approximately so. Only `.mcp.json` is exempt —
+it never travels by git and is **generated** at the destination from
+`DEFAULT_HUB_URL`/`$MCP_HUB_URL` (a copied one would carry the wrong URL to a
+box on another network). Plain folders are not transportable at all.
+
+**Conversation history is re-keyed, not copied.** A transcript embeds its
+absolute path in four structural fields — `cwd`,
+`file-history-delta.trackingPath`, `.backup.realParentDir`, and
+`file-history-snapshot.snapshot.trackedFileBackups` (a dict **keyed** by
+absolute path). Message content is left byte-exact: it records what happened on
+a machine that genuinely had that path. `mcp-hub transport-history` does the
+work and enforces two separate guards — *faithfulness* (nothing outside the
+named fields changed) and *completeness* (every surviving reference sits in a
+content field). Only the second can catch a coupling nobody thought of, and it
+**refuses to write** when it trips. Without it a clone carries live pointers
+into the source agent's memory dir, where a rewind would write.
+
+**Identity is re-derived, never copied.** Two clones of one repo on one machine
+derive the same name (repo from the git remote, host from the machine), so
+transport registers a per-worktree suffix under `workspaces` in
+`~/.mcp-hub/config.json`:
+
+```json
+{"workspaces": {"/home/me/Projects/xport/mcp-hub": "xport"}}
+```
+
+`cli.py` and `statusline/statusline-command.js` both honour it — **change both
+or neither**. Absent, derivation is unchanged, so the existing fleet keeps its
+names. Anything needing an agent's name should ask `mcp-hub identity --cwd <dir>`
+rather than re-deriving it; squad deriving from `basename` while the cli derives
+from the git remote is what makes a clone's statusline read `hub ?`.
+
+**First launch is pre-authorised.** A transported agent always lands in an
+untrusted directory with a freshly generated `.mcp.json`, so it would block on
+the folder-trust and new-MCP-server dialogs — and `heal` can't tell, because the
+pane looks alive. Transport seeds `hasTrustDialogAccepted` and
+`enabledMcpjsonServers: ["hub"]` into `~/.claude.json` for the destination path.
+The launch dance is deliberately **not** taught to click these: auto-trusting
+arbitrary repo content defeats the point of the prompt. Seeding makes it an
+explicit act by whoever authorised the transport.
+
 ## Stop hook — auto-surface queued messages
 
 Channels-based wake fires for `priority="normal"` and `"urgent"` messages, but `"low"` messages are deliberately queue-only (no wake). Without a Stop hook, agents only see queued items when they happen to call `get_messages()` — which often means never. The Stop hook closes that gap by auto-checking the inbox at every turn boundary. It also self-heals the keep-alive daemon: if no live daemon owns the agent's pidfile at a turn boundary, one is spawned detached (singleton-capped, fail-open).

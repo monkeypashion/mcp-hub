@@ -330,6 +330,46 @@ def _sanitize_ident(raw: str) -> str:
     ).strip("-")
 
 
+def _norm_path(p: str) -> str:
+    """Absolute, symlink-resolved, trailing-separator-free path for keying."""
+    try:
+        return os.path.realpath(os.path.abspath(p)).rstrip("/\\")
+    except OSError:
+        return os.path.abspath(p).rstrip("/\\")
+
+
+def _workspace_suffix(cwd: str) -> str | None:
+    """Per-worktree identity suffix from ~/.mcp-hub/config.json, or None.
+
+    Two clones of ONE repo on ONE machine derive the same name — `repo` comes
+    from the git remote and `host` from the machine, so nothing in the
+    derivation can tell them apart. Renaming the directory doesn't help. That
+    made a transported clone indistinguishable from its source: `squad ls`
+    reported it offline (no status file under the roster name) while the
+    statusline inside it reported the SOURCE's status (same derived name).
+    Two readouts of one agent, neither true.
+
+    `workspaces` maps an absolute worktree path to a suffix:
+
+        {"workspaces": {"/home/me/Projects/xport/mcp-hub": "xport"}}
+
+    Machine-local and keyed by path, so it is clone-local BY CONSTRUCTION —
+    unlike the old committed marker, it cannot be dragged to another clone.
+    Absent → unchanged derivation, so the existing fleet keeps its names.
+
+    Mirrored in statusline-command.js — change both or neither.
+    """
+    table = _load_hub_config().get("workspaces")
+    if not isinstance(table, dict):
+        return None
+    target = _norm_path(cwd)
+    for path, suffix in table.items():
+        if isinstance(path, str) and isinstance(suffix, str) and suffix.strip():
+            if _norm_path(path) == target:
+                return suffix.strip()
+    return None
+
+
 def _parse_org_repo(url: str) -> tuple[str, str] | None:
     """Parse (org, repo) from a git remote URL, ignoring the host entirely.
 
@@ -392,7 +432,9 @@ def _derive_agent_identity(cwd: str | None) -> tuple[str | None, str | None]:
     if not isinstance(opted_in, list) or project not in opted_in:
         return None, None
     host = _sanitize_ident(platform.node() or "unknown-host")
-    name = _sanitize_ident(f"{repo}-{host}") or None
+    suffix = _workspace_suffix(cwd)
+    raw = f"{repo}-{host}-{suffix}" if suffix else f"{repo}-{host}"
+    name = _sanitize_ident(raw) or None
     return name, project
 
 
@@ -791,6 +833,254 @@ def memory_import_command(args: argparse.Namespace) -> int:
             replace_index=args.replace_index,
         )
     )
+
+
+# ---------------------------------------------------------------------------
+# Transport: move an agent's CONVERSATION HISTORY to a new project path.
+#
+# Memory files are path-LOCATED but not path-ENCODED — copying them to the
+# destination's encoded dir is enough. Transcripts are different: they embed
+# the old absolute path in structural fields, ~2,200 times in a single day's
+# session. Those must be rewritten or the transported agent carries live
+# pointers back into the SOURCE agent's state (verified: 536 of them aimed at
+# the source's own memory dir, where a rewind would have written).
+#
+# Message content is NEVER rewritten. It records what happened on a machine
+# that genuinely had that path; changing it would forge the transcript.
+# ---------------------------------------------------------------------------
+
+# The transcript is written by JS JSON.stringify: compact separators, non-ASCII
+# emitted literally. Match it exactly or every line silently reformats into a
+# semantically-identical but byte-different file.
+_JS_JSON = {"separators": (",", ":"), "ensure_ascii": False}
+
+# Top-level fields where a surviving reference to the old path is CORRECT —
+# they are the historical record, not live pointers.
+_HISTORY_CONTENT_FIELDS = ("message", "toolUseResult", "attachment")
+
+
+def _rekey_deep(obj: Any, old: tuple[str, str], new: tuple[str, str]) -> Any:
+    """Repath every string AND every dict key in a structural subtree."""
+    def sub(s: str) -> str:
+        return s.replace(old[0], new[0]).replace(old[1], new[1])
+
+    if isinstance(obj, str):
+        return sub(obj)
+    if isinstance(obj, list):
+        return [_rekey_deep(v, old, new) for v in obj]
+    if isinstance(obj, dict):
+        return {
+            (sub(k) if isinstance(k, str) else k): _rekey_deep(v, old, new)
+            for k, v in obj.items()
+        }
+    return obj
+
+
+def _history_stale_fields(obj: Any, old: tuple[str, str]) -> list[str]:
+    """Dotted paths of every field still referencing the source path."""
+    found: list[str] = []
+
+    def stale(s: Any) -> bool:
+        return isinstance(s, str) and (old[0] in s or old[1] in s)
+
+    def walk(o: Any, prefix: str) -> None:
+        if isinstance(o, str):
+            if stale(o):
+                found.append(prefix)
+        elif isinstance(o, dict):
+            for k, v in o.items():
+                if stale(k):
+                    found.append(prefix)
+                walk(v, f"{prefix}.{k}" if prefix else str(k))
+        elif isinstance(o, list):
+            for v in o:
+                walk(v, prefix + "[]")
+
+    walk(obj, "")
+    return found
+
+
+def _rekey_transcript(text: str, old_cwd: str, new_cwd: str) -> tuple[str, dict[str, int]]:
+    """Re-key one transcript. Returns (new_text, stats).
+
+    FOUR structural couplings, all established empirically:
+      1. top-level  cwd
+      2. file-history-delta.trackingPath
+      3. file-history-delta.backup.realParentDir
+      4. file-history-snapshot.snapshot.trackedFileBackups — a dict KEYED by
+         absolute path, each value carrying its own realParentDir
+
+    (4) is the one that bites: the FIRST file-history-snapshot line in a
+    transcript has an empty trackedFileBackups, so sampling one line "proves"
+    the type carries no paths. It doesn't.
+
+    Two DIFFERENT guards, because they catch different failures:
+      - faithfulness  — nothing outside the named fields changed. Checked
+        against our own field list, so it can never catch a field we forgot.
+      - completeness  — every surviving reference sits in a content field.
+        This is the only thing that catches a MISSED field, and the caller
+        must refuse to write when it trips.
+    """
+    old = (_claude_project_dirname(old_cwd), old_cwd)
+    new = (_claude_project_dirname(new_cwd), new_cwd)
+    stats = {"lines": 0, "cwd": 0, "tracking": 0, "realparent": 0,
+             "snapshot": 0, "unparseable": 0, "roundtrip_mismatch": 0,
+             "content_touched": 0, "completeness_violations": 0}
+    out: list[str] = []
+
+    for raw in text.splitlines():
+        stats["lines"] += 1
+        if not raw.strip():
+            out.append(raw)
+            continue
+        try:
+            d = json.loads(raw)
+        except json.JSONDecodeError:
+            stats["unparseable"] += 1
+            out.append(raw)              # never drop a line we can't parse
+            continue
+
+        if json.dumps(d, **_JS_JSON) != raw:
+            stats["roundtrip_mismatch"] += 1
+        before = json.loads(json.dumps(d, **_JS_JSON))
+
+        cwd_val = d.get("cwd")
+        if isinstance(cwd_val, str) and old[1] in cwd_val:
+            d["cwd"] = cwd_val.replace(old[1], new[1])
+            stats["cwd"] += 1
+
+        if d.get("type") == "file-history-delta":
+            tp = d.get("trackingPath")
+            if isinstance(tp, str) and (old[0] in tp or old[1] in tp):
+                d["trackingPath"] = _rekey_deep(tp, old, new)
+                stats["tracking"] += 1
+            bk = d.get("backup")
+            if isinstance(bk, dict):
+                rp = bk.get("realParentDir")
+                if isinstance(rp, str) and (old[0] in rp or old[1] in rp):
+                    bk["realParentDir"] = _rekey_deep(rp, old, new)
+                    stats["realparent"] += 1
+
+        if d.get("type") == "file-history-snapshot":
+            snap = d.get("snapshot")
+            if isinstance(snap, dict):
+                tb = snap.get("trackedFileBackups")
+                if isinstance(tb, dict) and tb:
+                    rekeyed = _rekey_deep(tb, old, new)
+                    if rekeyed != tb:
+                        snap["trackedFileBackups"] = rekeyed
+                        stats["snapshot"] += 1
+
+        after = json.loads(json.dumps(d, **_JS_JSON))
+
+        def blank(o: dict[str, Any]) -> str:
+            o = json.loads(json.dumps(o, **_JS_JSON))
+            o.pop("cwd", None)
+            if o.get("type") == "file-history-delta":
+                o.pop("trackingPath", None)
+                if isinstance(o.get("backup"), dict):
+                    o["backup"].pop("realParentDir", None)
+            if o.get("type") == "file-history-snapshot":
+                if isinstance(o.get("snapshot"), dict):
+                    o["snapshot"].pop("trackedFileBackups", None)
+            return json.dumps(o, sort_keys=True, **_JS_JSON)
+
+        if blank(before) != blank(after):
+            stats["content_touched"] += 1
+
+        for field in _history_stale_fields(after, old):
+            root = field.split(".")[0].split("[")[0]
+            if root not in _HISTORY_CONTENT_FIELDS:
+                stats["completeness_violations"] += 1
+
+        out.append(json.dumps(d, **_JS_JSON))
+
+    return "\n".join(out) + ("\n" if out else ""), stats
+
+
+def identity_command(args: argparse.Namespace) -> int:
+    """Print the derived identity for a worktree — the ONE source of truth.
+
+    squad used to derive the roster name itself from `basename "$dest"` while
+    this module derives it from the git remote. Clone a repo into a
+    differently-named directory and the two disagree, so the daemon writes
+    status under one name while squad looks for the other and the statusline
+    reads `hub ?` forever. Anything that needs the name asks here instead.
+
+    Bypasses the opt-in gate (`--any`) when a caller needs the name for a
+    worktree it is about to opt in — otherwise this returns nothing for a
+    repo that hasn't been enrolled yet, which is exactly the transport case.
+    """
+    cwd = args.cwd or os.getcwd()
+    name, project = _derive_agent_identity(cwd)
+    if name is None and args.any:
+        url = _git_remote_url(cwd)
+        parsed = _parse_org_repo(url) if url else None
+        if parsed:
+            org, repo = parsed
+            project = f"{org}/{repo}"
+            host = _sanitize_ident(platform.node() or "unknown-host")
+            suffix = _workspace_suffix(cwd)
+            raw = f"{repo}-{host}-{suffix}" if suffix else f"{repo}-{host}"
+            name = _sanitize_ident(raw) or None
+    if name is None:
+        print("", end="")
+        return 1
+    if args.json:
+        print(json.dumps({"name": name, "project": project, "cwd": cwd}))
+    else:
+        print(name)
+    return 0
+
+
+def transport_history_command(args: argparse.Namespace) -> int:
+    """Copy + re-key every transcript from one project path to another."""
+    src_dir = pathlib.Path.home() / ".claude" / "projects" / _claude_project_dirname(args.from_cwd)
+    dst_dir = pathlib.Path.home() / ".claude" / "projects" / _claude_project_dirname(args.to_cwd)
+    if not src_dir.is_dir():
+        print(f"!! no history for {args.from_cwd} (looked in {src_dir})", file=sys.stderr)
+        return 1
+    files = sorted(p for p in src_dir.glob("*.jsonl") if p.is_file())
+    if not files:
+        print(f"no transcripts in {src_dir}")
+        return 0
+
+    if not args.dry_run:
+        dst_dir.mkdir(parents=True, exist_ok=True)
+
+    failed = 0
+    for src in files:
+        text, stats = _rekey_transcript(
+            src.read_text(encoding="utf-8"), args.from_cwd, args.to_cwd
+        )
+        flag = ""
+        if stats["completeness_violations"]:
+            # A structural field still points at the source: we missed a
+            # coupling. Writing would hand the clone live pointers into the
+            # source agent's state. Refuse — loudly.
+            flag = "  ✗ REFUSED (structural leak — a path field was missed)"
+            failed += 1
+        elif stats["content_touched"]:
+            flag = "  ✗ REFUSED (would alter message content)"
+            failed += 1
+        elif not args.dry_run:
+            (dst_dir / src.name).write_text(text, encoding="utf-8")
+        print(
+            f"  {src.name}: {stats['lines']} lines, "
+            f"cwd={stats['cwd']} tracking={stats['tracking']} "
+            f"realparent={stats['realparent']} snapshot={stats['snapshot']}"
+            f"{flag}"
+        )
+        if stats["roundtrip_mismatch"]:
+            print(
+                f"    !! {stats['roundtrip_mismatch']} lines did not round-trip "
+                "byte-exactly — serializer mismatch",
+                file=sys.stderr,
+            )
+
+    verb = "would transport" if args.dry_run else "transported"
+    print(f"{verb} {len(files) - failed}/{len(files)} transcript(s) -> {dst_dir}")
+    return 1 if failed else 0
 
 
 def _discover_agent_from_marker(cwd: str | None) -> tuple[str | None, str | None]:
@@ -1798,6 +2088,43 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Hub MCP endpoint (default: {DEFAULT_HUB_URL}, or $MCP_HUB_URL)",
     )
 
+    ident = sub.add_parser(
+        "identity",
+        help="Print the derived agent name for a worktree (single source of truth)",
+        description=(
+            "Prints the derived agent name for a worktree. Anything that needs "
+            "an agent's name should ask here rather than re-deriving it — "
+            "squad and this module disagreeing is what makes a clone's "
+            "statusline read `hub ?`."
+        ),
+    )
+    ident.add_argument("--cwd", default=None, help="Worktree (default: current directory)")
+    ident.add_argument("--json", action="store_true", help="Emit {name, project, cwd}")
+    ident.add_argument(
+        "--any",
+        action="store_true",
+        help="Derive even when the project isn't opted in yet (transport needs this)",
+    )
+
+    xport_hist = sub.add_parser(
+        "transport-history",
+        help="Copy + re-key an agent's conversation history to a new path",
+        description=(
+            "Copies every transcript from one project path's Claude state dir "
+            "to another's, rewriting the four structural path fields (cwd, "
+            "file-history-delta.trackingPath, .backup.realParentDir, and "
+            "file-history-snapshot.snapshot.trackedFileBackups) so the "
+            "transported agent resumes at the new path. Message content is "
+            "left byte-exact. Refuses to write any transcript where a "
+            "structural field still points at the source."
+        ),
+    )
+    xport_hist.add_argument("--from-cwd", required=True, help="Source worktree (absolute)")
+    xport_hist.add_argument("--to-cwd", required=True, help="Destination worktree (absolute)")
+    xport_hist.add_argument(
+        "--dry-run", action="store_true", help="Report what would transfer; write nothing"
+    )
+
     return parser
 
 
@@ -1833,6 +2160,10 @@ def main(argv: list[str] | None = None) -> int:
         return memory_import_command(args)
     if args.subcommand == "memory-verify":
         return memory_verify_command(args)
+    if args.subcommand == "identity":
+        return identity_command(args)
+    if args.subcommand == "transport-history":
+        return transport_history_command(args)
 
     parser.print_help()
     return 0

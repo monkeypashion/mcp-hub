@@ -2025,6 +2025,8 @@ _CLI_SUBCOMMANDS = {
     "memory-export",
     "memory-import",
     "memory-verify",
+    "transport-history",
+    "identity",
 }
 
 

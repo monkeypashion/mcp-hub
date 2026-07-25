@@ -581,6 +581,217 @@ rm_agent() {   # squad rm [agent] — exact inverse of add: session, roster, opt
   echo "removed '$a' (session, roster, hub opt-in, daemon) — repo left in place"
 }
 
+# ── Transport: clone an agent into another VSCode workspace ─────────────────
+# Operator's model: pick an agent in the terminal panel, pick a TARGET
+# WORKSPACE (a .code-workspace file), and the whole agent appears there ready
+# to right-click/start — code, memory, conversation history, launch args and
+# its own hub identity. Transport ends STOPPED; starting is the operator's.
+#
+# Identity is RE-DERIVED at the destination, never copied. Two clones of one
+# repo on one machine derive the SAME name (repo from the git remote, host
+# from the machine), so transport registers a per-worktree suffix under
+# "workspaces" in ~/.mcp-hub/config.json, which cli.py and the statusline both
+# honour. Without it `squad ls` calls the clone offline while the statusline
+# inside it shows the SOURCE's status — two readouts, neither true.
+
+ws_label() { basename "$1" .code-workspace; }
+
+# Refuse unless the destination is reconstructible FROM THE REMOTE: what
+# travels is what's pushed, so the clone is provably identical rather than
+# approximately so. Untracked files block too — except .mcp.json, which never
+# travels by git and is regenerated at the destination.
+transport_gate() {
+  local dir="$1" ahead untracked
+  git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 || { echo "not a git repo"; return 1; }
+  git -C "$dir" remote get-url origin >/dev/null 2>&1 \
+    || { echo "no 'origin' remote — transport requires one"; return 1; }
+  [ -z "$(git -C "$dir" status --porcelain --untracked-files=no)" ] \
+    || { echo "uncommitted changes"; return 1; }
+  ahead="$(git -C "$dir" rev-list --count '@{u}..HEAD' 2>/dev/null)" \
+    || { echo "branch has no upstream — push it first"; return 1; }
+  [ "$ahead" = 0 ] || { echo "$ahead unpushed commit(s)"; return 1; }
+  untracked="$(git -C "$dir" ls-files --others --exclude-standard | grep -vx '.mcp.json' || true)"
+  [ -z "$untracked" ] \
+    || { echo "untracked files ($(printf '%s' "$untracked" | tr '\n' ' '))"; return 1; }
+  return 0
+}
+
+# Register a per-worktree identity suffix (machine-local, keyed by path, so
+# it is clone-local by construction — it can never be committed and dragged
+# to another clone the way the old marker was).
+register_ws_suffix() {
+  python3 - "$HOME/.mcp-hub/config.json" "$1" "$2" <<'PYEOF'
+import json, pathlib, sys
+cfg, path, suffix = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+cfg.parent.mkdir(parents=True, exist_ok=True)
+try:
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    assert isinstance(data, dict)
+except Exception:
+    data = {}
+ws = data.get("workspaces")
+if not isinstance(ws, dict):
+    ws = {}
+ws[path] = suffix
+data["workspaces"] = ws
+cfg.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+print(f"  identity suffix: {suffix}")
+PYEOF
+}
+
+# Pre-seed the destination's trust + MCP approval. The launch dance
+# deliberately does NOT auto-answer the folder-trust dialog (auto-trusting
+# arbitrary repo content defeats the point of the prompt), and a transported
+# agent ALWAYS lands in an untrusted directory with a freshly generated
+# .mcp.json — so without this it hangs on two dialogs forever and heal can't
+# tell, because the pane looks alive. Seeding makes the trust decision an
+# explicit act by whoever authorised the transport.
+seed_claude_trust() {
+  python3 - "$HOME/.claude.json" "$1" <<'PYEOF'
+import json, pathlib, sys, os, tempfile
+p, proj = pathlib.Path(sys.argv[1]), sys.argv[2]
+try:
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert isinstance(data, dict)
+except Exception:
+    print("  !! ~/.claude.json unreadable — agent will hit the trust dialog")
+    raise SystemExit(0)                      # fail-open: never block transport
+projects = data.setdefault("projects", {})
+entry = projects.setdefault(proj, {})
+entry["hasTrustDialogAccepted"] = True
+enabled = entry.get("enabledMcpjsonServers")
+if not isinstance(enabled, list):
+    enabled = []
+if "hub" not in enabled:
+    enabled.append("hub")
+entry["enabledMcpjsonServers"] = enabled
+entry.setdefault("allowedTools", [])
+entry.setdefault("disabledMcpjsonServers", [])
+# Atomic replace: this file is live and rewritten by every running session.
+fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".claude.json.")
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2)
+os.replace(tmp, p)
+print("  trust + hub MCP pre-approved")
+PYEOF
+}
+
+# Insert a folder entry into a .code-workspace. These are JSONC with
+# hand-formatting and comments, so this is a surgical text insert — a
+# load-and-dump would strip the operator's comments and reflow the file.
+ws_add_folder() {
+  python3 - "$1" "$2" "$3" <<'PYEOF'
+import pathlib, re, sys
+ws, path, name = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+text = ws.read_text(encoding="utf-8")
+if f'"{path}"' in text:
+    print("  workspace already lists this folder")
+    raise SystemExit(0)
+m = re.search(r'"folders"\s*:\s*\[', text)
+if not m:
+    print("  !! no \"folders\" array — add the folder by hand")
+    raise SystemExit(0)                      # fail-open
+i = m.end()
+rest = text[i:]
+empty = rest.lstrip().startswith("]")
+entry = '\n\t\t{\n\t\t\t"name": "%s",\n\t\t\t"path": "%s"\n\t\t}' % (name, path)
+entry = entry.replace("\t", "  ")
+ws.write_text(text[:i] + entry + ("" if empty else ",") + text[i:], encoding="utf-8")
+print(f"  workspace folder added: {name}")
+PYEOF
+}
+
+transport_agent() {
+  local a="$1" wsfile="$2" dest="$3"
+  local src label branch name proj args class url reason repo
+  src="$(untilde "$(field "$a" 2)")"
+  [ -d "$src" ] || { echo "!! $a: missing worktree $src"; return 1; }
+  wsfile="$(untilde "$wsfile")"
+  [ -f "$wsfile" ] || { echo "!! no such workspace file: $wsfile"; return 1; }
+
+  if ! reason="$(transport_gate "$src")"; then
+    echo "!! $a: REFUSED — $reason"
+    echo "   transport moves what is PUSHED, so the destination is provably"
+    echo "   identical to the remote. Commit and push, then retry."
+    return 1
+  fi
+
+  label="$(ws_label "$wsfile")"
+  url="$(git -C "$src" remote get-url origin)"
+  repo="$(basename "${url%.git}")"
+  branch="$(git -C "$src" branch --show-current)"
+  [ -n "$dest" ] || dest="$(dirname "$wsfile")/$label/$repo"
+  if [ -e "$dest" ] && [ -n "$(ls -A "$dest" 2>/dev/null)" ]; then
+    echo "!! destination not empty: $dest"; return 1
+  fi
+
+  echo "transporting $a -> $label"
+  echo "  source : $src ($branch @ $(git -C "$src" rev-parse --short HEAD))"
+  echo "  dest   : $dest"
+
+  # 1. code — from the REMOTE, never the source's disk
+  git clone --quiet --branch "$branch" "$url" "$dest" || { echo "!! clone failed"; return 1; }
+  echo "  cloned $(git -C "$dest" rev-parse --short HEAD)"
+
+  # 2. identity: suffix first, so every later step derives the SAME name
+  register_ws_suffix "$dest" "$label"
+  proj="$(python3 -c "import sys;u=sys.argv[1].removesuffix('.git');p=u.split(':')[-1] if '://' not in u else u.split('://')[1].split('/',1)[1];print('/'.join([x for x in p.strip('/').split('/') if x][-2:]))" "$url")"
+  optin_project add "$proj"
+  name="$(MCP_HUB_QUIET=1 mcp-hub identity --cwd "$dest" --any 2>/dev/null)"
+  [ -n "$name" ] || { echo "!! could not derive a name for $dest"; return 1; }
+  echo "  identity: $name  ($proj)"
+
+  # 3. hub connection — untracked, so it never travels by git
+  python3 - "$dest/.mcp.json" <<'PYEOF'
+import json, os, sys, pathlib
+url = os.environ.get("MCP_HUB_URL", "http://100.109.6.114:8090/mcp")
+pathlib.Path(sys.argv[1]).write_text(
+    json.dumps({"mcpServers": {"hub": {"type": "http", "url": url}}}, indent=2) + "\n",
+    encoding="utf-8")
+print(f"  .mcp.json generated ({url})")
+PYEOF
+
+  # 4. memory — path-located, not path-encoded: a plain copy is correct
+  python3 - "$src" "$dest" <<'PYEOF'
+import pathlib, shutil, sys
+def enc(p): return "".join("-" if c in "/\\:" else c for c in p.rstrip("/\\"))
+home = pathlib.Path.home()
+s = home / ".claude" / "projects" / enc(sys.argv[1]) / "memory"
+d = home / ".claude" / "projects" / enc(sys.argv[2]) / "memory"
+if not s.is_dir():
+    print("  no memory to transport"); raise SystemExit(0)
+d.mkdir(parents=True, exist_ok=True)
+n = 0
+for f in sorted(s.glob("*.md")):
+    shutil.copy2(f, d / f.name); n += 1
+print(f"  memory: {n} file(s)")
+PYEOF
+
+  # 5. conversation history — re-keyed (four structural fields, two guards)
+  mcp-hub transport-history --from-cwd "$src" --to-cwd "$dest" \
+    | sed 's/^/  /' || echo "  !! history transport reported problems"
+
+  # 6. trust + MCP approval, or it hangs on dialogs at first launch
+  seed_claude_trust "$dest"
+
+  # 7. roster row — args and class travel; an agent without them is
+  #    operationally a different agent (can't be healed, can't hear)
+  args="$(field "$a" 4)"; class="$(field "$a" 5)"
+  mkdir -p "$(dirname "$CONF")"
+  if agents | grep -qxF -- "$name"; then
+    echo "  roster row already exists for $name"
+  else
+    printf '%s|%s||%s|%s\n' "$name" "$dest" "$args" "$class" >> "$CONF"
+    echo "  roster row added (args: ${args:-none}, class: ${class:-squad})"
+  fi
+
+  # 8. make it visible in the target workspace
+  ws_add_folder "$wsfile" "$dest" "$repo"
+
+  echo "done — start it with: $CMD start $name"
+  echo "      (or right-click its tab in $label)"
+}
+
 handoff() {
   local a="$1" dir cur
   dir="$(untilde "$(field "$a" 2)")"; cur="$(git -C "$dir" branch --show-current)"
@@ -1550,6 +1761,17 @@ sys.stdout.write("".join("%s\x1f%d\x1f%d\n" % r for r in out))
               done
             else board_paint "$(board_scan)"; fi ;;
   handoff)  a="$(need_agent "${2:-}")" || exit 1; handoff "$a" ;;
+  transport) # squad transport [agent] --to <workspace-file> [--dest <dir>]
+            shift; ws_arg=""; dest_arg=""; a_arg=""
+            while [ $# -gt 0 ]; do case "$1" in
+              --to)   ws_arg="${2:-}"; shift 2 ;;
+              --dest) dest_arg="${2:-}"; shift 2 ;;
+              -*)     echo "!! unknown transport flag '$1' (valid: --to, --dest)" >&2; exit 1 ;;
+              *)      a_arg="$1"; shift ;;
+            esac; done
+            [ -n "$ws_arg" ] || { echo "usage: $CMD transport [agent] --to <file.code-workspace> [--dest <dir>]" >&2; exit 1; }
+            a="$(need_agent "$a_arg")" || exit 1
+            transport_agent "$a" "$ws_arg" "$dest_arg" ;;
   add)      add_agent "${2:-}" "${3:-}" "${4:-}" ;;
   rm)       a="$(need_agent "${2:-}")" || exit 1; rm_agent "$a" ;;
   pull-local) pull_local "${2:-}" ;;

@@ -84,6 +84,31 @@ process.stdin.on('end', () => {
   try {
     const sanitizeIdent = (s) =>
       String(s).toLowerCase().replace(/[^a-z0-9_-]/g, '-').replace(/^-+|-+$/g, '');
+    // Per-worktree identity suffix — mirrors cli.py's _workspace_suffix.
+    // Two clones of ONE repo on ONE machine derive the same name, so a
+    // transported clone would read its SOURCE's status file and display the
+    // source's wakeability as its own. When a suffix is configured we use it
+    // EXCLUSIVELY (no fallback to the bare name): showing another agent's
+    // status is worse than showing none.
+    const workspaceSuffix = () => {
+      try {
+        const cfg = JSON.parse(
+          fs.readFileSync(path.join(os.homedir(), '.mcp-hub', 'config.json'), 'utf8')
+        );
+        const table = cfg && cfg.workspaces;
+        if (!table || typeof table !== 'object') return null;
+        const norm = (p) => {
+          try { return fs.realpathSync(path.resolve(p)).replace(/[/\\]+$/, ''); }
+          catch { return path.resolve(p).replace(/[/\\]+$/, ''); }
+        };
+        const target = norm(cwd);
+        for (const [p, s] of Object.entries(table)) {
+          if (typeof s === 'string' && s.trim() && norm(p) === target) return s.trim();
+        }
+      } catch { /* no config / unreadable → no suffix */ }
+      return null;
+    };
+
     const candidates = [];
     try {
       const url = execSync('git remote get-url origin', {
@@ -95,7 +120,10 @@ process.stdin.on('end', () => {
       const parts = tail.split('/').filter(Boolean);
       if (parts.length >= 2) {
         const repo = parts[parts.length - 1];
-        candidates.push(sanitizeIdent(`${repo}-${os.hostname()}`));
+        const suffix = workspaceSuffix();
+        candidates.push(sanitizeIdent(
+          suffix ? `${repo}-${os.hostname()}-${suffix}` : `${repo}-${os.hostname()}`
+        ));
       }
     } catch { /* not a git repo / no origin → marker fallback */ }
     try {
