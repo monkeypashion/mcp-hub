@@ -127,10 +127,15 @@ async def test_deaf_push_still_full_after_wake_ack_expiry(server):
     has_pending_wake_ack() reverts to False and the gate reports "render not in
     doubt" for a stream that never rendered anything.
 
-    Real incident: push at 12:21:09, agent deaf, Stop-hook drain ~90 MINUTES
-    later. Long past expiry, so the message was rendered "(already delivered
-    live — ...)" to an agent that had never seen it — it only recovered the
-    message by polling.
+    Real incident: push at 12:21:09 (hub time), agent deaf, Stop-hook drain
+    ~10 MINUTES later. Long past the 90-SECOND expiry, so the message was
+    rendered "(already delivered live — ...)" to an agent that had never seen
+    it — it only recovered the message by polling.
+
+    Note the claim is NOT reliably false — it tracks ELAPSED TIME, not delivery,
+    so it also fires correctly on a genuinely-live push once 90s have passed
+    (observed both ways the same day). The signal carries no information about
+    delivery either way, which is why this must fail safe rather than guess.
 
     Anything beyond the 90s window must still fail safe → full reprint.
     """
