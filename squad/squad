@@ -158,17 +158,22 @@ classify_text() {
   # prompt: a dialog footer as the literal last line is a dialog, wherever the
   # chrome is. Quoted text is followed by the agent's own UI, never ends there.
   lastline="$(printf '%s\n' "$t" | tail -1)"
-  if   printf '%s\n' "$below" | grep -qE '❯ 1\. [Y]es|[D]o you want to|[D]o you trust|[N]o, and tell Claude|requires [a]pproval' \
+  if   printf '%s\n' "$below" | grep -qE '❯ 1\. [Y]es|[D]o you want to|[D]o you trust|[N]o, and tell Claude|requires [a]pproval|[R]esume from summary' \
     || printf '%s\n' "$lastline" | grep -qE '[E]nter to confirm|[E]sc to cancel|[T]ab to amend'; then printf 'waiting'
   # WORKING: the live spinner / tool line is PRESENT-tense with a running
-  # elapsed timer in parens — "Nucleating… (1m 55s · ↓ 6.4k tokens)",
-  # "Running… (5s · timeout 1m)". The finished line is PAST-tense with no
+  # elapsed timer in parens — "Nucleating… (~1m 55s · ↓ 6.4k tokens)",
+  # "Running… (~5s · timeout 1m)". The finished line is PAST-tense with no
   # parens — "✻ Worked for 17s" — so the "… (<n><unit>" shape is what
-  # separates mid-turn from between-turns.
-  # 2026-07-20: "esc to interrupt" ALONE was the old test and it silently
+  # separates mid-turn from between-turns. (The ~ in the examples is not in
+  # the real UI — it stops these comment lines matching the pattern below,
+  # per this function's never-match-own-source rule.)
+  # 2026-07-20: "[e]sc to interrupt" ALONE was the old test and it silently
   # stopped matching in this build (2.1.215) — every working agent read as
   # idle, so `who` under-reported and heal's don't-interrupt-real-work guard
   # was inert. Keep the legacy pattern as a fallback for builds that show it.
+  # (Comment is char-classed for the same reason the patterns are: this
+  # file's own source must never classify as working — found 2026-07-25 when
+  # the rig's self-match guard failed on exactly this line.)
   elif printf '%s\n' "$t" | grep -qE '[e]sc to interrupt|…[[:space:]]*\([0-9]+[hms]'; then printf 'working'
   else printf 'idle'; fi
 }
@@ -177,6 +182,13 @@ classify_agent() {
   # NB: capture-pane is a pane-target command — no "=" prefix (see top note)
   classify_text "$(tm capture-pane -p -t "$1" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -20)"
 }
+
+# Wrap-tolerant pane probe for the launch dance: -J re-joins lines tmux soft-
+# wrapped, and stripping ALL whitespace heals hard wraps too (a 35-col VSCode
+# client re-wraps dialogs mid-word — that blinded the dance's grep and looped
+# dreamteam through 3 relaunches, 2026-07-25). Match flattened tokens against
+# this, e.g. 'channeldevelopment', never phrases with spaces.
+pane_flat() { tm capture-pane -p -J -t "$1" 2>/dev/null | tr -d '[:space:]'; }
 
 # Per-agent hub state files under ~/.mcp-hub, named with the same sanitisation
 # the daemon uses (non [A-Za-z0-9_-] -> _). status-*.json is the daemon's
@@ -314,19 +326,48 @@ launch_agent_cmd() {
   [ -n "$ghdir" ] && type_line "$a" "export GH_CONFIG_DIR=\"$ghdir\""
   type_line "$a" "claude $args"
   echo "started $a  ($args)"
-  # --dangerously-load-development-channels pops a confirm prompt on launch; auto-accept it
-  # (server:hub is your own hub = the "local development" case; option 1 is the default → Enter).
-  # if-form, not `grep && {...}`: when the prompt never shows (already
+  # Startup-dialog dance — auto-answer the two dialogs claude can pop at
+  # launch, in one loop because they STACK (channels first, resume-size
+  # behind it — observed order, dreamteam 2026-07-25):
+  #  - channels confirm (--dangerously-load-development-channels): option 1
+  #    (accept) is the default → Enter. server:hub is our own hub = the
+  #    "local development" case.
+  #  - resume-size dialog (client ≥2.1.220, --continue/--resume of a big
+  #    conversation: "1. [R]esume from summary (recommended) / 2. [R]esume
+  #    full session as-is / 3. Don't ask me again" — char-classed here per
+  #    classify_text's never-match-own-source rule): operator policy 2026-07-25
+  #    "resume full, I'll manage context separately" → option 2 via
+  #    Down+Enter, the exact keystrokes proven on the live dreamteam wedge.
+  #    NEVER option 3 — "don't ask me again" writes client-side state we
+  #    don't own.
+  # Matching is wrap-tolerant (pane_flat): a narrow client re-wraps dialog
+  # text mid-word, so grep flattened tokens, never phrases with spaces.
+  # if-form, not `grep && {...}`: when a prompt never shows (already
   # accepted, or hidden behind a trust dialog), the &&-list left the loop —
   # and this function — with a failing status, which set -e turned into
   # "up dies after starting one agent" (2026-07-23 migration).
-  case "$args" in *dangerously-load-development-channels*)
-    for _ in $(seq 1 10); do sleep 1
-      if tm capture-pane -t "$a" -p 2>/dev/null | grep -qi 'channel development'; then
-        tm send-keys -t "$a" Enter; break
+  # Exit: both dialogs answered, or statusline chrome visible (= claude is
+  # up, past the dialog phase), or 25s (e.g. trust dialog holding the pane —
+  # classify_text surfaces that as waiting; same fail-open as before).
+  local want_channels=0 want_resume=0 flat
+  case "$args" in *dangerously-load-development-channels*) want_channels=1 ;; esac
+  case "$args" in *--continue*|*--resume*) want_resume=1 ;; esac
+  if [ "$want_channels" = 1 ] || [ "$want_resume" = 1 ]; then
+    for _ in $(seq 1 25); do sleep 1
+      flat="$(pane_flat "$a")"
+      if [ "$want_channels" = 1 ] && printf '%s' "$flat" | grep -qi 'channeldevelopment'; then
+        tm send-keys -t "$a" Enter; want_channels=0; continue
       fi
-    done ;;
-  esac
+      if [ "$want_resume" = 1 ] && printf '%s' "$flat" | grep -qi 'resumefromsummary'; then
+        tm send-keys -t "$a" Down
+        tm send-keys -t "$a" Enter
+        want_resume=0; continue
+      fi
+      if [ "$want_channels" = 0 ] && [ "$want_resume" = 0 ]; then break; fi
+      # Chrome tokens, flattened (see classify_text for the spaced originals).
+      if printf '%s' "$flat" | grep -qE 'ctx\[|foragents|accepteditson|bypasspermissions'; then break; fi
+    done
+  fi
   return 0
 }
 
@@ -341,9 +382,13 @@ up_one() {
   fi
   # new-session bootstraps the tmux server on first launch; wrap under the slice if one is configured
   if [ -n "$SLICE" ] && ! tm list-sessions >/dev/null 2>&1 && systemctl --user list-unit-files 2>/dev/null | grep -q "^$SLICE"; then
-    systemd-run --user --slice="$SLICE" --scope -q tmux -L "$SOCK" new-session -d -s "$a" -c "$dir"
+    # -x/-y: a real size for the detached window (tmux defaults 80x24 with no
+    # client; a narrow attached client shrinks it further) — wide panes keep
+    # startup dialogs unwrapped for the dance + classify greps (dash already
+    # launches at 220x60 for the same reason).
+    systemd-run --user --slice="$SLICE" --scope -q tmux -L "$SOCK" new-session -d -s "$a" -c "$dir" -x 220 -y 60
   else
-    tm new-session -d -s "$a" -c "$dir"
+    tm new-session -d -s "$a" -c "$dir" -x 220 -y 60
   fi
   # Tab badging depends on tmux EMITTING titles, and the global set-titles
   # flag defaults OFF — dev only worked via a hand-edited ~/.tmux.conf, and
@@ -1354,8 +1399,9 @@ sys.stdout.write("".join("%s\x1f%d\x1f%d\n" % r for r in out))
                   [ -n "$q" ] || q="$(printf '%s\n' "$tail" | grep -E 'requires [a]pproval' | tail -1 | sed 's/^[[:space:]]*//')"
                 fi
                 act="$(printf '%s\n' "$tail" | grep -E '^●' | tail -1 | sed 's/^●[[:space:]]*//' | cut -c1-72 || true)"
-                # Elapsed comes from the SPINNER line only ("Nucleating… (1m 55s
-                # · ↓ 6.4k)"). A bare "(<n><unit>" also matches the statusline's
+                # Elapsed comes from the SPINNER line only ("Nucleating… (~1m 55s
+                # · ↓ 6.4k)" — ~ added so this comment can't match classify's
+                # working pattern). A bare "(<n><unit>" also matches the statusline's
                 # 5h-limit timer — which is how this first read "2h" for a turn
                 # seconds old. Anchor on the ellipsis, same shape classify uses.
                 el="$(printf '%s\n' "$tail" | grep -E '…[[:space:]]*\([0-9]+[hms]' | tail -1 \
