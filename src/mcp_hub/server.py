@@ -350,22 +350,55 @@ def _log_bind_diagnostic(source: str, name: str, session: Any) -> None:
 
 
 def is_channel_capable(session: Any) -> bool:
-    """True if `session`'s client advertises the claude/channel experimental
-    capability — i.e. is the kind of long-lived Claude Code session that can
-    actually receive a channel-push wake.
+    """True if `session`'s client declares the claude/channel experimental
+    capability.
 
-    Why this check exists: every Stop hook (cli.py) spawns a fresh
+    ⚠️ CURRENTLY RETURNS FALSE FOR EVERY CLIENT. Read this before using it,
+    extending it, or "fixing" #17 with it.
+
+    What it was written for: every Stop hook (cli.py) spawns a fresh
     streamablehttp_client to call get_messages / get_broadcasts_for_agent.
-    That bare client doesn't advertise claude/channel and is torn down when
-    the hook process exits. Without this gate, the Stop hook's identifying
-    tool calls hit `touch_session`, overwrite the agent's real wake-binding
-    with the stop-hook's ephemeral session_id, then the ephemeral session
-    DELETEs and the binding points at a dead session — silently breaking
-    wake on every Stop-hook fire.
+    That bare client is torn down when the hook process exits, so without a
+    gate its identifying tool calls hit `touch_session`, overwrite the agent's
+    real wake-binding with the ephemeral session_id, and leave the binding
+    pointing at a dead session — silently breaking wake on every Stop-hook
+    fire.
 
-    Only sessions advertising claude/channel are wakeable, so only those
-    belong in the registry. Sessions without it would never receive a push
-    anyway — binding them is just noise that clobbers real bindings.
+    Why it does not discriminate: `claude/channel` is a SERVER-declared
+    capability in this protocol, not a client-declared one. Clients check
+    whether the SERVER declared it (Claude Code filters connected servers on
+    `capabilities.experimental["claude/channel"]` and errors with "server did
+    not declare claude/channel capability"); the hub declares it in
+    create_server, which is why pushes render at all. Clients never send it,
+    so this predicate is unsatisfiable as written.
+
+    Established 2026-07-25 by two independent methods:
+      * a localhost listener captured the raw `initialize` from a real
+        2.1.220 — BOTH channels-loaded and flagless arms byte-identical:
+        capabilities={"roots":{"listChanged":true},"elicitation":{}}, no
+        experimental dict in either;
+      * string extraction from the 2.1.219 and 2.1.220 client bundles found
+        identical channel-capability counts, so no client version ever
+        "dropped" it — and the only `experimental: { 'claude/channel': {} }`
+        occurrences are documentation examples aimed at server authors.
+
+    Consequences, all load-bearing:
+      * The touch gate below has rejected 100% of sessions since it was wired
+        2026-07-18. It appeared to fix the clobbering bug because blocking
+        every bind necessarily blocks the ephemeral ones too — it never
+        distinguished them. Tool-call drift self-heal is therefore dead, and
+        register() (which has NO such gate) is the only reason any agent in
+        the fleet is bound at all.
+      * DO NOT gate register() on this — it would unbind the entire fleet.
+        That is the parked #17, and it must not be revived in this form.
+      * Client-side capability declaration is not available as evidence for
+        anything, including the compact "already delivered live" claim. Use
+        BEHAVIOURAL evidence instead (see has_pending_wake_ack) or inspect the
+        agent's launch args out-of-band (squad's has_comms()).
+
+    Kept rather than deleted because the gate's blanket-reject happens to
+    preserve the property it was added for; replacing it needs a predicate
+    that actually discriminates, which is a design task, not a cleanup.
     """
     params = getattr(session, "client_params", None)
     if params is None:
@@ -570,13 +603,24 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         """
         if ctx is None or not name:
             return
-        # THE GATE (wired 2026-07-18, corroborated by both clones): only
-        # sessions advertising claude/channel may bind. An ephemeral utility
-        # client (memory-export's twin-notify, any CLI calling send/post/
-        # broadcast as an agent) would otherwise re-point the agent's wake
-        # target at a session that dies when the process exits — the exact
-        # failure is_channel_capable's docstring was written for, previously
-        # only defended piecemeal via bind=False on the get_* paths. A
+        # THE GATE (wired 2026-07-18). Intent: only sessions that can receive a
+        # channel push may bind, so an ephemeral utility client (memory-export's
+        # twin-notify, any CLI calling send/post/broadcast as an agent) can't
+        # re-point the agent's wake target at a session that dies when the
+        # process exits — previously defended only piecemeal via bind=False on
+        # the get_* paths.
+        #
+        # ⚠️ IN PRACTICE THIS REJECTS EVERYTHING, including real interactive
+        # sessions — clients never declare claude/channel (see
+        # is_channel_capable's docstring for the 2026-07-25 evidence). The
+        # original "corroborated by both clones" note was wrong about WHY it
+        # worked: it blocks ephemeral clients by blocking all clients. So
+        # touch_session never binds anyone, tool-call drift self-heal is dead,
+        # and register() carries every binding in the fleet.
+        #
+        # Left in place deliberately: the blanket reject still delivers the
+        # anti-clobbering property, and a discriminating replacement needs a
+        # behavioural or launch-args signal (not a declarative one). A
         # non-capable session also must NOT clear is_idle: a CLI call is not
         # the agent's interactive turn.
         if not is_channel_capable(ctx.session):
