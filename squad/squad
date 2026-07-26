@@ -655,8 +655,8 @@ add_folder() {  # squad add-folder <dir> — enrol an EXISTING folder as an agen
   # scratch agents are plain directories) and neither is any prior Claude
   # history. Where a git remote DOES exist we derive the proper hub identity and
   # opt the project in, so comms come free — a bonus, never a gate.
-  local dir="$1" name proj
-  [ -n "$dir" ] || { echo "usage: $CMD add-folder <dir>" >&2; return 1; }
+  local dir="$1" wsfile="${2:-}" name proj
+  [ -n "$dir" ] || { echo "usage: $CMD add-folder <dir> [--to <file.code-workspace>]" >&2; return 1; }
   dir="$(untilde "$dir")"
   [ -d "$dir" ] || { echo "!! no such directory: $dir" >&2; return 1; }
   dir="$(cd "$dir" && pwd)"                       # absolute + symlink-free
@@ -665,7 +665,16 @@ add_folder() {  # squad add-folder <dir> — enrol an EXISTING folder as an agen
   # two rows for one worktree makes field() pick one arbitrarily.
   local owner
   owner="$(awk -F'|' -v d="$dir" '$2==d{print $1; exit}' "$CONF" 2>/dev/null || true)"
-  if [ -n "$owner" ]; then echo "$owner (already enrolled)"; return 0; fi
+  if [ -n "$owner" ]; then
+    echo "$owner (already enrolled)"
+    # Enrolment and workspace membership are INDEPENDENT: an agent can be
+    # enrolled and absent from a given workspace, which is exactly the state
+    # `ws-remove` leaves behind. Returning early here meant the CLI could never
+    # put it back — the cockpit only worked because the extension added the
+    # folder itself afterwards (operator confirmed the asymmetry, 2026-07-26).
+    [ -n "$wsfile" ] && ws_add_folder "$wsfile" "$dir" "$(basename "$dir")"
+    return 0
+  fi
 
   # Identity: ask the cli when there's a git remote to derive from — never
   # re-derive here, that divergence is what makes a statusline read `hub ?`.
@@ -697,6 +706,7 @@ add_folder() {  # squad add-folder <dir> — enrol an EXISTING folder as an agen
   else
     printf '%s|%s||%s|faculty\n' "$name" "$dir" "$RESUME_FLAG" >> "$CONF"
   fi
+  [ -n "$wsfile" ] && ws_add_folder "$wsfile" "$dir" "$(basename "$dir")"
   echo "$name"
 }
 
@@ -2393,7 +2403,14 @@ print("\n".join(r[2] for r in rows))
             ws_del_folder "$ws_arg" "$(untilde "$(field "$a" 2)")"
             echo "  '$a' is still enrolled (roster, hub opt-in and worktree untouched)."
             echo "  To retire it everywhere instead: $CMD rm $a" ;;
-  add-folder) add_folder "${2:-}" ;;
+  add-folder) # squad add-folder <dir> [--to <file.code-workspace>]
+            shift; d_arg="${1:-}"; ws_arg=""
+            while [ $# -gt 0 ]; do case "$1" in
+              --to) ws_arg="${2:-}"; shift 2 ;;
+              -*)   echo "!! unknown add-folder flag '$1' (valid: --to)" >&2; exit 1 ;;
+              *)    shift ;;
+            esac; done
+            add_folder "$d_arg" "$(untilde "$ws_arg")" ;;
   ext-align) ext_align ;;
   add)      # squad add <org>/<repo> [--to <file.code-workspace>]
             # Clone from GitHub into the RIGHT account folder (org_alias picks the

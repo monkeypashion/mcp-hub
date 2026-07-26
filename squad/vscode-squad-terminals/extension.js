@@ -783,8 +783,36 @@ function activate(context) {
           "Remove from workspace"
         );
         if (ok !== "Remove from workspace") return;
-        agents.forEach((a) => squadExec(["ws-remove", a, "--from", here.fsPath], a));
-        setTimeout(() => buildCockpitRef && buildCockpitRef(), 800);
+        // Remove via the API, NOT by shelling out to `squad ws-remove`.
+        // ws-remove edits the .code-workspace file directly, and VSCode reacts to
+        // an external change to that file by RELOADING THE WINDOW on its own
+        // heuristic — the operator saw it reload on one removal and not the next,
+        // which is the same inconsistency from two different mechanisms.
+        // updateWorkspaceFolders applies live, never reloads, and lets VSCode own
+        // the file's formatting. Same reasoning as the add path.
+        //
+        // The CLI verb stays: it is the only way to edit a workspace that isn't
+        // currently open.
+        const folders = vscode.workspace.workspaceFolders || [];
+        const targets = new Set(
+          agents
+            .map((a) => (rosterRows().find((r) => r.agent === a) || {}).worktree)
+            .filter(Boolean)
+            .map(canon)
+        );
+        // Remove highest index first: each removal reindexes the ones after it.
+        const idx = folders
+          .map((f, i) => [i, canon(f.uri.fsPath)])
+          .filter(([, p]) => targets.has(p))
+          .map(([i]) => i)
+          .sort((x, y) => y - x);
+        if (!idx.length) {
+          vscode.window.showInformationMessage(
+            "Squad: this workspace doesn't list that folder."
+          );
+          return;
+        }
+        for (const i of idx) vscode.workspace.updateWorkspaceFolders(i, 1);
       })
     )
   );

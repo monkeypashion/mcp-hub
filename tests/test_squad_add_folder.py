@@ -126,3 +126,35 @@ def test_relative_path_is_stored_absolute(env, tmp_path):
     )
     assert res.returncode == 0, res.stderr
     assert _rows(env)[0][1] == str(folder.resolve())
+
+
+def test_already_enrolled_still_lists_the_folder_in_a_workspace(env, tmp_path):
+    """The asymmetry the operator found by trying the CLI.
+
+    Enrolment and workspace membership are INDEPENDENT — `ws-remove` leaves an
+    agent enrolled but absent from a workspace. `add-folder` used to return early
+    on "already enrolled" and never restore the folder entry, so the CLI could not
+    undo what ws-remove did. The cockpit path only worked because the extension
+    added the folder itself afterwards.
+    """
+    env_, conf = env
+    folder = tmp_path / "notes"
+    folder.mkdir()
+    ws = tmp_path / "t.code-workspace"
+    ws.write_text('{\n  "folders": [],\n  "settings": {}\n}\n', encoding="utf-8")
+
+    first = subprocess.run(["bash", str(SQUAD), "add-folder", str(folder), "--to", str(ws)],
+                           capture_output=True, text=True, timeout=60, env=env_)
+    assert first.returncode == 0, first.stderr
+    assert str(folder) in ws.read_text(), "fresh enrolment must list the folder"
+
+    # simulate ws-remove: folder entry gone, agent still enrolled
+    ws.write_text('{\n  "folders": [],\n  "settings": {}\n}\n', encoding="utf-8")
+    assert "notes-" in conf.read_text()
+
+    second = subprocess.run(["bash", str(SQUAD), "add-folder", str(folder), "--to", str(ws)],
+                            capture_output=True, text=True, timeout=60, env=env_)
+    assert second.returncode == 0, second.stderr
+    assert "already enrolled" in second.stdout
+    assert str(folder) in ws.read_text(), "already-enrolled must STILL restore the folder"
+    assert len(_rows(env)) == 1, "and must not duplicate the roster row"
