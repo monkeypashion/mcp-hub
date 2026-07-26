@@ -2055,6 +2055,11 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             tags: Extra comma-separated tags, merged with the card's TAGS line.
         """
         now = time.time()
+        # Defensive size cap: the harvester takes DECISION→end-of-turn, so a
+        # convention-breaking turn (card followed by a ramble) could ship a
+        # novel. The queue is for one-glance asks; the ledger keeps raw
+        # bounded. 4KB is ~8x a well-formed card.
+        card = card[:4096]
         f = parse_decision_card(card)
         all_tags = ",".join(sorted({
             *(t for t in f["tags"].split(",") if t),
@@ -2062,10 +2067,29 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         }))
         conn = _get_db(db_path)
         open_row = conn.execute(
-            "SELECT id FROM decisions WHERE agent = ? AND status = 'open' "
+            "SELECT id, ask FROM decisions WHERE agent = ? AND status = 'open' "
             "AND source = ?",
             (from_agent, source),
         ).fetchone()
+        # A DIFFERENT ask is a new card, not a restatement — supersede the
+        # old row instead of overwriting it, or ask A's history vanishes
+        # from the ledger the moment the agent moves on to ask B. "Different"
+        # is token-overlap, not equality: agents rephrase when restating,
+        # and exact-match would churn a superseded row per rewording.
+        if open_row:
+            old = set((open_row["ask"] or "").lower().split())
+            new = set(f["ask"].lower().split())
+            different = (
+                bool(old) and bool(new)
+                and len(old & new) / len(old | new) < 0.5
+            )
+            if different:
+                conn.execute(
+                    "UPDATE decisions SET status='superseded', decided_at=? "
+                    "WHERE id=?",
+                    (now, open_row["id"]),
+                )
+                open_row = None
         if open_row:
             conn.execute(
                 """UPDATE decisions SET updated_at=?, raw=?, ask=?, why=?,

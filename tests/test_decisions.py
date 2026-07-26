@@ -377,3 +377,50 @@ async def test_resolve_never_touches_api_cards(server):
     )
     assert out == ""
     assert "svc" in await _call_tool(server, "decision_list", {})
+
+
+# ---------------------------------------------------------------------------
+# Hardening (operator: "make it solid while we have it open", 2026-07-26)
+# ---------------------------------------------------------------------------
+
+
+async def test_different_ask_supersedes_instead_of_overwriting(server):
+    """Ask A's ledger row must survive the agent moving on to ask B —
+    supersede, never overwrite."""
+    await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
+    card_b = CARD_V2.replace("approve the widget rebuild",
+                             "delete the staging database entirely tonight")
+    out = await _call_tool(server, "decision_put", {"from_agent": "alice", "card": card_b})
+    assert "#2 opened" in out
+    import json as _json
+    all_rows = _json.loads(
+        await _call_tool(server, "decision_list", {"status": "all", "format": "json"})
+    )
+    by_status = {r["status"] for r in all_rows}
+    assert "superseded" in by_status and "open" in by_status
+    assert len(all_rows) == 2
+
+
+async def test_rephrased_same_ask_updates_not_supersedes(server):
+    """Agents reword when restating — token-overlap similarity must treat a
+    rephrase as the SAME ask (no row churn, age preserved)."""
+    await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
+    reworded = CARD_V2.replace("approve the widget rebuild",
+                               "approve rebuilding the widget")
+    out = await _call_tool(server, "decision_put", {"from_agent": "alice", "card": reworded})
+    assert "updated" in out
+    import json as _json
+    all_rows = _json.loads(
+        await _call_tool(server, "decision_list", {"status": "all", "format": "json"})
+    )
+    assert len(all_rows) == 1
+
+
+async def test_card_raw_is_capped(server):
+    """A convention-breaking card (DECISION header then a ramble) must not
+    store a novel."""
+    huge = CARD_V2 + ("ramble " * 2000)
+    await _call_tool(server, "decision_put", {"from_agent": "alice", "card": huge})
+    import json as _json
+    rows = _json.loads(await _call_tool(server, "decision_list", {"format": "json"}))
+    assert len(rows[0]["raw"]) <= 4096

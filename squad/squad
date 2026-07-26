@@ -2454,9 +2454,12 @@ for name in order:
     if name in DEC:
         # open hub card wins over bio AND recap: it is the ask itself,
         # self-clearing, and exempt from the idle gate (open = pending
-        # until the agent withdraws it at its next Stop)
+        # until the agent withdraws it at its next Stop). Card text is
+        # agent-authored and lands raw in the operator terminal — strip
+        # control chars so a card can never carry ANSI escapes in.
         c = DEC.pop(name)
-        txt = " ".join((c.get("raw") or "").split())[:480]
+        txt = re.sub(r"[\x00-\x1f\x7f]", " ", c.get("raw") or "")
+        txt = " ".join(txt.split())[:480]
         age = max(0, now - int(c.get("submitted_at") or now))
         rows.append((0, age, "%s\x1f%s\x1fhub\x1f%s\x1f1\x1f%s" % (name, deaf, age_h(age), txt)))
         continue
@@ -2495,7 +2498,8 @@ for name in order:
 # local transcript and no bio next: line) still raise a hand
 for name, c in DEC.items():
     if not name: continue
-    txt = " ".join((c.get("raw") or "").split())[:480]
+    txt = re.sub(r"[\x00-\x1f\x7f]", " ", c.get("raw") or "")
+    txt = " ".join(txt.split())[:480]
     age = max(0, now - int(c.get("submitted_at") or now))
     rows.append((0, age, "%s\x1f%s\x1fhub\x1f%s\x1f1\x1f%s" % (name, "", age_h(age), txt)))
 # curated bio lines first, then recaps freshest-first — stale sinks

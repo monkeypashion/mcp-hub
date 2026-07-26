@@ -132,7 +132,9 @@ def _extract_decision_card(turn_text: str) -> str:
     card = matches[-1].group(0).strip()
     if "ASK:" not in card:
         return ""
-    return card
+    # cap before shipping — a convention-breaking turn (card then ramble)
+    # must not put a novel on the wire; the hub caps again defensively
+    return card[:4096]
 
 
 async def _query_hub(
@@ -1788,7 +1790,9 @@ def _write_decisions_cache(decisions_json: str) -> None:
             return
         path = _state_dir() / "decisions-open.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
+        # pid-suffixed tmp: every daemon on the box writes this file — a
+        # shared tmp name would let two writers truncate each other mid-write
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
         tmp.write_text(
             json.dumps({"ts": int(time.time()), "cards": rows}),
             encoding="utf-8",
@@ -2079,7 +2083,11 @@ async def _heartbeat_loop(hub_url: str, agent_name: str) -> bool:
                         try:
                             dl = await session.call_tool(
                                 "decision_list",
-                                {"status": "open", "format": "json"},
+                                # explicit high limit — the default (50)
+                                # would silently drop queue overflow, and a
+                                # silent cap reads as "covered everything"
+                                {"status": "open", "format": "json",
+                                 "limit": 500},
                             )
                             _write_decisions_cache(_extract_text(dl))
                         except Exception:  # noqa: BLE001
