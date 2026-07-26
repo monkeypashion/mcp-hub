@@ -155,6 +155,24 @@ into the hub, so comms come free — a bonus, never a gate. A plain folder gets
 `--continue` but **not** the comms flag, since that flag is inert without a hub
 identity and implying comms it cannot have would make the roster lie.
 
+**Removing is two different acts, so it is two verbs.** `squad ws-remove <agent>
+--from <ws>` drops the folder entry from that workspace only — the agent stays
+enrolled and still appears in any other workspace listing it. `squad rm <agent>`
+retires it everywhere (roster, hub opt-in, daemon; worktree kept). Cockpit:
+**Remove from this workspace** vs **Retire agent (remove everywhere)**.
+
+**No local clone yet?** `squad add <org>/<repo> --to <ws>` clones from GitHub
+first — `org_alias()` picks the ssh alias, i.e. *which GitHub identity*, and
+`pull_local()` picks the path (`~/Projects/code/<org>/<repo>`) — then opts in,
+enrols, and lists it in the workspace. Cockpit: **Clone from GitHub as agent…**.
+⚠️ Needs that org's `Host github-<org>` stanza in `~/.ssh/config`; fireblade-wsl
+has only `github-monkeypashion`, so other orgs fail there on auth.
+
+**A comms-off destination is honoured** when the workspace says so
+machine-readably — `"settings": { "squad.comms": false }`. Transport otherwise
+carries the source's args verbatim, which is how a comms-armed agent landed in a
+workspace whose header *comment* said comms were off. A comment cannot be read.
+
 Enrolled `faculty` (never auto-started by `up`) because an added folder is
 on-demand by nature. Refuses two rows for one worktree, and refuses when the
 derived name already belongs to a different folder — `field()` takes the first
@@ -202,9 +220,24 @@ In the cockpit: agent tab → **Transport to workspace…** asks which machine
 (this one, plus online *Linux* tailnet peers — transport needs a real toolchain
 there), then which `.code-workspace` on it, enumerated over SSH.
 
-**Cloning a whole squad** — `squad transport all --to <ws> [--host <host>]`, or
-**Transport ALL agents to workspace…** in the cockpit, which shows the dry run
-and makes you confirm against it first:
+**The unit of cloning is a WORKSPACE, not a "squad".** A squad is a team that
+talks; a general workspace isn't necessarily one — so scope by the
+`.code-workspace` file, using the same folder-membership rule the cockpit uses to
+decide which tabs to show. That makes squad-vs-general irrelevant: you clone a
+workspace, whatever it contains.
+
+```bash
+squad transport workspace ~/Projects/general.code-workspace \
+  --to ~/Projects/newbox.code-workspace --host dev-vm-1
+```
+
+Cockpit: **Transport THIS workspace to…** (dry run in a modal, confirmed against
+the real eligibility list). Covers both real cases — standing up a second squad
+for a side project, and retiring a machine by migrating one workspace. It is a
+CLONE: the source is untouched, so retire it deliberately afterwards.
+
+`squad transport all` remains **machine-scoped** — every roster row on the box,
+which is rarely what you want:
 
 ```bash
 squad transport all --to ~/Projects/newbox.code-workspace --dry-run   # preview

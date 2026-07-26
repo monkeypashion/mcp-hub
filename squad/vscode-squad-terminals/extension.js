@@ -57,6 +57,7 @@ const FALLBACK = ["terminal", "terminal.ansiBrightBlack"];
 
 // Terminal -> agent name, for context-menu target resolution
 const agentOf = new Map();
+let buildCockpitRef = null;   // set at activation so commands can refresh tabs
 
 function rosterRows() {
   const conf = path.join(os.homedir(), ".config", "squad", "squad.conf");
@@ -699,6 +700,122 @@ function activate(context) {
     })
   );
 
+  // ---- workspace-scoped actions ----
+  // The workspace is the unit the operator works in, and folder membership is
+  // already how the cockpit decides which tabs to show — so these reuse that
+  // one rule rather than inventing a second notion of "which agents".
+  //
+  // `Transport THIS workspace` exists because `all` is MACHINE-scoped, which was
+  // wrong for both real cases: standing up a second squad for a side project, and
+  // retiring a box by migrating one workspace. Machine scope would drag in every
+  // unrelated faculty agent.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("squad.transportWorkspace", async () => {
+      const here = vscode.workspace.workspaceFile;
+      if (!here) {
+        vscode.window.showWarningMessage("Squad: open a .code-workspace first.");
+        return;
+      }
+      const target = await pickTarget("Transport THIS workspace");
+      if (!target) return;
+      const base =
+        `${SQUAD} transport workspace ${JSON.stringify(here.fsPath)}` +
+        ` --to ${JSON.stringify(target.file)}` +
+        (target.host ? ` --host ${target.host}` : "");
+      // Dry run FIRST, confirmed against the real eligibility list: a bulk clone
+      // is expensive and partly irreversible, and ineligible agents must be read
+      // rather than discovered afterwards.
+      const preview = target.sh(`${base} --dry-run 2>&1`) || "(no output)";
+      const go = await vscode.window.showWarningMessage(
+        `Clone this workspace's agents into ${target.label}` +
+          `${target.host ? ` on ${target.host}` : ""}?`,
+        { modal: true, detail: preview },
+        "Transport"
+      );
+      if (go !== "Transport") return;
+      runTransport(`${target.host ? target.host + ":" : ""}${target.label} (workspace)`, base);
+    })
+  );
+
+  // Remove from THIS workspace vs retire everywhere: two different consequences,
+  // so two entries with names that say which. Conflating them is the mistake the
+  // Start label taught us.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("squad.wsRemove", (...args) =>
+      withAgents(args, async (agents) => {
+        const here = vscode.workspace.workspaceFile;
+        if (!here) {
+          vscode.window.showWarningMessage("Squad: no .code-workspace open.");
+          return;
+        }
+        const ok = await vscode.window.showWarningMessage(
+          `Remove ${labels(agents)} from this workspace?`,
+          {
+            modal: true,
+            detail:
+              "The tab disappears from THIS workspace only. The agent stays " +
+              "enrolled, keeps its hub identity and worktree, and still appears " +
+              "in any other workspace that lists it.",
+          },
+          "Remove from workspace"
+        );
+        if (ok !== "Remove from workspace") return;
+        agents.forEach((a) => squadExec(["ws-remove", a, "--from", here.fsPath], a));
+        setTimeout(() => buildCockpitRef && buildCockpitRef(), 800);
+      })
+    )
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("squad.retire", (...args) =>
+      withAgents(args, async (agents) => {
+        const ok = await vscode.window.showWarningMessage(
+          `Retire ${labels(agents)} completely?`,
+          {
+            modal: true,
+            detail:
+              "Removes the roster row, opts the repo out of the hub and retires " +
+              "the heartbeat daemon, on every workspace. The worktree and its " +
+              "files are left on disk.",
+          },
+          "Retire agent"
+        );
+        if (ok !== "Retire agent") return;
+        agents.forEach((a) => squadExec(["rm", a], a));
+      })
+    )
+  );
+
+  // Clone from GitHub with no local folder: org_alias picks the ssh alias (i.e.
+  // WHICH GitHub account) and pull_local picks the path, so the operator only
+  // supplies <org>/<repo>. Then it is listed here so a tab appears.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("squad.addFromGitHub", async () => {
+      const here = vscode.workspace.workspaceFile;
+      const spec = await vscode.window.showInputBox({
+        title: "Clone from GitHub and add as agent",
+        prompt: "<org>/<repo> — cloned to ~/Projects/code/<org>/<repo> using that org's GitHub identity",
+        placeHolder: "monkeypashion/some-repo",
+        validateInput: (v) =>
+          /^[^/\s]+\/[^/\s]+$/.test((v || "").trim()) ? null : "Expected <org>/<repo>",
+      });
+      if (!spec) return;
+      const t = vscode.window.createTerminal({
+        name: `clone ${spec.trim()}`,
+        iconPath: new vscode.ThemeIcon("cloud-download"),
+        color: new vscode.ThemeColor("terminal.ansiGreen"),
+      });
+      t.show(true);
+      // Visible terminal, not fire-and-forget: an unknown org, a missing ssh
+      // alias or a clone failure are all things the operator must read.
+      sendWhenReady(
+        t,
+        `${SQUAD} add ${spec.trim()}` +
+          (here ? ` --to ${JSON.stringify(here.fsPath)}` : "")
+      );
+    })
+  );
+
   // ---- standard claude slash commands (typed into the agent's pane) ----
   // /clear is destructive (wipes the conversation) -> modal confirm.
   for (const slash of ["context", "cost", "status", "doctor", "mcp", "model", "memory", "todos", "help"]) {
@@ -843,6 +960,7 @@ function activate(context) {
   if (boardTerm) boardTerm.show(true);
   };
 
+  buildCockpitRef = buildCockpit;
   buildCockpit();
 
   // Roster + folder watchers. Registered UNCONDITIONALLY — and deliberately

@@ -724,6 +724,102 @@ PYALIGN
   return 0
 }
 
+# ── Workspace as the unit of work ───────────────────────────────────────────
+# A `.code-workspace` file is the real boundary the operator works in, and the
+# cockpit already decides which tabs to show by FOLDER MEMBERSHIP. These helpers
+# reuse that one rule everywhere else, so "squad" vs "general" workspace stops
+# mattering: you act on a workspace, whatever it happens to contain. ("Squad"
+# means a team that talks; a general workspace isn't necessarily one — the
+# operator's distinction, and it's why the unit is the workspace, not the squad.)
+
+# Absolute folder paths of a .code-workspace. Relative entries resolve against
+# the FILE's directory, which is how VSCode reads them (dev-vm-1's general
+# workspace uses relative paths deliberately so the file moves with the tree).
+has_comms_args() {
+  case "$1" in
+    *--dangerously-load-development-channels*hub*|*--channels*hub*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+ws_folders() {
+  python3 - "$1" <<'PYWS'
+import json, pathlib, re, sys
+p = pathlib.Path(sys.argv[1])
+try:
+    text = p.read_text(encoding="utf-8")
+except OSError:
+    raise SystemExit(0)
+# JSONC: strip // line comments before parsing, but only outside strings.
+stripped = re.sub(r'(?m)^\s*//.*$', '', text)
+try:
+    data = json.loads(stripped)
+except Exception:
+    raise SystemExit(0)
+for f in data.get("folders") or []:
+    raw = f.get("path")
+    if not raw:
+        continue
+    q = pathlib.Path(raw)
+    print(str(q if q.is_absolute() else (p.parent / q)).rstrip("/"))
+PYWS
+}
+
+# Roster agents whose worktree is a folder of this workspace.
+ws_agents() {
+  local ws="$1" folders a d
+  folders="$(ws_folders "$ws")"
+  [ -n "$folders" ] || return 0
+  for a in $(agents); do
+    d="$(untilde "$(field "$a" 2)")"
+    printf '%s\n' "$folders" | grep -qxF -- "$d" && echo "$a"
+  done
+}
+
+# Drop a folder entry from a .code-workspace. Surgical: these files carry
+# comments and hand-formatting that a load-and-dump would destroy.
+ws_del_folder() {
+  python3 - "$1" "$2" <<'PYDEL'
+import pathlib, re, sys
+ws, target = pathlib.Path(sys.argv[1]), sys.argv[2].rstrip("/")
+text = ws.read_text(encoding="utf-8")
+base = ws.parent
+
+def resolves_here(raw):
+    q = pathlib.Path(raw)
+    return str(q if q.is_absolute() else (base / q)).rstrip("/") == target
+
+# Match one object in the folders array, with its trailing or leading comma.
+pat = re.compile(r'\{[^{}]*?"path"\s*:\s*"([^"]+)"[^{}]*?\}\s*,?|,\s*\{[^{}]*?"path"\s*:\s*"([^"]+)"[^{}]*?\}')
+for m in pat.finditer(text):
+    raw = m.group(1) or m.group(2)
+    if raw and resolves_here(raw):
+        out = text[:m.start()] + text[m.end():]
+        # a removal can leave "[ ,"/", ]" — tidy only those, touch nothing else
+        out = re.sub(r'\[\s*,', '[', out)
+        out = re.sub(r',(\s*\])', r'\1', out)
+        ws.write_text(out, encoding="utf-8")
+        print(f"  removed folder entry: {raw}")
+        raise SystemExit(0)
+print("  (workspace did not list that folder)")
+PYDEL
+}
+
+# Does this workspace declare hub comms OFF for its agents?
+#   "settings": { "squad.comms": false }
+# dev-vm-1's general workspace states the rule in a COMMENT, which transport
+# cannot read — so a comms-armed agent transported there arrived comms-armed,
+# contradicting the file's own stated intent. A machine-readable marker is the
+# only way to honour it automatically.
+ws_comms_off() {
+  python3 - "$1" <<'PYC' >/dev/null 2>&1
+import json, pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+data = json.loads(re.sub(r'(?m)^\s*//.*$', '', text))
+raise SystemExit(0 if (data.get("settings") or {}).get("squad.comms") is False else 1)
+PYC
+}
+
 # ── Transport: clone an agent into another VSCode workspace ─────────────────
 # Operator's model: pick an agent in the terminal panel, pick a TARGET
 # WORKSPACE (a .code-workspace file), and the whole agent appears there ready
@@ -916,6 +1012,16 @@ transport_agent() {
   [ -n "$dest" ] || dest="$(dirname "$wsfile")/$label/$repo"
   proj="$(worktree_project "$src")"
   args="$(field "$a" 4)"; class="$(field "$a" 5)"
+  # Transport carries the SOURCE's launch args verbatim, so a comms-armed agent
+  # landed comms-armed in a workspace whose whole point is that comms are off —
+  # which is what happened moving mcp-hub into dev-vm-1's general workspace.
+  # That file states the rule in a COMMENT, which nothing can read. Honour the
+  # machine-readable marker when the destination declares one:
+  #   "settings": { "squad.comms": false }
+  if [ -f "$wsfile" ] && ws_comms_off "$wsfile" && has_comms_args "$args"; then
+    args="$(strip_args_tokens "$args" '--dangerously-load-development-channels|server:hub|--channels')"
+    echo "  destination declares comms OFF — landing without the channels flag"
+  fi
 
   echo "transporting $a -> ${host:+$host:}$label"
   echo "  source : $src ($branch @ $(git -C "$src" rev-parse --short HEAD))"
@@ -2103,9 +2209,9 @@ print("\n".join(r[2] for r in rows))
               done
             else board_paint "$(board_scan)"; fi ;;
   handoff)  a="$(need_agent "${2:-}")" || exit 1; handoff "$a" ;;
-  transport) # squad transport <agent|all> --to <workspace-file> [--dest <dir>]
-             #                                [--host <host>] [--port N] [--dry-run]
-            shift; ws_arg=""; dest_arg=""; a_arg=""; host_arg=""; port_arg=""; rsh_arg=""; dry=0
+  transport) # squad transport <agent|all|workspace <ws>> --to <file.code-workspace>
+             #                 [--dest <dir>] [--host <h>] [--port N] [--rsh <cmd>] [--dry-run]
+            shift; ws_arg=""; dest_arg=""; a_arg=""; host_arg=""; port_arg=""; rsh_arg=""; dry=0; from_ws=""
             while [ $# -gt 0 ]; do case "$1" in
               --to)      ws_arg="${2:-}"; shift 2 ;;
               --dest)    dest_arg="${2:-}"; shift 2 ;;
@@ -2113,67 +2219,120 @@ print("\n".join(r[2] for r in rows))
               --port)    port_arg="${2:-}"; shift 2 ;;
               --rsh)     rsh_arg="${2:-}"; shift 2 ;;
               --dry-run) dry=1; shift ;;
+              workspace) from_ws="${2:-}"; shift 2 ;;
               -*)  echo "!! unknown transport flag '$1' (valid: --to, --dest, --host, --port, --rsh, --dry-run)" >&2; exit 1 ;;
               *)   a_arg="$1"; shift ;;
             esac; done
-            [ -n "$ws_arg" ] || { echo "usage: $CMD transport <agent|all> --to <file.code-workspace> [--dest <dir>] [--host <host>] [--dry-run]" >&2; exit 1; }
-            if [ "$a_arg" = all ]; then
-              # Squad-level clone: N transports, plus an eligibility report.
-              # Ineligible agents are LISTED, never silently skipped — "clone
-              # the squad" that quietly drops half of it is worse than a refusal.
-              ok=0; skipped=0; claimed=""
-              echo "== transport all -> ${host_arg:+$host_arg:}$(ws_label "$ws_arg") =="
-              for t in $(agents); do
-                d="$(untilde "$(field "$t" 2)")"
-                if ! r="$(transport_gate "$d" 2>/dev/null)"; then
-                  printf '  SKIP  %-38s %s\n' "$t" "$r"; skipped=$((skipped+1)); continue
-                fi
-                # Two agents can be clones of ONE repo (that is the whole point
-                # of derived identity), so the default dest — <ws>/<label>/<repo>
-                # — collides across them and every agent after the first would
-                # fail on "destination not empty". Disambiguate within this
-                # fan-out, deterministically and without any remote round-trip.
-                rp="$(basename "$(git -C "$d" remote get-url origin)" .git)"
-                dd="$(dirname "$ws_arg")/$(ws_label "$ws_arg")/$rp"; n=1
-                while case " $claimed " in *" $dd "*) true ;; *) false ;; esac; do
-                  n=$((n+1)); dd="$(dirname "$ws_arg")/$(ws_label "$ws_arg")/$rp-$n"
-                done
-                claimed="$claimed $dd"
-                if [ "$n" = 1 ]; then sfx="$(ws_label "$ws_arg")"; else sfx="$(ws_label "$ws_arg")-$n"; fi
-                if [ "$dry" = 1 ]; then
-                  printf '  OK    %-38s -> %-14s id-suffix %s (%s)\n' \
-                    "$t" "$(basename "$dd")" "$sfx" "$(git -C "$d" branch --show-current)"
-                  ok=$((ok+1)); continue
-                fi
-                echo "  ---- $t ----"
-                if transport_agent "$t" "$ws_arg" "$dd" "$host_arg" "$port_arg" "$sfx" "$rsh_arg" 2>&1 | sed 's/^/    /'; then
-                  ok=$((ok+1))
-                else
-                  printf '  FAIL  %-38s transport errored\n' "$t"; skipped=$((skipped+1))
-                fi
-              done
-              echo
-              if [ "$dry" = 1 ]; then echo "  $ok eligible, $skipped ineligible (dry run — nothing written)"
-              else echo "  $ok transported, $skipped skipped"; fi
-              [ "$skipped" = 0 ] || echo "  (ineligible agents need a git remote, a clean tree and nothing unpushed)"
-              exit 0
-            fi
-            a="$(need_agent "$a_arg")" || exit 1
-            if [ "$dry" = 1 ]; then
-              d="$(untilde "$(field "$a" 2)")"
-              if r="$(transport_gate "$d" 2>/dev/null)"; then
-                echo "OK: $a would transport to ${host_arg:+$host_arg:}$(ws_label "$ws_arg")"
-                echo "  branch : $(git -C "$d" branch --show-current) @ $(git -C "$d" rev-parse --short HEAD)"
-                echo "  dest   : ${dest_arg:-$(dirname "$ws_arg")/$(ws_label "$ws_arg")/$(basename "$d")}"
-              else
-                echo "REFUSED: $a — $r"; exit 1
+            [ -n "$ws_arg" ] || { echo "usage: $CMD transport <agent|all|workspace <ws>> --to <file.code-workspace> [--dest <dir>] [--host <h>] [--dry-run]" >&2; exit 1; }
+
+            # THE SET TO MOVE. `all` is machine-scoped and was wrong for both of
+            # the operator's actual cases (a second squad for a side project; and
+            # retiring a box by migrating one workspace) — it would drag in every
+            # roster row including unrelated faculty. `workspace <ws>` scopes by
+            # FOLDER MEMBERSHIP, the same rule the cockpit uses to decide which
+            # tabs to show. That makes squad-vs-general irrelevant: you clone a
+            # workspace, whatever it contains.
+            if [ -n "$from_ws" ]; then
+              from_ws="$(untilde "$from_ws")"
+              [ -f "$from_ws" ] || { echo "!! no such workspace file: $from_ws" >&2; exit 1; }
+              set -- $(ws_agents "$from_ws")
+              [ $# -gt 0 ] || { echo "!! no roster agents live in $(ws_label "$from_ws")"; exit 1; }
+              echo "== $(ws_label "$from_ws") -> ${host_arg:+$host_arg:}$(ws_label "$ws_arg") ($# agent(s)) =="
+            elif [ "$a_arg" = all ]; then
+              set -- $(agents)
+              echo "== transport all (this machine) -> ${host_arg:+$host_arg:}$(ws_label "$ws_arg") =="
+            else
+              a="$(need_agent "$a_arg")" || exit 1
+              if [ "$dry" = 1 ]; then
+                d="$(untilde "$(field "$a" 2)")"
+                if r="$(transport_gate "$d" 2>/dev/null)"; then
+                  echo "OK: $a would transport to ${host_arg:+$host_arg:}$(ws_label "$ws_arg")"
+                  echo "  branch : $(git -C "$d" branch --show-current) @ $(git -C "$d" rev-parse --short HEAD)"
+                  echo "  dest   : ${dest_arg:-$(dirname "$ws_arg")/$(ws_label "$ws_arg")/$(basename "$d")}"
+                else echo "REFUSED: $a — $r"; exit 1; fi
+                exit 0
               fi
-              exit 0
+              transport_agent "$a" "$ws_arg" "$dest_arg" "$host_arg" "$port_arg" "" "$rsh_arg"
+              exit $?
             fi
-            transport_agent "$a" "$ws_arg" "$dest_arg" "$host_arg" "$port_arg" "" "$rsh_arg" ;;
+
+            # Fan-out over the chosen set. Ineligible agents are NAMED with their
+            # reason — a "clone the workspace" that quietly drops half of it is
+            # worse than a refusal.
+            ok=0; skipped=0; claimed=""
+            for t in "$@"; do
+              d="$(untilde "$(field "$t" 2)")"
+              if ! r="$(transport_gate "$d" 2>/dev/null)"; then
+                printf '  SKIP  %-38s %s\n' "$t" "$r"; skipped=$((skipped+1)); continue
+              fi
+              # Two clones of ONE repo collide on both the default destination and
+              # the identity suffix; they must be disambiguated TOGETHER or the
+              # second silently shares the first's identity.
+              rp="$(basename "$(git -C "$d" remote get-url origin)" .git)"
+              dd="$(dirname "$ws_arg")/$(ws_label "$ws_arg")/$rp"; n=1
+              while case " $claimed " in *" $dd "*) true ;; *) false ;; esac; do
+                n=$((n+1)); dd="$(dirname "$ws_arg")/$(ws_label "$ws_arg")/$rp-$n"
+              done
+              claimed="$claimed $dd"
+              if [ "$n" = 1 ]; then sfx="$(ws_label "$ws_arg")"; else sfx="$(ws_label "$ws_arg")-$n"; fi
+              if [ "$dry" = 1 ]; then
+                printf '  OK    %-38s -> %-14s id-suffix %s (%s)\n' \
+                  "$t" "$(basename "$dd")" "$sfx" "$(git -C "$d" branch --show-current)"
+                ok=$((ok+1)); continue
+              fi
+              echo "  ---- $t ----"
+              if transport_agent "$t" "$ws_arg" "$dd" "$host_arg" "$port_arg" "$sfx" "$rsh_arg" 2>&1 | sed 's/^/    /'; then
+                ok=$((ok+1))
+              else
+                printf '  FAIL  %-38s transport errored\n' "$t"; skipped=$((skipped+1))
+              fi
+            done
+            echo
+            if [ "$dry" = 1 ]; then echo "  $ok eligible, $skipped ineligible (dry run — nothing written)"
+            else echo "  $ok transported, $skipped skipped"; fi
+            [ "$skipped" = 0 ] || echo "  (ineligible agents need a git remote, a clean tree and nothing unpushed)"
+            [ -n "$from_ws" ] && [ "$dry" = 0 ] && [ "$ok" -gt 0 ] && \
+              echo "  NOTE: this was a CLONE. The source workspace is untouched — retire it" && \
+              echo "        deliberately (verify the destination first, then '$CMD rm <agent>')."
+            exit 0 ;;
+  ws-remove) # squad ws-remove [agent] --from <file.code-workspace>
+             # Removes the agent's FOLDER from that workspace only. The agent
+             # stays enrolled and still appears in any other workspace listing
+             # it. Deliberately NOT the same verb as `rm`, which retires the
+             # agent everywhere — two different consequences must not share a
+             # name (2026-07-26: the whole Start-label lesson).
+            shift; ws_arg=""; a_arg=""
+            while [ $# -gt 0 ]; do case "$1" in
+              --from) ws_arg="${2:-}"; shift 2 ;;
+              -*) echo "!! unknown ws-remove flag '$1' (valid: --from)" >&2; exit 1 ;;
+              *)  a_arg="$1"; shift ;;
+            esac; done
+            [ -n "$ws_arg" ] || { echo "usage: $CMD ws-remove [agent] --from <file.code-workspace>" >&2; exit 1; }
+            ws_arg="$(untilde "$ws_arg")"
+            [ -f "$ws_arg" ] || { echo "!! no such workspace file: $ws_arg" >&2; exit 1; }
+            a="$(need_agent "$a_arg")" || exit 1
+            ws_del_folder "$ws_arg" "$(untilde "$(field "$a" 2)")"
+            echo "  '$a' is still enrolled (roster, hub opt-in and worktree untouched)."
+            echo "  To retire it everywhere instead: $CMD rm $a" ;;
   add-folder) add_folder "${2:-}" ;;
   ext-align) ext_align ;;
-  add)      add_agent "${2:-}" "${3:-}" "${4:-}" ;;
+  add)      # squad add <org>/<repo> [--to <file.code-workspace>]
+            # Clone from GitHub into the RIGHT account folder (org_alias picks the
+            # ssh alias, i.e. which GitHub identity; pull_local picks the path),
+            # opt in, enrol — and optionally list it in a workspace so a tab
+            # appears. No local clone needed beforehand: that is the point.
+            shift; spec="${1:-}"; ws_arg=""
+            while [ $# -gt 0 ]; do case "$1" in
+              --to) ws_arg="${2:-}"; shift 2 ;;
+              -*)   echo "!! unknown add flag '$1' (valid: --to)" >&2; exit 1 ;;
+              *)    shift ;;
+            esac; done
+            add_agent "$spec" || exit 1
+            if [ -n "$ws_arg" ]; then
+              ws_arg="$(untilde "$ws_arg")"
+              org="${spec%%/*}"; repo="${spec#*/}"; repo="${repo%.git}"
+              ws_add_folder "$ws_arg" "$HOME/Projects/code/$org/$repo" "$repo"
+            fi ;;
   rm)       a="$(need_agent "${2:-}")" || exit 1; rm_agent "$a" ;;
   pull-local) pull_local "${2:-}" ;;
   *) cat <<EOF
