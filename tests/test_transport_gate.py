@@ -277,6 +277,77 @@ def test_one_agent_failing_does_not_abandon_the_rest(env, tmp_path):
         assert (p / "occupied").exists(), "an occupied directory must be left alone"
 
 
+# ---- destination toolchain ------------------------------------------------
+
+def test_a_destination_without_mcp_hub_refuses_rather_than_guessing(env, tmp_path):
+    """The condition really hit on dev-vm-1, and it is easy to hit.
+
+    Identity is derived at the destination. For the mcp-hub repo itself the
+    freshly-cloned cli.py can do it, but for ANY OTHER repo the destination needs
+    `mcp-hub` on PATH — and a non-login ssh shell does not get ~/.local/bin, so a
+    box that plainly has it can still fail to find it. Getting a name wrong here
+    would silently give the clone the wrong identity, so it must refuse.
+    """
+    e, conf = env
+    work = _pushed_repo(tmp_path, repo="demo", rewrite_origin=False)
+    _enrol(conf, "demo-box", work)
+    shim = tmp_path / "fake-ssh"
+    shim.write_text(FAKE_SSH, encoding="utf-8")
+    shim.chmod(0o755)
+    # Keep the REAL PATH and drop only the directories that actually contain
+    # mcp-hub. Hand-building a minimal PATH looks tidier and made this test
+    # vacuous: it died at exit 127 on a missing `basename`, long before the
+    # identity step, and still "passed" because the word mcp-hub appears in the
+    # squad script's own path.
+    kept = [d for d in e["PATH"].split(os.pathsep)
+            if d and not os.path.exists(os.path.join(d, "mcp-hub"))]
+    e2 = dict(e, PATH=os.pathsep.join(kept))
+    assert subprocess.run(["sh", "-c", "command -v basename"], env=e2,
+                          capture_output=True).returncode == 0, "PATH lost the toolchain"
+    assert subprocess.run(["sh", "-c", "command -v mcp-hub"], env=e2,
+                          capture_output=True).returncode != 0, "mcp-hub still reachable"
+    res = subprocess.run(
+        ["bash", str(SQUAD), "transport", "demo-box", "--to", str(_ws(tmp_path, "far")),
+         "--host", "pretend-host", "--rsh", str(shim)],
+        capture_output=True, text=True, timeout=180, env=e2)
+    out = res.stdout + res.stderr
+    assert res.returncode != 0, f"should have refused:\n{out}"
+    assert "127" not in out, f"died on a missing tool, not the intended refusal:\n{out}"
+    # Match the REFUSAL text specifically. "identity" alone also matches the
+    # successful "identity suffix:" line printed just above it, which would let
+    # this pass on the wrong evidence — the same mistake twice in one test.
+    assert "cannot derive the agent name" in out, \
+        f"refused for some other reason:\n{out[-600:]}"
+    conf_text = conf.read_text()
+    assert conf_text.count("demo-box") == 1, "a refusal must not add a roster row"
+
+
+# ---- explicit overrides ---------------------------------------------------
+
+def test_dest_override_lands_exactly_where_told(env, tmp_path):
+    """--dest bypasses the derived location, for the one-off case."""
+    e, conf = env
+    work = _pushed_repo(tmp_path, rewrite_origin=False)
+    _enrol(conf, "demo-box", work)
+    where = tmp_path / "somewhere" / "else"
+    res = _run(env, "transport", "demo-box", "--to", str(_ws(tmp_path)), "--dest", str(where))
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert (where / "README.md").exists(), res.stdout
+
+
+def test_the_clone_inherits_the_sources_class(env, tmp_path):
+    """Lifecycle must travel: a squad-class agent cloned as faculty would stop
+    being swept by `up`, and vice versa would auto-start something on-demand."""
+    e, conf = env
+    work = _pushed_repo(tmp_path, rewrite_origin=False)
+    _enrol(conf, "demo-box", work, args="--continue", cls="squad")
+    res = _run(env, "transport", "demo-box", "--to", str(_ws(tmp_path, "cls")))
+    assert res.returncode == 0, res.stdout + res.stderr
+    rows = [ln for ln in conf.read_text().splitlines() if ln.startswith("demo-")]
+    assert len(rows) == 2, rows
+    assert rows[-1].split("|")[4] == "squad", f"class did not travel: {rows[-1]}"
+
+
 # ---- the remote leg, exercised locally ----------------------------------
 
 def test_the_whole_remote_leg_runs_end_to_end(env, tmp_path):
