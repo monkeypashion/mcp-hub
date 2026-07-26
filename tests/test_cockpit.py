@@ -201,6 +201,34 @@ def test_add_folder_cancelled_dialog_changes_nothing(box, tmp_path):
     assert out["sent"] == []
 
 
+# ---- Start & attach: a regression that already happened once -------------
+
+@pytest.mark.parametrize("command,mode", [
+    ("squad.startAttach", "--resume"),
+    ("squad.startAttachFresh", "--fresh"),
+])
+def test_start_and_attach_actually_attaches(box, command, mode):
+    """This broke in production today and the operator caught it, not a test.
+
+    It was rewired to start the agent via a background exec, which left the tab a
+    bare shell — so "Start & attach" only started. Attaching is a property of THIS
+    terminal, so the command must be TYPED INTO THE TAB, and it must contain the
+    attach as well as the restart. Both halves asserted, because the bug was the
+    presence of one without the other.
+    """
+    out = _drive(box, "run", command, terminal="demo · idle")
+    assert len(out["sent"]) == 1, out
+    cmd = out["sent"][0]
+    assert "squad restart demo" in cmd and mode in cmd, cmd
+    assert "squad attach demo" in cmd, f"started without attaching: {cmd}"
+
+
+def test_start_and_attach_on_a_non_agent_tab_warns(box):
+    out = _drive(box, "run", "squad.startAttach")
+    assert out["sent"] == []
+    assert any("no squad agent" in s for s in out["shown"]), out
+
+
 def test_bulk_transport_requires_confirmation(box):
     """A bulk clone is expensive and partly irreversible: ask, then act."""
     declined = _drive(box, "run", "squad.transportAll",
