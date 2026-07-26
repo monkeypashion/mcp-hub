@@ -630,7 +630,15 @@ function activate(context) {
     // cockpit tab: for a down agent this leaves a titled tab with a bare
     // prompt (the OSC title survives clear), and after a later detach/stop
     // it wipes the dead session's scrollback the same way restart does.
-    sendWhenReady(t, `squad attach --no-start ${agent}; clear`);
+    // `&& clear`, not `; clear`. On a live agent, clear wipes the dead
+    // session's scrollback after a detach — that's what it's for. But
+    // `attach --no-start` on a DOWN agent prints the only affordance that tab
+    // will ever show ("start it with… / right-click → Start & attach"), and an
+    // unconditional clear wiped it, leaving a blank pane. Clicking it then did
+    // nothing, because the start toast rides on onDidChangeActiveTerminal,
+    // which never fires when the terminal you click is already active
+    // (2026-07-26). attach exits 3 when down, so `&&` keeps the hint.
+    sendWhenReady(t, `squad attach --no-start ${agent} && clear`);
   }
 
   // hideOnStartup keeps VSCode from spawning a filler terminal into a

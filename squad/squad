@@ -581,6 +581,88 @@ rm_agent() {   # squad rm [agent] — exact inverse of add: session, roster, opt
   echo "removed '$a' (session, roster, hub opt-in, daemon) — repo left in place"
 }
 
+# ── ext_align: keep the cockpit extension's installed dir name in step ──────
+# VSCode's extension index (~/.vscode-server/extensions/extensions.json) records
+# `id-version` AND a location path. If that path does not exist, VSCode reports
+# "invalid extensions detected", never activates the extension, and the TERMINAL
+# PANEL SIMPLY DOESN'T OPEN — it reads as a cockpit bug, not a version bug.
+#
+# The install is a symlink into the repo, so a `git pull` that changes
+# package.json's version leaves the dir name stale. Worse (2026-07-25, third
+# occurrence): REVERTING a dir rename under a live index kills the cockpit
+# outright, where forgetting the rename on the way UP merely hides new menus.
+#
+# So: missing path = EMERGENCY, version skew = benign. We only ever rename the
+# directory; extensions.json belongs to VSCode and renaming is the one lever
+# proven to work (it also forces the manifest re-read that makes new menu
+# entries appear at all — which is why "just stop bumping the version" is the
+# wrong cure).
+# Interface agreed with mcp-hub-dev-vm-1 (their 24(b)); they build the dev-vm-1
+# side, this is the WSL/fireblade side. Fail-soft throughout: a cockpit repair
+# helper must never be the reason a heal pass dies.
+EXT_ID="monkeypashion.squad-terminals"
+
+ext_align() {
+  local base
+  for base in "$HOME/.vscode-server/extensions" "$HOME/.vscode/extensions"; do
+    [ -d "$base" ] || continue
+    python3 - "$base" "$EXT_ID" "$(dirname "$(readlink -f "$0")")/vscode-squad-terminals/package.json" <<'PYALIGN' || true
+import json, pathlib, sys, os
+
+base, ext_id, repo_pkg = pathlib.Path(sys.argv[1]), sys.argv[2], pathlib.Path(sys.argv[3])
+idx = base / "extensions.json"
+
+installed = sorted(base.glob(f"{ext_id}-*"))
+if not installed:
+    raise SystemExit(0)              # no cockpit install here — nothing to align
+
+try:
+    entries = json.loads(idx.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)              # VSCode owns this file; unreadable is not ours to fix
+
+want = None
+for e in entries:
+    if e.get("identifier", {}).get("id") == ext_id:
+        want = e.get("location", {}).get("path", "") or None
+
+# THE EMERGENCY: the index names a path that does not exist. VSCode then reports
+# "invalid extensions detected", never activates, and NO terminal panel opens —
+# it reads as a cockpit bug rather than a version bug. Repair by renaming the
+# real install to the name the index is asking for; that is the direction which
+# actually recovered dev-vm-1 on 2026-07-25.
+if want and not pathlib.Path(want).exists():
+    src = installed[0]
+    try:
+        os.rename(src, want)
+        print(f"ext_align: REPAIRED dead cockpit — {src.name} -> {pathlib.Path(want).name}")
+        print("           Reload Window to pick it up.")
+    except OSError as exc:
+        print(f"!! ext_align: cockpit is broken and the repair failed: {exc}")
+        print(f"   index wants: {want}")
+        print(f"   on disk    : {src}")
+    raise SystemExit(0)
+
+# Version skew with a VALID index is BENIGN — do not "fix" it. Measured from
+# VSCode's own cache-invalidation event (2026-07-26): the manifest version moved
+# 0.16.0 -> 0.17.0 with the location folder UNCHANGED and both entries marked
+# isValid, i.e. editing package.json is enough on its own to force a manifest
+# re-read. Renaming the folder toward the manifest would ORPHAN the index path
+# and produce exactly the dead cockpit above, so it is never done here.
+try:
+    manifest_ver = json.loads(repo_pkg.read_text(encoding="utf-8"))["version"]
+except Exception:
+    raise SystemExit(0)
+for d in installed:
+    dir_ver = d.name[len(ext_id) + 1:]
+    if dir_ver != manifest_ver:
+        print(f"ext_align: version skew (dir {dir_ver}, manifest {manifest_ver}) — benign; "
+              "index resolves and VSCode re-reads the manifest itself. No action taken.")
+PYALIGN
+  done
+  return 0
+}
+
 # ── Transport: clone an agent into another VSCode workspace ─────────────────
 # Operator's model: pick an agent in the terminal panel, pick a TARGET
 # WORKSPACE (a .code-workspace file), and the whole agent appears there ready
@@ -893,6 +975,9 @@ case "${1:-help}" in
             #                  overnight at a confident ⚡ 9/9 — heal "fixed"
             #                  them by nudging re-register, which is precisely
             #                  the non-cure.
+            # Cockpit first: if the extension is invalid the operator sees NO
+            # terminal panel, which hides every symptom heal is about to report.
+            ext_align
             healed=0
             relaunched=0
             # Agents this pass has already relaunched. The two recovery loops
@@ -1139,7 +1224,13 @@ case "${1:-help}" in
                 # agents, so for exactly the terminals that show this message
                 # most, "run up" would be advice that does nothing.
                 echo "$a is down (--no-start: not launching). Start it with: $CMD start $a   (or right-click the tab: Squad → Start & attach)"
-                exit 0
+                # Exit 3, not 0, so the caller can distinguish "attached, and
+                # you detached" from "never attached, agent is down". The
+                # cockpit uses it to decide whether to clear the pane: this
+                # hint is the ONLY visible affordance on a down agent's tab,
+                # and blanking it left the operator clicking a dead pane with
+                # nothing to act on (2026-07-26).
+                exit 3
               fi
               echo "$a not running — starting it..."; up_one "$a"; sleep 1
             elif ! pane_alive "$a"; then
@@ -1149,6 +1240,22 @@ case "${1:-help}" in
               if [ -z "$nostart" ]; then
                 echo "$a was degraded — restarting claude..."; tm kill-session -t "=$a" 2>/dev/null || true; up_one "$a"; sleep 1
               fi
+            fi
+            # switch-client RE-AIMS THE OPERATOR'S ATTACHED CLIENT. An agent's
+            # tool shell also runs inside tmux ($TMUX is set in every agent
+            # pane), so an agent calling `attach` on an UP session yanked the
+            # operator's view onto another agent with no warning — 2026-07-26,
+            # I did exactly this while "verifying" something and dropped the
+            # operator into a transported clone mid-conversation. It reads as
+            # the cockpit going haywire, and nothing in the output says what
+            # happened.
+            # A human always has a tty here; an agent's captured shell never
+            # does. Gate on that: refuse to re-aim a client we're not driving.
+            if [ -n "${TMUX:-}" ] && [ ! -t 1 ]; then
+              echo "$a is up. Refusing to switch-client from a non-interactive shell —"
+              echo "that would re-aim the operator's tmux view. Attach yourself with:"
+              echo "  $CMD attach $a      (from your own terminal)"
+              exit 4
             fi
             if [ -n "${TMUX:-}" ]; then           # already inside tmux — switch, don't nest
               tmux -L "$SOCK" switch-client -t "=$a" 2>/dev/null \
@@ -1772,6 +1879,7 @@ sys.stdout.write("".join("%s\x1f%d\x1f%d\n" % r for r in out))
             [ -n "$ws_arg" ] || { echo "usage: $CMD transport [agent] --to <file.code-workspace> [--dest <dir>]" >&2; exit 1; }
             a="$(need_agent "$a_arg")" || exit 1
             transport_agent "$a" "$ws_arg" "$dest_arg" ;;
+  ext-align) ext_align ;;
   add)      add_agent "${2:-}" "${3:-}" "${4:-}" ;;
   rm)       a="$(need_agent "${2:-}")" || exit 1; rm_agent "$a" ;;
   pull-local) pull_local "${2:-}" ;;
