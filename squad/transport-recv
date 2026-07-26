@@ -71,12 +71,22 @@ PY
 python3 - "$HOME/.claude.json" "$DEST" <<'PY'
 import json, os, pathlib, sys, tempfile
 p, proj = pathlib.Path(sys.argv[1]), sys.argv[2]
-try:
-    data = json.loads(p.read_text(encoding="utf-8"))
-    assert isinstance(data, dict)
-except Exception:
-    print("  !! ~/.claude.json unreadable — agent will hit the trust dialog")
-    raise SystemExit(0)                       # fail-open: never block a transport
+# MISSING and UNPARSEABLE need opposite treatment, and conflating them meant a
+# machine where Claude Code had never run got no seeding at all — so the
+# transported agent still blocked on the trust dialog, which is the entire thing
+# this step exists to prevent.
+if not p.exists():
+    data = {}                                 # fresh box: ours to create
+else:
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        assert isinstance(data, dict)
+    except Exception:
+        # A real file we cannot parse: never clobber it. Fail open and say so —
+        # the operator answers one dialog, rather than losing their settings.
+        print("  !! ~/.claude.json unreadable — leaving it alone;")
+        print("     the agent will ask about folder trust on first launch")
+        raise SystemExit(0)
 entry = data.setdefault("projects", {}).setdefault(proj, {})
 entry["hasTrustDialogAccepted"] = True
 enabled = entry.get("enabledMcpjsonServers")
@@ -97,8 +107,30 @@ PY
 #    operationally a different agent: it can't be healed and can't hear.
 mkdir -p "$(dirname "$CONF")"
 touch "$CONF"
-if awk -F'|' -v n="$NAME" '$1==n{found=1} END{exit !found}' "$CONF"; then
-  echo "  roster row already present for $NAME"
+EXISTING="$(awk -F'|' -v n="$NAME" '$1==n{print $2; exit}' "$CONF")"
+if [ -n "$EXISTING" ] && [ "$EXISTING" != "$DEST" ]; then
+  # IDENTITY COLLAPSE, not idempotency. The name already belongs to a DIFFERENT
+  # worktree, so appending would be impossible (field() takes the first match,
+  # so the second row is unreachable) and skipping silently would hand two
+  # clones one identity — they'd share a hub binding, an inbox, a heartbeat
+  # pidfile and a status cache.
+  #
+  # This is reachable whenever a caller transports two clones of ONE repo into
+  # one workspace without a per-destination suffix: the suffix defaults to the
+  # workspace label, which they share. `squad transport all` passes <label>-2,
+  # -3… precisely to avoid it — but a caller who doesn't know the trap exists
+  # must hit a wall here, not a shrug.
+  echo "!! REFUSING: '$NAME' already names a DIFFERENT worktree."
+  echo "     existing : $EXISTING"
+  echo "     this one : $DEST"
+  echo "   Two clones cannot share one identity — they would share a hub"
+  echo "   binding, inbox, heartbeat pidfile and status cache."
+  echo "   Pass a distinct identity suffix for this destination (squad"
+  echo "   transport all does this automatically: <workspace>-2, -3, ...)."
+  exit 5
+fi
+if [ -n "$EXISTING" ]; then
+  echo "  roster row already present for $NAME (same worktree — idempotent)"
 else
   printf '%s|%s||%s|%s\n' "$NAME" "$DEST" "$LAUNCH_ARGS" "$CLASS" >> "$CONF"
   echo "  roster row added (args: ${LAUNCH_ARGS:-none}, class: ${CLASS:-squad})"
