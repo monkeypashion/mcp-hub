@@ -322,6 +322,71 @@ def test_a_destination_without_mcp_hub_refuses_rather_than_guessing(env, tmp_pat
     assert conf_text.count("demo-box") == 1, "a refusal must not add a roster row"
 
 
+# ---- the clone knows it is a clone ---------------------------------------
+
+def _marker_dir(home: str, dest: pathlib.Path) -> pathlib.Path:
+    enc = str(dest).replace("/", "-").rstrip("-")
+    return pathlib.Path(home) / ".claude" / "projects" / enc / "memory"
+
+
+def test_a_clone_is_told_that_it_is_a_clone(env, tmp_path):
+    """The highest-value gap that was left, and a clone itself reported it.
+
+    The identity suffix makes a clone distinguishable to US — roster, statusline,
+    hub binding — and not to ITSELF. It resumes carrying the original's sense of
+    standing, and none of that authority travelled with the memory.
+    """
+    e, conf = env
+    work = _pushed_repo(tmp_path, rewrite_origin=False)
+    _enrol(conf, "demo-box", work)
+    res = _run(env, "transport", "demo-box", "--to", str(_ws(tmp_path, "cl")))
+    assert res.returncode == 0, res.stdout + res.stderr
+    dest = pathlib.Path(e["HOME"]) / "Projects" / "code" / "remotes" / "demo"
+    mem = _marker_dir(e["HOME"], dest)
+    marker = mem / "000_you_are_a_transported_clone.md"
+    assert marker.exists(), f"no marker written:\n{res.stdout}"
+    text = marker.read_text()
+    assert "demo-box" in text, "the marker must name what this is a copy OF"
+    # and it must be the FIRST thing in the index, since MEMORY.md is what loads
+    first = (mem / "MEMORY.md").read_text().splitlines()[0]
+    assert "000_you_are_a_transported_clone.md" in first, f"not indexed first: {first}"
+
+
+def test_the_marker_describes_rather_than_forbidding(env, tmp_path):
+    """A blanket "defer on everything" produces a uselessly timid agent.
+
+    The line that matters: your own worktree is yours, shared things need
+    authorisation addressed to YOU. Both halves have to be present, or the marker
+    either does nothing or over-fires.
+    """
+    e, conf = env
+    work = _pushed_repo(tmp_path, rewrite_origin=False)
+    _enrol(conf, "demo-box", work)
+    _run(env, "transport", "demo-box", "--to", str(_ws(tmp_path, "cl")))
+    dest = pathlib.Path(e["HOME"]) / "Projects" / "code" / "remotes" / "demo"
+    text = (_marker_dir(e["HOME"], dest) / "000_you_are_a_transported_clone.md").read_text()
+    # collapse whitespace: this is prose and it hard-wraps, so a phrase can span
+    # a newline ("...addressed\nto *you*") and never match as a literal substring
+    low = " ".join(text.lower().split())
+    assert "your own worktree is yours" in low, "must permit its own work"
+    assert "authorisation addressed to" in low, "must gate SHARED resources"
+    assert "mcp-hub identity" in low, "must tell the clone how to CHECK, not just assert"
+
+
+def test_the_marker_never_breaks_a_transport(env, tmp_path):
+    """Fail-soft: an unwritable memory dir is not a reason to fail the whole move."""
+    e, conf = env
+    work = _pushed_repo(tmp_path, rewrite_origin=False)
+    _enrol(conf, "demo-box", work)
+    dest = pathlib.Path(e["HOME"]) / "Projects" / "code" / "remotes" / "demo"
+    blocked = _marker_dir(e["HOME"], dest).parent
+    blocked.parent.mkdir(parents=True, exist_ok=True)
+    blocked.write_text("not a directory", encoding="utf-8")   # mkdir will fail
+    res = _run(env, "transport", "demo-box", "--to", str(_ws(tmp_path, "cl")))
+    assert res.returncode == 0, f"a marker failure must not fail the transport:\n{res.stdout}"
+    assert (dest / "README.md").exists(), "the clone still has to land"
+
+
 # ---- explicit overrides ---------------------------------------------------
 
 def test_dest_override_lands_exactly_where_told(env, tmp_path):
