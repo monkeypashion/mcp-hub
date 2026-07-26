@@ -62,8 +62,70 @@ AGENT_MARKER_PATH = pathlib.Path(".claude") / "hub-agent.json"
 # ---------------------------------------------------------------------------
 
 
+# -- DECISION card harvesting (stop-hook leg of the triage machinery) --------
+#
+# The agent authors the card as the END of its waiting turn (hub-instructions
+# convention); this hook is the courier that never forgets: card in last
+# turn -> decision_put (hand up fleet-wide within seconds); no card in last
+# turn -> decision_clear (an answered/moved-on ask self-withdraws). Only the
+# model can AUTHOR a card; everything after authorship is machinery.
+
+_DECISION_BLOCK_RE = re.compile(r"\*{0,2}DECISION\*{0,2}\b.*\Z", re.S)
+_WAITING_ON_OP_RE = re.compile(
+    r"(waiting (on|for) (you|the operator)|blocked on (you|the operator)"
+    r"|awaiting (your|the operator)|need(s|ing)? (your|the operator)"
+    r"|your (word|nod|call|decision|go[- ]?ahead)|action is yours)",
+    re.I,
+)
+
+
+def _read_last_assistant_text(transcript_path: str | None) -> str:
+    """Text of the LAST assistant message in the transcript, '' on any
+    problem. Reads only the file tail — transcripts grow to tens of MB and
+    this runs at every Stop."""
+    if not transcript_path:
+        return ""
+    try:
+        with open(transcript_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 262144))
+            tail = f.read().decode("utf-8", errors="ignore")
+    except OSError:
+        return ""
+    for line in reversed(tail.splitlines()):
+        if '"assistant"' not in line or '"text"' not in line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue  # first line of the tail window may be cut mid-record
+        if rec.get("type") != "assistant":
+            continue
+        content = (rec.get("message") or {}).get("content") or []
+        texts = [b.get("text", "") for b in content
+                 if isinstance(b, dict) and b.get("type") == "text"]
+        text = "\n".join(t for t in texts if t)
+        if text.strip():
+            return text
+    return ""
+
+
+def _extract_decision_card(turn_text: str) -> str:
+    """The DECISION card from a turn's text, '' if none. The convention puts
+    the card at the END of the turn, so we take from the last DECISION token
+    to end-of-text; a card without an ASK: field is not a card."""
+    matches = list(_DECISION_BLOCK_RE.finditer(turn_text))
+    if not matches:
+        return ""
+    card = matches[-1].group(0).strip()
+    if "ASK:" not in card:
+        return ""
+    return card
+
+
 async def _query_hub(
-    hub_url: str, agent_name: str
+    hub_url: str, agent_name: str, project: str = "", card: str = ""
 ) -> tuple[str, str, bool]:
     """Connect to the hub, return (dm_text, broadcast_text, is_online).
 
@@ -128,6 +190,24 @@ async def _query_hub(
                 broadcasts_result = await session.call_tool(
                     "get_broadcasts_for_agent", bc_args
                 )
+            # DECISION card leg: card in the last turn -> put (upserts the
+            # agent's open card); no card -> clear (idempotent no-op when
+            # nothing is open). Fail-soft: an older hub without these tools
+            # must not break message surfacing (version skew during deploys).
+            try:
+                if card:
+                    await session.call_tool(
+                        "decision_put",
+                        {"from_agent": agent_name, "card": card,
+                         "project": project or ""},
+                    )
+                else:
+                    await session.call_tool(
+                        "decision_clear", {"from_agent": agent_name},
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+
             agents_result = await session.call_tool("list_agents", {})
 
     messages_text = _extract_text(messages_result)
@@ -180,6 +260,7 @@ def build_hook_response(
     broadcasts_text: str = "",
     is_online: bool,
     stop_hook_active: bool = False,
+    card_nag: bool = False,
 ) -> dict[str, Any] | None:
     """Decide whether to emit a hook block and what the reason should be.
 
@@ -212,14 +293,17 @@ def build_hook_response(
 
     # Loop backstop: never re-block a Stop that's only firing because a prior
     # block fired, when there's nothing new to surface. Guards against any
-    # content-less block (e.g. a rebind nag) wedging the agent in a re-block
-    # loop, independent of the online/⚡ fix above.
+    # content-less block (rebind nag, card nag) wedging the agent in a
+    # re-block loop, independent of the online/⚡ fix above. The card nag in
+    # particular gets exactly ONE shot per natural Stop: if the agent's
+    # nag-response turn still lacks a card, we let it go rather than loop.
     if stop_hook_active and not has_content:
         return None
 
-    # No work needed: online + nothing queued. (Online — not ⚡ — is the gate:
-    # an idle agent legitimately lacks ⚡ between turns.)
-    if not has_content and is_online:
+    # No work needed: online + nothing queued + no correction owed.
+    # (Online — not ⚡ — is the gate: an idle agent legitimately lacks ⚡
+    # between turns.)
+    if not has_content and is_online and not card_nag:
         return None
 
     parts: list[str] = []
@@ -257,18 +341,25 @@ def build_hook_response(
         else:
             parts.append(warning)
 
-    if has_content:
-        parts.extend(
-            [
-                "",
-                (
-                    "Discipline reminder: process if related/important to current "
-                    "work; otherwise note (one-line ack) and continue. Don't deeply "
-                    "context-switch on FYI/low-priority items. Urgent always "
-                    "responds."
-                ),
-            ]
-        )
+    # Card nag — the authoring-compliance leg of the DECISION convention:
+    # last turn reads as waiting-on-operator but carries no card. One line,
+    # delivered at the exact moment of the miss; the loop backstop above
+    # guarantees it can't repeat within one natural Stop.
+    if card_nag:
+        parts.extend([
+            "",
+            (
+                "🙋 Your last message reads as waiting on the operator but has "
+                "no DECISION card — end your reply with the DECISION block "
+                "(**DECISION** / **ASK:** / **WHY:** / **VALUE:** …[n/10] / "
+                "**RISK:** …[n/10]) so the ask reaches their triage board."
+            ),
+        ])
+
+    # (The old always-appended "Discipline reminder" footer is gone: it cost
+    # ~230 bytes x every content-bearing Stop x every agent — ~20% of all
+    # stop-hook bytes fleet-wide on 2026-07-26 — repeating guidance that
+    # already lives in the hub's connect-time instructions.)
 
     return {"decision": "block", "reason": "\n".join(parts)}
 
@@ -1199,9 +1290,18 @@ def stop_hook_command(args: argparse.Namespace) -> int:
     # dead/absent daemon is revived at the next turn regardless of hub health.
     _ensure_daemon_alive(name, args.hub_url)
 
+    # DECISION card leg: harvest the card (or its absence) from the turn
+    # that just ended, ship it with the same hub round-trip below. Waiting
+    # language without a card earns the one-shot authoring nag.
+    last_turn = _read_last_assistant_text(payload.get("transcript_path"))
+    card = _extract_decision_card(last_turn)
+    card_nag = bool(last_turn) and not card and bool(
+        _WAITING_ON_OP_RE.search(last_turn)
+    )
+
     try:
         messages_text, broadcasts_text, is_online = asyncio.run(
-            _query_hub(args.hub_url, name)
+            _query_hub(args.hub_url, name, project or "", card)
         )
     except Exception as exc:  # noqa: BLE001
         # Fail open — never block the agent on hub flakiness.
@@ -1215,6 +1315,7 @@ def stop_hook_command(args: argparse.Namespace) -> int:
         broadcasts_text=broadcasts_text,
         is_online=is_online,
         stop_hook_active=stop_hook_active,
+        card_nag=card_nag,
     )
 
     if response is None:

@@ -124,8 +124,10 @@ def test_messages_bound_emits_block_with_content():
     assert response["decision"] == "block"
     assert "hello there" in response["reason"]
     assert "**bob**" in response["reason"]
-    # Discipline reminder should be in the reason
-    assert "Discipline" in response["reason"]
+    # The old always-on "Discipline reminder" footer is retired (2026-07-26):
+    # ~230 bytes x every content-bearing Stop x every agent, repeating what
+    # the hub's connect-time instructions already say.
+    assert "Discipline" not in response["reason"]
 
 
 def test_messages_unbound_emits_block_with_rebind_hint():
@@ -370,7 +372,7 @@ def test_messages_present_outputs_valid_hook_json(capsys):
         name="alice", project="proj", hub_url="http://x/mcp"
     )
 
-    async def _fake_query(_url, _name):
+    async def _fake_query(_url, _name, _project="", _card=""):
         return ("[10:00] **bob**: hello", "", True)  # DM, no broadcasts, bound
 
     with patch("mcp_hub.cli._query_hub", side_effect=_fake_query):
@@ -1254,3 +1256,91 @@ def test_write_status_cache_is_fail_soft(tmp_path, monkeypatch):
     monkeypatch.setattr("mcp_hub.cli._parse_status_from_agents", _boom)
     # Must not raise.
     _write_status_cache("mcp-hub-dev", _AGENTS_SAMPLE)
+
+
+# ---------------------------------------------------------------------------
+# DECISION card harvesting (stop-hook leg of the triage machinery)
+# ---------------------------------------------------------------------------
+
+from mcp_hub.cli import (  # noqa: E402
+    _WAITING_ON_OP_RE,
+    _extract_decision_card,
+    _read_last_assistant_text,
+)
+
+_CARD = (
+    "**DECISION**\n**ASK:** approve the rebuild\n**WHY:** broken\n"
+    "**VALUE:** works again [7/10]\n**RISK:** an hour [3/10]\n"
+)
+
+
+def test_extract_card_from_turn_end():
+    turn = "Long report about many things.\n\n" + _CARD
+    assert _extract_decision_card(turn).startswith("**DECISION**")
+    assert "[3/10]" in _extract_decision_card(turn)
+
+
+def test_extract_takes_last_block_when_quoted_earlier():
+    """A turn that QUOTES the convention (docs, examples) and then emits a
+    real card must yield the real card — last occurrence wins."""
+    turn = "The format is **DECISION** / ASK: etc as documented.\n\n" + _CARD
+    card = _extract_decision_card(turn)
+    assert "approve the rebuild" in card
+
+
+def test_extract_no_card_returns_empty():
+    assert _extract_decision_card("just a normal report, nothing pending") == ""
+
+
+def test_extract_decision_without_ask_is_not_a_card():
+    assert _extract_decision_card("I made a DECISION about lunch") == ""
+
+
+def test_waiting_regex_matches_prose_ask():
+    assert _WAITING_ON_OP_RE.search("blocked on you picking a database")
+    assert not _WAITING_ON_OP_RE.search("waiting on CI to finish")
+
+
+def _write_transcript(tmp_path, records):
+    p = tmp_path / "t.jsonl"
+    p.write_text("\n".join(json.dumps(r, separators=(",", ":")) for r in records))
+    return str(p)
+
+
+def _asst(text):
+    return {"type": "assistant",
+            "message": {"role": "assistant",
+                        "content": [{"type": "text", "text": text}]}}
+
+
+def test_read_last_assistant_text(tmp_path):
+    p = _write_transcript(tmp_path, [
+        _asst("first turn"),
+        {"type": "user", "message": {"content": "operator says hi"}},
+        _asst("the last word"),
+    ])
+    assert _read_last_assistant_text(p) == "the last word"
+
+
+def test_read_last_assistant_text_missing_file():
+    assert _read_last_assistant_text("/nonexistent/path.jsonl") == ""
+    assert _read_last_assistant_text(None) == ""
+
+
+def test_card_nag_present_in_block():
+    response = build_hook_response(
+        agent_name="alice", project="p", messages_text="",
+        is_online=True, card_nag=True,
+    )
+    assert response is not None
+    assert "no DECISION card" in response["reason"]
+
+
+def test_card_nag_suppressed_by_loop_backstop():
+    """A nag-only block must not re-fire on the Stop caused by its own
+    block — one shot per natural Stop."""
+    response = build_hook_response(
+        agent_name="alice", project="p", messages_text="",
+        is_online=True, stop_hook_active=True, card_nag=True,
+    )
+    assert response is None

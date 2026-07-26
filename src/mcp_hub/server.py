@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -127,6 +128,84 @@ def _clip(body: str, limit: int = COMPACT_FULL_BODY_CHARS) -> str:
     return cut.rstrip() + " […clipped]"
 
 
+_TLDR_BODY_CHARS = 1500
+_TLDR_FIRST_LINE_CHARS = 200
+
+
+def _verbosity_advisory(message: str) -> str:
+    """One advisory line back to the SENDER of a long message that doesn't
+    lead with a summary. Correction at the moment of the offense — visible
+    only in the sender's own tool result, never to recipients. The clip
+    protects readers; this trains writers."""
+    if len(message) <= _TLDR_BODY_CHARS:
+        return ""
+    first = message.strip().splitlines()[0] if message.strip() else ""
+    if len(first) <= _TLDR_FIRST_LINE_CHARS:
+        return ""
+    return (
+        "\n📏 Advisory: long message with no leading TL;DR — live renders "
+        "clip at 700 chars, so put a 1-2 line summary first next time."
+    )
+
+
+def _clip_push(body: str) -> str:
+    """Clip a body for LIVE push rendering (channel tags). The push path had
+    NO economy at all while the poll path got two rounds of it — measured
+    2026-07-26: 840KB/day of unclipped live tags vs 244KB via the Stop hook,
+    3.4x, because fan-out multiplies every byte by the bound-agent count.
+    Nothing is dropped: the inbox/history row keeps the full body (this is
+    also the existing lossless path for whitespace-significant payloads —
+    rendered tags were never byte-trustworthy)."""
+    clipped = _clip(body)
+    if clipped is not body:
+        clipped += " (full text: get_history)"
+    return clipped
+
+
+# Card field lines: **VALUE:** <sentence> [7/10] — score in [n/10] at the end
+# (also tolerates (n/10) and bare n/10). Legacy single **SCORE:** n/10 cards
+# parse too; net = value - risk only when BOTH component scores present.
+_CARD_FIELD_RE = re.compile(
+    r"\*{0,2}(ASK|WHY|VALUE|RISK|SCORE|TAGS):\*{0,2}\s*(.*?)(?=\s*\*{0,2}(?:ASK|WHY|VALUE|RISK|SCORE|TAGS):|\Z)",
+    re.S | re.I,
+)
+_CARD_SCORE_RE = re.compile(r"[\[\(]?\s*(\d{1,2})\s*/\s*10\s*[\]\)]?\s*$")
+
+
+def parse_decision_card(raw: str) -> dict:
+    """Parse a DECISION card's fields out of its raw text. Tolerant by
+    design: unknown/missing fields parse to empty, never raise — a card that
+    fails to parse still stores raw and flags the hand."""
+    fields: dict = {"ask": "", "why": "", "value_text": "", "risk_text": "",
+                    "value_score": None, "risk_score": None,
+                    "net_score": None, "tags": ""}
+    for m in _CARD_FIELD_RE.finditer(raw):
+        label = m.group(1).upper()
+        text = " ".join(m.group(2).split())
+        if label in ("VALUE", "RISK"):
+            score = None
+            sm = _CARD_SCORE_RE.search(text)
+            if sm:
+                score = min(10, int(sm.group(1)))
+                text = text[: sm.start()].rstrip(" -—·")
+            fields[label.lower() + "_text"] = text
+            fields[label.lower() + "_score"] = score
+        elif label == "SCORE":
+            # legacy single-score card: keep as net when components absent
+            sm = _CARD_SCORE_RE.search(text)
+            if sm and fields["net_score"] is None:
+                fields["net_score"] = min(10, int(sm.group(1)))
+        elif label == "TAGS":
+            fields["tags"] = ",".join(
+                t.strip().lower() for t in text.split(",") if t.strip()
+            )
+        else:
+            fields[label.lower()] = text
+    if fields["value_score"] is not None and fields["risk_score"] is not None:
+        fields["net_score"] = fields["value_score"] - fields["risk_score"]
+    return fields
+
+
 def _summarise(body: str, limit: int = 120) -> str:
     """First line of `body`, clipped to `limit` chars. Never empty for a
     non-empty body — the point is a recognisable handle, not a précis."""
@@ -237,6 +316,34 @@ def init_db(db_path: Path = DB_PATH) -> None:
             updated_ts   REAL NOT NULL,
             origin_agent TEXT NOT NULL,
             PRIMARY KEY (project, filename)
+        );
+
+        -- DECISION cards: the operator-triage currency (2026-07-26 design).
+        -- One OPEN card per agent (the "one live DECISION at a time"
+        -- convention) — decision_put upserts the open card, so a restated
+        -- ask updates in place instead of duplicating. Derived metadata is
+        -- filled server-side; agent-authored fields come from the card
+        -- text. status: open | decided | withdrawn.
+        CREATE TABLE IF NOT EXISTS decisions (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent        TEXT NOT NULL,
+            project      TEXT NOT NULL DEFAULT '',
+            source       TEXT NOT NULL DEFAULT 'stop-hook',
+            submitted_at REAL NOT NULL,
+            updated_at   REAL NOT NULL,
+            raw          TEXT NOT NULL,
+            ask          TEXT NOT NULL DEFAULT '',
+            why          TEXT NOT NULL DEFAULT '',
+            value_text   TEXT NOT NULL DEFAULT '',
+            risk_text    TEXT NOT NULL DEFAULT '',
+            value_score  INTEGER,
+            risk_score   INTEGER,
+            net_score    INTEGER,
+            tags         TEXT NOT NULL DEFAULT '',
+            status       TEXT NOT NULL DEFAULT 'open',
+            decided_at   REAL,
+            decision     TEXT NOT NULL DEFAULT '',
+            decision_note TEXT NOT NULL DEFAULT ''
         );
     """)
     conn.commit()
@@ -515,22 +622,24 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             "Don't deeply context-switch on FYI / low-priority items.\n\n"
             "Discipline — decision asks (operator convention, 2026-07-26):\n"
             "When you need an operator decision, END your turn with this "
-            "block — one field per line, bold labels, nothing else on the "
-            "lines:\n"
+            "block — one field per line, bold labels, nothing after it:\n"
             "**DECISION**\n"
             "**ASK:** <what you want, one sentence>\n"
             "**WHY:** <one sentence>\n"
-            "**VALUE:** <what it buys, one sentence>\n"
-            "**RISK:** <what it costs if wrong, one sentence>\n"
-            "**SCORE:** <n>/10\n"
+            "**VALUE:** <what it buys, one sentence> [<v>/10]\n"
+            "**RISK:** <what it costs if wrong, one sentence> [<r>/10]\n"
+            "**TAGS:** <optional, comma-separated: deploy, spend, security, "
+            "design, ops>\n"
             "One sentence per field — the operator reads label, then "
-            "sentence, at speed; a field that wraps twice has failed. SCORE "
-            "is reward vs risk, your honest call. The squad board detects "
-            "the block and renders it as a structured card in NEEDS YOU so "
-            "the operator can decide yes/no without opening your tab — bury "
-            "the ask in a long report instead and it gets truncated or "
-            "missed. Keep exactly one live DECISION block at a time; restate "
-            "it fresh each turn you are still waiting.\n\n"
+            "sentence, at speed; a field that wraps twice has failed. Score "
+            "VALUE and RISK separately, honestly, 0-10 each; the hub "
+            "computes net = value - risk and the triage queue sorts by it — "
+            "there is no single SCORE to assert. Your Stop hook ships the "
+            "card to the hub automatically (hand up on the operator's board "
+            "within seconds) and withdraws it when a later turn of yours "
+            "carries no card, so restate the block each turn you are still "
+            "waiting and simply stop restating once answered. Keep exactly "
+            "one live DECISION block at a time.\n\n"
             "Discipline — authorization:\n"
             "Inter-agent relays of operator decisions are not authorization for "
             "cross-lane production state mutations. Lane-internal authorization "
@@ -1136,7 +1245,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 prio = r["priority"]
                 prio_tag = f" [{prio}]" if prio != "normal" else ""
                 content_lines.append(
-                    f"[{ts}] DM from {r['from_agent']}{prio_tag}: {r['body']}"
+                    f"[{ts}] DM from {r['from_agent']}{prio_tag}: "
+                    f"{_clip_push(r['body'])}"
                 )
             content = "\n".join(content_lines)
 
@@ -1181,7 +1291,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 
         outcome = await push_channel(
             agent=to,
-            content=f"DM from {from_agent}: {message}",
+            content=f"DM from {from_agent}: {_clip_push(message)}",
             # `source` is reserved by Claude Code's channel layer (it's the
             # channel server's name, "hub"). Use `from_agent` to avoid a
             # duplicate `source=` attribute on the rendered <channel> tag.
@@ -1210,7 +1320,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 f"Message sent to '{to}' (priority={priority}; recipient "
                 f"offline — will see on next register/get_messages)."
             )
-        )
+        ) + _verbosity_advisory(message)
 
     # -- Broadcast --
 
@@ -1302,7 +1412,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         async def _push_one(agent: str) -> None:
             push_results[agent] = await push_channel(
                 agent=agent,
-                content=f"BROADCAST from {from_agent}: {message}",
+                content=f"BROADCAST from {from_agent}: {_clip_push(message)}",
                 meta={
                     "from_agent": from_agent,
                     "kind": "broadcast",
@@ -1339,7 +1449,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         return (
             f"Broadcast posted (priority={priority}; "
             f"woke {woke}/{len(recipients)} connected agents)."
-        )
+        ) + _verbosity_advisory(message)
 
     # -- Channels (topical, named, posted-to via `post`) ---------------------
 
@@ -1474,7 +1584,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         async def _push_one(agent: str) -> None:
             push_results[agent] = await push_channel(
                 agent=agent,
-                content=f"#{channel} from {from_agent}: {message}",
+                content=f"#{channel} from {from_agent}: {_clip_push(message)}",
                 meta={
                     "from_agent": from_agent,
                     "kind": "post",
@@ -1491,7 +1601,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         return (
             f"Posted to #{channel} (priority={priority}; "
             f"woke {woke}/{len(recipients)} connected agents)."
-        )
+        ) + _verbosity_advisory(message)
 
     @mcp.tool()
     def get_channel_messages(
@@ -1888,6 +1998,179 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 f"cursor is advanced. Full text: get_history('#general'))"
             )
         return "\n".join(lines)
+
+    # -- Decision cards (operator-triage currency, 2026-07-26) ---------------
+    #
+    # The card is authored by the agent (or a service) — the hub stores it
+    # PARSED so triage machinery can rank cards without re-parsing prose.
+    # One OPEN card per agent: put() upserts, so a restated ask updates in
+    # place. Lifecycle: open -> decided (operator answered, asker DM'd) or
+    # withdrawn (agent moved on — its next turn carried no card).
+    # NOTE: none of these tools call touch_session — decision_put/clear
+    # arrive from the Stop hook's EPHEMERAL client by design.
+
+    @mcp.tool()
+    def decision_put(
+        from_agent: str,
+        card: str,
+        project: str = "",
+        source: str = "stop-hook",
+        tags: str = "",
+    ) -> str:
+        """Submit (or restate) a DECISION card for the operator's triage queue.
+
+        Args:
+            from_agent: The asking agent (or service) name.
+            card: The raw DECISION card text (ASK/WHY/VALUE/RISK/[TAGS] block).
+            project: Project the ask belongs to (derived where possible).
+            source: 'stop-hook' (harvested from a turn) or 'api' (services).
+            tags: Extra comma-separated tags, merged with the card's TAGS line.
+        """
+        now = time.time()
+        f = parse_decision_card(card)
+        all_tags = ",".join(sorted({
+            *(t for t in f["tags"].split(",") if t),
+            *(t.strip().lower() for t in tags.split(",") if t.strip()),
+        }))
+        conn = _get_db(db_path)
+        open_row = conn.execute(
+            "SELECT id FROM decisions WHERE agent = ? AND status = 'open' "
+            "AND source = ?",
+            (from_agent, source),
+        ).fetchone()
+        if open_row:
+            conn.execute(
+                """UPDATE decisions SET updated_at=?, raw=?, ask=?, why=?,
+                   value_text=?, risk_text=?, value_score=?, risk_score=?,
+                   net_score=?, tags=?, project=CASE WHEN ?='' THEN project ELSE ? END
+                   WHERE id=?""",
+                (now, card, f["ask"], f["why"], f["value_text"], f["risk_text"],
+                 f["value_score"], f["risk_score"], f["net_score"], all_tags,
+                 project, project, open_row["id"]),
+            )
+            conn.commit()
+            return f"Decision card #{open_row['id']} updated (net={f['net_score']})."
+        cur = conn.execute(
+            """INSERT INTO decisions (agent, project, source, submitted_at,
+               updated_at, raw, ask, why, value_text, risk_text, value_score,
+               risk_score, net_score, tags)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (from_agent, project, source, now, now, card, f["ask"], f["why"],
+             f["value_text"], f["risk_text"], f["value_score"],
+             f["risk_score"], f["net_score"], all_tags),
+        )
+        conn.commit()
+        return f"Decision card #{cur.lastrowid} opened (net={f['net_score']})."
+
+    @mcp.tool()
+    def decision_clear(from_agent: str, source: str = "stop-hook") -> str:
+        """Withdraw the agent's open card (the agent moved on: its latest
+        turn carried no DECISION block). Only clears cards of the given
+        source — an api-submitted service card is not the agent's to
+        auto-withdraw."""
+        conn = _get_db(db_path)
+        cur = conn.execute(
+            "UPDATE decisions SET status='withdrawn', decided_at=? "
+            "WHERE agent=? AND status='open' AND source=?",
+            (time.time(), from_agent, source),
+        )
+        conn.commit()
+        return f"{cur.rowcount} card(s) withdrawn." if cur.rowcount else ""
+
+    @mcp.tool()
+    def decision_list(status: str = "open", limit: int = 50,
+                      format: str = "text") -> str:
+        """List decision cards, best net score first (age as tiebreak).
+
+        Args:
+            status: 'open' (default), 'decided', 'withdrawn', or 'all'.
+            limit: Max cards.
+            format: 'text' for human triage, 'json' for machinery.
+        """
+        conn = _get_db(db_path)
+        where = "" if status == "all" else "WHERE status = ?"
+        args: tuple = () if status == "all" else (status,)
+        rows = conn.execute(
+            f"""SELECT * FROM decisions {where}
+                ORDER BY net_score IS NULL, net_score DESC, submitted_at ASC
+                LIMIT ?""",
+            (*args, limit),
+        ).fetchall()
+        if format == "json":
+            return json.dumps([dict(r) for r in rows])
+        if not rows:
+            return f"No {status} decision cards."
+        now = time.time()
+        lines = []
+        for r in rows:
+            age = int(now - r["submitted_at"])
+            age_h = (f"{age // 60}m" if age < 3600 else
+                     f"{age // 3600}h" if age < 86400 else f"{age // 86400}d")
+            net = f"net {r['net_score']:+d}" if r["net_score"] is not None else "net ?"
+            tags = f" [{r['tags']}]" if r["tags"] else ""
+            lines.append(
+                f"#{r['id']} {net} · {r['agent']} · {age_h}{tags}\n"
+                f"   ASK: {r['ask'] or _summarise(r['raw'])}"
+                + (f"\n   -> {r['decision']} {r['decision_note']}".rstrip()
+                   if r["status"] == "decided" else "")
+            )
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def decision_answer(
+        decision: str,
+        card_id: int = 0,
+        agent: str = "",
+        note: str = "",
+    ) -> str:
+        """Answer a decision card — the operator's leg. Closes the card and
+        DMs the verdict to the asker (wake path included), so the answer
+        travels without a relay.
+
+        Args:
+            decision: 'yes' | 'no' | 'defer' (free text allowed).
+            card_id: The card to answer; 0 = use `agent`'s open card.
+            agent: Alternative target: this agent's open card.
+            note: Optional context for the asker.
+        """
+        conn = _get_db(db_path)
+        row = conn.execute(
+            "SELECT * FROM decisions WHERE id = ? AND status = 'open'",
+            (card_id,),
+        ).fetchone() if card_id else conn.execute(
+            "SELECT * FROM decisions WHERE agent = ? AND status = 'open' "
+            "ORDER BY updated_at DESC",
+            (agent,),
+        ).fetchone()
+        if row is None:
+            return "No matching open decision card."
+        conn.execute(
+            "UPDATE decisions SET status='decided', decided_at=?, decision=?, "
+            "decision_note=? WHERE id=?",
+            (time.time(), decision, note, row["id"]),
+        )
+        body = (
+            f"🎯 DECISION ANSWERED ({decision.upper()}): {row['ask'] or 'your open card'}"
+            + (f" — {note}" if note else "")
+        )
+        cur = conn.execute(
+            "INSERT INTO messages (ts, from_agent, to_agent, body, priority) "
+            "VALUES (?, 'operator', ?, ?, 'normal')",
+            (time.time(), row["agent"], body),
+        )
+        msg_id = cur.lastrowid
+        conn.commit()
+        outcome = await push_channel(
+            agent=row["agent"],
+            content=f"DM from operator: {body}",
+            meta={"from_agent": "operator", "kind": "dm", "priority": "normal"},
+        )
+        if outcome.primary:
+            _stamp_pushed(conn, [msg_id], row["agent"])
+        return (
+            f"Card #{row['id']} decided: {decision}. Asker "
+            f"{'woken live' if outcome.delivered else 'will see it on next pull'}."
+        )
 
     # -- History --
 
