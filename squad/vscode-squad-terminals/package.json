@@ -2,7 +2,7 @@
   "name": "squad-terminals",
   "displayName": "Squad Terminals",
   "description": "Auto-opens one plain terminal per squad agent (squad attach) with icon+color, and adds per-agent squad actions to the terminal tab context menu.",
-  "version": "0.17.0",
+  "version": "0.18.0",
   "publisher": "monkeypashion",
   "engines": {
     "vscode": "^1.90.0"
@@ -30,22 +30,22 @@
       },
       {
         "command": "squad.sendPrompt",
-        "title": "Send prompt\u2026",
+        "title": "Send prompt…",
         "category": "Squad"
       },
       {
         "command": "squad.stockPrompt",
-        "title": "Stock prompt\u2026",
+        "title": "Stock prompt…",
         "category": "Squad"
       },
       {
         "command": "squad.broadcast",
-        "title": "Broadcast to team via agent\u2026",
+        "title": "Broadcast to team via agent…",
         "category": "Squad"
       },
       {
         "command": "squad.dmVia",
-        "title": "Message agent(s) via this one\u2026",
+        "title": "Message agent(s) via this one…",
         "category": "Squad"
       },
       {
@@ -205,7 +205,7 @@
       },
       {
         "command": "squad.slash.custom",
-        "title": "Other /command\u2026",
+        "title": "Other /command…",
         "category": "Squad"
       },
       {
@@ -230,17 +230,17 @@
       },
       {
         "command": "squad.transport",
-        "title": "Transport to workspace\u2026",
+        "title": "Transport to workspace…",
         "category": "Squad"
       },
       {
         "command": "squad.transportAll",
-        "title": "Transport ALL agents to workspace\u2026",
+        "title": "Transport ALL agents to workspace…",
         "category": "Squad"
       },
       {
         "command": "squad.addFolder",
-        "title": "Add existing folder as agent\u2026",
+        "title": "Add existing folder as agent…",
         "category": "Squad"
       }
     ],
@@ -518,8 +518,8 @@
           "default": "confirm",
           "enumDescriptions": [
             "Focusing a down agent's terminal shows a one-click 'Start & attach' prompt (default).",
-            "Focusing a down agent's terminal starts claude immediately \u2014 zero-click; window-restore/panel-reveal focus events can start an agent from a glance.",
-            "Never auto-start; use the tab context menu (Squad \u2192 Start & attach)."
+            "Focusing a down agent's terminal starts claude immediately — zero-click; window-restore/panel-reveal focus events can start an agent from a glance.",
+            "Never auto-start; use the tab context menu (Squad → Start & attach)."
           ],
           "description": "What happens when you focus the terminal of an agent that is down."
         }
