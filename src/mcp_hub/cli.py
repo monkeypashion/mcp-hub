@@ -114,10 +114,20 @@ async def _query_hub(
             except Exception:  # noqa: BLE001
                 msg_args.pop("compact")
                 messages_result = await session.call_tool("get_messages", msg_args)
-            broadcasts_result = await session.call_tool(
-                "get_broadcasts_for_agent",
-                {"agent_name": agent_name, "bind": False},
-            )
+            # compact=True mirrors the DM economy onto broadcasts (they were
+            # the unclipped half of the Stop-hook context tax). Same
+            # version-skew fallback as get_messages above: during a deploy a
+            # newer CLI may hit an older hub that rejects the flag.
+            bc_args = {"agent_name": agent_name, "bind": False, "compact": True}
+            try:
+                broadcasts_result = await session.call_tool(
+                    "get_broadcasts_for_agent", bc_args
+                )
+            except Exception:  # noqa: BLE001
+                bc_args.pop("compact")
+                broadcasts_result = await session.call_tool(
+                    "get_broadcasts_for_agent", bc_args
+                )
             agents_result = await session.call_tool("list_agents", {})
 
     messages_text = _extract_text(messages_result)

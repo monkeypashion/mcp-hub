@@ -1781,6 +1781,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         agent_name: str,
         limit: int = 50,
         bind: bool = True,
+        compact: bool = False,
         ctx: Context | None = None,
     ) -> str:
         """Get broadcasts this agent hasn't seen yet, and advance their cursor.
@@ -1803,6 +1804,16 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                   bind=False because its streamablehttp_client is ephemeral
                   and binding to it would clobber the agent's real wake
                   target. See note on get_messages for full rationale.
+            compact: Stop-hook economy, mirroring get_messages: the first
+                  COMPACT_FULL_MESSAGES bodies are clipped at
+                  COMPACT_FULL_BODY_CHARS, the rest summarised to one line.
+                  Broadcasts turned out to be the unclipped half of the
+                  Stop-hook context tax (operator, 2026-07-26: multi-KB
+                  fleet broadcasts landing whole in every idle agent's
+                  context). No already-seen-live leg here: a broadcast row
+                  is shared by all recipients, so it can't carry a
+                  per-recipient pushed generation. Nothing is dropped,
+                  only shortened — the footer points at the full text.
         """
         conn = _get_db(db_path)
         # Broadcast drain is a wake-ack too — same rationale as get_messages.
@@ -1844,11 +1855,38 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         conn.commit()
 
         lines = []
+        capped = 0
+        clipped = 0
+        full_budget = COMPACT_FULL_MESSAGES
         for r in rows:
             ts = time.strftime("%H:%M:%S", time.localtime(r["ts"]))
             prio = r["priority"] if r["priority"] != "normal" else ""
             prio_tag = f" [{prio}]" if prio else ""
-            lines.append(f"[{ts}] **{r['from_agent']}**{prio_tag}: {r['body']}")
+            body = r["body"]
+            if compact:
+                if full_budget > 0:
+                    full_budget -= 1
+                    clipped_body = _clip(body)
+                    if clipped_body is not body:
+                        clipped += 1
+                    body = clipped_body
+                else:
+                    capped += 1
+                    body = _summarise(body, COMPACT_SUMMARY_CHARS)
+            lines.append(f"[{ts}] **{r['from_agent']}**{prio_tag}: {body}")
+        if compact and (capped or clipped):
+            # Point at get_history('#general'), not get_broadcasts_for_agent:
+            # this very call advanced the cursor, so a repeat returns nothing.
+            # (Same read-semantics trap the get_messages footer already hit.)
+            what = []
+            if capped:
+                what.append(f"{capped} past the {COMPACT_FULL_MESSAGES}-message cap")
+            if clipped:
+                what.append(f"{clipped} clipped at {COMPACT_FULL_BODY_CHARS} chars")
+            lines.append(
+                f"({' and '.join(what)} — shortened to save context, and the "
+                f"cursor is advanced. Full text: get_history('#general'))"
+            )
         return "\n".join(lines)
 
     # -- History --

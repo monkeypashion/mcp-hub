@@ -739,6 +739,97 @@ async def test_broadcasts_for_agent_unregistered_returns_empty(server):
     assert out == ""
 
 
+# ---------------------------------------------------------------------------
+# get_broadcasts_for_agent compact mode — the Stop-hook broadcast economy
+#
+# Broadcasts were the UNCLIPPED half of the Stop-hook context tax: DMs got
+# the compact economy on 2026-07-25 (ef53e2f), broadcasts rendered verbatim
+# up to limit=50. Multi-KB fleet broadcasts landed whole in every idle
+# agent's context at every turn boundary (operator, 2026-07-26).
+# ---------------------------------------------------------------------------
+
+
+async def test_broadcasts_compact_clips_long_bodies(server):
+    from mcp_hub.server import COMPACT_FULL_BODY_CHARS
+
+    await _call_tool(server, "register", {"name": "alice", "project": "x"})
+    await _call_tool(server, "register", {"name": "bob", "project": "y"})
+    long_body = "line one of the broadcast\n" + ("x" * 4000)
+    await _call_tool(
+        server, "broadcast",
+        {"from_agent": "bob", "message": long_body, "priority": "low"},
+    )
+    out = await _call_tool(
+        server, "get_broadcasts_for_agent",
+        {"agent_name": "alice", "compact": True},
+    )
+    assert "[…clipped]" in out
+    assert len(out) < len(long_body)
+    assert f"clipped at {COMPACT_FULL_BODY_CHARS} chars" in out
+    assert "get_history('#general')" in out
+
+
+async def test_broadcasts_compact_summarises_past_budget(server):
+    """Beyond COMPACT_FULL_MESSAGES bodies, compact mode renders one-line
+    summaries — a flood of broadcasts must not scale the output linearly."""
+    from mcp_hub.server import COMPACT_FULL_MESSAGES
+
+    await _call_tool(server, "register", {"name": "alice", "project": "x"})
+    await _call_tool(server, "register", {"name": "bob", "project": "y"})
+    n = COMPACT_FULL_MESSAGES + 3
+    for i in range(n):
+        await _call_tool(
+            server, "broadcast",
+            {"from_agent": "bob",
+             "message": f"broadcast {i} headline\nbody detail line {i}",
+             "priority": "low"},
+        )
+    out = await _call_tool(
+        server, "get_broadcasts_for_agent",
+        {"agent_name": "alice", "compact": True},
+    )
+    # All present (nothing dropped) …
+    for i in range(n):
+        assert f"broadcast {i} headline" in out
+    # … but only the first COMPACT_FULL_MESSAGES carry their body text.
+    assert f"body detail line {COMPACT_FULL_MESSAGES - 1}" in out
+    assert f"body detail line {COMPACT_FULL_MESSAGES}" not in out
+    assert f"{3} past the {COMPACT_FULL_MESSAGES}-message cap" in out
+
+
+async def test_broadcasts_default_stays_verbatim(server):
+    """compact is opt-in: the default path renders full bodies unchanged
+    (other callers rely on lossless output)."""
+    await _call_tool(server, "register", {"name": "alice", "project": "x"})
+    await _call_tool(server, "register", {"name": "bob", "project": "y"})
+    long_body = "headline\n" + ("y" * 2000)
+    await _call_tool(
+        server, "broadcast",
+        {"from_agent": "bob", "message": long_body, "priority": "low"},
+    )
+    out = await _call_tool(
+        server, "get_broadcasts_for_agent", {"agent_name": "alice"},
+    )
+    assert "y" * 2000 in out
+    assert "[…clipped]" not in out
+
+
+async def test_broadcasts_compact_short_bodies_untouched_no_footer(server):
+    """Compact mode with nothing to shorten adds no footer noise."""
+    await _call_tool(server, "register", {"name": "alice", "project": "x"})
+    await _call_tool(server, "register", {"name": "bob", "project": "y"})
+    await _call_tool(
+        server, "broadcast",
+        {"from_agent": "bob", "message": "short and sweet", "priority": "low"},
+    )
+    out = await _call_tool(
+        server, "get_broadcasts_for_agent",
+        {"agent_name": "alice", "compact": True},
+    )
+    assert "short and sweet" in out
+    assert "shortened to save context" not in out
+
+
 async def test_auto_bind_rebinds_drifted_agent_on_tool_call(server):
     """Drift recovery: after the registry is cleared (simulating a hub
     redeploy that wiped in-memory bindings), the very next tool call from
