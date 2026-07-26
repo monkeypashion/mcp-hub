@@ -29,7 +29,8 @@ pytestmark = pytest.mark.skipif(not RECV.exists(), reason="transport-recv not pr
 def _repo(path: pathlib.Path) -> pathlib.Path:
     """A git repo whose origin decides the derived name."""
     path.mkdir(parents=True)
-    run = lambda *a: subprocess.run(a, cwd=path, capture_output=True, check=True)
+    def run(*a):
+        subprocess.run(a, cwd=path, capture_output=True, check=True)
     run("git", "init", "-q")
     run("git", "remote", "add", "origin", ORIGIN)
     return path
@@ -55,7 +56,7 @@ def home(tmp_path):
 
 def _roster(home: pathlib.Path) -> list[str]:
     conf = home / ".config" / "squad" / "squad.conf"
-    return [l for l in conf.read_text().splitlines() if l.strip()] if conf.exists() else []
+    return [line for line in conf.read_text().splitlines() if line.strip()] if conf.exists() else []
 
 
 def test_wires_up_a_destination(home, tmp_path):
@@ -125,3 +126,30 @@ def test_distinct_suffixes_give_two_independent_agents(home, tmp_path):
     names = [r.split("|")[0] for r in rows]
     assert len(set(names)) == 2, f"identities must differ, got {names}"
     assert names[1].endswith("-target-2")
+
+
+def test_refusal_seeds_nothing_for_the_rejected_destination(home, tmp_path):
+    """A refusal must not leave the rejected destination half-wired.
+
+    Caught in review by mcp-hub-dev-vm-1: the check used to sit beside the
+    roster append, so by the time it fired, steps 3-4 had already written
+    .mcp.json and the trust/MCP approval for a destination we then declined to
+    enrol. "Changes nothing" was overstated. The check now runs before any
+    seeding, and rolls back the one thing written ahead of it.
+    """
+    h, ws = home
+    first = _repo(tmp_path / "a" / "mcp-hub")
+    second = _repo(tmp_path / "b" / "mcp-hub")
+    assert _recv(h, first, ws, "target").returncode == 0
+
+    res = _recv(h, second, ws, "target")
+    assert res.returncode == 5
+
+    assert not (second / ".mcp.json").exists(), "no hub config for a rejected dest"
+    claude = json.loads((h / ".claude.json").read_text())
+    assert str(second) not in claude.get("projects", {}), "no trust seeding either"
+    cfg = json.loads((h / ".mcp-hub" / "config.json").read_text())
+    assert str(second) not in cfg.get("workspaces", {}), "suffix must be rolled back"
+    assert str(second) not in ws.read_text(), "no workspace folder entry"
+    # and the accepted agent is still intact
+    assert len(_roster(h)) == 1 and _roster(h)[0].split("|")[1] == str(first)

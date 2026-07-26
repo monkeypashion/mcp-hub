@@ -56,6 +56,46 @@ if [ -z "$NAME" ]; then
 fi
 echo "  identity: $NAME"
 
+# 2b. COLLISION CHECK — before anything is seeded.
+# Deliberately here, not beside the roster append: steps 3-6 write .mcp.json,
+# trust/MCP approval and a workspace folder entry, so checking later meant a
+# refusal had already changed state for a destination we then declined to
+# enrol. Caught in review by mcp-hub-dev-vm-1, who was right that "changes
+# nothing" was overstated.
+EXISTING="$(awk -F'|' -v n="$NAME" '$1==n{print $2; exit}' "$CONF" 2>/dev/null || true)"
+if [ -n "$EXISTING" ] && [ "$EXISTING" != "$DEST" ]; then
+  # IDENTITY COLLAPSE, not idempotency. The name already belongs to a DIFFERENT
+  # worktree, so appending would be unreachable anyway (field() takes the first
+  # match) and skipping silently would hand two clones one identity — sharing a
+  # hub binding, inbox, heartbeat pidfile and status cache.
+  echo "!! REFUSING: '$NAME' already names a DIFFERENT worktree."
+  echo "     existing : $EXISTING"
+  echo "     this one : $DEST"
+  echo "   Two clones cannot share one identity — they would share a hub"
+  echo "   binding, inbox, heartbeat pidfile and status cache."
+  echo "   Pass a distinct identity suffix for this destination (squad"
+  echo "   transport all does this automatically: <workspace>-2, -3, ...)."
+  # Roll back the only thing we wrote (step 1), so a refusal really does leave
+  # nothing behind. The cloned repo is the SOURCE's doing and is left in place
+  # deliberately — reporting it beats deleting a directory we did not create.
+  python3 - "$HOME/.mcp-hub/config.json" "$DEST" <<'PYROLL' || true
+import json, pathlib, sys
+cfg, dest = pathlib.Path(sys.argv[1]), sys.argv[2]
+try:
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    ws = data.get("workspaces")
+    if isinstance(ws, dict) and dest in ws:
+        ws.pop(dest)
+        data["workspaces"] = ws
+        cfg.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        print("   (rolled back this destination's identity suffix)")
+except Exception:
+    pass
+PYROLL
+  echo "   left in place: the clone at $DEST — remove it if you don't want it."
+  exit 5
+fi
+
 # 3. hub connection file — untracked, so it never arrives via git.
 python3 - "$DEST/.mcp.json" "$HUB_URL" <<'PY'
 import json, os, pathlib, sys
@@ -107,28 +147,6 @@ PY
 #    operationally a different agent: it can't be healed and can't hear.
 mkdir -p "$(dirname "$CONF")"
 touch "$CONF"
-EXISTING="$(awk -F'|' -v n="$NAME" '$1==n{print $2; exit}' "$CONF")"
-if [ -n "$EXISTING" ] && [ "$EXISTING" != "$DEST" ]; then
-  # IDENTITY COLLAPSE, not idempotency. The name already belongs to a DIFFERENT
-  # worktree, so appending would be impossible (field() takes the first match,
-  # so the second row is unreachable) and skipping silently would hand two
-  # clones one identity — they'd share a hub binding, an inbox, a heartbeat
-  # pidfile and a status cache.
-  #
-  # This is reachable whenever a caller transports two clones of ONE repo into
-  # one workspace without a per-destination suffix: the suffix defaults to the
-  # workspace label, which they share. `squad transport all` passes <label>-2,
-  # -3… precisely to avoid it — but a caller who doesn't know the trap exists
-  # must hit a wall here, not a shrug.
-  echo "!! REFUSING: '$NAME' already names a DIFFERENT worktree."
-  echo "     existing : $EXISTING"
-  echo "     this one : $DEST"
-  echo "   Two clones cannot share one identity — they would share a hub"
-  echo "   binding, inbox, heartbeat pidfile and status cache."
-  echo "   Pass a distinct identity suffix for this destination (squad"
-  echo "   transport all does this automatically: <workspace>-2, -3, ...)."
-  exit 5
-fi
 if [ -n "$EXISTING" ]; then
   echo "  roster row already present for $NAME (same worktree — idempotent)"
 else

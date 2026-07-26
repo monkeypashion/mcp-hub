@@ -41,12 +41,13 @@ def _add(env_conf, folder) -> subprocess.CompletedProcess:
 
 def _rows(env_conf) -> list[list[str]]:
     _, conf = env_conf
-    return [l.split("|") for l in conf.read_text().splitlines() if l.strip()]
+    return [line.split("|") for line in conf.read_text().splitlines() if line.strip()]
 
 
 def _git(path: pathlib.Path, origin: str) -> pathlib.Path:
     path.mkdir(parents=True, exist_ok=True)
-    run = lambda *a: subprocess.run(a, cwd=path, capture_output=True, check=True)
+    def run(*a):
+        subprocess.run(a, cwd=path, capture_output=True, check=True)
     run("git", "init", "-q")
     run("git", "remote", "add", "origin", origin)
     return path
