@@ -312,3 +312,28 @@ async def test_short_message_no_advisory(server):
         server, "send", {"from_agent": "alice", "to": "bob", "message": "hi"},
     )
     assert "Advisory" not in out
+
+
+async def test_long_tldr_line_is_still_compliance(server):
+    """fb-wsl's live false positive (2026-07-26): a message whose first line
+    IS the TL;DR but runs past 200 chars must not be flagged — an explicit
+    marker beats the line-length heuristic. A false positive in a training
+    signal teaches people to ignore it."""
+    await _call_tool(server, "register", {"name": "alice", "project": "p"})
+    body = ("TL;DR: " + "a genuinely long but deliberate summary line " * 6
+            + "\n" + ("detail " * 400))
+    assert len(body.splitlines()[0]) > 200
+    out = await _call_tool(
+        server, "broadcast", {"from_agent": "alice", "message": body},
+    )
+    assert "Advisory" not in out
+
+
+async def test_bold_summary_marker_counts_too(server):
+    await _call_tool(server, "register", {"name": "alice", "project": "p"})
+    body = ("**Summary** — " + "the gist stated at some length " * 8
+            + "\n" + ("detail " * 400))
+    out = await _call_tool(
+        server, "broadcast", {"from_agent": "alice", "message": body},
+    )
+    assert "Advisory" not in out

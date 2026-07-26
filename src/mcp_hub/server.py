@@ -132,14 +132,24 @@ _TLDR_BODY_CHARS = 1500
 _TLDR_FIRST_LINE_CHARS = 200
 
 
+_TLDR_MARKER_RE = re.compile(r"^\s*(\*{0,2})(tl;?dr|summary)\b", re.I)
+
+
 def _verbosity_advisory(message: str) -> str:
     """One advisory line back to the SENDER of a long message that doesn't
     lead with a summary. Correction at the moment of the offense — visible
     only in the sender's own tool result, never to recipients. The clip
-    protects readers; this trains writers."""
+    protects readers; this trains writers.
+
+    An explicit TL;DR/Summary marker counts as compliance regardless of how
+    long that line runs — the first version keyed on line length alone and
+    flagged a message that literally began "TL;DR:" (fb-wsl, 2026-07-26).
+    A false positive in a training signal teaches people to ignore it."""
     if len(message) <= _TLDR_BODY_CHARS:
         return ""
     first = message.strip().splitlines()[0] if message.strip() else ""
+    if _TLDR_MARKER_RE.match(first):
+        return ""
     if len(first) <= _TLDR_FIRST_LINE_CHARS:
         return ""
     return (
