@@ -176,7 +176,7 @@ def _clip_push(body: str) -> str:
 # (also tolerates (n/10) and bare n/10). Legacy single **SCORE:** n/10 cards
 # parse too; net = value - risk only when BOTH component scores present.
 _CARD_FIELD_RE = re.compile(
-    r"\*{0,2}(ASK|WHY|VALUE|RISK|SCORE|TAGS):\*{0,2}\s*(.*?)(?=\s*\*{0,2}(?:ASK|WHY|VALUE|RISK|SCORE|TAGS):|\Z)",
+    r"\*{0,2}(ASK|WHY|VALUE|RISK|SCORE|TAGS|NET):\*{0,2}\s*(.*?)(?=\s*\*{0,2}(?:ASK|WHY|VALUE|RISK|SCORE|TAGS|NET):|\Z)",
     re.S | re.I,
 )
 _CARD_SCORE_RE = re.compile(r"[\[\(]?\s*(\d{1,2})\s*/\s*10\s*[\]\)]?\s*$")
@@ -209,6 +209,11 @@ def parse_decision_card(raw: str) -> dict:
             fields["tags"] = ",".join(
                 t.strip().lower() for t in text.split(",") if t.strip()
             )
+        elif label == "NET":
+            # Author-asserted total, for PANE display only — the hub always
+            # recomputes net from the components; a fumbled author sum must
+            # not override arithmetic.
+            pass
         else:
             fields[label.lower()] = text
     if fields["value_score"] is not None and fields["risk_score"] is not None:
@@ -638,18 +643,31 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             "**WHY:** <one sentence>\n"
             "**VALUE:** <what it buys, one sentence> [<v>/10]\n"
             "**RISK:** <what it costs if wrong, one sentence> [<r>/10]\n"
+            "**NET:** <v minus r, e.g. +5>\n"
             "**TAGS:** <optional, comma-separated: deploy, spend, security, "
             "design, ops>\n"
             "One sentence per field — the operator reads label, then "
             "sentence, at speed; a field that wraps twice has failed. Score "
             "VALUE and RISK separately, honestly, 0-10 each; the hub "
             "computes net = value - risk and the triage queue sorts by it — "
-            "there is no single SCORE to assert. Your Stop hook ships the "
-            "card to the hub automatically (hand up on the operator's board "
-            "within seconds) and withdraws it when a later turn of yours "
-            "carries no card, so restate the block each turn you are still "
-            "waiting and simply stop restating once answered. Keep exactly "
-            "one live DECISION block at a time.\n\n"
+            "there is no single SCORE to assert; write NET yourself for the "
+            "pane reader, the hub recomputes and its arithmetic wins. Your "
+            "Stop hook ships the card to the hub automatically (hand up on "
+            "the operator's board within seconds) and withdraws it when a "
+            "later turn of yours carries no card, so restate the block each "
+            "turn you are still waiting. Keep exactly one live DECISION "
+            "block at a time.\n"
+            "FIRST-PARTY ONLY (operator rule, 2026-07-26): file a card only "
+            "for a decision YOU need. Never card an ask on another agent's "
+            "behalf — a proxy card is useless information on the operator's "
+            "queue. If the decision belongs to another lane, DM that agent "
+            "telling them to file their own card, and file nothing.\n"
+            "When the operator answers you IN YOUR PANE, close the loop: "
+            "end your acknowledging turn with one line — "
+            "**DECIDED:** <their verdict, your words, one sentence> — and "
+            "your Stop hook records it on the card (agent-recorded "
+            "provenance). That line is what turns an in-pane answer into a "
+            "ledger entry; without it the card closes verdict-less.\n\n"
             "Discipline — authorization:\n"
             "Inter-agent relays of operator decisions are not authorization for "
             "cross-lane production state mutations. Lane-internal authorization "
@@ -2086,6 +2104,25 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         )
         conn.commit()
         return f"{cur.rowcount} card(s) withdrawn." if cur.rowcount else ""
+
+    @mcp.tool()
+    def decision_resolve(from_agent: str, verdict: str, source: str = "stop-hook") -> str:
+        """Close the agent's own open card WITH the verdict it just received
+        in-pane — the smart half of answer capture (operator, 2026-07-26:
+        "rather than relying on some flaky auto capture"). The agent that
+        processed the operator's answer records it: its closing turn ends
+        with `**DECIDED:** <verdict>` and the Stop hook ships it here. The
+        verdict is agent-recorded, so it is stored with that provenance —
+        distinct from a decision_answer verdict typed by the operator."""
+        conn = _get_db(db_path)
+        cur = conn.execute(
+            "UPDATE decisions SET status='decided', decided_at=?, "
+            "decision='in-pane', decision_note=? "
+            "WHERE agent=? AND status='open' AND source=?",
+            (time.time(), f"[agent-recorded] {verdict}", from_agent, source),
+        )
+        conn.commit()
+        return f"Card resolved: {verdict}" if cur.rowcount else ""
 
     @mcp.tool()
     def decision_list(status: str = "open", limit: int = 50,

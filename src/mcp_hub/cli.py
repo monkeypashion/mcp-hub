@@ -111,6 +111,17 @@ def _read_last_assistant_text(transcript_path: str | None) -> str:
     return ""
 
 
+_DECIDED_RE = re.compile(r"\*{0,2}DECIDED:\*{0,2}\s*(.+?)\s*$", re.M)
+
+
+def _extract_decided(turn_text: str) -> str:
+    """The `**DECIDED:** <verdict>` closing marker, '' if none. The agent
+    that received an in-pane answer records the verdict itself (it just
+    understood and acted on it) — machinery only ships; last one wins."""
+    matches = list(_DECIDED_RE.finditer(turn_text))
+    return matches[-1].group(1).strip() if matches else ""
+
+
 def _extract_decision_card(turn_text: str) -> str:
     """The DECISION card from a turn's text, '' if none. The convention puts
     the card at the END of the turn, so we take from the last DECISION token
@@ -125,7 +136,8 @@ def _extract_decision_card(turn_text: str) -> str:
 
 
 async def _query_hub(
-    hub_url: str, agent_name: str, project: str = "", card: str = ""
+    hub_url: str, agent_name: str, project: str = "", card: str = "",
+    decided: str = "",
 ) -> tuple[str, str, bool]:
     """Connect to the hub, return (dm_text, broadcast_text, is_online).
 
@@ -190,12 +202,19 @@ async def _query_hub(
                 broadcasts_result = await session.call_tool(
                     "get_broadcasts_for_agent", bc_args
                 )
-            # DECISION card leg: card in the last turn -> put (upserts the
-            # agent's open card); no card -> clear (idempotent no-op when
-            # nothing is open). Fail-soft: an older hub without these tools
-            # must not break message surfacing (version skew during deploys).
+            # DECISION card leg. Precedence: a DECIDED marker (the agent
+            # recording the in-pane verdict it just received) closes the
+            # open card WITH the verdict; else a card in the last turn ->
+            # put (upserts); else -> clear (idempotent, verdict-less
+            # withdrawal). Fail-soft: an older hub without these tools must
+            # not break message surfacing (version skew during deploys).
             try:
-                if card:
+                if decided:
+                    await session.call_tool(
+                        "decision_resolve",
+                        {"from_agent": agent_name, "verdict": decided},
+                    )
+                elif card:
                     await session.call_tool(
                         "decision_put",
                         {"from_agent": agent_name, "card": card,
@@ -1295,13 +1314,14 @@ def stop_hook_command(args: argparse.Namespace) -> int:
     # language without a card earns the one-shot authoring nag.
     last_turn = _read_last_assistant_text(payload.get("transcript_path"))
     card = _extract_decision_card(last_turn)
-    card_nag = bool(last_turn) and not card and bool(
+    decided = "" if card else _extract_decided(last_turn)
+    card_nag = bool(last_turn) and not card and not decided and bool(
         _WAITING_ON_OP_RE.search(last_turn)
     )
 
     try:
         messages_text, broadcasts_text, is_online = asyncio.run(
-            _query_hub(args.hub_url, name, project or "", card)
+            _query_hub(args.hub_url, name, project or "", card, decided)
         )
     except Exception as exc:  # noqa: BLE001
         # Fail open — never block the agent on hub flakiness.
@@ -1756,6 +1776,28 @@ def _write_status_cache(agent_name: str, agents_text: str) -> None:
         pass
 
 
+def _write_decisions_cache(decisions_json: str) -> None:
+    """Atomically cache the hub's OPEN decision cards for local readers
+    (squad board: hub-backed 🙋 vs legacy recap-flag disambiguation).
+    All daemons on the box write the same file — last-write-wins is fine,
+    they're all fetching the same global queue. Fail-soft like the status
+    cache: this is display plumbing, never worth a dead heartbeat."""
+    try:
+        rows = json.loads(decisions_json) if decisions_json.strip() else []
+        if not isinstance(rows, list):
+            return
+        path = _state_dir() / "decisions-open.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(
+            json.dumps({"ts": int(time.time()), "cards": rows}),
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 FLEET_BOARD_STALENESS_SECONDS = 45.0
 
 
@@ -2031,6 +2073,17 @@ async def _heartbeat_loop(hub_url: str, agent_name: str) -> bool:
                         agents_text = _extract_text(agents_result)
                         _write_status_cache(agent_name, agents_text)
                         _write_fleet_board(agent_name, agents_text)
+                        # Open decision cards → local cache, so the board can
+                        # tell a hub-backed 🙋 from a legacy recap flag.
+                        # Fail-soft (older hub lacks the tool).
+                        try:
+                            dl = await session.call_tool(
+                                "decision_list",
+                                {"status": "open", "format": "json"},
+                            )
+                            _write_decisions_cache(_extract_text(dl))
+                        except Exception:  # noqa: BLE001
+                            pass
                         await asyncio.sleep(STATUS_REFRESH_SECONDS)
                         since_heartbeat += STATUS_REFRESH_SECONDS
         except Exception as exc:  # noqa: BLE001

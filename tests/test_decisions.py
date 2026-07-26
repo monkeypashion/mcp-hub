@@ -337,3 +337,43 @@ async def test_bold_summary_marker_counts_too(server):
         server, "broadcast", {"from_agent": "alice", "message": body},
     )
     assert "Advisory" not in out
+
+
+# ---------------------------------------------------------------------------
+# decision_resolve — in-pane answers recorded by the agent that got them
+# ---------------------------------------------------------------------------
+
+
+async def test_resolve_closes_with_agent_recorded_verdict(server):
+    await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
+    out = await _call_tool(
+        server, "decision_resolve",
+        {"from_agent": "alice", "verdict": "yes — operator said ship it"},
+    )
+    assert "Card resolved" in out
+    import json as _json
+    rows = _json.loads(
+        await _call_tool(server, "decision_list",
+                         {"status": "decided", "format": "json"})
+    )
+    assert rows[0]["decision"] == "in-pane"
+    assert rows[0]["decision_note"] == "[agent-recorded] yes — operator said ship it"
+
+
+async def test_resolve_with_nothing_open_is_silent(server):
+    out = await _call_tool(
+        server, "decision_resolve", {"from_agent": "ghost", "verdict": "yes"},
+    )
+    assert out == ""
+
+
+async def test_resolve_never_touches_api_cards(server):
+    await _call_tool(
+        server, "decision_put",
+        {"from_agent": "svc", "card": CARD_V2, "source": "api"},
+    )
+    out = await _call_tool(
+        server, "decision_resolve", {"from_agent": "svc", "verdict": "yes"},
+    )
+    assert out == ""
+    assert "svc" in await _call_tool(server, "decision_list", {})

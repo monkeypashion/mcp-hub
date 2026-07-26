@@ -372,7 +372,7 @@ def test_messages_present_outputs_valid_hook_json(capsys):
         name="alice", project="proj", hub_url="http://x/mcp"
     )
 
-    async def _fake_query(_url, _name, _project="", _card=""):
+    async def _fake_query(*_a, **_k):
         return ("[10:00] **bob**: hello", "", True)  # DM, no broadcasts, bound
 
     with patch("mcp_hub.cli._query_hub", side_effect=_fake_query):
@@ -1344,3 +1344,20 @@ def test_card_nag_suppressed_by_loop_backstop():
         is_online=True, stop_hook_active=True, card_nag=True,
     )
     assert response is None
+
+
+def test_extract_decided_takes_last_line():
+    from mcp_hub.cli import _extract_decided
+    turn = ("Operator said yes in the pane, proceeding.\n\n"
+            "**DECIDED:** yes — arm it, gate stays dark\n")
+    assert _extract_decided(turn) == "yes — arm it, gate stays dark"
+    assert _extract_decided("no marker here") == ""
+
+
+def test_card_beats_decided_when_both_present():
+    """A turn that closes one ask and opens another: the new card wins the
+    put path (stop_hook_command only extracts DECIDED when no card)."""
+    from mcp_hub.cli import _extract_decided, _extract_decision_card
+    turn = "**DECIDED:** yes\n\n**DECISION**\n**ASK:** next thing\n"
+    assert _extract_decision_card(turn)
+    assert _extract_decided(turn) == "yes"

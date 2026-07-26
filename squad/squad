@@ -2426,16 +2426,48 @@ except Exception:
     pass
 if not order: raise SystemExit
 now = int(time.time())
+# Hub-backed hands: the decisions cache (written by the heartbeat daemons
+# from decision_list) is AUTHORITATIVE when fresh. An open card = a real
+# hand, verbatim, regardless of recap prose; a recap flag with NO open card
+# is labelled so the operator can tell a live ask from a legacy/stale one
+# ("I cannot tell if it is a new valid card or a stuck hand", 2026-07-26).
+# A stale cache (daemons down) applies NO labels — never claim "no card on
+# hub" from an instrument that is not reporting.
+DEC, dec_fresh = {}, False
+try:
+    dsnap = json.load(open(os.path.expanduser("~/.mcp-hub/decisions-open.json")))
+    if now - int(dsnap.get("ts") or 0) < 300:
+        dec_fresh = True
+        for c in dsnap.get("cards", []):
+            DEC[c.get("agent", "")] = c
+except Exception:
+    pass
+
+def age_h(age):
+    return "%dm" % (age // 60) if age < 3600 else ("%dh" % (age // 3600) if age < 86400 else "%dd" % (age // 86400))
+
 missing = 0
 rows = []   # (sort_group, age_seconds, rendered)
 for name in order:
     a = fleet.get(name, {})
     deaf = "" if a.get("wakeable", True) else "x"
+    if name in DEC:
+        # open hub card wins over bio AND recap: it is the ask itself,
+        # self-clearing, and exempt from the idle gate (open = pending
+        # until the agent withdraws it at its next Stop)
+        c = DEC.pop(name)
+        txt = " ".join((c.get("raw") or "").split())[:480]
+        age = max(0, now - int(c.get("submitted_at") or now))
+        rows.append((0, age, "%s\x1f%s\x1fhub\x1f%s\x1f1\x1f%s" % (name, deaf, age_h(age), txt)))
+        continue
     if a.get("next"):
         w = 1 if (WRE and re.search(WRE, a["next"], re.I)) else 0
+        txt = a["next"][:300 if w else 120]
+        if w and dec_fresh:
+            txt = "(no card on hub — stale?) " + txt
         # flagged rows are the ones the operator must actually read — give a
         # structured DECISION line room for its RISK/SCORE tail (2026-07-26)
-        rows.append((0, 0, "%s\x1f%s\x1fbio\x1f\x1f%d\x1f%s" % (name, deaf, w, a["next"][:300 if w else 120])))
+        rows.append((0, 0, "%s\x1f%s\x1fbio\x1f\x1f%d\x1f%s" % (name, deaf, w, txt)))
     elif name in recaps:
         ep, w, txt = recaps[name]
         # 🙋 gate: a recap flag counts only while the pane is actually IDLE —
@@ -2450,13 +2482,22 @@ for name in order:
         m = re.search(r"(?:(?<=[.!?] )|^)((?:Next|Waiting|Blocked|DECISION)\b.*)", txt)
         if m: txt = m.group(1)
         age = max(0, now - ep)
-        age_h = "%dm" % (age // 60) if age < 3600 else ("%dh" % (age // 3600) if age < 86400 else "%dd" % (age // 86400))
         # a structured block must keep its SCORE tail through display
         # truncation — the card renderer downstream needs every field
         lim = 480 if ("DECISION" in txt and "ASK:" in txt) else (300 if w else 120)
-        rows.append((1, age, "%s\x1f%s\x1frecap\x1f%s\x1f%d\x1f%s" % (name, deaf, age_h, w, txt[:lim])))
+        txt = txt[:lim]
+        if w and dec_fresh:
+            txt = "(no card on hub — stale?) " + txt
+        rows.append((1, age, "%s\x1f%s\x1frecap\x1f%s\x1f%d\x1f%s" % (name, deaf, age_h(age), w, txt)))
     else:
         missing += 1
+# agents whose only presence is an open hub card (e.g. remote boxes with no
+# local transcript and no bio next: line) still raise a hand
+for name, c in DEC.items():
+    if not name: continue
+    txt = " ".join((c.get("raw") or "").split())[:480]
+    age = max(0, now - int(c.get("submitted_at") or now))
+    rows.append((0, age, "%s\x1f%s\x1fhub\x1f%s\x1f1\x1f%s" % (name, "", age_h(age), txt)))
 # curated bio lines first, then recaps freshest-first — stale sinks
 rows.sort(key=lambda r: (r[0], r[1]))
 print("%d %d" % (int(now - snap.get("ts", now)), missing))
@@ -2497,21 +2538,25 @@ print("\n".join(r[2] for r in rows))
                       # both the | separators and flattened markdown **)
                       printf '%s\n' "$nx" \
                         | sed -E -e 's/\*\*//g' -e 's/ *\|+ */ /g' \
-                                 -e 's/(^| )(ASK|WHY|VALUE|RISK|SCORE|TAGS):/\n\2:/g' \
+                                 -e 's/(^| )(ASK|WHY|VALUE|RISK|SCORE|TAGS|NET):/\n\2:/g' \
                         | while IFS= read -r fl; do
                             case "$fl" in
+                              NET:*)
+                                printf '     \033[1;33m%-7s%s\033[0m\n' "NET:" "${fl#*:}" ;;
                               ASK:*|WHY:*|VALUE:*|RISK:*|SCORE:*|TAGS:*)
                                 printf '     \033[1m%-7s\033[0m%s\n' "${fl%%:*}:" "${fl#*:}" ;;
                             esac
                           done
-                      # NET is the deciding number — synthesize it from the
-                      # two component scores (operator: individuals alone
-                      # don't support a yes/no; the total must be visible)
-                      _v=$(printf '%s' "$nx" | sed -nE 's|.*VALUE:[^[]*\[([0-9]+)/10\].*|\1|p')
-                      _r=$(printf '%s' "$nx" | sed -nE 's|.*RISK:[^[]*\[([0-9]+)/10\].*|\1|p')
-                      [ -n "$_v" ] && [ -n "$_r" ] && \
-                        printf '     \033[1;33mNET:   %+d\033[0m  (value %s − risk %s)\n' \
-                          "$((_v - _r))" "$_v" "$_r" ;;
+                      # NET is the deciding number — when the author omitted
+                      # it (pre-NET cards), synthesize from the components
+                      # (operator: individuals alone don't support a yes/no)
+                      case "$nx" in *NET:*) : ;; *)
+                        _v=$(printf '%s' "$nx" | sed -nE 's|.*VALUE:[^[]*\[([0-9]+)/10\].*|\1|p')
+                        _r=$(printf '%s' "$nx" | sed -nE 's|.*RISK:[^[]*\[([0-9]+)/10\].*|\1|p')
+                        [ -n "$_v" ] && [ -n "$_r" ] && \
+                          printf '     \033[1;33mNET:   %+d\033[0m  (value %s − risk %s)\n' \
+                            "$((_v - _r))" "$_v" "$_r" ;;
+                      esac ;;
                     ?*) printf '     \033[2m%s\033[0m\n' "$nx" ;;
                   esac
                 done <<< "$wait_rows"
