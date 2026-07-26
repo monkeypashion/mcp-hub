@@ -763,11 +763,35 @@ rm_agent() {   # squad rm [agent] — exact inverse of add: session, roster, opt
 # occurrence): REVERTING a dir rename under a live index kills the cockpit
 # outright, where forgetting the rename on the way UP merely hides new menus.
 #
-# So: missing path = EMERGENCY, version skew = benign. We only ever rename the
-# directory; extensions.json belongs to VSCode and renaming is the one lever
-# proven to work (it also forces the manifest re-read that makes new menu
-# entries appear at all — which is why "just stop bumping the version" is the
-# wrong cure).
+# ONE RULE: the installed directory must be named <id>-<manifest version>.
+#
+# VSCode keys its extension cache on the installed FOLDER NAME, not on the
+# version inside package.json — measured on fireblade-wsl 2026-07-26 and
+# confirmed by the operator. The manifest went 0.17.0 -> 0.18.x -> 0.19.0 ->
+# 0.20.0 across several window reloads with the folder pinned at -0.17.0: the
+# index never moved, the manifest was never re-read, and every new menu entry
+# was silently invisible. Renaming the folder to -0.20.0 made them appear at
+# once. So "version skew is benign, take no action" — what this helper used to
+# do — was itself the thing keeping the cockpit stale.
+#
+# The two proven recoveries only LOOK like different rules:
+#   * dev-vm-1, 2026-07-25: index 0.17.0, dir 0.14.0, manifest 0.17.0 — renaming
+#     to 0.17.0 fixed it. Read as "rename to what the index asks for", but the
+#     manifest said 0.17.0 too, so that incident never discriminated.
+#   * fireblade-wsl, 2026-07-26: index 0.17.0, dir 0.17.0, manifest 0.20.0 —
+#     only the manifest rule explains the fix.
+# Naming the dir after the MANIFEST satisfies both, and because the target comes
+# from the repo rather than from the index it is idempotent and cannot
+# oscillate against the repair branch (two rules with different targets would
+# have renamed back and forth on alternate runs).
+#
+# The dangerous direction is neither of these: renaming to a version matching
+# NEITHER the index nor the manifest (dev's revert to -0.14.0 under a live
+# 0.17.0 index) orphans the index path and kills the panel outright. This helper
+# never picks such a name.
+#
+# We only ever rename the directory; extensions.json belongs to VSCode, which
+# rebuilds it on its next scan.
 # Interface agreed with mcp-hub-dev-vm-1 (their 24(b)); they build the dev-vm-1
 # side, this is the WSL/fireblade side. Fail-soft throughout: a cockpit repair
 # helper must never be the reason a heal pass dies.
@@ -790,45 +814,53 @@ if not installed:
 try:
     entries = json.loads(idx.read_text(encoding="utf-8"))
 except Exception:
-    raise SystemExit(0)              # VSCode owns this file; unreadable is not ours to fix
+    # VSCode owns this file, and an unreadable one usually means it is mid-write.
+    # The rename target doesn't depend on the index, but racing a live writer for
+    # no gain is a bad trade — skip this pass, the next one will align.
+    raise SystemExit(0)
 
 want = None
 for e in entries:
     if e.get("identifier", {}).get("id") == ext_id:
         want = e.get("location", {}).get("path", "") or None
 
-# THE EMERGENCY: the index names a path that does not exist. VSCode then reports
-# "invalid extensions detected", never activates, and NO terminal panel opens —
-# it reads as a cockpit bug rather than a version bug. Repair by renaming the
-# real install to the name the index is asking for; that is the direction which
-# actually recovered dev-vm-1 on 2026-07-25.
-if want and not pathlib.Path(want).exists():
-    src = installed[0]
-    try:
-        os.rename(src, want)
-        print(f"ext_align: REPAIRED dead cockpit — {src.name} -> {pathlib.Path(want).name}")
-        print("           Reload Window to pick it up.")
-    except OSError as exc:
-        print(f"!! ext_align: cockpit is broken and the repair failed: {exc}")
-        print(f"   index wants: {want}")
-        print(f"   on disk    : {src}")
-    raise SystemExit(0)
-
-# Version skew with a VALID index is BENIGN — do not "fix" it. Measured from
-# VSCode's own cache-invalidation event (2026-07-26): the manifest version moved
-# 0.16.0 -> 0.17.0 with the location folder UNCHANGED and both entries marked
-# isValid, i.e. editing package.json is enough on its own to force a manifest
-# re-read. Renaming the folder toward the manifest would ORPHAN the index path
-# and produce exactly the dead cockpit above, so it is never done here.
+# The manifest is the sole authority on what the directory must be called.
+# Without it we cannot know the target, and a guessed rename is the one move
+# that manufactures a dead cockpit — so stop rather than guess.
 try:
     manifest_ver = json.loads(repo_pkg.read_text(encoding="utf-8"))["version"]
 except Exception:
     raise SystemExit(0)
-for d in installed:
-    dir_ver = d.name[len(ext_id) + 1:]
-    if dir_ver != manifest_ver:
-        print(f"ext_align: version skew (dir {dir_ver}, manifest {manifest_ver}) — benign; "
-              "index resolves and VSCode re-reads the manifest itself. No action taken.")
+
+want_dir = base / f"{ext_id}-{manifest_ver}"
+strays = [d for d in installed if d.name != want_dir.name]
+
+if not strays:
+    # Correctly named. The only thing that can still bite is an index entry
+    # naming a path that no longer exists — say so, but don't touch
+    # extensions.json; VSCode rebuilds it on its next scan.
+    if want and not pathlib.Path(want).exists():
+        print(f"ext_align: install is correctly {want_dir.name}, but the index still "
+              f"names {pathlib.Path(want).name} (gone) — Reload Window to re-index.")
+    raise SystemExit(0)
+
+if want_dir.exists():
+    # Two installs of the same extension. Which one VSCode picks is not ours to
+    # decide, and deleting an install is not a repair a heal pass should make.
+    print(f"!! ext_align: two installs present — {want_dir.name} plus "
+          f"{', '.join(d.name for d in strays)}.")
+    print("   Leaving both. Remove the stale one by hand, then Reload Window.")
+    raise SystemExit(0)
+
+src = strays[0]
+try:
+    os.rename(src, want_dir)
+    print(f"ext_align: renamed {src.name} -> {want_dir.name} (manifest {manifest_ver}).")
+    print("           Reload Window — until you do, the cockpit runs the OLD menus.")
+except OSError as exc:
+    print(f"!! ext_align: could not align the cockpit install: {exc}")
+    print(f"   on disk: {src}")
+    print(f"   wanted : {want_dir}")
 PYALIGN
   done
   return 0
