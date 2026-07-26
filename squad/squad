@@ -231,7 +231,7 @@ pane_flat() { tm capture-pane -p -J -t "$1" 2>/dev/null | tr -d '[:space:]'; }
 # self-clears at the next recap; a false "all fine" costs days.
 # Single source for the pattern — the harvest python AND the board's bio-line
 # check both read this env var; never inline a second copy.
-export WAIT_ON_OP_RE='(action is yours|your (direct )?(word|nod|call|decision|window|go[- ]?ahead)|waiting (on|for) (you|the operator)|blocked on (you|the operator)|awaiting (your|the operator)|need(s|ing)? (your|the operator)|WAITING[ -]ON[ -]OPERATOR)'
+export WAIT_ON_OP_RE='(action is yours|your (direct )?(word|nod|call|decision|window|go[- ]?ahead)|waiting (on|for) (you|the operator)|blocked on (you|the operator)|awaiting (your|the operator)|need(s|ing)? (your|the operator)|WAITING[ -]ON[ -]OPERATOR|\bDECISION\b.{0,16}ASK:)'
 
 BOARD_USAGE_TTL="${SQUAD_BOARD_USAGE_TTL:-60}"
 usage_refresh() {
@@ -2198,7 +2198,9 @@ for name in order:
     deaf = "" if a.get("wakeable", True) else "x"
     if a.get("next"):
         w = 1 if (WRE and re.search(WRE, a["next"], re.I)) else 0
-        rows.append((0, 0, "%s\x1f%s\x1fbio\x1f\x1f%d\x1f%s" % (name, deaf, w, a["next"][:120])))
+        # flagged rows are the ones the operator must actually read — give a
+        # structured DECISION line room for its RISK/SCORE tail (2026-07-26)
+        rows.append((0, 0, "%s\x1f%s\x1fbio\x1f\x1f%d\x1f%s" % (name, deaf, w, a["next"][:300 if w else 120])))
     elif name in recaps:
         ep, w, txt = recaps[name]
         # 🙋 gate: a recap flag counts only while the pane is actually IDLE —
@@ -2210,11 +2212,11 @@ for name in order:
         # the actionable half: recaps bury "Next action is yours: ..." at the
         # tail — when a sentence starts with Next/Waiting/Blocked, show from
         # THERE (that is the line the operator actually wants on the board)
-        m = re.search(r"(?:(?<=[.!?] )|^)((?:Next|Waiting|Blocked)\b.*)", txt)
+        m = re.search(r"(?:(?<=[.!?] )|^)((?:Next|Waiting|Blocked|DECISION)\b.*)", txt)
         if m: txt = m.group(1)
         age = max(0, now - ep)
         age_h = "%dm" % (age // 60) if age < 3600 else ("%dh" % (age // 3600) if age < 86400 else "%dd" % (age // 86400))
-        rows.append((1, age, "%s\x1f%s\x1frecap\x1f%s\x1f%d\x1f%s" % (name, deaf, age_h, w, txt[:120])))
+        rows.append((1, age, "%s\x1f%s\x1frecap\x1f%s\x1f%d\x1f%s" % (name, deaf, age_h, w, txt[:300 if w else 120])))
     else:
         missing += 1
 # curated bio lines first, then recaps freshest-first — stale sinks
@@ -2249,7 +2251,23 @@ print("\n".join(r[2] for r in rows))
                 while IFS=$'\037' read -r a deaf srckind age wf nx; do
                   [ -n "$a" ] || continue
                   printf '  \033[1;31m🙋 %-26s\033[0m waiting on YOU \033[1m%s\033[0m\n' "$a" "${age:-}"
-                  [ -n "$nx" ] && printf '     \033[2m%s\033[0m\n' "$nx"
+                  case "$nx" in
+                    *DECISION*ASK:*)
+                      # structured decision card: one field per line, bold
+                      # label, plain text — the harvest flattens everything to
+                      # one line, so re-split on the field labels here (accepts
+                      # both the | separators and flattened markdown **)
+                      printf '%s\n' "$nx" \
+                        | sed -E -e 's/\*\*//g' -e 's/ *\|+ */ /g' \
+                                 -e 's/(^| )(ASK|WHY|VALUE|RISK|SCORE):/\n\2:/g' \
+                        | while IFS= read -r fl; do
+                            case "$fl" in
+                              ASK:*|WHY:*|VALUE:*|RISK:*|SCORE:*)
+                                printf '     \033[1m%-7s\033[0m%s\n' "${fl%%:*}:" "${fl#*:}" ;;
+                            esac
+                          done ;;
+                    ?*) printf '     \033[2m%s\033[0m\n' "$nx" ;;
+                  esac
                 done <<< "$wait_rows"
               fi
               if [ -z "$out" ] && [ -z "$wait_rows" ]; then
