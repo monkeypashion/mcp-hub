@@ -299,28 +299,31 @@ function activate(context) {
     // the session actually being down (checked via tmux directly; if it's
     // up, this terminal either is attached already or the user detached on
     // purpose — say so instead of typing).
-    vscode.commands.registerCommand("squad.startAttach", (...args) => {
-      cancelPendingToasts();
-      const list = Array.isArray(args[1]) && args[1].length ? args[1] : [args[0]];
-      let any = false;
-      for (const t of list) {
-        const a = resolveAgent(t);
-        if (!a || !t || typeof t.sendText !== "function") continue;
-        any = true;
-        cp.execFile("tmux", ["-L", "squad", "has-session", "-t", "=" + a], (err) => {
-          if (err) {
-            inflight.set(t, Date.now()); // manual start arms the focus-path throttle too
-            t.show(false);
-            t.sendText(`squad attach ${a}`); // down: start-if-down attach — an explicit click, not window-open
-          } else {
-            vscode.window.showInformationMessage(
-              `Squad: ${shortLabel(a)} is already up — this tab is attached, or reattach with: squad attach ${a}`
-            );
-          }
-        });
-      }
-      if (!any) vscode.window.showWarningMessage("Squad: no squad agent in the selection.");
-    }),
+    // Start is a CHOICE, not a readout. It was one entry whose meaning depended
+    // on the roster's --continue, so it could silently resume megabytes of prior
+    // conversation — and wanting the other behaviour meant leaving the menu,
+    // changing a setting under Launch settings, and coming back. Restart had it
+    // right all along by offering both; Start now mirrors it.
+    //
+    // `restart --resume|--fresh` is a one-off override that never touches the
+    // roster, and on a DOWN agent it routes to up_one with those args — so the
+    // same two actions work whether the agent is up or down, and the old
+    // has-session branch (and its "already up" dead end) disappears.
+    //
+    // Found by the operator using it, after I "fixed" the label and left the
+    // trap underneath: naming a consequence is not the same as offering it.
+    vscode.commands.registerCommand("squad.startAttach", (...args) =>
+      withAgents(args, (agents) => {
+        cancelPendingToasts();
+        agents.forEach((a) => squadExec(["restart", a, "--resume"], a));
+      })
+    ),
+    vscode.commands.registerCommand("squad.startAttachFresh", (...args) =>
+      withAgents(args, (agents) => {
+        cancelPendingToasts();
+        agents.forEach((a) => squadExec(["restart", a, "--fresh"], a));
+      })
+    ),
     vscode.commands.registerCommand("squad.stop", (...args) =>
       withAgents(args, (agents) => agents.forEach((a) => squadExec(["stop", a], a)))
     ),
@@ -452,21 +455,6 @@ function activate(context) {
       )
     );
   }
-
-  // `Start & attach` gets TWO menu labels, one command. Whether a start resumes
-  // the previous conversation is decided by the roster's --continue, which was
-  // visible only two levels down under Launch settings — so the label said
-  // "Start & attach" and silently resumed megabytes of prior conversation. That
-  // is the defect that made me describe this menu wrongly to the operator
-  // (2026-07-26). `Stop (session ends, conversation kept)` already named its
-  // consequence; this brings Start in line. Delegates rather than duplicating
-  // the handler, so the two ids can never drift apart, and is gated on
-  // squad.hasResume — the same context key the Launch settings entries use.
-  context.subscriptions.push(
-    vscode.commands.registerCommand("squad.startAttachFresh", (...args) =>
-      vscode.commands.executeCommand("squad.startAttach", ...args)
-    )
-  );
 
   // ---- transport: clone this agent into another VSCode workspace ----
   // The operator's model: pick the agent's tab, pick a TARGET WORKSPACE, and
@@ -907,11 +895,21 @@ function activate(context) {
             inflight.set(t, Date.now()); // also throttles repeat toasts
             vscode.window
               .showInformationMessage(
-                `Squad: ${shortLabel(a)} is down — start claude and attach?`,
-                "Start & attach"
+                `Squad: ${shortLabel(a)} is down — start it?`,
+                "Resume conversation",
+                "Fresh conversation"
               )
               .then((pick) => {
-                if (pick === "Start & attach") go();
+                // The same two outcomes as the menu, worded the same. The old
+                // toast offered "Start & attach" and then silently followed the
+                // roster — a third vocabulary for one decision, able to
+                // contradict the menu label sitting right beside it.
+                if (!pick) return;
+                inflight.set(t, Date.now());
+                t.show(false);
+                t.sendText(
+                  `squad restart ${a} ${pick === "Resume conversation" ? "--resume" : "--fresh"}`
+                );
               });
           });
         }, TOAST_DELAY_MS)

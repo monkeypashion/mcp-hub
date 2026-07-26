@@ -2,7 +2,7 @@
   "name": "squad-terminals",
   "displayName": "Squad Terminals",
   "description": "Auto-opens one plain terminal per squad agent (squad attach) with icon+color, and adds per-agent squad actions to the terminal tab context menu.",
-  "version": "0.18.1",
+  "version": "0.18.2",
   "publisher": "monkeypashion",
   "engines": {
     "vscode": "^1.90.0"
@@ -60,7 +60,7 @@
       },
       {
         "command": "squad.startAttach",
-        "title": "Start & attach  (resumes conversation)",
+        "title": "Start & attach  (resume conversation)",
         "category": "Squad"
       },
       {
@@ -291,65 +291,78 @@
       "squad.agentMenu": [
         {
           "command": "squad.answerYes",
-          "group": "0_answer@1"
+          "group": "0_answer@1",
+          "when": "squad.isAgent"
         },
         {
           "command": "squad.answerAlways",
-          "group": "0_answer@2"
+          "group": "0_answer@2",
+          "when": "squad.isAgent"
         },
         {
           "command": "squad.answerNo",
-          "group": "0_answer@3"
+          "group": "0_answer@3",
+          "when": "squad.isAgent"
         },
         {
           "command": "squad.sendPrompt",
-          "group": "1_talk@1"
+          "group": "1_talk@1",
+          "when": "squad.isAgent"
         },
         {
           "command": "squad.stockPrompt",
-          "group": "1_talk@2"
+          "group": "1_talk@2",
+          "when": "squad.isAgent"
         },
         {
           "command": "squad.broadcast",
-          "group": "1_talk@3"
+          "group": "1_talk@3",
+          "when": "squad.isAgent"
         },
         {
           "command": "squad.dmVia",
-          "group": "1_talk@4"
+          "group": "1_talk@4",
+          "when": "squad.isAgent"
         },
         {
           "command": "squad.interrupt",
-          "group": "1_talk@5"
+          "group": "1_talk@5",
+          "when": "squad.isAgent"
         },
         {
           "submenu": "squad.slashMenu",
-          "group": "1_talk@6"
+          "group": "1_talk@6",
+          "when": "squad.isAgent"
         },
         {
           "command": "squad.startAttach",
           "group": "2_lifecycle@0",
-          "when": "squad.isAgent && squad.hasResume"
+          "when": "squad.isAgent"
         },
         {
           "command": "squad.startAttachFresh",
           "group": "2_lifecycle@0",
-          "when": "squad.isAgent && !squad.hasResume"
+          "when": "squad.isAgent"
         },
         {
           "command": "squad.restartResume",
-          "group": "2_lifecycle@1"
+          "group": "2_lifecycle@1",
+          "when": "squad.isAgent"
         },
         {
           "command": "squad.restartFresh",
-          "group": "2_lifecycle@2"
+          "group": "2_lifecycle@2",
+          "when": "squad.isAgent"
         },
         {
           "command": "squad.stop",
-          "group": "2_lifecycle@3"
+          "group": "2_lifecycle@3",
+          "when": "squad.isAgent"
         },
         {
           "submenu": "squad.launchMenu",
-          "group": "2_lifecycle@4"
+          "group": "2_lifecycle@4",
+          "when": "squad.isAgent"
         },
         {
           "command": "squad.transport",
