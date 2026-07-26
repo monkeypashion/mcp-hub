@@ -318,18 +318,22 @@ def init_db(db_path: Path = DB_PATH) -> None:
 
 
 def _log_bind_diagnostic(source: str, name: str, session: Any) -> None:
-    """One-line dump of clientInfo + experimental capabilities on every bind.
+    """One-line dump of clientInfo + FULL capabilities on every bind decision.
 
     Read prod logs for these lines to see exactly what each kind of client
-    advertises. The goal: find a reliable signal for distinguishing
-    long-lived Claude Code interactive sessions (real wake targets) from
-    ephemeral utility clients like the Stop hook's streamablehttp_client.
-    Once we have that signal, the bind can be gated on it.
+    advertises. This found the clientInfo.name discriminator that now gates
+    the touch bind (see is_interactive_client) — and it stays wide on
+    purpose: the last usable signal (experimental capabilities) vanished
+    silently and took a week of archaeology to notice. Logging the whole
+    handshake surface means the NEXT vanished-or-renamed signal shows up in
+    the same day's logs, not as retrospective guesswork. Rejections are
+    logged too (source=touch_session-skipped), so a future client rename
+    appears as a stream of skipped binds naming the new string.
     """
     try:
         params = getattr(session, "client_params", None)
         client_info = None
-        experimental = None
+        capabilities = None
         if params is not None:
             ci = getattr(params, "clientInfo", None)
             if ci is not None:
@@ -337,12 +341,10 @@ def _log_bind_diagnostic(source: str, name: str, session: Any) -> None:
                     f"{getattr(ci, 'name', '?')}/"
                     f"{getattr(ci, 'version', '?')}"
                 )
-            caps = getattr(params, "capabilities", None)
-            if caps is not None:
-                experimental = getattr(caps, "experimental", None)
+            capabilities = getattr(params, "capabilities", None)
         logger.info(
-            "bind-diag source=%s name=%s sid=%x clientInfo=%s experimental=%s",
-            source, name, id(session), client_info, experimental,
+            "bind-diag source=%s name=%s sid=%x clientInfo=%s capabilities=%s",
+            source, name, id(session), client_info, capabilities,
         )
     except Exception:  # noqa: BLE001
         # Diagnostic must never break a real bind path.
@@ -353,7 +355,11 @@ def is_channel_capable(session: Any) -> bool:
     """True if `session`'s client declares the claude/channel experimental
     capability.
 
-    ⚠️ CURRENTLY RETURNS FALSE FOR EVERY CLIENT. Read this before using it,
+    ⚠️ RETURNS FALSE FOR EVERY CLIENT, AND IS NO LONGER WIRED ANYWHERE.
+    Superseded at the touch-bind site by is_interactive_client (clientInfo
+    discriminator). RETAINED AS EVIDENCE, NOT AS A UTILITY — do not wire it
+    back in anywhere: the record below is why no client-declared capability
+    predicate can ever work in this protocol. Read this before using it,
     extending it, or "fixing" #17 with it.
 
     What it was written for: every Stop hook (cli.py) spawns a fresh
@@ -408,6 +414,55 @@ def is_channel_capable(session: Any) -> bool:
         return False
     experimental = getattr(caps, "experimental", None) or {}
     return "claude/channel" in experimental
+
+
+# ALLOWLIST, deliberately — an unknown future client name must default to
+# REJECTED (no bind), never accepted. The fail direction is safe: a predicate
+# that never matches leaves us exactly where the dead capability gate did
+# (touch_session never binds, register carries every binding) — no
+# regression, just no repair. Do NOT "fix" a non-matching name by flipping
+# this to a denylist; read the observed name out of the bind-diag logs and
+# add it here explicitly.
+INTERACTIVE_CLIENT_NAMES = frozenset({"claude-code"})
+
+
+def is_interactive_client(session: Any) -> bool:
+    """True if `session` belongs to a real interactive Claude Code client —
+    the only kind of session that may own an agent's wake binding via
+    touch_session.
+
+    The discriminator is `clientInfo.name`, MEASURED not assumed
+    (2026-07-26, both directions):
+
+      * Real Claude Code 2.1.220 (localhost capture rig, raw `initialize`):
+        clientInfo = {"name": "claude-code", "title": "Claude Code",
+        "version": "2.1.220", ...} — `name` is exactly "claude-code".
+      * Every ephemeral utility client we spawn (stop-hook, heartbeat
+        daemon, memory-export twin-notify, scripts): cli.py never passes
+        client_info, so the mcp SDK default applies — verified live:
+        DEFAULT_CLIENT_INFO = name='mcp' version='0.1.0'. "mcp" is a
+        known-real rejected value, not a hypothetical.
+
+    Rules, agreed with fireblade-wsl before building:
+      * Match NAME only, never version — 219→220-style churn must not
+        unbind the fleet.
+      * Gate touch_session ONLY, never register(). If clientInfo.name ever
+        changes, a touch-only gate degrades to exactly today's survivable
+        state (register carries the bindings); a register gate would
+        silently unbind the entire fleet.
+      * clientInfo is client-asserted (spoofable) — same trust level as
+        everything else on this hub. And claude-code ≠ flag-loaded: a
+        flagless interactive session binds-but-deaf, the same exposure
+        register() already has; wake-ack strikes keep the claims honest.
+        Composition: clientInfo gates BINDING, strikes gate CLAIMS.
+    """
+    params = getattr(session, "client_params", None)
+    if params is None:
+        return False
+    ci = getattr(params, "clientInfo", None)
+    if ci is None:
+        return False
+    return getattr(ci, "name", None) in INTERACTIVE_CLIENT_NAMES
 
 
 # ---------------------------------------------------------------------------
@@ -603,27 +658,28 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         """
         if ctx is None or not name:
             return
-        # THE GATE (wired 2026-07-18). Intent: only sessions that can receive a
-        # channel push may bind, so an ephemeral utility client (memory-export's
-        # twin-notify, any CLI calling send/post/broadcast as an agent) can't
-        # re-point the agent's wake target at a session that dies when the
-        # process exits — previously defended only piecemeal via bind=False on
-        # the get_* paths.
+        # THE GATE (wired 2026-07-18 on capabilities; repaired 2026-07-26 to
+        # the clientInfo discriminator — backlog 23c(b)). Intent: only a real
+        # interactive Claude Code session may own the bind, so an ephemeral
+        # utility client (memory-export's twin-notify, any CLI calling
+        # send/post/broadcast as an agent) can't re-point the agent's wake
+        # target at a session that dies when the process exits.
         #
-        # ⚠️ IN PRACTICE THIS REJECTS EVERYTHING, including real interactive
-        # sessions — clients never declare claude/channel (see
-        # is_channel_capable's docstring for the 2026-07-25 evidence). The
-        # original "corroborated by both clones" note was wrong about WHY it
-        # worked: it blocks ephemeral clients by blocking all clients. So
-        # touch_session never binds anyone, tool-call drift self-heal is dead,
-        # and register() carries every binding in the fleet.
+        # History: the original is_channel_capable gate checked a capability
+        # clients never declare, so it rejected 100% of sessions for a week —
+        # it "worked" by blocking ephemeral clients along with everyone else,
+        # and tool-call drift self-heal was silently dead the whole time
+        # (register() carried every binding in the fleet). The repair also
+        # restores the ack path: a bound agent's ordinary post-wake tool call
+        # now clears its wake expectation, so the compact "already delivered
+        # live" annotation fires only when TRUE (the 23c double-surface
+        # mechanism).
         #
-        # Left in place deliberately: the blanket reject still delivers the
-        # anti-clobbering property, and a discriminating replacement needs a
-        # behavioural or launch-args signal (not a declarative one). A
-        # non-capable session also must NOT clear is_idle: a CLI call is not
-        # the agent's interactive turn.
-        if not is_channel_capable(ctx.session):
+        # A rejected session also must NOT clear is_idle: a CLI call is not
+        # the agent's interactive turn. Rejections are logged with the
+        # observed clientInfo so a future client rename shows up same-day in
+        # the logs instead of as silent fleet-wide bind failure.
+        if not is_interactive_client(ctx.session):
             _log_bind_diagnostic("touch_session-skipped", name, ctx.session)
             return
         conn = _get_db(db_path)
@@ -833,6 +889,15 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 
         # Bind the current MCP session so we can push channel notifications.
         # Re-registering from a new session replaces the old binding atomically.
+        #
+        # DELIBERATELY UNGATED — do not add is_interactive_client (or any
+        # client-declared predicate) here. register() is the one binding path
+        # that must never depend on a client-asserted string: if
+        # clientInfo.name ever changes, a gated touch_session degrades to
+        # today's survivable state, but a gated register() would silently
+        # unbind the entire fleet. That is parked #17, refused three times
+        # now; the exposure (an ephemeral/headless session calling register
+        # as an agent) is accepted and kept honest by wake-ack strikes.
         if ctx is not None:
             _log_bind_diagnostic("register", name, ctx.session)
             registry.bind(name, ctx.session)

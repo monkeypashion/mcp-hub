@@ -22,6 +22,7 @@ from mcp_hub.server import (
     _VALID_PRIORITIES,
     create_server,
     is_channel_capable,
+    is_interactive_client,
 )
 
 
@@ -1101,9 +1102,16 @@ class _FakeCaps:
         self.experimental = experimental
 
 
+class _FakeClientInfo:
+    def __init__(self, name, version="0.0.0"):
+        self.name = name
+        self.version = version
+
+
 class _FakeParams:
-    def __init__(self, capabilities):
+    def __init__(self, capabilities=None, clientInfo=None):  # noqa: N803 — mirrors the MCP field name
         self.capabilities = capabilities
+        self.clientInfo = clientInfo
 
 
 class _FakeSessionWithParams:
@@ -1154,6 +1162,70 @@ def test_is_channel_capable_false_for_object_without_attrs():
         pass
 
     assert is_channel_capable(_Bare()) is False
+
+
+# ---------------------------------------------------------------------------
+# is_interactive_client — the clientInfo discriminator (23c(b) repair)
+#
+# Both directions use MEASURED values, not hypotheticals:
+# "claude-code" captured from a real 2.1.220 initialize handshake;
+# "mcp"/"0.1.0" is the mcp SDK's DEFAULT_CLIENT_INFO, which every hub
+# utility client presents by construction (cli.py never passes client_info).
+# ---------------------------------------------------------------------------
+
+
+def test_is_interactive_client_true_for_claude_code():
+    sess = _FakeSessionWithParams(
+        _FakeParams(clientInfo=_FakeClientInfo("claude-code", "2.1.220"))
+    )
+    assert is_interactive_client(sess) is True
+
+
+def test_is_interactive_client_ignores_version():
+    """Name only, never version — client version churn (219→220→…) must
+    not unbind the fleet."""
+    sess = _FakeSessionWithParams(
+        _FakeParams(clientInfo=_FakeClientInfo("claude-code", "9.9.9-future"))
+    )
+    assert is_interactive_client(sess) is True
+
+
+def test_is_interactive_client_false_for_mcp_sdk_default():
+    """The known-real ephemeral value: every stop-hook / daemon / script
+    client presents the SDK default mcp/0.1.0. Assert it literally."""
+    sess = _FakeSessionWithParams(
+        _FakeParams(clientInfo=_FakeClientInfo("mcp", "0.1.0"))
+    )
+    assert is_interactive_client(sess) is False
+
+
+def test_is_interactive_client_false_for_unknown_name():
+    """Allowlist, not denylist: an unknown future client name defaults to
+    REJECTED."""
+    sess = _FakeSessionWithParams(
+        _FakeParams(clientInfo=_FakeClientInfo("claude-code-cli"))
+    )
+    assert is_interactive_client(sess) is False
+
+
+def test_is_interactive_client_false_when_client_info_missing():
+    sess = _FakeSessionWithParams(_FakeParams(clientInfo=None))
+    assert is_interactive_client(sess) is False
+
+
+def test_is_interactive_client_false_when_client_params_is_none():
+    """Pre-initialize sessions have no client_params yet — never bind them."""
+    sess = _FakeSessionWithParams(None)
+    assert is_interactive_client(sess) is False
+
+
+def test_is_interactive_client_false_for_object_without_attrs():
+    """Defensive: malformed sessions return False rather than raising."""
+
+    class _Bare:
+        pass
+
+    assert is_interactive_client(_Bare()) is False
 
 
 # ---------------------------------------------------------------------------
@@ -1301,13 +1373,14 @@ async def test_create_channel_idempotent_for_existing(server):
 
 
 # ---------------------------------------------------------------------------
-# touch_session capability gate — the wake-clobber fix (2026-07-18)
+# touch_session gate — the wake-clobber fix (2026-07-18, repaired 2026-07-26)
 #
-# is_channel_capable existed with a docstring describing exactly this failure
-# but was never wired into touch_session: any send/post/broadcast from an
-# ephemeral CLI session (memory-export's twin-notify being the everyday case)
-# re-pointed the CALLER's wake binding at a session that dies with the
-# process. Observed live: exporter goes ✖ REBIND ~3 min after every export.
+# Any send/post/broadcast from an ephemeral CLI session (memory-export's
+# twin-notify being the everyday case) must not re-point the CALLER's wake
+# binding at a session that dies with the process. Observed live: exporter
+# goes ✖ REBIND ~3 min after every export. The original capability gate
+# delivered this by rejecting EVERY session (drift self-heal dead); the
+# clientInfo gate delivers it while letting real interactive sessions bind.
 # ---------------------------------------------------------------------------
 
 
@@ -1319,13 +1392,19 @@ class _GateCtx:
         self.session = session
 
 
-def _capable_session():
-    return _FakeSessionWithParams(_FakeParams(_FakeCaps({"claude/channel": {}})))
+def _interactive_session():
+    """Shaped like a real Claude Code session: clientInfo name claude-code."""
+    return _FakeSessionWithParams(
+        _FakeParams(clientInfo=_FakeClientInfo("claude-code", "2.1.220"))
+    )
 
 
 def _ephemeral_session():
-    """Shaped like a bare streamablehttp_client: no claude/channel."""
-    return _FakeSessionWithParams(_FakeParams(_FakeCaps({})))
+    """Shaped like a bare streamablehttp_client (stop-hook, twin-notify):
+    the SDK-default clientInfo mcp/0.1.0."""
+    return _FakeSessionWithParams(
+        _FakeParams(clientInfo=_FakeClientInfo("mcp", "0.1.0"))
+    )
 
 
 async def test_send_from_ephemeral_session_does_not_clobber_binding(server):
@@ -1333,7 +1412,7 @@ async def test_send_from_ephemeral_session_does_not_clobber_binding(server):
     registry = server._hub_registry
     await _call_tool(server, "register", {"name": "alice", "project": "p"})
     await _call_tool(server, "register", {"name": "bob", "project": "p"})
-    live = _capable_session()
+    live = _interactive_session()
     registry.bind("alice", live)
 
     # alice sends via an EPHEMERAL session (CLI) — like memory-export's notify
@@ -1345,16 +1424,17 @@ async def test_send_from_ephemeral_session_does_not_clobber_binding(server):
     assert registry.get("alice") is live  # binding untouched
 
 
-async def test_send_from_capable_session_still_self_heals_binding(server):
-    """The drift self-heal must survive the gate: a REAL interactive session
-    calling send still refreshes/repoints the binding."""
+async def test_send_from_interactive_session_self_heals_binding(server):
+    """The drift self-heal must actually work now: a REAL interactive
+    session calling send refreshes/repoints the binding. Under the dead
+    capability gate this path was silently broken for a week."""
     registry = server._hub_registry
     await _call_tool(server, "register", {"name": "alice", "project": "p"})
     await _call_tool(server, "register", {"name": "bob", "project": "p"})
-    old = _capable_session()
+    old = _interactive_session()
     registry.bind("alice", old)
 
-    new_live = _capable_session()
+    new_live = _interactive_session()
     await server._tool_manager.call_tool(
         "send",
         {"from_agent": "alice", "to": "bob", "message": "hi"},
