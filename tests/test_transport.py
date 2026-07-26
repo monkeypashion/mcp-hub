@@ -91,7 +91,15 @@ def test_rewrites_cwd_and_leaves_message_content_alone():
     assert stats["completeness_violations"] == 0
 
 
-def test_rewrites_file_history_delta_fields():
+def test_neutralises_file_history_delta_rather_than_repointing_it():
+    """A delta names a backup of a file on the SOURCE machine.
+
+    Those backups do not travel, so re-keying them to the destination produced
+    dangling pointers — and, when the old path happened to exist on the
+    destination, pointers into a tree we do not own. Measured on the first real
+    cross-machine transport: ~1,600 such pointers aimed at the RECEIVING agent's
+    live worktree, where a rewind would have written. Blank them instead.
+    """
     line = js({
         "type": "file-history-delta",
         "trackingPath": f"/home/me/.claude/projects/{OLD_ENC}/memory/MEMORY.md",
@@ -99,13 +107,20 @@ def test_rewrites_file_history_delta_fields():
     })
     out, stats = cli._rekey_transcript(line, OLD, NEW)
     rec = json.loads(out)
-    assert NEW_ENC in rec["trackingPath"] and OLD_ENC not in rec["trackingPath"]
-    assert NEW_ENC in rec["backup"]["realParentDir"]
+    assert rec["trackingPath"] == "", "must not point anywhere, not even at the new path"
+    assert rec["backup"]["realParentDir"] == ""
     assert stats["tracking"] == 1 and stats["realparent"] == 1
 
 
-def test_rewrites_snapshot_backups_including_dict_keys():
-    """The coupling that was missed: trackedFileBackups is KEYED by path."""
+def test_drops_snapshot_backups_entirely():
+    """trackedFileBackups is keyed by absolute path — and must not survive.
+
+    Originally this asserted the keys were RE-KEYED. That was wrong for the same
+    reason as the delta above: the backups do not travel. Note an emptied dict
+    would satisfy an `all(...)` assertion vacuously, which is how the weaker
+    version of this test kept passing after the behaviour changed — assert the
+    dict is EMPTY, not that every remaining key looks right.
+    """
     key = f"/home/me/.claude/projects/{OLD_ENC}/memory/MEMORY.md"
     line = js({
         "type": "file-history-snapshot",
@@ -117,15 +132,13 @@ def test_rewrites_snapshot_backups_including_dict_keys():
     })
     out, stats = cli._rekey_transcript(line, OLD, NEW)
     tb = json.loads(out)["snapshot"]["trackedFileBackups"]
+    assert tb == {}, f"the journal must be dropped, not repointed; got {tb}"
     assert stats["snapshot"] == 1
-    assert all(OLD_ENC not in k for k in tb), "dict KEYS must be re-keyed, not just values"
-    assert all(NEW_ENC in k for k in tb)
-    assert all(NEW_ENC in v["realParentDir"] for v in tb.values())
     assert stats["completeness_violations"] == 0
 
 
 def test_empty_snapshot_does_not_hide_later_populated_ones():
-    """Guards against the exact sampling error that caused the miss."""
+    """Guards against the sampling error that hid the coupling originally."""
     key = f"/home/me/.claude/projects/{OLD_ENC}/x.md"
     text = "\n".join([
         js({"type": "file-history-snapshot", "snapshot": {"trackedFileBackups": {}}}),
