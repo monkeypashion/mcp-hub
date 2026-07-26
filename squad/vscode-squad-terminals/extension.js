@@ -123,6 +123,29 @@ function sendWhenReady(t, text) {
   setTimeout(fire, 4000);
 }
 
+// Icon+colour for an agent. Keyed on the REPO, found by longest-prefix match on
+// the agent name — NOT on shortLabel, which only strips "-<hostname>".
+//
+// A transported agent carries an identity suffix (mcp-hub-dev-vm-1-general), so
+// shortLabel returns the whole name, THEME misses, and the tab falls back to a
+// grey terminal icon. The operator spotted it as "transport doesn't take the icon
+// across" — but the icon was never data that travels; it's derived, and the
+// derivation wasn't suffix-aware. Fixing the lookup fixes every suffixed identity
+// at once, including ones nobody has created yet.
+//
+// LONGEST match, and only on a "-" boundary: shortest-first would let a key that
+// prefixes another win wrongly, and an unanchored match would make "sam" claim
+// "samba-...".
+function themeFor(agent) {
+  let best = null;
+  for (const key of Object.keys(THEME)) {
+    if (agent === key || agent.startsWith(key + "-")) {
+      if (!best || key.length > best.length) best = key;
+    }
+  }
+  return best ? THEME[best] : FALLBACK;
+}
+
 // short label: strip the derived "-<hostname>" suffix (sanitized like cli.py)
 function shortLabel(agent) {
   const host = os.hostname().toLowerCase().replace(/[^a-z0-9_-]/g, "-");
@@ -922,8 +945,7 @@ function activate(context) {
   // A down agent's terminal shows how to start it; nothing launches itself.
   for (const { agent, worktree } of mine) {
     if ([...agentOf.values()].includes(agent)) continue;
-    const label = shortLabel(agent);
-    const [icon, color] = THEME[label] || FALLBACK;
+    const [icon, color] = themeFor(agent);
     const t = vscode.window.createTerminal({
       iconPath: new vscode.ThemeIcon(icon),
       color: new vscode.ThemeColor(color),
