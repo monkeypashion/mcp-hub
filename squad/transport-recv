@@ -203,7 +203,18 @@ python3 - "$WSFILE" "$DEST" <<'PY'
 import pathlib, re, sys
 ws, dest = pathlib.Path(sys.argv[1]), sys.argv[2]
 if not ws.is_file():
-    print(f"  !! no workspace file at {ws} — add the folder by hand"); raise SystemExit(0)
+    # By the time we get here the clone has ALREADY landed, so refusing leaves a
+    # half-wired agent with no tab — worse than creating the file. A missing
+    # target workspace is also the normal case: "create it empty, then transport
+    # into it" is the operator's own opening move.
+    try:
+        ws.parent.mkdir(parents=True, exist_ok=True)
+        ws.write_text('{\n  "folders": [],\n  "settings": {}\n}\n', encoding="utf-8")
+        print(f"  created workspace {ws.name}")
+    except OSError as exc:
+        print(f"  !! no workspace file at {ws} and could not create it ({exc})"
+              " — add the folder by hand")
+        raise SystemExit(0)
 text = ws.read_text(encoding="utf-8")
 if f'"{dest}"' in text:
     print("  workspace already lists this folder"); raise SystemExit(0)

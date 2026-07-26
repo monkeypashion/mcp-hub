@@ -2,7 +2,7 @@
   "name": "squad-terminals",
   "displayName": "Squad Terminals",
   "description": "Auto-opens one plain terminal per squad agent (squad attach) with icon+color, and adds per-agent squad actions to the terminal tab context menu.",
-  "version": "0.20.0",
+  "version": "0.21.0",
   "publisher": "monkeypashion",
   "engines": {
     "vscode": "^1.90.0"
@@ -266,6 +266,11 @@
       {
         "command": "squad.addFromGitHub",
         "title": "Clone from GitHub as agent\u2026",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.teardownWorkspace",
+        "title": "Tear THIS workspace down\u2026",
         "category": "Squad"
       }
     ],
@@ -571,6 +576,10 @@
         {
           "command": "squad.transportWorkspace",
           "group": "1_ws@2"
+        },
+        {
+          "command": "squad.teardownWorkspace",
+          "group": "3_ws_close@1"
         },
         {
           "command": "squad.transportAll",

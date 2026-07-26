@@ -577,21 +577,50 @@ function activate(context) {
         const files = wsOn(host).filter(
           (f) => host || !here || canon(f) !== canon(here.fsPath)   // never offer where it already lives
         );
-        if (!files.length) {
-          vscode.window.showWarningMessage(
-            `Squad: no .code-workspace files found${host ? ` on ${host}` : " in ~/Projects or ~"}.`
-          );
-          return null;
-        }
+        // "Create it empty, then transport into it" is the operator's own
+        // opening move, so a target that doesn't exist yet is the NORMAL case —
+        // not an error. It must also be offered when the list is empty, which
+        // used to dead-end in a warning: the one moment you most need to make a
+        // workspace is when there isn't one.
+        const NEW = "➕ New workspace…";
         const pick = await vscode.window.showQuickPick(
-          files.map((f) => ({ label: path.basename(f, ".code-workspace"), description: f })),
+          [
+            { label: NEW, description: host ? `on ${host}` : "in ~/Projects", isNew: true },
+            ...files.map((f) => ({ label: path.basename(f, ".code-workspace"), description: f })),
+          ],
           {
             title: `${title} — which workspace${host ? ` on ${host}` : ""}?`,
-            placeHolder: "Refuses any repo that is dirty or unpushed",
+            placeHolder: files.length
+              ? "Refuses any repo that is dirty or unpushed"
+              : `No workspaces found${host ? ` on ${host}` : " in ~/Projects or ~"} — make one`,
           }
         );
         if (!pick) return null;
-        return { host, file: pick.description, label: pick.label, sh };
+        if (!pick.isNew) return { host, file: pick.description, label: pick.label, sh };
+
+        const name = await vscode.window.showInputBox({
+          title: `${title} — name the new workspace`,
+          placeHolder: "e.g. side-project",
+          validateInput: (v) =>
+            /^[A-Za-z0-9._-]+$/.test(v || "")
+              ? null
+              : "letters, digits, dot, dash and underscore only",
+        });
+        if (!name) return null;
+        // Resolve the DESTINATION's home rather than assuming it matches this
+        // box's. Quoting $HOME through ssh has already produced a directory
+        // literally named "$HOME" once (2026-07-26); asking is the only way that
+        // is right on both machines.
+        const home = host
+          ? sh(`tailscale ssh ${host} 'printf %s "$HOME"'`).trim()
+          : os.homedir();
+        if (!home) {
+          vscode.window.showWarningMessage(`Squad: could not resolve $HOME on ${host}.`);
+          return null;
+        }
+        // The file itself is created by transport at the far end, so there is
+        // nothing to clean up if the operator cancels or the gate refuses.
+        return { host, file: `${home}/Projects/${name}.code-workspace`, label: name, sh };
   };
 
   // Runs in a visible terminal rather than fire-and-forget: transport REFUSES
@@ -757,6 +786,75 @@ function activate(context) {
       );
       if (go !== "Transport") return;
       runTransport(`${target.host ? target.host + ":" : ""}${target.label} (workspace)`, base);
+    })
+  );
+
+  // ---- tear this workspace's squad down ----
+  // The closing move for the ephemeral case: spin a parallel squad up for a side
+  // project, then close it down. Without this the clones just accumulate.
+  //
+  // Code is KEPT unless explicitly asked for, and even then squad only removes
+  // TRANSPORTED CLONES — deletion is gated on a transport-registered identity
+  // suffix, so pointing this at the main workspace cannot delete an original.
+  // The two menu entries name their consequence rather than their mechanism.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("squad.teardownWorkspace", async () => {
+      const here = vscode.workspace.workspaceFile;
+      if (!here) {
+        vscode.window.showWarningMessage("Squad: open a .code-workspace first.");
+        return;
+      }
+      const mode = await vscode.window.showQuickPick(
+        [
+          {
+            label: "Close down, keep every folder on disk",
+            detail: "Removes the tabs, roster rows and daemons. No code is deleted.",
+            del: false,
+          },
+          {
+            label: "Close down and delete the transported clones",
+            detail:
+              "Also removes the worktrees + Claude state of agents that were " +
+              "transported here. Originals, added folders, and any clone with " +
+              "unpushed work are kept and named.",
+            del: true,
+          },
+        ],
+        {
+          title: `Tear down ${path.basename(here.fsPath, ".code-workspace")}`,
+          placeHolder: "This workspace's agents",
+        }
+      );
+      if (!mode) return;
+
+      const base =
+        `${SQUAD} teardown workspace ${JSON.stringify(here.fsPath)}` +
+        (mode.del ? " --delete-worktrees" : "");
+      // Confirm against the REAL plan, per agent, not a generic warning. The
+      // dry run is what distinguishes "delete two clones" from "delete the
+      // repos you work in" — so it must be read before anything is removed.
+      let preview;
+      try {
+        preview = cp
+          .execSync(`${base} --dry-run 2>&1`, { timeout: 20000, stdio: ["ignore", "pipe", "pipe"] })
+          .toString();
+      } catch (e) {
+        preview = (e && e.stdout ? e.stdout.toString() : "") || "(no output)";
+      }
+      const go = await vscode.window.showWarningMessage(
+        `Tear down ${path.basename(here.fsPath, ".code-workspace")}?`,
+        { modal: true, detail: preview },
+        mode.del ? "Tear down and delete" : "Tear down"
+      );
+      if (!go) return;
+
+      const t = vscode.window.createTerminal({
+        name: `teardown → ${path.basename(here.fsPath, ".code-workspace")}`,
+        iconPath: new vscode.ThemeIcon("trash"),
+        color: new vscode.ThemeColor("terminal.ansiRed"),
+      });
+      t.show(true);
+      sendWhenReady(t, `${base} --yes`);
     })
   );
 

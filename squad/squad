@@ -1082,6 +1082,64 @@ print(f"  workspace folder added: {name}")
 PYEOF
 }
 
+# Create a .code-workspace. The operator's flow starts with an EMPTY target
+# workspace, and making them hand-author JSON before they can transport is the
+# one manual step the whole feature exists to remove. Never clobbers: an
+# existing file is left exactly as it is (it may be a live workspace with
+# folders and hand-written comments in it).
+ws_create() {
+  local ws="$1"
+  ws="$(untilde "$ws")"
+  case "$ws" in *.code-workspace) ;; *) ws="$ws.code-workspace" ;; esac
+  if [ -e "$ws" ]; then echo "$ws"; return 0; fi
+  mkdir -p "$(dirname "$ws")" || { echo "!! cannot create $(dirname "$ws")" >&2; return 1; }
+  printf '{\n  "folders": [],\n  "settings": {}\n}\n' > "$ws" || return 1
+  echo "$ws"
+}
+
+# Does a path exist — here or on the far end? $1 is deliberately unquoted: the
+# remote shell may be "tailscale ssh", i.e. two words.
+path_exists() {  # <rsh> <host> <path>
+  if [ -n "$2" ]; then $1 "$2" "[ -e '$3' ]" 2>/dev/null; else [ -e "$3" ]; fi
+}
+
+# WHERE A CLONE LANDS. The operator's account->location ruleset already answers
+# this — org_alias/pull_local put a repo at ~/Projects/code/<org>/<repo>, and
+# that is where they expect to find one. Transport used to invent
+# <workspace-dir>/<label>/<repo> instead, which is how moving mcp-hub into the
+# general workspace produced a stray ~/Projects/general/mcp-hub: a directory
+# named after a WORKSPACE sitting in a tree organised by ACCOUNT.
+#
+# Canonical when free, then <repo>-<label>, then numbered. The suffix moves in
+# lockstep, because dest and identity must be disambiguated TOGETHER: two clones
+# of one repo landing on distinct paths but sharing a suffix would derive the
+# same agent name and silently share identity — the precise collision the
+# suffix exists to prevent.
+dest_candidate() {  # <home> <org/repo> <label> <n>
+  local home="$1" org="${2%%/*}" repo="${2#*/}" label="$3" n="$4"
+  case "$n" in
+    1) printf '%s/Projects/code/%s/%s' "$home" "$org" "$repo" ;;
+    2) printf '%s/Projects/code/%s/%s-%s' "$home" "$org" "$repo" "$label" ;;
+    *) printf '%s/Projects/code/%s/%s-%s-%s' "$home" "$org" "$repo" "$label" "$n" ;;
+  esac
+}
+dest_suffix() { if [ "$2" = 1 ]; then printf '%s' "$1"; else printf '%s-%s' "$1" "$2"; fi; }
+
+# First candidate free on the destination's disk, starting at <minn> so a
+# fan-out can reserve slots for repeats of one repo without knowing the paths.
+# Prints "<dest>\t<suffix>". Bounded: a wedged existence probe must not spin.
+resolve_dest() {  # <rsh> <host> <home> <org/repo> <label> <minn>
+  local n="${6:-1}" cand
+  while [ "$n" -le 20 ]; do
+    cand="$(dest_candidate "$3" "$4" "$5" "$n")"
+    if ! path_exists "$1" "$2" "$cand"; then
+      printf '%s\t%s' "$cand" "$(dest_suffix "$5" "$n")"; return 0
+    fi
+    n=$((n+1))
+  done
+  return 1
+}
+
 # Mirror of cli.py _claude_project_dirname: every / \ : becomes '-'.
 enc_project_dir() { printf '%s' "$1" | sed -e 's:[/\\:]:-:g' -e 's/-*$//'; }
 # The DESTINATION's Claude state dir, absolute. The remote's $HOME must be
@@ -1091,8 +1149,8 @@ enc_project_dir() { printf '%s' "$1" | sed -e 's:[/\\:]:-:g' -e 's/-*$//'; }
 dest_state_dir() { printf '%s/.claude/projects/%s' "$1" "$(enc_project_dir "$2")"; }
 
 transport_agent() {
-  local a="$1" wsfile="$2" dest="$3" host="${4:-}" port="${5:-}" sfx="${6:-}"
-  local src label branch name url reason repo proj args class
+  local a="$1" wsfile="$2" dest="$3" host="${4:-}" port="${5:-}" nth="${6:-1}"
+  local src label branch name url reason repo proj args class idsfx resolved
   local rsh="" remote=0 stage rhome="$HOME" dstate rsh_override="${7:-}"
   src="$(untilde "$(field "$a" 2)")"
   [ -d "$src" ] || { echo "!! $a: missing worktree $src"; return 1; }
@@ -1129,7 +1187,14 @@ transport_agent() {
     rhome="$($rsh "$host" 'printf %s "$HOME"')"
     [ -n "$rhome" ] || { echo "!! could not resolve \$HOME on $host"; return 1; }
   else
-    [ -f "$wsfile" ] || { echo "!! no such workspace file: $wsfile"; return 1; }
+    # A target workspace that doesn't exist yet is the NORMAL opening move —
+    # the operator's flow is "create it empty, then transport into it". Making
+    # them hand-author JSON first is the manual step this feature exists to
+    # remove. Never clobbers an existing file.
+    if [ ! -f "$wsfile" ]; then
+      ws_create "$wsfile" >/dev/null || { echo "!! cannot create workspace $wsfile"; return 1; }
+      echo "  created workspace $(ws_label "$wsfile")"
+    fi
   fi
 
   # The gate is SOURCE-side and identical either way: what travels is what's
@@ -1142,17 +1207,36 @@ transport_agent() {
   fi
 
   label="$(ws_label "$wsfile")"
-  # The identity suffix defaults to the workspace label, which is shared by
-  # every agent landing in that workspace. Fine when they're different repos
-  # (name = <repo>-<host>-<suffix>), but two clones of ONE repo would then
-  # derive the SAME name and silently share identity — the exact collision the
-  # suffix exists to prevent. Fan-out passes a unique one.
-  [ -n "$sfx" ] && label="$sfx"
   url="$(git -C "$src" remote get-url origin)"
   repo="$(basename "${url%.git}")"
   branch="$(git -C "$src" branch --show-current)"
-  [ -n "$dest" ] || dest="$(dirname "$wsfile")/$label/$repo"
   proj="$(worktree_project "$src")"
+
+  # PATH and SUFFIX are resolved from different things, deliberately.
+  #
+  # The path walks disk availability. The suffix counts how many clones of THIS
+  # repo this operation is landing (<nth>, which a fan-out supplies). Tying the
+  # suffix to the path attempt instead looks tidier and is wrong: on a
+  # same-machine transport the canonical path is ALWAYS taken — by the original
+  # — so every such clone came out named "...-<label>-2" with nothing for the
+  # 2 to distinguish it from. Caught on a live dry run, not by a test.
+  #
+  # A suffix that does collide is not a silent failure: transport-recv refuses
+  # when the derived name already names a different worktree, so the guard is at
+  # the destination where the whole roster is visible. That is what lets the
+  # suffix be readable rather than defensively unique.
+  idsfx="$(dest_suffix "$label" "$nth")"
+  if [ -z "$dest" ]; then
+    if [ -n "$proj" ]; then
+      resolved="$(resolve_dest "$rsh" "$host" "$rhome" "$proj" "$label" 1)" \
+        || { echo "!! no free destination under $rhome/Projects/code/${proj%%/*}"; return 1; }
+      dest="${resolved%%$'\t'*}"
+    else
+      # No org/repo to file it under (shouldn't happen — the gate requires an
+      # origin — but never invent a path from a half-known identity).
+      dest="$(dirname "$wsfile")/$label/$repo"
+    fi
+  fi
   args="$(field "$a" 4)"; class="$(field "$a" 5)"
   # Transport carries the SOURCE's launch args verbatim, so a comms-armed agent
   # landed comms-armed in a workspace whose whole point is that comms are off —
@@ -1228,13 +1312,141 @@ transport_agent() {
   local recv; recv="$(dirname "$(readlink -f "$0")")/transport-recv"
   [ -f "$recv" ] || { echo "!! transport-recv missing beside squad"; return 1; }
   if [ "$remote" = 1 ]; then
-    $rsh "$host" "bash -s '$dest' '$wsfile' '$label' '$proj' '$args' '$class' '${MCP_HUB_URL:-}'" \
+    $rsh "$host" "bash -s '$dest' '$wsfile' '$idsfx' '$proj' '$args' '$class' '${MCP_HUB_URL:-}'" \
       < "$recv" || return 1
   else
-    bash "$recv" "$dest" "$wsfile" "$label" "$proj" "$args" "$class" "${MCP_HUB_URL:-}" || return 1
+    bash "$recv" "$dest" "$wsfile" "$idsfx" "$proj" "$args" "$class" "${MCP_HUB_URL:-}" || return 1
   fi
 
   echo "done${host:+ (on $host)} — the agent is STOPPED; start it from its tab in $label"
+}
+
+# ── Teardown: close a cloned squad down ─────────────────────────────────────
+# The inverse of `transport workspace`. The operator's ephemeral case — spin a
+# parallel squad up for a side project, then close it down — needs the closing
+# move to be as cheap as the opening one, or the clones just accumulate.
+#
+# THE SAFETY PROPERTY, which is the whole design: deleting a worktree is gated
+# on the agent having a REGISTERED IDENTITY SUFFIX in ~/.mcp-hub/config.json's
+# "workspaces" map. Only transport writes one. An original, an add-folder'd
+# directory or a hand-made agent has no entry and CANNOT be deleted here — it
+# is unenrolled and left on disk, with the reason printed.
+#
+# Without that gate this verb is a foot-cannon: pointed at the MAIN workspace it
+# would delete the primary repos, because they are clean and pushed exactly like
+# clones are. "Is it safe to delete" cannot tell an original from a copy.
+# Provenance can, and provenance is the only thing that can.
+ws_suffix_of() {  # <worktree> -> registered suffix, empty if none
+  python3 - "$HOME/.mcp-hub/config.json" "$1" <<'PYEOF'
+import json, os, pathlib, sys
+cfg, path = pathlib.Path(sys.argv[1]), sys.argv[2]
+try:
+    ws = (json.loads(cfg.read_text(encoding="utf-8")) or {}).get("workspaces") or {}
+except Exception:
+    raise SystemExit(0)
+want = os.path.normpath(path)
+for k, v in ws.items():
+    if os.path.normpath(k) == want:
+        print(v); break
+PYEOF
+}
+
+unregister_ws_suffix() {
+  python3 - "$HOME/.mcp-hub/config.json" "$1" <<'PYEOF'
+import json, os, pathlib, sys
+cfg, path = pathlib.Path(sys.argv[1]), sys.argv[2]
+try:
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    assert isinstance(data, dict)
+except Exception:
+    raise SystemExit(0)
+ws = data.get("workspaces")
+if not isinstance(ws, dict):
+    raise SystemExit(0)
+want = os.path.normpath(path)
+for k in [k for k in ws if os.path.normpath(k) == want]:
+    del ws[k]
+data["workspaces"] = ws
+cfg.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+PYEOF
+}
+
+# Is any REMAINING roster row on this project? Teardown must not opt the repo
+# out of the hub while an original clone of it still lives here — that would
+# silence the hooks for an agent it never touched.
+project_still_present() {
+  local proj="$1" a d
+  for a in $(agents); do
+    d="$(untilde "$(field "$a" 2)")"
+    [ -d "$d" ] || continue
+    [ "$(worktree_project "$d")" = "$proj" ] && return 0
+  done
+  return 1
+}
+
+teardown_workspace() {  # <wsfile> <delete:0|1> <dry:0|1> <rmws:0|1>
+  local ws="$1" del="$2" dry="$3" rmws="$4"
+  local a d sfx r list plan_del="" plan_un="" proj safe state
+  ws="$(untilde "$ws")"
+  [ -f "$ws" ] || { echo "!! no such workspace file: $ws" >&2; return 1; }
+  list="$(ws_agents "$ws")"
+  [ -n "$list" ] || { echo "no roster agents live in $(ws_label "$ws")" >&2; return 1; }
+
+  echo "== teardown $(ws_label "$ws") =="
+  for a in $list; do
+    d="$(untilde "$(field "$a" 2)")"
+    sfx="$(ws_suffix_of "$d")"
+    if [ "$del" = 0 ]; then
+      printf '  UNENROL  %-30s %s\n' "$a" "(code left in place)"
+      plan_un="$plan_un $a"
+    elif [ -z "$sfx" ]; then
+      printf '  UNENROL  %-30s %s\n' "$a" "not a transported clone — code left in place"
+      plan_un="$plan_un $a"
+    elif ! r="$(transport_gate "$d" 2>/dev/null)"; then
+      printf '  UNENROL  %-30s %s\n' "$a" "$r — code left in place"
+      plan_un="$plan_un $a"
+    else
+      printf '  DELETE   %-30s %s\n' "$a" "$d"
+      printf '           %-30s %s\n' "" "+ $(dest_state_dir "$HOME" "$d")"
+      plan_del="$plan_del $a"
+    fi
+  done
+  [ "$rmws" = 1 ] && echo "  DELETE   workspace file                 $ws"
+
+  if [ "$dry" = 1 ]; then
+    echo
+    echo "  dry run — nothing written."
+    [ "$del" = 1 ] || echo "  (worktrees are KEPT; pass --delete-worktrees to remove transported clones)"
+    return 0
+  fi
+
+  for a in $list; do
+    d="$(untilde "$(field "$a" 2)")"
+    proj=""; [ -d "$d" ] && proj="$(worktree_project "$d")"
+    tm kill-session -t "=$a" 2>/dev/null || true
+    tmp="$(mktemp)"; awk -F'|' -v a="$a" '$1!=a' "$CONF" > "$tmp" && mv "$tmp" "$CONF"
+    ws_del_folder "$ws" "$d" >/dev/null 2>&1 || true
+    safe="$(printf '%s' "$a" | sed 's/[^A-Za-z0-9_-]/_/g')"
+    [ -f "$HOME/.mcp-hub/heartbeat-$safe.pid" ] \
+      && kill "$(cat "$HOME/.mcp-hub/heartbeat-$safe.pid" 2>/dev/null)" 2>/dev/null
+    rm -f "$HOME/.mcp-hub/heartbeat-$safe.pid" "$HOME/.mcp-hub/status-$safe.json"
+    case " $plan_del " in
+      *" $a "*)
+        state="$(dest_state_dir "$HOME" "$d")"
+        rm -rf "$d" "$state"
+        unregister_ws_suffix "$d"
+        echo "  deleted $a ($d)"
+        ;;
+      *) echo "  unenrolled $a (code at $d left in place)" ;;
+    esac
+    # Opt out only when nothing else on this box still uses the project.
+    [ -n "$proj" ] && ! project_still_present "$proj" && optin_project remove "$proj"
+  done
+
+  if [ "$rmws" = 1 ]; then
+    rm -f "$ws" && echo "  removed workspace file $ws"
+  fi
+  echo "done — $(ws_label "$ws") torn down"
 }
 
 handoff() {
@@ -2363,6 +2575,14 @@ print("\n".join(r[2] for r in rows))
               *)   a_arg="$1"; shift ;;
             esac; done
             [ -n "$ws_arg" ] || { echo "usage: $CMD transport <agent|all|workspace <ws>> --to <file.code-workspace> [--dest <dir>] [--host <h>] [--dry-run]" >&2; exit 1; }
+            # --dest names ONE directory, so it cannot mean anything sane for a
+            # set: every agent would land on the same path and all but the first
+            # would fail on "destination not empty" — or worse, share identity.
+            if [ -n "$dest_arg" ] && { [ "$a_arg" = all ] || [ -n "$from_ws" ]; }; then
+              echo "!! --dest names a single directory and cannot be used with 'all' or 'workspace'." >&2
+              echo "   Destinations are derived per repo (~/Projects/code/<org>/<repo>)." >&2
+              exit 1
+            fi
 
             # THE SET TO MOVE. `all` is machine-scoped and was wrong for both of
             # the operator's actual cases (a second squad for a side project; and
@@ -2387,7 +2607,15 @@ print("\n".join(r[2] for r in rows))
                 if r="$(transport_gate "$d" 2>/dev/null)"; then
                   echo "OK: $a would transport to ${host_arg:+$host_arg:}$(ws_label "$ws_arg")"
                   echo "  branch : $(git -C "$d" branch --show-current) @ $(git -C "$d" rev-parse --short HEAD)"
-                  echo "  dest   : ${dest_arg:-$(dirname "$ws_arg")/$(ws_label "$ws_arg")/$(basename "$d")}"
+                  if [ -n "$dest_arg" ]; then
+                    echo "  dest   : $dest_arg"
+                  elif [ -z "$host_arg" ] && rr="$(resolve_dest "" "" "$HOME" "$(worktree_project "$d")" "$(ws_label "$ws_arg")" 1)"; then
+                    echo "  dest   : ${rr%%$'\t'*}"
+                    echo "  id-sfx : $(dest_suffix "$(ws_label "$ws_arg")" 1)"
+                  else
+                    echo "  dest   : $(dest_candidate '~' "$(worktree_project "$d")" "$(ws_label "$ws_arg")" 1) (on $host_arg)"
+                  fi
+                  [ -f "$(untilde "$ws_arg")" ] || echo "  note   : workspace $(ws_label "$ws_arg") does not exist yet — it will be created"
                 else echo "REFUSED: $a — $r"; exit 1; fi
                 exit 0
               fi
@@ -2407,20 +2635,30 @@ print("\n".join(r[2] for r in rows))
               # Two clones of ONE repo collide on both the default destination and
               # the identity suffix; they must be disambiguated TOGETHER or the
               # second silently shares the first's identity.
-              rp="$(basename "$(git -C "$d" remote get-url origin)" .git)"
-              dd="$(dirname "$ws_arg")/$(ws_label "$ws_arg")/$rp"; n=1
-              while case " $claimed " in *" $dd "*) true ;; *) false ;; esac; do
-                n=$((n+1)); dd="$(dirname "$ws_arg")/$(ws_label "$ws_arg")/$rp-$n"
-              done
-              claimed="$claimed $dd"
-              if [ "$n" = 1 ]; then sfx="$(ws_label "$ws_arg")"; else sfx="$(ws_label "$ws_arg")-$n"; fi
+              # Reserve a slot PER org/repo. Two clones of one repo must get
+              # different destinations AND different identity suffixes, and they
+              # have to move together — same path with a shared suffix means the
+              # second silently inherits the first's agent name. Counting the
+              # project (not the resolved path) lets transport_agent do the
+              # actual existence probing, which is the only place that knows the
+              # destination's $HOME on a remote run.
+              lbl="$(ws_label "$ws_arg")"
+              pj="$(worktree_project "$d")"; n=1
+              for c in $claimed; do [ "$c" = "$pj" ] && n=$((n+1)); done
+              claimed="$claimed $pj"
               if [ "$dry" = 1 ]; then
-                printf '  OK    %-38s -> %-14s id-suffix %s (%s)\n' \
-                  "$t" "$(basename "$dd")" "$sfx" "$(git -C "$d" branch --show-current)"
+                sfxshow="$(dest_suffix "$lbl" "$n")"
+                if [ -z "$host_arg" ] && rr="$(resolve_dest "" "" "$HOME" "$pj" "$lbl" "$n")"; then
+                  dshow="${rr%%$'\t'*}"
+                else
+                  dshow="$(dest_candidate '~' "$pj" "$lbl" "$n")"
+                fi
+                printf '  OK    %-30s -> %-44s id-suffix %s (%s)\n' \
+                  "$t" "$dshow" "$sfxshow" "$(git -C "$d" branch --show-current)"
                 ok=$((ok+1)); continue
               fi
               echo "  ---- $t ----"
-              if transport_agent "$t" "$ws_arg" "$dd" "$host_arg" "$port_arg" "$sfx" "$rsh_arg" 2>&1 | sed 's/^/    /'; then
+              if transport_agent "$t" "$ws_arg" "" "$host_arg" "$port_arg" "$n" "$rsh_arg" 2>&1 | sed 's/^/    /'; then
                 ok=$((ok+1))
               else
                 printf '  FAIL  %-38s transport errored\n' "$t"; skipped=$((skipped+1))
@@ -2434,6 +2672,39 @@ print("\n".join(r[2] for r in rows))
               echo "  NOTE: this was a CLONE. The source workspace is untouched — retire it" && \
               echo "        deliberately (verify the destination first, then '$CMD rm <agent>')."
             exit 0 ;;
+  ws-new)   # squad ws-new <file.code-workspace> — create an empty target workspace
+            shift
+            [ -n "${1:-}" ] || { echo "usage: $CMD ws-new <file.code-workspace>" >&2; exit 1; }
+            f="$(ws_create "$1")" || exit 1
+            echo "$f"
+            exit 0 ;;
+  teardown) # squad teardown workspace <ws> [--delete-worktrees] [--remove-workspace]
+            #                               [--dry-run] [--yes]
+            # Closes a cloned squad down. Worktree deletion is gated on the agent
+            # having a transport-registered identity suffix, so this can never
+            # delete an original — see teardown_workspace.
+            shift; ws_arg=""; del=0; dry=0; rmws=0; yes=0
+            while [ $# -gt 0 ]; do case "$1" in
+              workspace)          ws_arg="${2:-}"; shift 2 ;;
+              --delete-worktrees) del=1; shift ;;
+              --remove-workspace) rmws=1; shift ;;
+              --dry-run)          dry=1; shift ;;
+              --yes)              yes=1; shift ;;
+              -*) echo "!! unknown teardown flag '$1' (valid: --delete-worktrees, --remove-workspace, --dry-run, --yes)" >&2; exit 1 ;;
+              *)  ws_arg="$1"; shift ;;
+            esac; done
+            [ -n "$ws_arg" ] || {
+              echo "usage: $CMD teardown workspace <file.code-workspace> [--delete-worktrees] [--remove-workspace] [--dry-run] [--yes]" >&2; exit 1; }
+            # Anything that removes bytes needs a second, explicit act. The dry
+            # run is the check; --yes is the acknowledgement that it was read.
+            if [ "$dry" = 0 ] && { [ "$del" = 1 ] || [ "$rmws" = 1 ]; } && [ "$yes" = 0 ]; then
+              teardown_workspace "$ws_arg" "$del" 1 "$rmws" || exit $?
+              echo
+              echo "!! refusing to delete without --yes. Re-run with --yes to proceed." >&2
+              exit 1
+            fi
+            teardown_workspace "$ws_arg" "$del" "$dry" "$rmws"
+            exit $? ;;
   ws-remove) # squad ws-remove [agent] --from <file.code-workspace>
              # Removes the agent's FOLDER from that workspace only. The agent
              # stays enrolled and still appears in any other workspace listing
@@ -2549,6 +2820,36 @@ interact
                                 for you (via answer's fail-closed parser)
   $CMD args [agent] "..."       set the agent's DEFAULT launch args (roster; used by up/restart/heal)
   $CMD handoff [agent]          commit WIP to wip/<agent>-<date> + push (before switching machines)
+
+workspaces (a "workspace" is a .code-workspace file; the cockpit shows a tab per folder in it)
+  $CMD add-folder <dir> [--to <ws>]
+                                enrol an EXISTING folder as an agent. git optional — where a
+                                remote exists identity is derived and comms come free.
+  $CMD ws-new <ws>              create an empty target workspace (transport creates it too)
+  $CMD ws-remove [agent] --from <ws>
+                                drop the agent's FOLDER from that workspace. Stays enrolled.
+  $CMD transport <agent|all|workspace <ws>> --to <ws>
+                                clone a whole agent — code, memory, history, launch args and
+                                its own hub identity — into another workspace. Lands STOPPED.
+                                  --host <h>   another machine (over the tailnet)
+                                  --dest <dir> override the destination (single agent only)
+                                  --dry-run    report the gate verdict, write nothing
+                                Refuses unless the source is reconstructible FROM THE REMOTE:
+                                git repo with an origin, nothing uncommitted, unpushed or
+                                untracked. Destinations derive from the account ruleset —
+                                ~/Projects/code/<org>/<repo>, then <repo>-<label> if taken.
+  $CMD teardown workspace <ws> [--delete-worktrees] [--remove-workspace] [--dry-run] [--yes]
+                                close a cloned squad down: sessions, roster rows, workspace
+                                folder entries, daemons. Code is KEPT unless you ask.
+                                --delete-worktrees only ever removes TRANSPORTED CLONES — an
+                                agent with no transport-registered identity suffix is
+                                unenrolled and left on disk, so this cannot delete an
+                                original. Clones with unpushed work are kept too, and named.
+                                Anything destructive needs --yes; without it you get the dry
+                                run and a refusal.
+  $CMD ext-align                name the cockpit extension's install dir after its manifest
+                                (VSCode caches on the FOLDER NAME — a stale name means new
+                                menu items silently never appear). Reload Window after.
 
 helpers
   $CMD pull-local <org>/<repo>  clone/pull into the right account folder, no enrollment
