@@ -203,6 +203,80 @@ def test_a_workspace_declaring_comms_off_lands_the_clone_without_them(env, tmp_p
     assert "--continue" in row, "but it must keep the rest of its launch args"
 
 
+# ---- unreachable far end -------------------------------------------------
+
+def test_an_unreachable_host_refuses_with_advice(env, tmp_path):
+    """/bin/false as the remote shell: every probe fails, nothing is attempted."""
+    e, conf = env
+    work = _pushed_repo(tmp_path, rewrite_origin=False)
+    _enrol(conf, "demo-box", work)
+    res = _run(env, "transport", "demo-box", "--to", str(_ws(tmp_path)),
+               "--host", "nowhere", "--rsh", "/bin/false")
+    assert res.returncode != 0
+    out = res.stdout + res.stderr
+    assert "cannot reach" in out, out
+    assert "--rsh" in out, "the refusal should name the escape hatch"
+
+
+def test_a_dry_run_against_an_unreachable_host_says_it_is_guessing(env, tmp_path):
+    """A preview it could not verify must SAY so, not quietly print a plan.
+
+    This is the same class as the two preview bugs found by running the real use
+    cases: a plan the operator confirms has to be a plan that was checked.
+    """
+    e, conf = env
+    work = _pushed_repo(tmp_path, rewrite_origin=False)
+    b = tmp_path / "work" / "demo-two"
+    subprocess.run(["git", "clone", "-q", str(tmp_path / "remotes" / "demo.git"), str(b)],
+                   check=True, capture_output=True)
+    _enrol(conf, "demo-a", work)
+    _enrol(conf, "demo-b", b)
+    src = tmp_path / "src.code-workspace"
+    src.write_text(json.dumps({"folders": [{"path": str(work)}, {"path": str(b)}]}),
+                   encoding="utf-8")
+    res = _run(env, "transport", "workspace", str(src), "--to", str(_ws(tmp_path)),
+               "--host", "nowhere", "--rsh", "/bin/false", "--dry-run")
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "UNCHECKED" in res.stdout, res.stdout
+
+
+# ---- partial failure in a fan-out ---------------------------------------
+
+def test_one_agent_failing_does_not_abandon_the_rest(env, tmp_path):
+    """A squad clone that dies halfway and says nothing is the worst outcome.
+
+    The first agent's destination is pre-occupied so its transport fails; the
+    second must still go, and the summary must count both honestly.
+    """
+    e, conf = env
+    a = _pushed_repo(tmp_path, repo="demo", rewrite_origin=False)
+    b = _pushed_repo(tmp_path, repo="other", rewrite_origin=False)
+    _enrol(conf, "demo-a", a)
+    _enrol(conf, "other-b", b)
+    # Exhaust the destination search for 'demo' only. resolve_dest walks 20
+    # candidates (demo, demo-far, demo-far-2 … demo-far-19), so occupying three
+    # merely pushes it to the fourth — measured on the first attempt at this
+    # test, which passed for the wrong reason.
+    occupied = ["demo", "demo-far"] + [f"demo-far-{i}" for i in range(2, 20)]
+    for n in occupied:
+        d = pathlib.Path(e["HOME"]) / "Projects" / "code" / "remotes" / n
+        d.mkdir(parents=True)
+        (d / "occupied").write_text("x", encoding="utf-8")
+    src = tmp_path / "src.code-workspace"
+    src.write_text(json.dumps({"folders": [{"path": str(a)}, {"path": str(b)}]}),
+                   encoding="utf-8")
+
+    res = _run(env, "transport", "workspace", str(src), "--to", str(_ws(tmp_path, "far")))
+    out = res.stdout + res.stderr
+    landed = pathlib.Path(e["HOME"]) / "Projects" / "code" / "remotes" / "other"
+    assert (landed / "README.md").exists(), f"the healthy agent was abandoned:\n{out}"
+    assert "1 transported" in out, out
+    assert "FAIL" in out, f"the failure must be NAMED, not silently counted:\n{out}"
+    for d in occupied:
+        p = pathlib.Path(e["HOME"]) / "Projects" / "code" / "remotes" / d
+        assert (p / "occupied").exists(), "an occupied directory must be left alone"
+
+
 # ---- the remote leg, exercised locally ----------------------------------
 
 def test_the_whole_remote_leg_runs_end_to_end(env, tmp_path):
