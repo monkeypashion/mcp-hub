@@ -221,6 +221,75 @@ def test_workspace_file_removal_is_opt_in(env, tmp_path):
     assert not ws2.exists()
 
 
+def _claude_json(home: str, *paths: pathlib.Path):
+    """What transport's trust-seeding leaves behind, per destination path."""
+    p = pathlib.Path(home) / ".claude.json"
+    p.write_text(json.dumps({"projects": {
+        **{str(d): {"hasTrustDialogAccepted": True, "enabledMcpjsonServers": ["hub"]}
+           for d in paths},
+        "/home/someone/unrelated": {"hasTrustDialogAccepted": True},
+    }}, indent=2), encoding="utf-8")
+    return p
+
+
+def test_deleting_a_clone_removes_its_trust_entry(env, tmp_path):
+    """Found by RUNNING a teardown, not by a test — nothing looked at this file.
+
+    Transport seeds folder-trust + hub-MCP approval so a clone's first launch
+    doesn't hang on dialogs, and its stated justification is that seeding makes
+    trust "an explicit act by whoever authorised the transport". An entry that
+    outlives the agent breaks exactly that: the destination path is derived from
+    repo + label, so a LATER transport to the same place arrives pre-trusted on
+    an authorisation granted for a different, deleted agent.
+    """
+    e, conf = env
+    work = _pushed_repo(tmp_path, "monkeypashion", "demo")
+    _enrol(conf, "demo-box", work)
+    _register_suffix(e["HOME"], work, "side")
+    cj = _claude_json(e["HOME"], work)
+    ws = _workspace(tmp_path, work)
+
+    res = _run(env, "teardown", "workspace", str(ws), "--delete-worktrees", "--yes")
+    assert res.returncode == 0, res.stderr
+    projects = json.loads(cj.read_text())["projects"]
+    assert str(work) not in projects, "the deleted clone's trust must not outlive it"
+    assert "/home/someone/unrelated" in projects, "and nothing else may be touched"
+
+
+def test_unenrolling_KEEPS_the_trust_entry(env, tmp_path):
+    """The inverse case, and the reason this isn't unconditional.
+
+    An unenrolled agent keeps its code and can be re-enrolled. Revoking trust it
+    was legitimately granted would re-prompt it for no reason — so only an
+    actually-deleted worktree loses its entry.
+    """
+    e, conf = env
+    work = _pushed_repo(tmp_path, "monkeypashion", "demo")
+    _enrol(conf, "demo-box", work)          # no registered suffix -> unenrol only
+    cj = _claude_json(e["HOME"], work)
+    ws = _workspace(tmp_path, work)
+
+    res = _run(env, "teardown", "workspace", str(ws), "--delete-worktrees", "--yes")
+    assert res.returncode == 0, res.stderr
+    assert work.is_dir(), "precondition: this agent is kept, not deleted"
+    assert str(work) in json.loads(cj.read_text())["projects"], \
+        "code kept ⇒ trust kept, or the agent gets re-prompted for nothing"
+
+
+def test_unreadable_claude_json_does_not_fail_the_teardown(env, tmp_path):
+    """Fail-open, same as the seeding side: never block on this file."""
+    e, conf = env
+    work = _pushed_repo(tmp_path, "monkeypashion", "demo")
+    _enrol(conf, "demo-box", work)
+    _register_suffix(e["HOME"], work, "side")
+    (pathlib.Path(e["HOME"]) / ".claude.json").write_text("{ not json", encoding="utf-8")
+    ws = _workspace(tmp_path, work)
+
+    res = _run(env, "teardown", "workspace", str(ws), "--delete-worktrees", "--yes")
+    assert res.returncode == 0, res.stderr
+    assert not work.exists(), "the worktree deletion must still happen"
+
+
 def test_unknown_workspace_is_refused(env, tmp_path):
     res = _run(env, "teardown", "workspace", str(tmp_path / "nope.code-workspace"))
     assert res.returncode != 0

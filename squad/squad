@@ -1080,6 +1080,45 @@ print("  trust + hub MCP pre-approved")
 PYEOF
 }
 
+# The inverse of seed_claude_trust, for teardown. A seeded entry that OUTLIVES
+# its agent quietly breaks the property seeding exists to provide — that trust
+# was an explicit act for THAT transport. Left behind, a later transport to the
+# same computed path (same repo, same label, hence the same destination) arrives
+# PRE-TRUSTED on an authorisation granted for a different, deleted agent. Found
+# by running a real teardown, not by a test: nothing hermetic looked at
+# ~/.claude.json.
+#
+# Only ever called for a worktree actually being DELETED. An unenrolled agent
+# keeps its code and may be re-enrolled, and re-prompting it for trust it was
+# legitimately granted would be the wrong correction.
+unseed_claude_trust() {
+  python3 - "$HOME/.claude.json" "$1" <<'PYEOF'
+import json, os, pathlib, sys, tempfile
+p, proj = pathlib.Path(sys.argv[1]), sys.argv[2]
+try:
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert isinstance(data, dict)
+except Exception:
+    raise SystemExit(0)                      # fail-open: never block a teardown
+projects = data.get("projects")
+if not isinstance(projects, dict):
+    raise SystemExit(0)
+want = os.path.normpath(proj)
+gone = [k for k in projects if os.path.normpath(k) == want]
+if not gone:
+    raise SystemExit(0)
+for k in gone:
+    del projects[k]
+# Atomic replace: this file is live and rewritten by every running session —
+# the same discipline the seeding side uses.
+fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".claude.json.")
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2)
+os.replace(tmp, p)
+print("  trust entry removed from ~/.claude.json")
+PYEOF
+}
+
 # Insert a folder entry into a .code-workspace. These are JSONC with
 # hand-formatting and comments, so this is a surgical text insert — a
 # load-and-dump would strip the operator's comments and reflow the file.
@@ -1431,6 +1470,7 @@ teardown_workspace() {  # <wsfile> <delete:0|1> <dry:0|1> <rmws:0|1>
     else
       printf '  DELETE   %-30s %s\n' "$a" "$d"
       printf '           %-30s %s\n' "" "+ $(dest_state_dir "$HOME" "$d")"
+      printf '           %-30s %s\n' "" "+ its trust entry in ~/.claude.json"
       plan_del="$plan_del $a"
     fi
   done
@@ -1459,6 +1499,7 @@ teardown_workspace() {  # <wsfile> <delete:0|1> <dry:0|1> <rmws:0|1>
         rm -rf "$d" "$state"
         unregister_ws_suffix "$d"
         echo "  deleted $a ($d)"
+        unseed_claude_trust "$d"
         ;;
       *) echo "  unenrolled $a (code at $d left in place)" ;;
     esac
