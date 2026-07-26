@@ -358,10 +358,22 @@ def init_db(db_path: Path = DB_PATH) -> None:
             status       TEXT NOT NULL DEFAULT 'open',
             decided_at   REAL,
             decision     TEXT NOT NULL DEFAULT '',
-            decision_note TEXT NOT NULL DEFAULT ''
+            decision_note TEXT NOT NULL DEFAULT '',
+            clear_strikes INTEGER NOT NULL DEFAULT 0
         );
     """)
     conn.commit()
+
+    # Migrate: strike counter for existing decisions tables (deployed before
+    # the 3-strike withdrawal rule).
+    try:
+        conn.execute(
+            "ALTER TABLE decisions ADD COLUMN "
+            "clear_strikes INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
 
     # Migrate: add bio column for existing databases
     try:
@@ -2102,7 +2114,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             conn.execute(
                 """UPDATE decisions SET updated_at=?, raw=?, ask=?, why=?,
                    value_text=?, risk_text=?, value_score=?, risk_score=?,
-                   net_score=?, tags=?, project=CASE WHEN ?='' THEN project ELSE ? END
+                   net_score=?, tags=?, clear_strikes=0,
+                   project=CASE WHEN ?='' THEN project ELSE ? END
                    WHERE id=?""",
                 (now, card, f["ask"], f["why"], f["value_text"], f["risk_text"],
                  f["value_score"], f["risk_score"], f["net_score"], all_tags,
@@ -2124,18 +2137,50 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 
     @mcp.tool()
     def decision_clear(from_agent: str, source: str = "stop-hook") -> str:
-        """Withdraw the agent's open card (the agent moved on: its latest
-        turn carried no DECISION block). Only clears cards of the given
-        source — an api-submitted service card is not the agent's to
-        auto-withdraw."""
+        """Register a cardless turn against the agent's open card; withdraw
+        after 3 consecutive ones.
+
+        One cardless turn is NOT evidence the agent moved on — agents take
+        turns constantly while still waiting (answering peer DMs, heal
+        nudges, the Stop hook's own surfaced items). Instant withdrawal
+        made live asks evaporate unanswered while the operator's queue
+        showed empty — the delete-project stall of 2026-07-26 late, an
+        hour of four lanes each believing the other side was the blocker.
+        Three consecutive cardless turns is the same evidence standard as
+        the wake-ack strikes. A restatement (decision_put) resets the
+        count; a DECIDED marker (decision_resolve) or operator answer
+        closes immediately regardless.
+
+        Only touches cards of the given source — an api-submitted service
+        card is not the agent's to auto-withdraw."""
         conn = _get_db(db_path)
-        cur = conn.execute(
-            "UPDATE decisions SET status='withdrawn', decided_at=? "
+        row = conn.execute(
+            "SELECT id, clear_strikes FROM decisions "
             "WHERE agent=? AND status='open' AND source=?",
-            (time.time(), from_agent, source),
+            (from_agent, source),
+        ).fetchone()
+        if row is None:
+            return ""
+        strikes = (row["clear_strikes"] or 0) + 1
+        if strikes >= 3:
+            # Stamp WHY the row left the queue (vps, 2026-07-26): without
+            # provenance, "operator answered in-pane" and "system dropped a
+            # live ask" both render as GONE — which is precisely the
+            # ambiguity that let a wrong causal claim ride tonight's stall.
+            conn.execute(
+                "UPDATE decisions SET status='withdrawn', decided_at=?, "
+                "decision_note='[auto] 3 consecutive cardless turns' "
+                "WHERE id=?",
+                (time.time(), row["id"]),
+            )
+            conn.commit()
+            return "1 card(s) withdrawn (3 consecutive cardless turns)."
+        conn.execute(
+            "UPDATE decisions SET clear_strikes=? WHERE id=?",
+            (strikes, row["id"]),
         )
         conn.commit()
-        return f"{cur.rowcount} card(s) withdrawn." if cur.rowcount else ""
+        return f"Card kept open (cardless turn {strikes}/3)."
 
     @mcp.tool()
     def decision_resolve(from_agent: str, verdict: str, source: str = "stop-hook") -> str:

@@ -126,11 +126,29 @@ async def test_put_opens_then_restate_updates_in_place(server):
     assert "net +6" in listing  # 9 - 3, recomputed on restate
 
 
-async def test_clear_withdraws_open_card(server):
+async def test_clear_withdraws_only_after_three_strikes(server):
+    """One cardless turn is not evidence of moving on — agents answer DMs
+    and heal nudges while genuinely waiting. Instant withdrawal made live
+    asks evaporate unanswered (the 2026-07-26 delete-project stall)."""
+    await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
+    for expected in ("1/3", "2/3"):
+        out = await _call_tool(server, "decision_clear", {"from_agent": "alice"})
+        assert f"kept open (cardless turn {expected})" in out
+        assert "alice" in await _call_tool(server, "decision_list", {})
+    out = await _call_tool(server, "decision_clear", {"from_agent": "alice"})
+    assert "withdrawn (3 consecutive cardless turns)" in out
+    assert "No open decision cards" in await _call_tool(server, "decision_list", {})
+
+
+async def test_restatement_resets_clear_strikes(server):
+    """A restated card starts the 3-count over — strikes must be
+    CONSECUTIVE cardless turns."""
+    await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
+    await _call_tool(server, "decision_clear", {"from_agent": "alice"})
+    await _call_tool(server, "decision_clear", {"from_agent": "alice"})
     await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
     out = await _call_tool(server, "decision_clear", {"from_agent": "alice"})
-    assert "1 card(s) withdrawn" in out
-    assert "No open decision cards" in await _call_tool(server, "decision_list", {})
+    assert "1/3" in out  # back to strike one, not withdrawn
 
 
 async def test_clear_with_nothing_open_is_silent(server):
