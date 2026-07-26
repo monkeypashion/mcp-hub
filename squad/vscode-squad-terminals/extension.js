@@ -453,6 +453,21 @@ function activate(context) {
     );
   }
 
+  // `Start & attach` gets TWO menu labels, one command. Whether a start resumes
+  // the previous conversation is decided by the roster's --continue, which was
+  // visible only two levels down under Launch settings — so the label said
+  // "Start & attach" and silently resumed megabytes of prior conversation. That
+  // is the defect that made me describe this menu wrongly to the operator
+  // (2026-07-26). `Stop (session ends, conversation kept)` already named its
+  // consequence; this brings Start in line. Delegates rather than duplicating
+  // the handler, so the two ids can never drift apart, and is gated on
+  // squad.hasResume — the same context key the Launch settings entries use.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("squad.startAttachFresh", (...args) =>
+      vscode.commands.executeCommand("squad.startAttach", ...args)
+    )
+  );
+
   // ---- transport: clone this agent into another VSCode workspace ----
   // The operator's model: pick the agent's tab, pick a TARGET WORKSPACE, and
   // the whole agent (code, memory, conversation, launch args, its own hub
