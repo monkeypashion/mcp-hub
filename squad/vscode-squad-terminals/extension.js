@@ -467,40 +467,102 @@ function activate(context) {
           return;
         }
         const agent = agents[0];
-        const found = new Set();
-        for (const dir of [path.join(os.homedir(), "Projects"), os.homedir()]) {
-          try {
-            for (const f of fs.readdirSync(dir)) {
-              if (f.endsWith(".code-workspace")) found.add(path.join(dir, f));
-            }
-          } catch { /* dir absent — fine */ }
-        }
-        // Never offer the workspace this agent already lives in.
         const here = vscode.workspace.workspaceFile;
-        const picks = [...found]
-          .filter((f) => !here || canon(f) !== canon(here.fsPath))
-          .map((f) => ({ label: path.basename(f, ".code-workspace"), description: f }));
-        if (!picks.length) {
+        // Keep stdout even on a non-zero exit. `ls` over a glob that matches
+        // nothing exits non-zero while still listing what DID match, and
+        // discarding that made remote workspace discovery silently return
+        // nothing (2026-07-26).
+        const sh = (cmd) => {
+          try {
+            return cp.execSync(cmd, { timeout: 15000, stdio: ["ignore", "pipe", "ignore"] })
+              .toString();
+          } catch (e) {
+            return e && e.stdout ? e.stdout.toString() : "";
+          }
+        };
+
+        // ---- step 1: this machine, or another one? ----
+        // Remote hosts come from the tailnet rather than a config file: the
+        // tailnet IS the list of machines reachable without key management,
+        // and a second registry would only drift from it.
+        const hosts = sh("tailscale status")
+          .split("\n")
+          .map((l) => l.trim().split(/\s+/))
+          .filter((f) => f.length >= 5 && f[0].startsWith("100."))
+          .filter((f) => f[3] === "linux")            // needs git/python3/mcp-hub
+          .filter((f) => !f.slice(4).join(" ").includes("offline"))
+          .map((f) => f[1])
+          .filter((h) => h && h !== os.hostname());
+
+        const wsOn = (host) => {
+          // Enumerate .code-workspace candidates — locally with fs, remotely
+          // over ssh. Same two roots either way.
+          const roots = ["~/Projects", "~"];
+          if (!host) {
+            const out = new Set();
+            for (const dir of [path.join(os.homedir(), "Projects"), os.homedir()]) {
+              try {
+                for (const f of fs.readdirSync(dir)) {
+                  if (f.endsWith(".code-workspace")) out.add(path.join(dir, f));
+                }
+              } catch { /* absent — fine */ }
+            }
+            return [...out];
+          }
+          const globs = roots.map((r) => `${r}/*.code-workspace`).join(" ");
+          return sh(`tailscale ssh ${host} 'ls -1 ${globs} 2>/dev/null'`)
+            .split("\n").map((s) => s.trim()).filter(Boolean);
+        };
+
+        let host = "";
+        if (hosts.length) {
+          const where = await vscode.window.showQuickPick(
+            [
+              { label: "This machine", description: os.hostname(), host: "" },
+              ...hosts.map((h) => ({ label: h, description: "over the tailnet", host: h })),
+            ],
+            {
+              title: `Transport ${shortLabel(agent)} — to which machine?`,
+              placeHolder: "The agent is CLONED; the source keeps running",
+            }
+          );
+          if (!where) return;
+          host = where.host;
+        }
+
+        // ---- step 2: which workspace on that machine? ----
+        const files = wsOn(host).filter(
+          (f) => host || !here || canon(f) !== canon(here.fsPath)   // never offer where it already lives
+        );
+        if (!files.length) {
           vscode.window.showWarningMessage(
-            "Squad: no other .code-workspace files found in ~/Projects or ~."
+            `Squad: no .code-workspace files found${host ? ` on ${host}` : " in ~/Projects or ~"}.`
           );
           return;
         }
-        const pick = await vscode.window.showQuickPick(picks, {
-          title: `Transport ${shortLabel(agent)} to which workspace?`,
-          placeHolder: "The agent is CLONED — the source keeps running",
-        });
+        const pick = await vscode.window.showQuickPick(
+          files.map((f) => ({ label: path.basename(f, ".code-workspace"), description: f })),
+          {
+            title: `Transport ${shortLabel(agent)} to which workspace${host ? ` on ${host}` : ""}?`,
+            placeHolder: "Refuses if the repo is dirty or unpushed",
+          }
+        );
         if (!pick) return;
+
         // Runs in a visible terminal rather than fire-and-forget: transport
         // REFUSES on a dirty or unpushed tree, and that refusal is something
         // the operator must read, not a silently-swallowed exit code.
         const t = vscode.window.createTerminal({
-          name: `transport → ${pick.label}`,
+          name: `transport → ${host ? host + ":" : ""}${pick.label}`,
           iconPath: new vscode.ThemeIcon("arrow-right"),
           color: new vscode.ThemeColor("terminal.ansiCyan"),
         });
         t.show(true);
-        sendWhenReady(t, `${SQUAD} transport ${agent} --to ${JSON.stringify(pick.description)}`);
+        sendWhenReady(
+          t,
+          `${SQUAD} transport ${agent} --to ${JSON.stringify(pick.description)}` +
+            (host ? ` --host ${host}` : "")
+        );
       })
     )
   );

@@ -149,11 +149,39 @@ identity. In the cockpit it's the agent tab's **Transport to workspace…** entr
 which lists the `.code-workspace` files it finds in `~/Projects` and `~`.
 
 ```bash
+# same machine
 squad transport mcp-hub-fireblade-wsl --to ~/Projects/xport.code-workspace
+
+# another machine (over the tailnet — no key distribution needed)
+squad transport mcp-hub-fireblade-wsl --to ~/Projects/squad.code-workspace --host dev-vm-1
+
 # optional: --dest <dir>   (default: <workspace-dir>/<workspace-name>/<repo>)
+#           --port N       (ssh port, e.g. a loopback target for testing)
 ```
 
 The agent lands **stopped** — starting it is the operator's call.
+
+**Cross-machine split of work.** The source ships bytes: repo via `git clone`
+from origin, memory and the re-keyed transcripts via `rsync`. The destination
+wires them up via `squad/transport-recv`, because the encoded Claude state dir,
+the derived agent name and the roster row all depend on the *destination's*
+absolute paths and hostname — none of it can be computed correctly by the
+source. `transport-recv` is idempotent, so a half-finished transport is just
+re-run. The destination needs `git`, `python3` and `mcp-hub` on PATH; it refuses
+with a clear message otherwise, rather than guessing a name.
+
+The re-key runs where the source transcripts live but must land in another box's
+encoded dir, so `mcp-hub transport-history --out-dir` stages it locally and the
+staged copy is shipped.
+
+**Every transfer count is observed at the destination**, never the source. An
+early version reported "55 file(s) shipped" when rsync had copied zero (missing
+`-a`, so it printed `skipping directory .` and exited 0). A transfer report that
+measures the near end is an assumption with a number attached.
+
+In the cockpit: agent tab → **Transport to workspace…** asks which machine
+(this one, plus online *Linux* tailnet peers — transport needs a real toolchain
+there), then which `.code-workspace` on it, enumerated over SSH.
 
 **A "target workspace" is a `.code-workspace` file.** The extension gates
 terminals on folder membership, so transport writes the folder entry into that
