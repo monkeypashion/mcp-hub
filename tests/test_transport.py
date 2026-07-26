@@ -216,6 +216,68 @@ def test_transport_history_refuses_to_write_on_structural_leak(tmp_path, monkeyp
     assert not dst.exists(), "refused transcripts must not be written"
 
 
+THIRD = "/home/monke/Projects/code/monkeypashion/mcp-hub"   # neither source nor dest
+
+
+def test_a_third_path_in_cwd_is_repointed_at_the_destination(tmp_path, monkeypatch):
+    """The gap the old guard could not see, measured on a real transcript.
+
+    Rewriting only the SOURCE path left any OTHER path untouched. This seat's
+    recorded cwd is one tree while it works in another, so 109 records in a real
+    transported transcript kept naming a different real clone of the same repo.
+    A transcript is per-project, so every cwd in it named that project somewhere;
+    the clone's copy should say the clone.
+    """
+    rc, dst = _run_transport_history(
+        tmp_path, monkeypatch,
+        [js({"type": "user", "cwd": OLD}), js({"type": "user", "cwd": THIRD})],
+    )
+    assert rc == 0
+    cwds = [json.loads(ln)["cwd"] for ln in dst.read_text().splitlines()]
+    assert cwds == [NEW, NEW], cwds
+
+
+def test_an_unclassified_path_field_is_refused_by_class_not_by_string(tmp_path, monkeypatch):
+    """The point of classifying FIELDS: a path that is neither source nor
+    destination still trips the guard, so the next coupling nobody predicted does
+    not need a fourth special case."""
+    rc, dst = _run_transport_history(
+        tmp_path, monkeypatch,
+        [js({"type": "user", "cwd": OLD, "somethingNobodyClassified": f"{THIRD}/x"})],
+    )
+    assert rc == 1, "an unclassified structural path must refuse"
+    assert not dst.exists()
+
+
+def test_environment_paths_do_not_block_a_transport(tmp_path, monkeypatch):
+    """hookInfos names binaries on whichever box ran them — configuration, not
+    location. One is always present, so refusing on it would block everything."""
+    rc, dst = _run_transport_history(
+        tmp_path, monkeypatch,
+        [js({"type": "user", "cwd": OLD,
+             "hookInfos": [{"command": "/home/monke/.venv/bin/mcp-hub stop-hook"}]})],
+    )
+    assert rc == 0, "an environment path must not refuse"
+    assert json.loads(dst.read_text())["hookInfos"][0]["command"].endswith("stop-hook"), \
+        "and it must be left byte-exact, not re-keyed"
+
+
+def test_a_slash_command_in_prose_is_not_mistaken_for_a_path(tmp_path, monkeypatch):
+    """"/compact" is indistinguishable from an absolute path by SHAPE.
+
+    Found by running the new guard against a real transcript: it refused on nine
+    `lastPrompt` values, all of them slash commands. Only classifying the field
+    can tell text that starts with a slash from a pointer at a directory.
+    """
+    rc, dst = _run_transport_history(
+        tmp_path, monkeypatch,
+        [js({"type": "user", "cwd": OLD, "lastPrompt": "/compact"}),
+         js({"type": "summary", "cwd": OLD, "content": "/status then /cost"})],
+    )
+    assert rc == 0, "prose beginning with a slash must not be read as a path"
+    assert json.loads(dst.read_text().splitlines()[0])["lastPrompt"] == "/compact"
+
+
 def test_transport_history_dry_run_writes_nothing(tmp_path, monkeypatch):
     rc, dst = _run_transport_history(
         tmp_path, monkeypatch, [js({"type": "user", "cwd": OLD})], dry_run=True

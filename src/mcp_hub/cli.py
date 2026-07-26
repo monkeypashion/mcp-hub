@@ -976,9 +976,73 @@ def memory_import_command(args: argparse.Namespace) -> int:
 # semantically-identical but byte-different file.
 _JS_JSON = {"separators": (",", ":"), "ensure_ascii": False}
 
-# Top-level fields where a surviving reference to the old path is CORRECT —
-# they are the historical record, not live pointers.
-_HISTORY_CONTENT_FIELDS = ("message", "toolUseResult", "attachment")
+# ---- field classification --------------------------------------------------
+# The completeness guard used to key on the SOURCE path: "did any reference to
+# where this came from survive outside a content field". That cannot see a THIRD
+# path — one that is neither source nor destination — so a guard reporting
+# "complete" was asserting a property it had not checked. Measured 2026-07-27.
+#
+# Classifying FIELDS instead of matching a string fixes the class rather than the
+# instance: a coupling nobody has thought of yet lands in none of these buckets
+# and trips the guard, instead of needing a fourth special case each time.
+
+# CONTENT — the historical record. A path here is what genuinely happened on a
+# machine that genuinely had it, so these stay byte-exact. Never re-keyed.
+# `lastPrompt` and `content` are here because they hold TEXT the human or model
+# wrote. Note what putting them here also fixes: a slash command like "/compact"
+# is indistinguishable from an absolute path by shape, so any pattern-matching
+# approach flags prose. Classifying the field is the only thing that can tell
+# "text that happens to start with a slash" from "a pointer at a directory".
+_HISTORY_CONTENT_FIELDS = (
+    "message", "toolUseResult", "attachment", "lastPrompt", "content",
+)
+
+# ENVIRONMENT — absolute paths that describe the BOX, not the worktree: a hook
+# command names a binary on whichever machine ran it. Re-keying these would be
+# wrong (they are configuration, not location) and refusing on them would block
+# every transport, since one is always present.
+_HISTORY_ENV_FIELDS = ("hookInfos",)
+
+# LOCATED — the field's value IS the session's location, so after a re-key it must
+# name the destination and nothing else.
+_HISTORY_LOCATED_FIELDS = ("cwd",)
+
+# Anything that looks like an absolute filesystem path, POSIX or Windows.
+_ABS_PATH_RE = re.compile(r"^(?:/[^/\s]|[A-Za-z]:[\\/])")
+
+
+def _history_unclassified_paths(obj: Any, dest: str) -> list[str]:
+    """Dotted paths of structural fields carrying a path this module has not
+    classified — the check that survives a coupling nobody predicted.
+
+    Deliberately keyed on the FIELD, not on any particular path string, which is
+    what the old source-only guard could not do. A LOCATED field naming anything
+    but the destination counts too: that is exactly the third-path case, where a
+    real repo that is neither source nor destination stayed pointed at.
+    """
+    found: list[str] = []
+
+    def walk(o: Any, prefix: str, root: str) -> None:
+        if isinstance(o, str):
+            if not _ABS_PATH_RE.match(o):
+                return
+            if root in _HISTORY_CONTENT_FIELDS or root in _HISTORY_ENV_FIELDS:
+                return
+            if root in _HISTORY_LOCATED_FIELDS:
+                if o != dest:
+                    found.append(prefix)
+                return
+            found.append(prefix)
+        elif isinstance(o, dict):
+            for k, v in o.items():
+                child = f"{prefix}.{k}" if prefix else str(k)
+                walk(v, child, root or str(k))
+        elif isinstance(o, list):
+            for v in o:
+                walk(v, prefix + "[]", root)
+
+    walk(obj, "", "")
+    return found
 
 
 def _rekey_deep(obj: Any, old: tuple[str, str], new: tuple[str, str]) -> Any:
@@ -1047,7 +1111,8 @@ def _rekey_transcript(text: str, old_cwd: str, new_cwd: str) -> tuple[str, dict[
     new = (_claude_project_dirname(new_cwd), new_cwd)
     stats = {"lines": 0, "cwd": 0, "tracking": 0, "realparent": 0,
              "snapshot": 0, "unparseable": 0, "roundtrip_mismatch": 0,
-             "content_touched": 0, "completeness_violations": 0}
+             "content_touched": 0, "completeness_violations": 0,
+             "unclassified_paths": 0}
     out: list[str] = []
 
     for raw in text.splitlines():
@@ -1066,9 +1131,17 @@ def _rekey_transcript(text: str, old_cwd: str, new_cwd: str) -> tuple[str, dict[
             stats["roundtrip_mismatch"] += 1
         before = json.loads(json.dumps(d, **_JS_JSON))
 
+        # `cwd` is the session's LOCATION, and in the clone's copy every record's
+        # location is the clone. Rewriting only the source path left a THIRD path
+        # untouched whenever one existed — measured 2026-07-27, 109 records naming
+        # a different real clone of the same repo, because this seat's recorded
+        # cwd is one tree while it works in another. A transcript is per-project,
+        # so any cwd in it named that project somewhere; pointing them all at the
+        # destination is the same claim the source-path rewrite already makes,
+        # applied completely instead of partially.
         cwd_val = d.get("cwd")
-        if isinstance(cwd_val, str) and old[1] in cwd_val:
-            d["cwd"] = cwd_val.replace(old[1], new[1])
+        if isinstance(cwd_val, str) and cwd_val and cwd_val != new[1]:
+            d["cwd"] = new[1] if old[1] not in cwd_val else cwd_val.replace(old[1], new[1])
             stats["cwd"] += 1
 
         # Same reasoning as the snapshot journal above: a delta names a backup
@@ -1123,6 +1196,11 @@ def _rekey_transcript(text: str, old_cwd: str, new_cwd: str) -> tuple[str, dict[
             root = field.split(".")[0].split("[")[0]
             if root not in _HISTORY_CONTENT_FIELDS:
                 stats["completeness_violations"] += 1
+
+        # The same question asked of FIELDS rather than of one path string, so a
+        # third path — or a coupling nobody has classified — cannot pass by being
+        # neither source nor destination.
+        stats["unclassified_paths"] += len(_history_unclassified_paths(after, new[1]))
 
         out.append(json.dumps(d, **_JS_JSON))
 
@@ -1201,6 +1279,13 @@ def transport_history_command(args: argparse.Namespace) -> int:
             # coupling. Writing would hand the clone live pointers into the
             # source agent's state. Refuse — loudly.
             flag = "  ✗ REFUSED (structural leak — a path field was missed)"
+            failed += 1
+        elif stats["unclassified_paths"]:
+            # A structural field carries a path this module has not classified,
+            # so nobody has decided whether it should travel, be neutralised, or
+            # be left alone. Undecided is not the same as safe.
+            flag = ("  ✗ REFUSED (unclassified path field — "
+                    f"{stats['unclassified_paths']} occurrence(s))")
             failed += 1
         elif stats["content_touched"]:
             flag = "  ✗ REFUSED (would alter message content)"
