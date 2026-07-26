@@ -213,6 +213,7 @@ async def test_since_id_overrides_since_minutes(server):
     records = json.loads(out)
     # Both seeded messages have id >= 1 (probably 1 and 2); since_id=1
     # returns those with id > 1.
+    assert records, "since_id=1 must return the later message, not nothing"
     assert all(r["id"] > 1 for r in records)
 
 

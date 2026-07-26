@@ -1645,6 +1645,81 @@ def _write_status_cache(agent_name: str, agents_text: str) -> None:
         pass
 
 
+FLEET_BOARD_STALENESS_SECONDS = 45.0
+
+
+def _parse_fleet_rows(agents_text: str) -> list[dict[str, Any]]:
+    """Parse list_agents' rendered rows into structured records for the
+    cockpit's Fleet view.
+
+    Same head/bio split discipline as _parse_status_from_agents: markers are
+    read only from the head (before the first em-dash) so a bio containing
+    ⚡/🟢 can't skew the flags. The rendered format is ours (server.py
+    list_agents) — if that ever changes, change this with it.
+
+    `next` is the fleet-board convention: an agent that wants its "what's
+    next" shown on every cockpit keeps a `next: <one line>` fragment in its
+    bio (update_bio at milestones/sign-off). Absent → empty string, the view
+    renders a dim placeholder.
+    """
+    rows: list[dict[str, Any]] = []
+    for line in agents_text.splitlines():
+        parts = line.split("—", 1)
+        head = parts[0]
+        bio = parts[1].strip() if len(parts) > 1 else ""
+        if "🟢" not in head:
+            continue  # not an agent row
+        name_m = re.search(r"\*\*(.+?)\*\*", head)
+        if not name_m:
+            continue
+        tail = head.split("**", 2)[-1]
+        proj_m = re.search(r"\(([^)]*)\)", tail)
+        sess_m = re.search(r"⚡×(\d+)", head)
+        next_m = re.search(r"(?i)next:\s*(.+)$", bio)
+        rows.append({
+            "name": name_m.group(1).strip(),
+            "project": proj_m.group(1) if proj_m else "",
+            "wakeable": "⚡" in head,
+            "idle": "💤" in head,
+            "sessions": int(sess_m.group(1)) if sess_m else 1,
+            "next": next_m.group(1).strip() if next_m else "",
+        })
+    return rows
+
+
+def _fleet_board_path() -> pathlib.Path:
+    return _state_dir() / "fleet-board.json"
+
+
+def _write_fleet_board(agent_name: str, agents_text: str) -> None:
+    """Write the box-wide fleet snapshot the cockpit's Fleet view renders.
+
+    Rides the list_agents text the daemon already fetched for its own status
+    cache — zero extra hub traffic. The staleness gate keeps N same-box
+    daemons from rewriting an equivalent file every few seconds; last-writer-
+    wins is safe because every writer parses the same source. Fail-soft like
+    _write_status_cache: this file is cosmetic, the heartbeat is not.
+    """
+    try:
+        path = _fleet_board_path()
+        try:
+            if time.time() - path.stat().st_mtime < FLEET_BOARD_STALENESS_SECONDS:
+                return
+        except OSError:
+            pass  # no file yet — write it
+        snap = {
+            "ts": int(time.time()),
+            "writer": agent_name,
+            "agents": _parse_fleet_rows(agents_text),
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(snap), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _mark_hub_disruption() -> None:
     """Record that the hub connection just broke, fleet-wide.
 
@@ -1842,9 +1917,9 @@ async def _heartbeat_loop(hub_url: str, agent_name: str) -> bool:
                                     )
                                     return True
                         agents_result = await session.call_tool("list_agents", {})
-                        _write_status_cache(
-                            agent_name, _extract_text(agents_result)
-                        )
+                        agents_text = _extract_text(agents_result)
+                        _write_status_cache(agent_name, agents_text)
+                        _write_fleet_board(agent_name, agents_text)
                         await asyncio.sleep(STATUS_REFRESH_SECONDS)
                         since_heartbeat += STATUS_REFRESH_SECONDS
         except Exception as exc:  # noqa: BLE001

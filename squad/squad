@@ -1764,10 +1764,14 @@ case "${1:-help}" in
             # duplicated scraping logic is exactly how `who` and `heal` drifted
             # apart until working agents read as idle for days.
             #
-            # NOT shown, deliberately: planned work / sequencing. Nothing in
-            # the system records intent today (4 TodoWrite calls fleet-wide on
-            # 2026-07-21, and ~/.claude/todos is empty), so such a column would
-            # render empty forever — a panel that looks informative and isn't.
+            # Planned work / sequencing: shown ONLY for agents that record it.
+            # The original omission ("nothing in the system records intent,
+            # a NEXT column would render empty forever", 2026-07-21) was
+            # reversed 2026-07-25 by the bio convention — agents keep
+            # "next: <one line>" in their hub bio, the heartbeat daemons parse
+            # it into ~/.mcp-hub/fleet-board.json, and the NEXT section below
+            # renders it FLEET-WIDE (other boxes' agents included). Agents
+            # that post nothing cost one dim summary line, not an empty grid.
             bwatch=""; bjson=""
             for _x in "$@"; do case "$_x" in -w|--watch) bwatch=1 ;; --json) bjson=1 ;; esac; done
             jesc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\000-\037'; }
@@ -1820,30 +1824,65 @@ case "${1:-help}" in
             # Heaviest scan on the board (62MB today), hence the longest TTL.
             BOARD_USAGE_TTL="${SQUAD_BOARD_USAGE_TTL:-60}"
             usage_refresh() {
+              # ONE pass over every agent transcript, TWO caches out: token
+              # usage AND the latest /recap each agent produced. Recaps are
+              # the automatic "what's next" source for the NEXT section —
+              # /recap output lands verbatim in the transcript
+              # (<local-command-stdout>…), so the board harvests it with zero
+              # agent cooperation; the bio next: line stays as the curated
+              # override. Merged into this scan because it already reads every
+              # line of every transcript — a second reader would double the
+              # heaviest I/O on the board (62MB fleet-wide, 2026-07-21).
               local c="$HOME/.mcp-hub/board-usage.cache" a w
               if [ -f "$c" ] && [ $(( $(date +%s) - $(stat -c %Y "$c" 2>/dev/null || echo 0) )) -lt "$BOARD_USAGE_TTL" ]; then
                 return 0
               fi
               { for a in $(agents); do printf '%s\t%s\n' "$a" "$(untilde "$(field "$a" 2)")"; done; } \
-                | python3 -c '
-import sys, os, json, glob, time, datetime
+                | RECAP_CACHE="$HOME/.mcp-hub/board-recap.cache" python3 -c '
+import sys, os, json, glob, time, datetime, re
 # agent -> transcript dir: Claude Code encodes the worktree path with / -> -
 rows = [l.rstrip("\n").split("\t") for l in sys.stdin if l.strip()]
 day = datetime.date.today().isoformat()
 hour_ago = time.time() - 3600
+STDOUT_RE = re.compile(r"<local-command-stdout>(.*?)</local-command-stdout>", re.S)
 out = []
+recaps = []
 for agent, wt in rows:
     d = os.path.expanduser("~/.claude/projects/" + wt.replace("/", "-"))
     tot = hr = 0
+    r_ts, r_txt = 0, ""
     for f in glob.glob(os.path.join(d, "*.jsonl")):
         try: fh = open(f, errors="ignore")
         except OSError: continue
         with fh:
             for line in fh:
-                if "\"usage\"" not in line: continue
+                # Two recap shapes, newest of EITHER wins:
+                #   away_summary — the client-generated "※ recap" system
+                #     record (automatic; what the operator sees in the pane)
+                #   /recap       — the slash command, stdout in the caveat blob
+                is_away  = "\"away_summary\"" in line
+                is_recap = "<command-name>/recap" in line
+                if "\"usage\"" not in line and not (is_away or is_recap): continue
                 try: rec = json.loads(line)
                 except Exception: continue
                 ts = rec.get("timestamp") or ""
+                if is_away or is_recap:
+                    try: ep = datetime.datetime.fromisoformat(ts.replace("Z","+00:00")).timestamp()
+                    except Exception: ep = 0
+                    if ep > r_ts:
+                        if is_away:
+                            txt = rec.get("content") or ""
+                        else:
+                            content = (rec.get("message") or {}).get("content") or ""
+                            texts = [content] if isinstance(content, str) else \
+                                    [b.get("text","") for b in content if isinstance(b, dict)]
+                            m = STDOUT_RE.search("\n".join(texts))
+                            txt = m.group(1) if m else ""
+                        txt = " ".join(str(txt).split())
+                        txt = re.sub(r"\s*\(disable recaps in /config\)\s*$", "", txt)
+                        if txt:
+                            r_ts, r_txt = ep, txt[:600]
+                    continue
                 if not ts.startswith(day): continue
                 u = (rec.get("message") or {}).get("usage") or {}
                 o = u.get("output_tokens", 0)
@@ -1852,6 +1891,16 @@ for agent, wt in rows:
                     if datetime.datetime.fromisoformat(ts.replace("Z","+00:00")).timestamp() >= hour_ago: hr += o
                 except Exception: pass
     out.append((agent, tot, hr))
+    if r_txt:
+        recaps.append((agent, int(r_ts), r_txt))
+rc = os.environ.get("RECAP_CACHE")
+if rc:
+    try:
+        tmp = rc + "." + str(os.getpid())
+        with open(tmp, "w") as f:
+            f.write("".join("%s\x1f%d\x1f%s\n" % r for r in recaps))
+        os.replace(tmp, rc)
+    except Exception: pass
 sys.stdout.write("".join("%s\x1f%d\x1f%d\n" % r for r in out))
 ' > "$c.$$" 2>/dev/null && mv -f "$c.$$" "$c" 2>/dev/null || rm -f "$c.$$"
             }
@@ -1954,6 +2003,77 @@ sys.stdout.write("".join("%s\x1f%d\x1f%d\n" % r for r in out))
                     "$( [ "${ahead:-0}" -gt 0 ] && printf '%s unpushed' "$ahead" || printf '' )" \
                     "${branch}"
                 done <<< "$out"
+              fi
+              # --- what each agent says comes NEXT. Two sources, merged:
+              #   bio  — the curated "next: <line>" convention in the hub bio
+              #          (fleet-wide incl. other boxes, via the daemons'
+              #          fleet-board.json). Explicit, so it WINS when present.
+              #   recap— the newest /recap the agent produced, harvested from
+              #          its transcript by usage_refresh (this box's agents
+              #          only; automatic, no agent cooperation needed). Shown
+              #          with its age — a recap is a statement from a moment,
+              #          not a maintained field.
+              # Reading caches only — never re-scraping — honours the board's
+              # single-scan rule. Agents with neither source are one dim count.
+              out="$(python3 -c '
+import json, os, time, re
+fleet, recaps, order = {}, {}, []
+try:
+    snap = json.load(open(os.path.expanduser("~/.mcp-hub/fleet-board.json")))
+    for a in snap.get("agents", []):
+        fleet[a.get("name","")] = a
+        order.append(a.get("name",""))
+except Exception:
+    snap = {}
+try:
+    for line in open(os.path.expanduser("~/.mcp-hub/board-recap.cache")):
+        parts = line.rstrip("\n").split("\x1f", 2)
+        if len(parts) == 3:
+            recaps[parts[0]] = (int(parts[1] or 0), parts[2])
+            if parts[0] not in fleet: order.append(parts[0])
+except Exception:
+    pass
+if not order: raise SystemExit
+now = int(time.time())
+missing = 0
+rows = []   # (sort_group, age_seconds, rendered)
+for name in order:
+    a = fleet.get(name, {})
+    deaf = "" if a.get("wakeable", True) else "x"
+    if a.get("next"):
+        rows.append((0, 0, "%s\x1f%s\x1fbio\x1f\x1f%s" % (name, deaf, a["next"][:120])))
+    elif name in recaps:
+        ep, txt = recaps[name]
+        # the actionable half: recaps bury "Next action is yours: ..." at the
+        # tail — when a sentence starts with Next/Waiting/Blocked, show from
+        # THERE (that is the line the operator actually wants on the board)
+        m = re.search(r"(?:(?<=[.!?] )|^)((?:Next|Waiting|Blocked)\b.*)", txt)
+        if m: txt = m.group(1)
+        age = max(0, now - ep)
+        age_h = "%dm" % (age // 60) if age < 3600 else "%dh" % (age // 3600)
+        rows.append((1, age, "%s\x1f%s\x1frecap\x1f%s\x1f%s" % (name, deaf, age_h, txt[:120])))
+    else:
+        missing += 1
+# curated bio lines first, then recaps freshest-first — stale sinks
+rows.sort(key=lambda r: (r[0], r[1]))
+print("%d %d" % (int(now - snap.get("ts", now)), missing))
+print("\n".join(r[2] for r in rows))
+' 2>/dev/null || true)"
+              if [ -n "$out" ]; then
+                fb_age="$(printf '%s\n' "$out" | head -1 | awk '{print $1}')"
+                fb_miss="$(printf '%s\n' "$out" | head -1 | awk '{print $2}')"
+                printf '\n\033[1;36m▌NEXT\033[0m'
+                [ "${fb_age:-0}" -gt 180 ] 2>/dev/null && printf '  \033[1;31mbio feed stale %ss\033[0m' "$fb_age"
+                printf '\n'
+                printf '%s\n' "$out" | tail -n +2 | while IFS=$'\037' read -r a deaf src age nx; do
+                  [ -n "$a" ] || continue
+                  if [ "$src" = "recap" ]; then
+                    printf '  \033[36m%-28s\033[0m %s\033[2m(recap %s ago)\033[0m %s\n' "$a" "${deaf:+✖ }" "$age" "$nx"
+                  else
+                    printf '  \033[36m%-28s\033[0m %s%s\n' "$a" "${deaf:+✖ }" "$nx"
+                  fi
+                done
+                [ "${fb_miss:-0}" -gt 0 ] 2>/dev/null && printf '  \033[2m(%s agents: no next in bio, no /recap on record)\033[0m\n' "$fb_miss"
               fi
               # --- who is spending the budget (output tokens today / last hour)
               out="$(printf '%s\n' "$rows" | awk -F'\037' '($12+0)>0' | sort -t$'\037' -k12,12nr | head -5)"
