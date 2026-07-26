@@ -60,7 +60,7 @@
       },
       {
         "command": "squad.startAttach",
-        "title": "Start & attach",
+        "title": "Start & attach  (resumes conversation)",
         "category": "Squad"
       },
       {
@@ -242,6 +242,11 @@
         "command": "squad.addFolder",
         "title": "Add existing folder as agent…",
         "category": "Squad"
+      },
+      {
+        "command": "squad.startAttachFresh",
+        "title": "Start & attach  (fresh conversation)",
+        "category": "Squad"
       }
     ],
     "submenus": [
@@ -322,7 +327,13 @@
         },
         {
           "command": "squad.startAttach",
-          "group": "2_lifecycle@0"
+          "group": "2_lifecycle@0",
+          "when": "squad.isAgent && squad.hasResume"
+        },
+        {
+          "command": "squad.startAttachFresh",
+          "group": "2_lifecycle@0",
+          "when": "squad.isAgent && !squad.hasResume"
         },
         {
           "command": "squad.restartResume",
