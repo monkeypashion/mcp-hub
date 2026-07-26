@@ -2,7 +2,7 @@
   "name": "squad-terminals",
   "displayName": "Squad Terminals",
   "description": "Auto-opens one plain terminal per squad agent (squad attach) with icon+color, and adds per-agent squad actions to the terminal tab context menu.",
-  "version": "0.19.0",
+  "version": "0.20.0",
   "publisher": "monkeypashion",
   "engines": {
     "vscode": "^1.90.0"
@@ -293,6 +293,18 @@
       {
         "id": "squad.launchMenu",
         "label": "Launch settings (next launch)"
+      },
+      {
+        "id": "squad.messagingMenu",
+        "label": "Messaging"
+      },
+      {
+        "id": "squad.lifecycleMenu",
+        "label": "Restart & launch settings"
+      },
+      {
+        "id": "squad.workspaceMenu",
+        "label": "Workspace & enrolment"
       }
     ],
     "menus": {
@@ -330,47 +342,17 @@
           "when": "squad.isAgent"
         },
         {
-          "command": "squad.stockPrompt",
+          "command": "squad.interrupt",
           "group": "1_talk@2",
           "when": "squad.isAgent"
         },
         {
-          "command": "squad.broadcast",
-          "group": "1_talk@3",
-          "when": "squad.isAgent"
-        },
-        {
-          "command": "squad.dmVia",
-          "group": "1_talk@4",
-          "when": "squad.isAgent"
-        },
-        {
-          "command": "squad.interrupt",
-          "group": "1_talk@5",
-          "when": "squad.isAgent"
-        },
-        {
-          "submenu": "squad.slashMenu",
-          "group": "1_talk@6",
-          "when": "squad.isAgent"
-        },
-        {
           "command": "squad.startAttach",
-          "group": "2_lifecycle@0",
-          "when": "squad.isAgent"
-        },
-        {
-          "command": "squad.startAttachFresh",
-          "group": "2_lifecycle@0",
-          "when": "squad.isAgent"
-        },
-        {
-          "command": "squad.restartResume",
           "group": "2_lifecycle@1",
           "when": "squad.isAgent"
         },
         {
-          "command": "squad.restartFresh",
+          "command": "squad.startAttachFresh",
           "group": "2_lifecycle@2",
           "when": "squad.isAgent"
         },
@@ -380,40 +362,17 @@
           "when": "squad.isAgent"
         },
         {
-          "submenu": "squad.launchMenu",
+          "submenu": "squad.messagingMenu",
+          "group": "1_talk@3"
+        },
+        {
+          "submenu": "squad.lifecycleMenu",
           "group": "2_lifecycle@4",
           "when": "squad.isAgent"
         },
         {
-          "command": "squad.transport",
-          "group": "2_lifecycle@5",
-          "when": "squad.isAgent"
-        },
-        {
-          "command": "squad.transportAll",
-          "group": "3_workspace@5"
-        },
-        {
-          "command": "squad.addFolder",
-          "group": "3_workspace@0"
-        },
-        {
-          "command": "squad.transportWorkspace",
+          "submenu": "squad.workspaceMenu",
           "group": "3_workspace@1"
-        },
-        {
-          "command": "squad.addFromGitHub",
-          "group": "3_workspace@2"
-        },
-        {
-          "command": "squad.wsRemove",
-          "group": "3_workspace@3",
-          "when": "squad.isAgent"
-        },
-        {
-          "command": "squad.retire",
-          "group": "3_workspace@4",
-          "when": "squad.isAgent"
         }
       ],
       "squad.slashMenu": [
@@ -564,6 +523,76 @@
           "command": "squad.resume.off",
           "group": "2_resume@2",
           "when": "squad.isAgent && squad.hasResume"
+        }
+      ],
+      "squad.messagingMenu": [
+        {
+          "command": "squad.stockPrompt",
+          "group": "1_msg@1",
+          "when": "squad.isAgent"
+        },
+        {
+          "command": "squad.broadcast",
+          "group": "1_msg@2",
+          "when": "squad.isAgent"
+        },
+        {
+          "command": "squad.dmVia",
+          "group": "1_msg@3",
+          "when": "squad.isAgent"
+        },
+        {
+          "submenu": "squad.slashMenu",
+          "group": "2_slash@1"
+        }
+      ],
+      "squad.lifecycleMenu": [
+        {
+          "command": "squad.restartResume",
+          "group": "1_restart@1",
+          "when": "squad.isAgent"
+        },
+        {
+          "command": "squad.restartFresh",
+          "group": "1_restart@2",
+          "when": "squad.isAgent"
+        },
+        {
+          "submenu": "squad.launchMenu",
+          "group": "2_settings@1"
+        }
+      ],
+      "squad.workspaceMenu": [
+        {
+          "command": "squad.transport",
+          "group": "1_ws@1",
+          "when": "squad.isAgent"
+        },
+        {
+          "command": "squad.transportWorkspace",
+          "group": "1_ws@2"
+        },
+        {
+          "command": "squad.transportAll",
+          "group": "1_ws@3"
+        },
+        {
+          "command": "squad.addFolder",
+          "group": "1_ws@4"
+        },
+        {
+          "command": "squad.addFromGitHub",
+          "group": "1_ws@5"
+        },
+        {
+          "command": "squad.wsRemove",
+          "group": "1_ws@6",
+          "when": "squad.isAgent"
+        },
+        {
+          "command": "squad.retire",
+          "group": "1_ws@7",
+          "when": "squad.isAgent"
         }
       ]
     },
