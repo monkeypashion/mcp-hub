@@ -949,27 +949,36 @@ def _rekey_transcript(text: str, old_cwd: str, new_cwd: str) -> tuple[str, dict[
             d["cwd"] = cwd_val.replace(old[1], new[1])
             stats["cwd"] += 1
 
+        # Same reasoning as the snapshot journal above: a delta names a backup
+        # of a file on the SOURCE machine. Neutralise the pointers instead of
+        # aiming them somewhere — whether that somewhere exists or not.
         if d.get("type") == "file-history-delta":
-            tp = d.get("trackingPath")
-            if isinstance(tp, str) and (old[0] in tp or old[1] in tp):
-                d["trackingPath"] = _rekey_deep(tp, old, new)
+            if isinstance(d.get("trackingPath"), str):
+                d["trackingPath"] = ""
                 stats["tracking"] += 1
             bk = d.get("backup")
-            if isinstance(bk, dict):
-                rp = bk.get("realParentDir")
-                if isinstance(rp, str) and (old[0] in rp or old[1] in rp):
-                    bk["realParentDir"] = _rekey_deep(rp, old, new)
-                    stats["realparent"] += 1
+            if isinstance(bk, dict) and isinstance(bk.get("realParentDir"), str):
+                bk["realParentDir"] = ""
+                stats["realparent"] += 1
 
+        # file-history is a machine-LOCAL undo journal, not conversation. It
+        # points at backup files that do not exist at the destination, so
+        # re-keying it produced dangling pointers at best — and at worst live
+        # ones: paths that were harmless on the source can name something real
+        # on the destination. Measured on the first cross-machine transport:
+        # 1,899 structural references to a path that was merely an install copy
+        # here and is the RECEIVING agent's live worktree there. A rewind in the
+        # transported session could have written into it.
+        #
+        # So for transport we DROP the journal rather than rewrite it. Nothing
+        # is lost that exists at the far end, and no pointer can aim at a tree
+        # we do not own. Re-keying a path only makes sense when the thing it
+        # names travels; these do not.
         if d.get("type") == "file-history-snapshot":
             snap = d.get("snapshot")
-            if isinstance(snap, dict):
-                tb = snap.get("trackedFileBackups")
-                if isinstance(tb, dict) and tb:
-                    rekeyed = _rekey_deep(tb, old, new)
-                    if rekeyed != tb:
-                        snap["trackedFileBackups"] = rekeyed
-                        stats["snapshot"] += 1
+            if isinstance(snap, dict) and snap.get("trackedFileBackups"):
+                snap["trackedFileBackups"] = {}
+                stats["snapshot"] += 1
 
         after = json.loads(json.dumps(d, **_JS_JSON))
 
