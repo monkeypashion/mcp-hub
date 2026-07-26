@@ -157,6 +157,50 @@ def test_transport_with_no_agent_selected_warns(box):
     assert any("no squad agent" in s for s in out["shown"]), out
 
 
+def test_transport_workspace_scopes_to_this_workspace_and_confirms(box, tmp_path):
+    """Use case 2's entry point: move THIS workspace's agents, not the machine's."""
+    ws = tmp_path / "here.code-workspace"
+    ws.write_text('{"folders":[],"settings":{}}', encoding="utf-8")
+    out = _drive(box, "run", "squad.transportWorkspace",
+                 answers=["New workspace", "newbox", "Transport"], wsfile=str(ws))
+    assert len(out["sent"]) == 1, out
+    cmd = out["sent"][0]
+    assert "transport workspace" in cmd and str(ws) in cmd, cmd
+    assert "newbox.code-workspace" in cmd
+
+
+def test_transport_workspace_declined_sends_nothing(box, tmp_path):
+    ws = tmp_path / "here.code-workspace"
+    ws.write_text('{"folders":[],"settings":{}}', encoding="utf-8")
+    out = _drive(box, "run", "squad.transportWorkspace",
+                 answers=["New workspace", "newbox"], wsfile=str(ws))
+    assert out["sent"] == [], "no confirmation ⇒ nothing runs"
+
+
+@pytest.mark.parametrize("command", [
+    "squad.transportWorkspace",
+    "squad.addFolder",
+    "squad.wsRemove",
+    "squad.teardownWorkspace",
+])
+def test_workspace_commands_refuse_without_a_workspace_open(box, command):
+    """The cockpit shows tabs by FOLDER MEMBERSHIP, so every one of these is
+    meaningless outside a .code-workspace. Each must say so rather than act on a
+    guess."""
+    out = _drive(box, "run", command, answers=[])
+    assert out["sent"] == [], f"{command} acted with no workspace open"
+    assert out["shown"], f"{command} failed silently — no message at all"
+
+
+def test_add_folder_cancelled_dialog_changes_nothing(box, tmp_path):
+    """The stub's file dialog always cancels, which is the case worth pinning:
+    an abandoned picker must not enrol anything."""
+    ws = tmp_path / "here.code-workspace"
+    ws.write_text('{"folders":[],"settings":{}}', encoding="utf-8")
+    out = _drive(box, "run", "squad.addFolder", answers=[], wsfile=str(ws))
+    assert out["sent"] == []
+
+
 def test_bulk_transport_requires_confirmation(box):
     """A bulk clone is expensive and partly irreversible: ask, then act."""
     declined = _drive(box, "run", "squad.transportAll",
