@@ -12,6 +12,10 @@
 # can simply be re-run.
 #
 # Args: <dest-dir> <workspace-file> <suffix> <project> <args> <class> <hub-url>
+#       [origin-agent]   — the agent this is a copy OF, named in the clone's
+#                          own marker file (step 7). Optional: an older source
+#                          box that doesn't send it still transports fine, the
+#                          marker just says "another agent".
 set -euo pipefail
 
 DEST="${1:?dest dir}"; WSFILE="${2:?workspace file}"; SUFFIX="${3:?suffix}"
@@ -241,5 +245,79 @@ entry = ('\n    {\n      "name": "%s",\n      "path": "%s"\n    }'
 ws.write_text(text[:i] + entry + ("" if empty else ",") + text[i:], encoding="utf-8")
 print(f"  workspace folder added: {pathlib.Path(dest).name}")
 PY
+
+# 7. TELL THE CLONE IT IS A CLONE.
+# The identity suffix makes a clone distinguishable to US — roster row,
+# statusline, hub binding. It does NOT make the clone distinguishable to ITSELF:
+# it resumes carrying the original's sense of standing, that this repo is its
+# lane and that pushing or deploying is its call. None of that authority
+# travelled. An untold clone acts as the original, with full confidence.
+#
+# Memory is the delivery mechanism, because it loads before the clone's first
+# turn. Proven live 2026-07-26: a clone given this file identified itself
+# unprompted, VERIFIED it by checking its own path rather than taking the file's
+# word, worked out that the original's unpushed commits could not exist in its
+# body (transport clones from origin), and stayed inside the stated scope.
+#
+# It DESCRIBES rather than forbids. A blanket "you are a copy, defer on
+# everything" produces a uselessly timid agent, which is its own failure.
+python3 - "$HOME" "$DEST" "$NAME" "${8:-}" <<'PYMARK' || true
+import datetime, pathlib, re, sys
+
+home, dest, name, origin = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+enc = re.sub(r"-+$", "", re.sub(r"[/\\:]", "-", dest))
+mem = pathlib.Path(home) / ".claude" / "projects" / enc / "memory"
+try:
+    mem.mkdir(parents=True, exist_ok=True)
+except OSError as exc:                      # fail-soft: never break a transport
+    print(f"  !! could not write the clone marker ({exc})")
+    raise SystemExit(0)
+
+when = datetime.date.today().isoformat()
+came_from = f"`{origin}`" if origin else "another agent"
+body = f"""---
+name: you-are-a-transported-clone
+description: "READ FIRST. You are a TRANSPORTED COPY. Your memory and conversation were cloned from {came_from}; its authority was not."
+metadata:
+  type: project
+---
+
+**You are `{name}`, created {when} by `squad transport` from {came_from}.** You
+are not that agent, even though the memory and conversation you just resumed say
+"I" about work it did.
+
+**Why you cannot tell from the inside.** Transport copies memory and re-keys the
+conversation, so you inherit the original's sense of standing — that this repo is
+its lane, that pushing or deploying is its call, that it speaks for this project.
+None of that came with you. Assume the original is still live and still holds it.
+
+**What that means in practice.** Your own worktree is yours: read it, work in it,
+run its tests. But anything SHARED — the hub as a voice for this project, a
+default branch, a deploy, another machine's state — needs authorisation addressed
+to *you*, by the operator, in this session. A memory of having been trusted is not
+the same as being trusted, and it is the one thing a copy cannot inherit.
+
+**If you are unsure whether you are the original, you are not.** The original
+does not need to ask. Check `mcp-hub identity --cwd .` against your worktree, and
+note that commits the original had not pushed cannot exist in your body at all —
+transport clones from the remote.
+
+Say plainly that you are a transported clone when it matters. Being a copy is not
+a defect; acting as though you were the original is.
+"""
+marker = mem / "000_you_are_a_transported_clone.md"
+marker.write_text(body, encoding="utf-8")
+
+# Index it FIRST — MEMORY.md is what gets loaded, and this has to be read before
+# the clone forms a view of who it is.
+line = ("- [🔴 READ FIRST: you are a transported clone]"
+        "(000_you_are_a_transported_clone.md) — you are a COPY of "
+        f"{came_from}; its authority did not travel with its memory")
+idx = mem / "MEMORY.md"
+prev = idx.read_text(encoding="utf-8") if idx.exists() else ""
+if "000_you_are_a_transported_clone.md" not in prev:
+    idx.write_text(line + "\n" + prev, encoding="utf-8")
+print("  clone marker written (the clone will know it is a copy)")
+PYMARK
 
 echo "  READY — start it with: squad start $NAME"

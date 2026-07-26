@@ -1402,10 +1402,10 @@ transport_agent() {
   local recv; recv="$(dirname "$(readlink -f "$0")")/transport-recv"
   [ -f "$recv" ] || { echo "!! transport-recv missing beside squad"; return 1; }
   if [ "$remote" = 1 ]; then
-    $rsh "$host" "bash -s '$dest' '$wsfile' '$idsfx' '$proj' '$args' '$class' '${MCP_HUB_URL:-}'" \
+    $rsh "$host" "bash -s '$dest' '$wsfile' '$idsfx' '$proj' '$args' '$class' '${MCP_HUB_URL:-}' '$a'" \
       < "$recv" || return 1
   else
-    bash "$recv" "$dest" "$wsfile" "$idsfx" "$proj" "$args" "$class" "${MCP_HUB_URL:-}" || return 1
+    bash "$recv" "$dest" "$wsfile" "$idsfx" "$proj" "$args" "$class" "${MCP_HUB_URL:-}" "$a" || return 1
   fi
 
   echo "done${host:+ (on $host)} — the agent is STOPPED; start it from its tab in $label"
