@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import re
 import subprocess
 
 import pytest
@@ -151,6 +152,77 @@ def test_dest_override_is_refused_for_a_set(env, tmp_path):
     res = _run(env, "transport", "all", "--to", str(ws), "--dest", str(tmp_path / "x"))
     assert res.returncode != 0
     assert "cannot be used with 'all'" in res.stderr
+
+
+def _clone_of(tmp_path: pathlib.Path, repo: str, name: str) -> pathlib.Path:
+    """A second worktree of an existing bare repo — i.e. the same org/repo."""
+    dest = tmp_path / "work" / name
+    subprocess.run(["git", "clone", "-q", str(tmp_path / "remotes" / f"{repo}.git"), str(dest)],
+                   check=True, capture_output=True)
+    _git(dest, "remote", "set-url", "origin",
+         f"git@github-monkeypashion:monkeypashion/{repo}.git")
+    return dest
+
+
+def _ws_with(tmp_path: pathlib.Path, name: str, *folders: pathlib.Path) -> pathlib.Path:
+    ws = tmp_path / f"{name}.code-workspace"
+    entries = ",\n".join('    {"name": "%s", "path": "%s"}' % (f.name, f) for f in folders)
+    ws.write_text('{\n  "folders": [\n%s\n  ],\n  "settings": {}\n}\n' % entries,
+                  encoding="utf-8")
+    return ws
+
+
+def test_preview_never_puts_two_agents_in_one_directory(env, tmp_path):
+    """The defect a live multi-agent dry run exposed, invisible to 447 tests.
+
+    A dry run writes nothing, so each row's search began at its own reserved slot
+    and found the SAME free path — the preview showed two agents landing in one
+    directory. The real run was fine (agent one creates its directory before
+    agent two looks), which is exactly what made it dangerous: the preview is
+    what the cockpit asks the operator to confirm against.
+    """
+    e, conf = env
+    a = _pushed_repo(tmp_path, "monkeypashion", "demo")
+    b = _clone_of(tmp_path, "demo", "demo-two")
+    _enrol(conf, "demo-a", a)
+    _enrol(conf, "demo-b", b)
+    # THE CONDITION THAT MAKES IT BITE: canonical already occupied, by the
+    # original. Without this both rows diverge on their own and the test passes
+    # against the broken code — which it did on the first attempt here.
+    (pathlib.Path(e["HOME"]) / "Projects" / "code" / "monkeypashion" / "demo").mkdir(parents=True)
+    src = _ws_with(tmp_path, "src", a, b)
+    dst = tmp_path / "side.code-workspace"
+
+    res = _run(env, "transport", "workspace", str(src), "--to", str(dst), "--dry-run")
+    assert res.returncode == 0, res.stderr
+    # anchor on the OK rows — the header line also contains "-> <label>"
+    dests = re.findall(r"^\s*OK\s+\S+\s+-> (\S+)", res.stdout, re.M)
+    assert len(dests) == 2, res.stdout
+    assert dests[0] != dests[1], f"two agents cannot land in one directory: {dests}"
+
+
+def test_preview_numbers_the_directory_to_match_the_agent(env, tmp_path):
+    """A clone called ...-side-2 must not live in a directory called ...-side-3.
+
+    Path and identity are resolved from different things (disk availability vs
+    clones-in-this-operation), which is correct — but when both need a number it
+    should be the SAME number, or the roster is unreadable without the source
+    open.
+    """
+    e, conf = env
+    a = _pushed_repo(tmp_path, "monkeypashion", "demo")
+    b = _clone_of(tmp_path, "demo", "demo-two")
+    _enrol(conf, "demo-a", a)
+    _enrol(conf, "demo-b", b)
+    src = _ws_with(tmp_path, "src", a, b)
+    dst = tmp_path / "side.code-workspace"
+
+    res = _run(env, "transport", "workspace", str(src), "--to", str(dst), "--dry-run")
+    assert res.returncode == 0, res.stderr
+    for dest, sfx in re.findall(r"-> (\S+)\s+id-suffix (\S+)", res.stdout):
+        if sfx.rsplit("-", 1)[-1].isdigit():
+            assert dest.endswith(sfx.rsplit("-", 1)[-1]), \
+                f"directory {dest} does not carry the agent's number ({sfx})"
 
 
 def test_ws_new_creates_an_empty_workspace_and_never_clobbers(env, tmp_path):

@@ -1159,6 +1159,39 @@ ws_create() {
   echo "$ws"
 }
 
+# Resolve a working remote shell for <host>. The command goes to STDOUT so a
+# caller can capture it; notes and diagnostics go to stderr.
+#
+# PROBE, never assume: a tailnet peer running `tailscale up --ssh` mints
+# ephemeral host keys, so plain ssh dies with "Host key verification failed" on
+# a box `tailscale ssh` reaches fine — exactly what happened on the first real
+# cross-machine run (dev-vm-1, 2026-07-26), where hardcoded `ssh` reported
+# "cannot reach" a perfectly reachable host.
+#
+# Extracted from transport_agent so a DRY RUN can probe the far end too. Without
+# that, a remote preview cannot check whether a destination is occupied and
+# happily reports the canonical path for a box that already has that repo
+# checked out there — a plan the operator confirms and reality then contradicts.
+resolve_rsh() {  # <host> <port> <override>
+  local host="$1" port="$2" override="$3" rsh
+  if [ -n "$override" ]; then rsh="$override"
+  elif [ -n "$port" ]; then rsh="ssh -p $port"
+  else rsh="ssh -o BatchMode=yes -o ConnectTimeout=8"; fi
+  if ! $rsh "$host" true 2>/dev/null; then
+    if [ -z "$override" ] && [ -z "$port" ] && command -v tailscale >/dev/null \
+       && tailscale ssh "$host" true 2>/dev/null; then
+      rsh="tailscale ssh"
+      echo "  (plain ssh refused $host; using tailscale ssh)" >&2
+    else
+      echo "!! cannot reach $host — tried: $rsh${override:+ (--rsh override)}" >&2
+      echo "   If it's a tailnet peer, check \`tailscale ssh $host true\`." >&2
+      echo "   Otherwise pass --rsh '<command>' (e.g. --rsh 'ssh -J jump')." >&2
+      return 1
+    fi
+  fi
+  printf '%s' "$rsh"
+}
+
 # Does a path exist — here or on the far end? $1 is deliberately unquoted: the
 # remote shell may be "tailscale ssh", i.e. two words.
 path_exists() {  # <rsh> <host> <path>
@@ -1177,24 +1210,37 @@ path_exists() {  # <rsh> <host> <path>
 # of one repo landing on distinct paths but sharing a suffix would derive the
 # same agent name and silently share identity — the precise collision the
 # suffix exists to prevent.
+# Candidate n: 1 is canonical, 2 adds the label, 3+ number it. The n-1 on the
+# numbered form is what keeps a directory's number equal to its AGENT's number
+# (see dest_minn) — an agent called ...-uc1-2 living in a directory called
+# ...-uc1-3 is readable only with this function open.
 dest_candidate() {  # <home> <org/repo> <label> <n>
   local home="$1" org="${2%%/*}" repo="${2#*/}" label="$3" n="$4"
   case "$n" in
     1) printf '%s/Projects/code/%s/%s' "$home" "$org" "$repo" ;;
     2) printf '%s/Projects/code/%s/%s-%s' "$home" "$org" "$repo" "$label" ;;
-    *) printf '%s/Projects/code/%s/%s-%s-%s' "$home" "$org" "$repo" "$label" "$n" ;;
+    *) printf '%s/Projects/code/%s/%s-%s-%s' "$home" "$org" "$repo" "$label" "$((n-1))" ;;
   esac
 }
 dest_suffix() { if [ "$2" = 1 ]; then printf '%s' "$1"; else printf '%s-%s' "$1" "$2"; fi; }
+# Where occurrence <k> of a repo starts searching. k=1 tries canonical first;
+# k>=2 skips straight to the numbered form that matches its own suffix.
+dest_minn() { if [ "$1" = 1 ]; then printf 1; else printf '%s' "$(( $1 + 1 ))"; fi; }
 
-# First candidate free on the destination's disk, starting at <minn> so a
-# fan-out can reserve slots for repeats of one repo without knowing the paths.
+# First candidate free on the destination's disk, starting at <minn>. <claimed>
+# is a space-separated list of paths to treat as ALREADY TAKEN — needed because
+# a dry run writes nothing, so without it every agent's search finds the same
+# free slot and the preview shows two agents landing in one directory. The
+# preview is what the operator confirms against, so it has to model the real
+# sequence rather than the empty disk it runs on.
 # Prints "<dest>\t<suffix>". Bounded: a wedged existence probe must not spin.
-resolve_dest() {  # <rsh> <host> <home> <org/repo> <label> <minn>
-  local n="${6:-1}" cand
+resolve_dest() {  # <rsh> <host> <home> <org/repo> <label> <minn> [claimed]
+  local n="${6:-1}" claimed="${7:-}" cand taken
   while [ "$n" -le 20 ]; do
     cand="$(dest_candidate "$3" "$4" "$5" "$n")"
-    if ! path_exists "$1" "$2" "$cand"; then
+    taken=0
+    case " $claimed " in *" $cand "*) taken=1 ;; esac
+    if [ "$taken" = 0 ] && ! path_exists "$1" "$2" "$cand"; then
       printf '%s\t%s' "$cand" "$(dest_suffix "$5" "$n")"; return 0
     fi
     n=$((n+1))
@@ -1227,25 +1273,7 @@ transport_agent() {
   # `tailscale ssh` reaches fine. rsync rides either (verified: rsync -e
   # "tailscale ssh" round-trips a file).
   if [ "$remote" = 1 ]; then
-    if [ -n "$rsh_override" ]; then
-      rsh="$rsh_override"
-    elif [ -n "$port" ]; then
-      rsh="ssh -p $port"
-    else
-      rsh="ssh -o BatchMode=yes -o ConnectTimeout=8"
-    fi
-    if ! $rsh "$host" true 2>/dev/null; then
-      if [ -z "$rsh_override" ] && [ -z "$port" ] && command -v tailscale >/dev/null \
-         && tailscale ssh "$host" true 2>/dev/null; then
-        rsh="tailscale ssh"
-        echo "  (plain ssh refused $host; using tailscale ssh)"
-      else
-        echo "!! cannot reach $host — tried: $rsh${rsh_override:+ (--rsh override)}"
-        echo "   If it's a tailnet peer, check \`tailscale ssh $host true\`."
-        echo "   Otherwise pass --rsh '<command>' (e.g. --rsh 'ssh -J jump')."
-        return 1
-      fi
-    fi
+    rsh="$(resolve_rsh "$host" "$port" "$rsh_override")" || return 1
     rhome="$($rsh "$host" 'printf %s "$HOME"')"
     [ -n "$rhome" ] || { echo "!! could not resolve \$HOME on $host"; return 1; }
   else
@@ -1290,7 +1318,7 @@ transport_agent() {
   idsfx="$(dest_suffix "$label" "$nth")"
   if [ -z "$dest" ]; then
     if [ -n "$proj" ]; then
-      resolved="$(resolve_dest "$rsh" "$host" "$rhome" "$proj" "$label" 1)" \
+      resolved="$(resolve_dest "$rsh" "$host" "$rhome" "$proj" "$label" "$(dest_minn "$nth")")" \
         || { echo "!! no free destination under $rhome/Projects/code/${proj%%/*}"; return 1; }
       dest="${resolved%%$'\t'*}"
     else
@@ -2733,6 +2761,21 @@ print("\n".join(r[2] for r in rows))
               exit 1
             fi
 
+            # A DRY RUN MUST PROBE THE FAR END. Resolved once here, for both the
+            # single-agent and fan-out previews. Without it a remote preview
+            # cannot tell whether a destination is occupied, so it reports the
+            # canonical path even for a box that already has that repo checked
+            # out there — the operator confirms a plan reality then contradicts.
+            dry_rsh=""; dry_host="$host_arg"; dry_home="$HOME"
+            if [ "$dry" = 1 ] && [ -n "$host_arg" ]; then
+              if dry_rsh="$(resolve_rsh "$host_arg" "$port_arg" "$rsh_arg")"; then
+                dry_home="$($dry_rsh "$host_arg" 'printf %s "$HOME"')"
+              else
+                dry_rsh=""; dry_host=""; dry_home="~"
+                echo "  (cannot reach $host_arg — destinations below are UNCHECKED)"
+              fi
+            fi
+
             # THE SET TO MOVE. `all` is machine-scoped and was wrong for both of
             # the operator's actual cases (a second squad for a side project; and
             # retiring a box by migrating one workspace) — it would drag in every
@@ -2758,11 +2801,11 @@ print("\n".join(r[2] for r in rows))
                   echo "  branch : $(git -C "$d" branch --show-current) @ $(git -C "$d" rev-parse --short HEAD)"
                   if [ -n "$dest_arg" ]; then
                     echo "  dest   : $dest_arg"
-                  elif [ -z "$host_arg" ] && rr="$(resolve_dest "" "" "$HOME" "$(worktree_project "$d")" "$(ws_label "$ws_arg")" 1)"; then
-                    echo "  dest   : ${rr%%$'\t'*}"
+                  elif rr="$(resolve_dest "$dry_rsh" "$dry_host" "$dry_home" "$(worktree_project "$d")" "$(ws_label "$ws_arg")" 1)"; then
+                    echo "  dest   : ${rr%%$'\t'*}${host_arg:+ (on $host_arg)}"
                     echo "  id-sfx : $(dest_suffix "$(ws_label "$ws_arg")" 1)"
                   else
-                    echo "  dest   : $(dest_candidate '~' "$(worktree_project "$d")" "$(ws_label "$ws_arg")" 1) (on $host_arg)"
+                    echo "  dest   : $(dest_candidate "$dry_home" "$(worktree_project "$d")" "$(ws_label "$ws_arg")" 1)${host_arg:+ (on $host_arg)}"
                   fi
                   [ -f "$(untilde "$ws_arg")" ] || echo "  note   : workspace $(ws_label "$ws_arg") does not exist yet — it will be created"
                 else echo "REFUSED: $a — $r"; exit 1; fi
@@ -2775,7 +2818,7 @@ print("\n".join(r[2] for r in rows))
             # Fan-out over the chosen set. Ineligible agents are NAMED with their
             # reason — a "clone the workspace" that quietly drops half of it is
             # worse than a refusal.
-            ok=0; skipped=0; claimed=""
+            ok=0; skipped=0; claimed=""; claimed_d=""
             for t in "$@"; do
               d="$(untilde "$(field "$t" 2)")"
               if ! r="$(transport_gate "$d" 2>/dev/null)"; then
@@ -2797,11 +2840,15 @@ print("\n".join(r[2] for r in rows))
               claimed="$claimed $pj"
               if [ "$dry" = 1 ]; then
                 sfxshow="$(dest_suffix "$lbl" "$n")"
-                if [ -z "$host_arg" ] && rr="$(resolve_dest "" "" "$HOME" "$pj" "$lbl" "$n")"; then
+                # claimed_d: slots earlier rows in THIS preview already took. A
+                # dry run writes nothing, so without it every row finds the same
+                # free path and the plan shows two agents in one directory.
+                if rr="$(resolve_dest "$dry_rsh" "$dry_host" "$dry_home" "$pj" "$lbl" "$(dest_minn "$n")" "$claimed_d")"; then
                   dshow="${rr%%$'\t'*}"
                 else
-                  dshow="$(dest_candidate '~' "$pj" "$lbl" "$n")"
+                  dshow="$(dest_candidate "$dry_home" "$pj" "$lbl" "$(dest_minn "$n")")"
                 fi
+                claimed_d="$claimed_d $dshow"
                 printf '  OK    %-30s -> %-44s id-suffix %s (%s)\n' \
                   "$t" "$dshow" "$sfxshow" "$(git -C "$d" branch --show-current)"
                 ok=$((ok+1)); continue
