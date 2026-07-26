@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# transport-recv — the DESTINATION half of `squad transport`, run on the target
+# machine (locally, or piped to `ssh bash -s`).
+#
+# Everything here is destination-side by necessity: the encoded Claude state
+# dir, the derived agent name and the roster row all depend on the DESTINATION's
+# absolute paths and hostname, so none of it can be computed correctly by the
+# source box. The source ships bytes (repo via git, memory + re-keyed
+# transcripts via rsync) and then calls this to wire them up.
+#
+# Idempotent: every step no-ops if already done, so a half-finished transport
+# can simply be re-run.
+#
+# Args: <dest-dir> <workspace-file> <suffix> <project> <args> <class> <hub-url>
+set -euo pipefail
+
+DEST="${1:?dest dir}"; WSFILE="${2:?workspace file}"; SUFFIX="${3:?suffix}"
+PROJECT="${4:?org/repo}"; LAUNCH_ARGS="${5:-}"; CLASS="${6:-}"; HUB_URL="${7:-}"
+CONF="${SQUAD_CONF:-$HOME/.config/squad/squad.conf}"
+
+command -v python3 >/dev/null || { echo "!! no python3 on this host"; exit 1; }
+
+# 1. identity suffix FIRST — every later step derives the same name from it.
+python3 - "$HOME/.mcp-hub/config.json" "$DEST" "$SUFFIX" "$PROJECT" <<'PY'
+import json, pathlib, sys
+cfg, dest, suffix, project = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+cfg.parent.mkdir(parents=True, exist_ok=True)
+try:
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    assert isinstance(data, dict)
+except Exception:
+    data = {}
+ws = data.get("workspaces")
+data["workspaces"] = ws if isinstance(ws, dict) else {}
+data["workspaces"][dest] = suffix
+projects = data.get("projects")
+projects = projects if isinstance(projects, list) else []
+if project not in projects:
+    projects.append(project)
+data["projects"] = projects
+cfg.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+print(f"  identity suffix: {suffix}   (project opted in)")
+PY
+
+# 2. derived name — ASK the cli, never re-derive. squad deriving from basename
+#    while cli.py derives from the git remote is what makes a clone's
+#    statusline read `hub ?` forever.
+NAME=""
+if command -v mcp-hub >/dev/null; then
+  NAME="$(mcp-hub identity --cwd "$DEST" --any 2>/dev/null || true)"
+fi
+if [ -z "$NAME" ]; then
+  echo "!! mcp-hub not on PATH here — cannot derive the agent name."
+  echo "   Install it on this host (pip install -e in the clone), then re-run."
+  exit 1
+fi
+echo "  identity: $NAME"
+
+# 3. hub connection file — untracked, so it never arrives via git.
+python3 - "$DEST/.mcp.json" "$HUB_URL" <<'PY'
+import json, os, pathlib, sys
+url = sys.argv[2] or os.environ.get("MCP_HUB_URL") or "http://100.109.6.114:8090/mcp"
+pathlib.Path(sys.argv[1]).write_text(
+    json.dumps({"mcpServers": {"hub": {"type": "http", "url": url}}}, indent=2) + "\n",
+    encoding="utf-8")
+print(f"  .mcp.json generated ({url})")
+PY
+
+# 4. trust + MCP pre-approval, or first launch blocks on two dialogs forever
+#    and heal can't tell, because the pane looks alive.
+python3 - "$HOME/.claude.json" "$DEST" <<'PY'
+import json, os, pathlib, sys, tempfile
+p, proj = pathlib.Path(sys.argv[1]), sys.argv[2]
+try:
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert isinstance(data, dict)
+except Exception:
+    print("  !! ~/.claude.json unreadable — agent will hit the trust dialog")
+    raise SystemExit(0)                       # fail-open: never block a transport
+entry = data.setdefault("projects", {}).setdefault(proj, {})
+entry["hasTrustDialogAccepted"] = True
+enabled = entry.get("enabledMcpjsonServers")
+enabled = enabled if isinstance(enabled, list) else []
+if "hub" not in enabled:
+    enabled.append("hub")
+entry["enabledMcpjsonServers"] = enabled
+entry.setdefault("allowedTools", [])
+entry.setdefault("disabledMcpjsonServers", [])
+fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".claude.json.")
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2)
+os.replace(tmp, p)                            # this file is live; replace atomically
+print("  trust + hub MCP pre-approved")
+PY
+
+# 5. roster row — args and class TRAVEL. An agent without them is
+#    operationally a different agent: it can't be healed and can't hear.
+mkdir -p "$(dirname "$CONF")"
+touch "$CONF"
+if awk -F'|' -v n="$NAME" '$1==n{found=1} END{exit !found}' "$CONF"; then
+  echo "  roster row already present for $NAME"
+else
+  printf '%s|%s||%s|%s\n' "$NAME" "$DEST" "$LAUNCH_ARGS" "$CLASS" >> "$CONF"
+  echo "  roster row added (args: ${LAUNCH_ARGS:-none}, class: ${CLASS:-squad})"
+fi
+
+# 6. make it visible in the target workspace. JSONC with comments and
+#    hand-formatting, so this is a surgical insert — a load-and-dump would
+#    strip the operator's notes and reflow the file.
+python3 - "$WSFILE" "$DEST" <<'PY'
+import pathlib, re, sys
+ws, dest = pathlib.Path(sys.argv[1]), sys.argv[2]
+if not ws.is_file():
+    print(f"  !! no workspace file at {ws} — add the folder by hand"); raise SystemExit(0)
+text = ws.read_text(encoding="utf-8")
+if f'"{dest}"' in text:
+    print("  workspace already lists this folder"); raise SystemExit(0)
+m = re.search(r'"folders"\s*:\s*\[', text)
+if not m:
+    print('  !! no "folders" array — add the folder by hand'); raise SystemExit(0)
+i = m.end()
+empty = text[i:].lstrip().startswith("]")
+entry = ('\n    {\n      "name": "%s",\n      "path": "%s"\n    }'
+         % (pathlib.Path(dest).name, dest))
+ws.write_text(text[:i] + entry + ("" if empty else ",") + text[i:], encoding="utf-8")
+print(f"  workspace folder added: {pathlib.Path(dest).name}")
+PY
+
+echo "  READY — start it with: squad start $NAME"

@@ -783,18 +783,41 @@ print(f"  workspace folder added: {name}")
 PYEOF
 }
 
+# Mirror of cli.py _claude_project_dirname: every / \ : becomes '-'.
+enc_project_dir() { printf '%s' "$1" | sed -e 's:[/\\:]:-:g' -e 's/-*$//'; }
+# The DESTINATION's Claude state dir, absolute. The remote's $HOME must be
+# asked for, never assumed and never embedded as a literal "$HOME": quoting it
+# through ssh either expands on the wrong box or (single-quoted) creates a
+# directory actually named "$HOME" — done exactly that, 2026-07-26.
+dest_state_dir() { printf '%s/.claude/projects/%s' "$1" "$(enc_project_dir "$2")"; }
+
 transport_agent() {
-  local a="$1" wsfile="$2" dest="$3"
-  local src label branch name proj args class url reason repo
+  local a="$1" wsfile="$2" dest="$3" host="${4:-}" port="${5:-}"
+  local src label branch name url reason repo proj args class
+  local rsh="" remote=0 stage rhome="$HOME" dstate
   src="$(untilde "$(field "$a" 2)")"
   [ -d "$src" ] || { echo "!! $a: missing worktree $src"; return 1; }
+  [ -n "$host" ] && remote=1
   wsfile="$(untilde "$wsfile")"
-  [ -f "$wsfile" ] || { echo "!! no such workspace file: $wsfile"; return 1; }
 
+  # SSH transport for the remote leg. tailscale ssh needs no key distribution
+  # (dev-vm-1 and prod-1 advertise host keys); plain ssh covers everything else,
+  # including a loopback target for testing.
+  if [ "$remote" = 1 ]; then
+    if [ -n "$port" ]; then rsh="ssh -p $port"; else rsh="ssh"; fi
+    $rsh "$host" true 2>/dev/null || { echo "!! cannot reach $host over ssh"; return 1; }
+    rhome="$($rsh "$host" 'printf %s "$HOME"')"
+    [ -n "$rhome" ] || { echo "!! could not resolve \$HOME on $host"; return 1; }
+  else
+    [ -f "$wsfile" ] || { echo "!! no such workspace file: $wsfile"; return 1; }
+  fi
+
+  # The gate is SOURCE-side and identical either way: what travels is what's
+  # PUSHED, so the destination is provably identical to the remote rather than
+  # approximately so.
   if ! reason="$(transport_gate "$src")"; then
     echo "!! $a: REFUSED — $reason"
-    echo "   transport moves what is PUSHED, so the destination is provably"
-    echo "   identical to the remote. Commit and push, then retry."
+    echo "   transport moves what is PUSHED. Commit and push, then retry."
     return 1
   fi
 
@@ -803,75 +826,79 @@ transport_agent() {
   repo="$(basename "${url%.git}")"
   branch="$(git -C "$src" branch --show-current)"
   [ -n "$dest" ] || dest="$(dirname "$wsfile")/$label/$repo"
-  if [ -e "$dest" ] && [ -n "$(ls -A "$dest" 2>/dev/null)" ]; then
-    echo "!! destination not empty: $dest"; return 1
-  fi
-
-  echo "transporting $a -> $label"
-  echo "  source : $src ($branch @ $(git -C "$src" rev-parse --short HEAD))"
-  echo "  dest   : $dest"
-
-  # 1. code — from the REMOTE, never the source's disk
-  git clone --quiet --branch "$branch" "$url" "$dest" || { echo "!! clone failed"; return 1; }
-  echo "  cloned $(git -C "$dest" rev-parse --short HEAD)"
-
-  # 2. identity: suffix first, so every later step derives the SAME name
-  register_ws_suffix "$dest" "$label"
-  proj="$(python3 -c "import sys;u=sys.argv[1].removesuffix('.git');p=u.split(':')[-1] if '://' not in u else u.split('://')[1].split('/',1)[1];print('/'.join([x for x in p.strip('/').split('/') if x][-2:]))" "$url")"
-  optin_project add "$proj"
-  name="$(MCP_HUB_QUIET=1 mcp-hub identity --cwd "$dest" --any 2>/dev/null)"
-  [ -n "$name" ] || { echo "!! could not derive a name for $dest"; return 1; }
-  echo "  identity: $name  ($proj)"
-
-  # 3. hub connection — untracked, so it never travels by git
-  python3 - "$dest/.mcp.json" <<'PYEOF'
-import json, os, sys, pathlib
-url = os.environ.get("MCP_HUB_URL", "http://100.109.6.114:8090/mcp")
-pathlib.Path(sys.argv[1]).write_text(
-    json.dumps({"mcpServers": {"hub": {"type": "http", "url": url}}}, indent=2) + "\n",
-    encoding="utf-8")
-print(f"  .mcp.json generated ({url})")
-PYEOF
-
-  # 4. memory — path-located, not path-encoded: a plain copy is correct
-  python3 - "$src" "$dest" <<'PYEOF'
-import pathlib, shutil, sys
-def enc(p): return "".join("-" if c in "/\\:" else c for c in p.rstrip("/\\"))
-home = pathlib.Path.home()
-s = home / ".claude" / "projects" / enc(sys.argv[1]) / "memory"
-d = home / ".claude" / "projects" / enc(sys.argv[2]) / "memory"
-if not s.is_dir():
-    print("  no memory to transport"); raise SystemExit(0)
-d.mkdir(parents=True, exist_ok=True)
-n = 0
-for f in sorted(s.glob("*.md")):
-    shutil.copy2(f, d / f.name); n += 1
-print(f"  memory: {n} file(s)")
-PYEOF
-
-  # 5. conversation history — re-keyed (four structural fields, two guards)
-  mcp-hub transport-history --from-cwd "$src" --to-cwd "$dest" \
-    | sed 's/^/  /' || echo "  !! history transport reported problems"
-
-  # 6. trust + MCP approval, or it hangs on dialogs at first launch
-  seed_claude_trust "$dest"
-
-  # 7. roster row — args and class travel; an agent without them is
-  #    operationally a different agent (can't be healed, can't hear)
+  proj="$(worktree_project "$src")"
   args="$(field "$a" 4)"; class="$(field "$a" 5)"
-  mkdir -p "$(dirname "$CONF")"
-  if agents | grep -qxF -- "$name"; then
-    echo "  roster row already exists for $name"
+
+  echo "transporting $a -> ${host:+$host:}$label"
+  echo "  source : $src ($branch @ $(git -C "$src" rev-parse --short HEAD))"
+  echo "  dest   : ${host:+$host:}$dest"
+
+  # ---- 1. code, cloned FROM THE REMOTE (never from the source's disk) ----
+  if [ "$remote" = 1 ]; then
+    $rsh "$host" "set -e; [ ! -e '$dest' ] || [ -z \"\$(ls -A '$dest' 2>/dev/null)\" ] || { echo '!! destination not empty: $dest'; exit 1; }
+      mkdir -p '$(dirname "$dest")'
+      if [ -d '$dest/.git' ]; then git -C '$dest' fetch --quiet origin && git -C '$dest' checkout --quiet '$branch'
+      else git clone --quiet --branch '$branch' '$url' '$dest'; fi
+      echo \"  cloned \$(git -C '$dest' rev-parse --short HEAD)\"" || return 1
   else
-    printf '%s|%s||%s|%s\n' "$name" "$dest" "$args" "$class" >> "$CONF"
-    echo "  roster row added (args: ${args:-none}, class: ${class:-squad})"
+    if [ -e "$dest" ] && [ -n "$(ls -A "$dest" 2>/dev/null)" ]; then
+      echo "!! destination not empty: $dest"; return 1
+    fi
+    git clone --quiet --branch "$branch" "$url" "$dest" || { echo "!! clone failed"; return 1; }
+    echo "  cloned $(git -C "$dest" rev-parse --short HEAD)"
   fi
 
-  # 8. make it visible in the target workspace
-  ws_add_folder "$wsfile" "$dest" "$repo"
+  # ---- 2. memory: path-LOCATED, not path-encoded, so a plain copy is right --
+  local srcmem landed
+  dstate="$(dest_state_dir "$rhome" "$dest")"
+  srcmem="$HOME/.claude/projects/$(enc_project_dir "$src")/memory"
+  if [ -d "$srcmem" ]; then
+    if [ "$remote" = 1 ]; then
+      $rsh "$host" "mkdir -p \"$dstate/memory\""
+      rsync -a -q -e "$rsh" "$srcmem"/ "$host:$dstate/memory/" || echo "  !! memory rsync failed"
+      # COUNT AT THE DESTINATION. Reporting the source count told me 55 files
+      # had shipped when zero had (2026-07-26) — a transfer report must observe
+      # the far end, never the near one.
+      landed="$($rsh "$host" "ls -1 \"$dstate/memory\"/*.md 2>/dev/null | wc -l")"
+    else
+      mkdir -p "$dstate/memory"
+      cp -a "$srcmem"/*.md "$dstate/memory"/ 2>/dev/null || true
+      landed="$(ls -1 "$dstate/memory"/*.md 2>/dev/null | wc -l)"
+    fi
+    echo "  memory: $landed file(s) at the destination (source has $(ls -1 "$srcmem"/*.md 2>/dev/null | wc -l))"
+  else
+    echo "  no memory to transport"
+  fi
 
-  echo "done — start it with: $CMD start $name"
-  echo "      (or right-click its tab in $label)"
+  # ---- 3. conversation history: re-keyed (4 structural fields, 2 guards) ----
+  # The re-key must run where the SOURCE transcripts live, but the result
+  # belongs in the DESTINATION's encoded dir — so stage locally, then ship.
+  if [ "$remote" = 1 ]; then
+    stage="$(mktemp -d)"
+    if mcp-hub transport-history --from-cwd "$src" --to-cwd "$dest" --out-dir "$stage" | sed 's/^/  /'; then
+      $rsh "$host" "mkdir -p \"$dstate\""
+      rsync -a -q -e "$rsh" "$stage"/ "$host:$dstate/" || echo "  !! history rsync failed"
+      echo "  history: $($rsh "$host" "ls -1 \"$dstate\"/*.jsonl 2>/dev/null | wc -l") transcript(s) at the destination"
+    else
+      echo "  !! history re-key refused — transported WITHOUT conversation history"
+    fi
+    rm -rf "$stage"
+  else
+    mcp-hub transport-history --from-cwd "$src" --to-cwd "$dest" | sed 's/^/  /' \
+      || echo "  !! history re-key refused — transported WITHOUT conversation history"
+  fi
+
+  # ---- 4. destination-side wiring (identity, trust, roster, workspace) ----
+  local recv; recv="$(dirname "$(readlink -f "$0")")/transport-recv"
+  [ -f "$recv" ] || { echo "!! transport-recv missing beside squad"; return 1; }
+  if [ "$remote" = 1 ]; then
+    $rsh "$host" "bash -s '$dest' '$wsfile' '$label' '$proj' '$args' '$class' '${MCP_HUB_URL:-}'" \
+      < "$recv" || return 1
+  else
+    bash "$recv" "$dest" "$wsfile" "$label" "$proj" "$args" "$class" "${MCP_HUB_URL:-}" || return 1
+  fi
+
+  echo "done${host:+ (on $host)} — the agent is STOPPED; start it from its tab in $label"
 }
 
 handoff() {
@@ -1869,16 +1896,18 @@ sys.stdout.write("".join("%s\x1f%d\x1f%d\n" % r for r in out))
             else board_paint "$(board_scan)"; fi ;;
   handoff)  a="$(need_agent "${2:-}")" || exit 1; handoff "$a" ;;
   transport) # squad transport [agent] --to <workspace-file> [--dest <dir>]
-            shift; ws_arg=""; dest_arg=""; a_arg=""
+            shift; ws_arg=""; dest_arg=""; a_arg=""; host_arg=""; port_arg=""
             while [ $# -gt 0 ]; do case "$1" in
               --to)   ws_arg="${2:-}"; shift 2 ;;
               --dest) dest_arg="${2:-}"; shift 2 ;;
-              -*)     echo "!! unknown transport flag '$1' (valid: --to, --dest)" >&2; exit 1 ;;
+              --host) host_arg="${2:-}"; shift 2 ;;
+              --port) port_arg="${2:-}"; shift 2 ;;
+              -*)     echo "!! unknown transport flag '$1' (valid: --to, --dest, --host, --port)" >&2; exit 1 ;;
               *)      a_arg="$1"; shift ;;
             esac; done
             [ -n "$ws_arg" ] || { echo "usage: $CMD transport [agent] --to <file.code-workspace> [--dest <dir>]" >&2; exit 1; }
             a="$(need_agent "$a_arg")" || exit 1
-            transport_agent "$a" "$ws_arg" "$dest_arg" ;;
+            transport_agent "$a" "$ws_arg" "$dest_arg" "$host_arg" "$port_arg" ;;
   ext-align) ext_align ;;
   add)      add_agent "${2:-}" "${3:-}" "${4:-}" ;;
   rm)       a="$(need_agent "${2:-}")" || exit 1; rm_agent "$a" ;;

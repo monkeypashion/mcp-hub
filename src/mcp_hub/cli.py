@@ -1034,9 +1034,20 @@ def identity_command(args: argparse.Namespace) -> int:
 
 
 def transport_history_command(args: argparse.Namespace) -> int:
-    """Copy + re-key every transcript from one project path to another."""
+    """Copy + re-key every transcript from one project path to another.
+
+    `--out-dir` writes the re-keyed transcripts somewhere other than this
+    machine's own Claude state dir. That's what makes a CROSS-MACHINE
+    transport possible: the re-key must happen where the source transcripts
+    live, but the result belongs in the DESTINATION's encoded dir on another
+    box — so we re-key into a staging dir here and ship that.
+    """
     src_dir = pathlib.Path.home() / ".claude" / "projects" / _claude_project_dirname(args.from_cwd)
-    dst_dir = pathlib.Path.home() / ".claude" / "projects" / _claude_project_dirname(args.to_cwd)
+    dst_dir = (
+        pathlib.Path(args.out_dir)
+        if getattr(args, "out_dir", None)
+        else pathlib.Path.home() / ".claude" / "projects" / _claude_project_dirname(args.to_cwd)
+    )
     if not src_dir.is_dir():
         print(f"!! no history for {args.from_cwd} (looked in {src_dir})", file=sys.stderr)
         return 1
@@ -2123,6 +2134,15 @@ def build_parser() -> argparse.ArgumentParser:
     xport_hist.add_argument("--to-cwd", required=True, help="Destination worktree (absolute)")
     xport_hist.add_argument(
         "--dry-run", action="store_true", help="Report what would transfer; write nothing"
+    )
+    xport_hist.add_argument(
+        "--out-dir",
+        default=None,
+        help=(
+            "Write re-keyed transcripts here instead of this machine's Claude "
+            "state dir. Used for cross-machine transport: re-key locally into a "
+            "staging dir, then ship it to the destination box."
+        ),
     )
 
     return parser
