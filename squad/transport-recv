@@ -45,13 +45,55 @@ PY
 # 2. derived name — ASK the cli, never re-derive. squad deriving from basename
 #    while cli.py derives from the git remote is what makes a clone's
 #    statusline read `hub ?` forever.
+# `ssh host 'cmd'` runs a NON-interactive shell, which never sources the profile
+# that puts ~/.local/bin on PATH — so `command -v mcp-hub` fails on a box where
+# mcp-hub is plainly installed. Found the moment this ran against a second real
+# machine (dev-vm-1, 2026-07-26); a loopback rig cannot expose it, because it
+# shares the caller's own PATH. Look where it actually lives before giving up.
+find_mcp_hub() {
+  local c
+  command -v mcp-hub 2>/dev/null && return 0
+  for c in "$HOME/.local/bin/mcp-hub" \
+           "$DEST/.venv/bin/mcp-hub" \
+           "$HOME/Projects/code/monkeypashion/mcp-hub/.venv/bin/mcp-hub"; do
+    [ -x "$c" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+# Prefer the code we JUST CLONED over anything installed here. Two reasons:
+# the clone is guaranteed to match the transport that shipped it (an installed
+# mcp-hub built from master may predate `identity` entirely — dev-vm-1,
+# 2026-07-26), and cli.py imports with a bare python3 because every third-party
+# import in it is lazy, so no venv or pip install is needed at the destination.
 NAME=""
-if command -v mcp-hub >/dev/null; then
-  NAME="$(mcp-hub identity --cwd "$DEST" --any 2>/dev/null || true)"
+if [ -f "$DEST/src/mcp_hub/cli.py" ]; then
+  NAME="$(python3 - "$DEST" "$DEST/src" <<'PYID' 2>/dev/null || true
+import sys
+sys.path.insert(0, sys.argv[2])
+try:
+    from mcp_hub.cli import _derive_agent_identity
+except Exception:
+    raise SystemExit(0)
+name, _project = _derive_agent_identity(sys.argv[1])
+if name:
+    print(name)
+PYID
+)"
+fi
+# Fall back to an installed mcp-hub (older transports, or a dest whose clone
+# predates `identity`). Never re-derive by hand: squad deriving from basename
+# while cli.py derives from the git remote is what makes a statusline read
+# `hub ?` forever.
+if [ -z "$NAME" ]; then
+  MCPHUB="$(find_mcp_hub || true)"
+  [ -n "$MCPHUB" ] && NAME="$("$MCPHUB" identity --cwd "$DEST" --any 2>/dev/null || true)"
 fi
 if [ -z "$NAME" ]; then
-  echo "!! mcp-hub not on PATH here — cannot derive the agent name."
-  echo "   Install it on this host (pip install -e in the clone), then re-run."
+  echo "!! cannot derive the agent name here — mcp-hub not found or not working."
+  echo "   Looked on PATH, in ~/.local/bin, in $DEST/.venv/bin, and in the"
+  echo "   canonical clone's .venv. Install it on this host (pip install -e in a"
+  echo "   clone) or symlink it into ~/.local/bin, then re-run — this script is"
+  echo "   idempotent."
   exit 1
 fi
 echo "  identity: $NAME"
@@ -170,8 +212,21 @@ if not m:
     print('  !! no "folders" array — add the folder by hand'); raise SystemExit(0)
 i = m.end()
 empty = text[i:].lstrip().startswith("]")
+# Match the file's own convention. dev-vm-1's general.code-workspace uses
+# RELATIVE paths deliberately — its header says so, "paths are relative, so this
+# file moves with the tree unchanged". An absolute path would work and quietly
+# break that property, so use relative when the destination sits under the
+# workspace file's directory.
+shown = dest
+try:
+    rel = pathlib.Path(dest).relative_to(ws.parent)
+    if any('"path": "' + str(f) in text or "'path': '" + str(f) in text
+           for f in [p.name for p in [ws.parent]]) or not text.count('"path": "/'):
+        shown = str(rel)
+except ValueError:
+    pass
 entry = ('\n    {\n      "name": "%s",\n      "path": "%s"\n    }'
-         % (pathlib.Path(dest).name, dest))
+         % (pathlib.Path(dest).name, shown))
 ws.write_text(text[:i] + entry + ("" if empty else ",") + text[i:], encoding="utf-8")
 print(f"  workspace folder added: {pathlib.Path(dest).name}")
 PY
