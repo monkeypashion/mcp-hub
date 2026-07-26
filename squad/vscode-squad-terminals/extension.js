@@ -142,6 +142,26 @@ function resolveAgent(terminal) {
   return undefined;
 }
 
+// Start an agent with an explicit resume/fresh mode AND attach this terminal to
+// it. Typed into the tab rather than exec'd in the background, because attaching
+// is a property of THIS terminal — and because a background exec leaves the tab a
+// bare shell, which is how "Start & attach" came to only start (2026-07-26).
+// `clear` runs after attach returns (i.e. on detach) so the tab never shows the
+// typed command or the launch chatter.
+function startWithMode(args, mode) {
+  const list = Array.isArray(args[1]) && args[1].length ? args[1] : [args[0]];
+  let any = false;
+  for (const t of list) {
+    const a = resolveAgent(t);
+    if (!a || !t || typeof t.sendText !== "function") continue;
+    any = true;
+    inflight.set(t, Date.now());          // suppress the focus toast for this tab
+    t.show(false);
+    t.sendText(`clear; squad restart ${a} ${mode} >/dev/null 2>&1 && squad attach ${a}; clear`);
+  }
+  if (!any) vscode.window.showWarningMessage("Squad: no squad agent in the selection.");
+}
+
 function squadExec(args, agent) {
   cp.execFile(SQUAD, args, { timeout: 30000 }, (err, _out, stderr) => {
     if (err) vscode.window.showErrorMessage(`squad ${args[0]} ${agent}: ${stderr || err.message}`);
@@ -312,17 +332,20 @@ function activate(context) {
     //
     // Found by the operator using it, after I "fixed" the label and left the
     // trap underneath: naming a consequence is not the same as offering it.
+    // ...and it must ATTACH, which is the whole second half of its name. The
+    // first cut of this ran `restart` via execFile — which starts the agent in
+    // its own tmux session and leaves the cockpit tab sitting as a bare shell,
+    // so "Start & attach" only started. Worse, the operator then SEES the
+    // command and its output in the tab, because nothing ever took the screen
+    // over. `squad restart <a> --resume|--fresh && squad attach <a>` gets both:
+    // the one-off mode override, then this terminal attaches; `clear` wipes the
+    // typed line and the launch chatter so the tab shows the agent, not a
+    // transcript of how it got there.
     vscode.commands.registerCommand("squad.startAttach", (...args) =>
-      withAgents(args, (agents) => {
-        cancelPendingToasts();
-        agents.forEach((a) => squadExec(["restart", a, "--resume"], a));
-      })
+      startWithMode(args, "--resume")
     ),
     vscode.commands.registerCommand("squad.startAttachFresh", (...args) =>
-      withAgents(args, (agents) => {
-        cancelPendingToasts();
-        agents.forEach((a) => squadExec(["restart", a, "--fresh"], a));
-      })
+      startWithMode(args, "--fresh")
     ),
     vscode.commands.registerCommand("squad.stop", (...args) =>
       withAgents(args, (agents) => agents.forEach((a) => squadExec(["stop", a], a)))
@@ -905,10 +928,13 @@ function activate(context) {
                 // roster — a third vocabulary for one decision, able to
                 // contradict the menu label sitting right beside it.
                 if (!pick) return;
-                inflight.set(t, Date.now());
-                t.show(false);
-                t.sendText(
-                  `squad restart ${a} ${pick === "Resume conversation" ? "--resume" : "--fresh"}`
+                // Route through the SAME helper the menu uses, so the two can
+                // never diverge in what they actually DO. The first cut had the
+                // toast starting without attaching, which left the operator
+                // staring at command output in a bare shell.
+                startWithMode(
+                  [t],
+                  pick === "Resume conversation" ? "--resume" : "--fresh"
                 );
               });
           });

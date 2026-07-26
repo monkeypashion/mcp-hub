@@ -1338,7 +1338,7 @@ case "${1:-help}" in
                 # `start`, not `up`: up deliberately skips faculty-class
                 # agents, so for exactly the terminals that show this message
                 # most, "run up" would be advice that does nothing.
-                echo "$a is down (--no-start: not launching). Start it with: $CMD start $a   (or right-click the tab: Squad → Start & attach)"
+                echo "$a is down. Right-click this tab -> Squad -> Start & attach (resume conversation) or (fresh conversation)."
                 # Exit 3, not 0, so the caller can distinguish "attached, and
                 # you detached" from "never attached, agent is down". The
                 # cockpit uses it to decide whether to clear the pane: this
