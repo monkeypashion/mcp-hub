@@ -546,6 +546,60 @@ migrate_roster_name() {
   echo "migrated roster: $old -> $derived"
 }
 
+add_folder() {  # squad add-folder <dir> — enrol an EXISTING folder as an agent
+  # The pull to `transport`'s push: nothing is cloned, copied or re-keyed. A
+  # folder that already exists becomes a roster agent so the cockpit can open a
+  # tab for it and `start` can run claude there.
+  #
+  # Deliberately incurious about the folder: git is not required (the operator's
+  # scratch agents are plain directories) and neither is any prior Claude
+  # history. Where a git remote DOES exist we derive the proper hub identity and
+  # opt the project in, so comms come free — a bonus, never a gate.
+  local dir="$1" name proj
+  [ -n "$dir" ] || { echo "usage: $CMD add-folder <dir>" >&2; return 1; }
+  dir="$(untilde "$dir")"
+  [ -d "$dir" ] || { echo "!! no such directory: $dir" >&2; return 1; }
+  dir="$(cd "$dir" && pwd)"                       # absolute + symlink-free
+
+  # Already enrolled? Report the existing name rather than adding a second row —
+  # two rows for one worktree makes field() pick one arbitrarily.
+  local owner
+  owner="$(awk -F'|' -v d="$dir" '$2==d{print $1; exit}' "$CONF" 2>/dev/null || true)"
+  if [ -n "$owner" ]; then echo "$owner (already enrolled)"; return 0; fi
+
+  # Identity: ask the cli when there's a git remote to derive from — never
+  # re-derive here, that divergence is what makes a statusline read `hub ?`.
+  # Fall back to <basename>-<hostname> for a plain folder, matching how the
+  # existing scratch agents are named.
+  proj="$(worktree_project "$dir" 2>/dev/null || true)"
+  if [ -n "$proj" ]; then
+    optin_project add "$proj" >/dev/null 2>&1 || true
+    name="$(mcp-hub identity --cwd "$dir" --any 2>/dev/null || true)"
+  fi
+  [ -n "${name:-}" ] || name="$(sanitize_ident "$(basename "$dir")-$(hostname)")"
+  [ -n "$name" ] || { echo "!! could not derive a name for $dir" >&2; return 1; }
+
+  if agents | grep -qxF -- "$name"; then
+    echo "!! '$name' already names a different worktree:" >&2
+    echo "     $(field "$name" 2)" >&2
+    echo "   Rename the folder or enrol it by hand with a distinct name." >&2
+    return 1
+  fi
+
+  # faculty: never auto-started by `up`, shown on who/board only while running.
+  # An added folder is on-demand by nature — the operator starts it deliberately.
+  # --continue so a relaunch keeps its conversation (heal refuses to relaunch
+  # agents without it); comms only when the project is hub-opted-in, since the
+  # flag is inert for a folder with no hub identity.
+  mkdir -p "$(dirname "$CONF")"; touch "$CONF"
+  if [ -n "$proj" ]; then
+    printf '%s|%s||%s %s|faculty\n' "$name" "$dir" "$RESUME_FLAG" "$COMMS_FLAG" >> "$CONF"
+  else
+    printf '%s|%s||%s|faculty\n' "$name" "$dir" "$RESUME_FLAG" >> "$CONF"
+  fi
+  echo "$name"
+}
+
 add_agent() {  # squad add <org>/<repo> — clone/pull, opt in, enroll/migrate under the DERIVED name
   local spec="$1" out dest name
   [[ "$spec" == ?*/?* ]] || { echo "usage: $CMD add <org>/<repo>"; return 1; }
@@ -559,7 +613,14 @@ add_agent() {  # squad add <org>/<repo> — clone/pull, opt in, enroll/migrate u
   migrate_roster_name "$dest" "$name"              # legacy-name line for this worktree -> derived
   if agents | grep -qxF -- "$name"; then echo "'$name' enrolled -> $dest"; return 0; fi
   mkdir -p "$(dirname "$CONF")"
-  printf '%s|%s||--dangerously-load-development-channels server:hub\n' "$name" "$dest" >> "$CONF"
+  # --continue as well as the comms flag: capability and CONTINUITY are
+  # different questions, and an agent with only the first is a trap. heal's
+  # deaf-sweep refuses to relaunch an agent whose roster lacks --continue
+  # (rightly — it will not destroy a conversation to fix a comms problem), so a
+  # wake-capable agent without it gets detected deaf and then nagged forever
+  # with advice that cannot work. Enrolling an agent that cannot be recovered
+  # is not enrolling it. Flip per-agent later with `$CMD resume off <agent>`.
+  printf '%s|%s||%s %s\n' "$name" "$dest" "$RESUME_FLAG" "$COMMS_FLAG" >> "$CONF"
   echo "enrolled '$name' -> $dest"
   echo "  run: $CMD restart $name   (or $CMD up)  to launch it"
 }
@@ -1968,6 +2029,7 @@ sys.stdout.write("".join("%s\x1f%d\x1f%d\n" % r for r in out))
               exit 0
             fi
             transport_agent "$a" "$ws_arg" "$dest_arg" "$host_arg" "$port_arg" ;;
+  add-folder) add_folder "${2:-}" ;;
   ext-align) ext_align ;;
   add)      add_agent "${2:-}" "${3:-}" "${4:-}" ;;
   rm)       a="$(need_agent "${2:-}")" || exit 1; rm_agent "$a" ;;

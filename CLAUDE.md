@@ -141,6 +141,25 @@ mklink /J %USERPROFILE%\.claude\skills\memory-sync D:\Projects\code\monkeypashio
 
 **Three or more clones**: same ceremony, star-shaped. Each spoke exports **in turn** with the canonical machine importing between exports (staging is last-write-wins per filename — draining between exports means the curator sees every divergent version instead of only the last). Then one curation, one publish, all spokes force-import + verify. Linear cost, single curation point, no pairwise sync.
 
+## Adding an existing folder as an agent
+
+`squad add-folder <dir>`, or **Add existing folder as agent…** in the cockpit
+(agent tab → Squad). The *pull* to transport's push: nothing is cloned, copied
+or re-keyed — a folder that already exists becomes a roster agent, a tab appears,
+and **Start & attach** runs claude there.
+
+Deliberately incurious about the folder: **git is not required** (the scratch
+agents are plain directories) and neither is any prior Claude history. Where a
+git remote *does* exist, identity is derived properly and the project is opted
+into the hub, so comms come free — a bonus, never a gate. A plain folder gets
+`--continue` but **not** the comms flag, since that flag is inert without a hub
+identity and implying comms it cannot have would make the roster lie.
+
+Enrolled `faculty` (never auto-started by `up`) because an added folder is
+on-demand by nature. Refuses two rows for one worktree, and refuses when the
+derived name already belongs to a different folder — `field()` takes the first
+match, so a duplicate name silently shadows.
+
 ## Transport — clone an agent into another workspace
 
 `squad transport <agent> --to <file.code-workspace>` moves a whole agent, not

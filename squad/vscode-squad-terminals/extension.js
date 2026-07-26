@@ -597,6 +597,82 @@ function activate(context) {
     })
   );
 
+  // ---- add an existing folder to this workspace as an agent ----
+  // The PULL to transport's push: nothing is cloned, copied or re-keyed. You
+  // point at a folder that already exists and it becomes a cockpit tab.
+  //
+  // Deliberately incurious about the folder: no git required, no prior Claude
+  // history required. This is how the operator's scratch agents were made by
+  // hand (wispr-flow-alternative, pc-cleanup, pc-upgrade — non-git, no args,
+  // faculty), so the feature is that same act without editing a config file.
+  //
+  // If the folder DOES happen to be a git repo with an origin, we opt it into
+  // the hub so it gets comms — a bonus when available, never a requirement.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("squad.addFolder", async () => {
+      const wf = vscode.workspace.workspaceFile;
+      if (!wf) {
+        vscode.window.showWarningMessage(
+          "Squad: open a .code-workspace first — agent tabs only appear in one."
+        );
+        return;
+      }
+      const picked = await vscode.window.showOpenDialog({
+        canSelectFolders: true,
+        canSelectFiles: false,
+        canSelectMany: false,
+        openLabel: "Add as agent",
+        title: "Add an existing folder to this workspace as an agent",
+        defaultUri: vscode.Uri.file(
+          fs.existsSync(path.join(os.homedir(), "Projects"))
+            ? path.join(os.homedir(), "Projects")
+            : os.homedir()
+        ),
+      });
+      if (!picked || !picked.length) return;
+      const dir = picked[0].fsPath;
+
+      // Already an agent? Then this is a no-op worth naming, not a duplicate.
+      const existing = rosterRows().find((r) => canon(r.worktree) === canon(dir));
+      if (existing) {
+        const inWs = (vscode.workspace.workspaceFolders || []).some(
+          (f) => canon(f.uri.fsPath) === canon(dir)
+        );
+        vscode.window.showInformationMessage(
+          `Squad: ${shortLabel(existing.agent)} already covers that folder` +
+            (inWs ? "." : " — adding it to this workspace.")
+        );
+        if (inWs) return;
+      }
+
+      const out = cp.spawnSync(SQUAD, ["add-folder", dir], {
+        timeout: 60000, encoding: "utf8",
+      });
+      const said = ((out.stdout || "") + (out.stderr || "")).trim();
+      if (out.status !== 0) {
+        vscode.window.showErrorMessage(`Squad: ${said || "add-folder failed"}`);
+        return;
+      }
+
+      // Add the folder via the API rather than editing the workspace file:
+      // VSCode owns the formatting, and this fires onDidChangeWorkspaceFolders,
+      // which the cockpit builder already listens for — so the tab appears
+      // without a reload.
+      const already = (vscode.workspace.workspaceFolders || []).some(
+        (f) => canon(f.uri.fsPath) === canon(dir)
+      );
+      if (!already) {
+        vscode.workspace.updateWorkspaceFolders(
+          (vscode.workspace.workspaceFolders || []).length, 0,
+          { uri: vscode.Uri.file(dir), name: path.basename(dir) }
+        );
+      }
+      vscode.window.showInformationMessage(
+        `Squad: ${said || path.basename(dir)} — right-click its tab → Start & attach.`
+      );
+    })
+  );
+
   // ---- standard claude slash commands (typed into the agent's pane) ----
   // /clear is destructive (wipes the conversation) -> modal confirm.
   for (const slash of ["context", "cost", "status", "doctor", "mcp", "model", "memory", "todos", "help"]) {

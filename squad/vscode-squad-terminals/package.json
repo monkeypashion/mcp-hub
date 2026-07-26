@@ -237,6 +237,11 @@
         "command": "squad.transportAll",
         "title": "Transport ALL agents to workspace\u2026",
         "category": "Squad"
+      },
+      {
+        "command": "squad.addFolder",
+        "title": "Add existing folder as agent\u2026",
+        "category": "Squad"
       }
     ],
     "submenus": [
@@ -343,6 +348,10 @@
         {
           "command": "squad.transportAll",
           "group": "2_lifecycle@6"
+        },
+        {
+          "command": "squad.addFolder",
+          "group": "2_lifecycle@7"
         }
       ],
       "squad.slashMenu": [
