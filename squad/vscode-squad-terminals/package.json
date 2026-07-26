@@ -232,6 +232,11 @@
         "command": "squad.transport",
         "title": "Transport to workspace\u2026",
         "category": "Squad"
+      },
+      {
+        "command": "squad.transportAll",
+        "title": "Transport ALL agents to workspace\u2026",
+        "category": "Squad"
       }
     ],
     "submenus": [
@@ -334,6 +339,10 @@
           "command": "squad.transport",
           "group": "2_lifecycle@5",
           "when": "squad.isAgent"
+        },
+        {
+          "command": "squad.transportAll",
+          "group": "2_lifecycle@6"
         }
       ],
       "squad.slashMenu": [

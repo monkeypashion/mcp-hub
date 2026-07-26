@@ -792,7 +792,7 @@ enc_project_dir() { printf '%s' "$1" | sed -e 's:[/\\:]:-:g' -e 's/-*$//'; }
 dest_state_dir() { printf '%s/.claude/projects/%s' "$1" "$(enc_project_dir "$2")"; }
 
 transport_agent() {
-  local a="$1" wsfile="$2" dest="$3" host="${4:-}" port="${5:-}"
+  local a="$1" wsfile="$2" dest="$3" host="${4:-}" port="${5:-}" sfx="${6:-}"
   local src label branch name url reason repo proj args class
   local rsh="" remote=0 stage rhome="$HOME" dstate
   src="$(untilde "$(field "$a" 2)")"
@@ -822,6 +822,12 @@ transport_agent() {
   fi
 
   label="$(ws_label "$wsfile")"
+  # The identity suffix defaults to the workspace label, which is shared by
+  # every agent landing in that workspace. Fine when they're different repos
+  # (name = <repo>-<host>-<suffix>), but two clones of ONE repo would then
+  # derive the SAME name and silently share identity — the exact collision the
+  # suffix exists to prevent. Fan-out passes a unique one.
+  [ -n "$sfx" ] && label="$sfx"
   url="$(git -C "$src" remote get-url origin)"
   repo="$(basename "${url%.git}")"
   branch="$(git -C "$src" branch --show-current)"
@@ -1895,18 +1901,72 @@ sys.stdout.write("".join("%s\x1f%d\x1f%d\n" % r for r in out))
               done
             else board_paint "$(board_scan)"; fi ;;
   handoff)  a="$(need_agent "${2:-}")" || exit 1; handoff "$a" ;;
-  transport) # squad transport [agent] --to <workspace-file> [--dest <dir>]
-            shift; ws_arg=""; dest_arg=""; a_arg=""; host_arg=""; port_arg=""
+  transport) # squad transport <agent|all> --to <workspace-file> [--dest <dir>]
+             #                                [--host <host>] [--port N] [--dry-run]
+            shift; ws_arg=""; dest_arg=""; a_arg=""; host_arg=""; port_arg=""; dry=0
             while [ $# -gt 0 ]; do case "$1" in
-              --to)   ws_arg="${2:-}"; shift 2 ;;
-              --dest) dest_arg="${2:-}"; shift 2 ;;
-              --host) host_arg="${2:-}"; shift 2 ;;
-              --port) port_arg="${2:-}"; shift 2 ;;
-              -*)     echo "!! unknown transport flag '$1' (valid: --to, --dest, --host, --port)" >&2; exit 1 ;;
-              *)      a_arg="$1"; shift ;;
+              --to)      ws_arg="${2:-}"; shift 2 ;;
+              --dest)    dest_arg="${2:-}"; shift 2 ;;
+              --host)    host_arg="${2:-}"; shift 2 ;;
+              --port)    port_arg="${2:-}"; shift 2 ;;
+              --dry-run) dry=1; shift ;;
+              -*)  echo "!! unknown transport flag '$1' (valid: --to, --dest, --host, --port, --dry-run)" >&2; exit 1 ;;
+              *)   a_arg="$1"; shift ;;
             esac; done
-            [ -n "$ws_arg" ] || { echo "usage: $CMD transport [agent] --to <file.code-workspace> [--dest <dir>]" >&2; exit 1; }
+            [ -n "$ws_arg" ] || { echo "usage: $CMD transport <agent|all> --to <file.code-workspace> [--dest <dir>] [--host <host>] [--dry-run]" >&2; exit 1; }
+            if [ "$a_arg" = all ]; then
+              # Squad-level clone: N transports, plus an eligibility report.
+              # Ineligible agents are LISTED, never silently skipped — "clone
+              # the squad" that quietly drops half of it is worse than a refusal.
+              ok=0; skipped=0; claimed=""
+              echo "== transport all -> ${host_arg:+$host_arg:}$(ws_label "$ws_arg") =="
+              for t in $(agents); do
+                d="$(untilde "$(field "$t" 2)")"
+                if ! r="$(transport_gate "$d" 2>/dev/null)"; then
+                  printf '  SKIP  %-38s %s\n' "$t" "$r"; skipped=$((skipped+1)); continue
+                fi
+                # Two agents can be clones of ONE repo (that is the whole point
+                # of derived identity), so the default dest — <ws>/<label>/<repo>
+                # — collides across them and every agent after the first would
+                # fail on "destination not empty". Disambiguate within this
+                # fan-out, deterministically and without any remote round-trip.
+                rp="$(basename "$(git -C "$d" remote get-url origin)" .git)"
+                dd="$(dirname "$ws_arg")/$(ws_label "$ws_arg")/$rp"; n=1
+                while case " $claimed " in *" $dd "*) true ;; *) false ;; esac; do
+                  n=$((n+1)); dd="$(dirname "$ws_arg")/$(ws_label "$ws_arg")/$rp-$n"
+                done
+                claimed="$claimed $dd"
+                if [ "$n" = 1 ]; then sfx="$(ws_label "$ws_arg")"; else sfx="$(ws_label "$ws_arg")-$n"; fi
+                if [ "$dry" = 1 ]; then
+                  printf '  OK    %-38s -> %-14s id-suffix %s (%s)\n' \
+                    "$t" "$(basename "$dd")" "$sfx" "$(git -C "$d" branch --show-current)"
+                  ok=$((ok+1)); continue
+                fi
+                echo "  ---- $t ----"
+                if transport_agent "$t" "$ws_arg" "$dd" "$host_arg" "$port_arg" "$sfx" 2>&1 | sed 's/^/    /'; then
+                  ok=$((ok+1))
+                else
+                  printf '  FAIL  %-38s transport errored\n' "$t"; skipped=$((skipped+1))
+                fi
+              done
+              echo
+              if [ "$dry" = 1 ]; then echo "  $ok eligible, $skipped ineligible (dry run — nothing written)"
+              else echo "  $ok transported, $skipped skipped"; fi
+              [ "$skipped" = 0 ] || echo "  (ineligible agents need a git remote, a clean tree and nothing unpushed)"
+              exit 0
+            fi
             a="$(need_agent "$a_arg")" || exit 1
+            if [ "$dry" = 1 ]; then
+              d="$(untilde "$(field "$a" 2)")"
+              if r="$(transport_gate "$d" 2>/dev/null)"; then
+                echo "OK: $a would transport to ${host_arg:+$host_arg:}$(ws_label "$ws_arg")"
+                echo "  branch : $(git -C "$d" branch --show-current) @ $(git -C "$d" rev-parse --short HEAD)"
+                echo "  dest   : ${dest_arg:-$(dirname "$ws_arg")/$(ws_label "$ws_arg")/$(basename "$d")}"
+              else
+                echo "REFUSED: $a — $r"; exit 1
+              fi
+              exit 0
+            fi
             transport_agent "$a" "$ws_arg" "$dest_arg" "$host_arg" "$port_arg" ;;
   ext-align) ext_align ;;
   add)      add_agent "${2:-}" "${3:-}" "${4:-}" ;;

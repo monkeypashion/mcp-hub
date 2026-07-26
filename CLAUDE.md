@@ -183,6 +183,26 @@ In the cockpit: agent tab → **Transport to workspace…** asks which machine
 (this one, plus online *Linux* tailnet peers — transport needs a real toolchain
 there), then which `.code-workspace` on it, enumerated over SSH.
 
+**Cloning a whole squad** — `squad transport all --to <ws> [--host <host>]`, or
+**Transport ALL agents to workspace…** in the cockpit, which shows the dry run
+and makes you confirm against it first:
+
+```bash
+squad transport all --to ~/Projects/newbox.code-workspace --dry-run   # preview
+squad transport all --to ~/Projects/newbox.code-workspace --host dev-vm-1
+```
+
+Ineligible agents are **named with their reason**, never silently skipped — a
+"clone the squad" that quietly drops half of it is worse than a refusal. Two
+collisions the fan-out has to resolve, both invisible until you have two clones
+of one repo in the roster: the default destination `<ws>/<label>/<repo>` is the
+same for both (disambiguated to `<repo>-2`, `-3`…), and so is the identity
+suffix, which would make them derive the SAME agent name and silently share
+identity (suffix becomes `<label>-2`, `-3`… to match).
+
+`--dry-run` works for a single agent too, and reports the gate verdict without
+writing anything.
+
 **A "target workspace" is a `.code-workspace` file.** The extension gates
 terminals on folder membership, so transport writes the folder entry into that
 file (a surgical JSONC insert — these files carry comments and hand-formatting

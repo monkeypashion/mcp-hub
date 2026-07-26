@@ -459,14 +459,9 @@ function activate(context) {
   // identity) appears there ready to start. Workspaces are discovered rather
   // than configured — a .code-workspace file IS the target, so there is no
   // second registry to keep in sync with reality.
-  context.subscriptions.push(
-    vscode.commands.registerCommand("squad.transport", (...args) =>
-      withAgents(args, async (agents) => {
-        if (agents.length !== 1) {
-          vscode.window.showWarningMessage("Squad: transport one agent at a time.");
-          return;
-        }
-        const agent = agents[0];
+  // Shared by squad.transport and squad.transportAll: ask which machine, then
+  // which workspace on it. Returns {host, file} or null if cancelled.
+  const pickTarget = async (title) => {
         const here = vscode.workspace.workspaceFile;
         // Keep stdout even on a non-zero exit. `ls` over a glob that matches
         // nothing exits non-zero while still listing what DID match, and
@@ -521,12 +516,10 @@ function activate(context) {
               { label: "This machine", description: os.hostname(), host: "" },
               ...hosts.map((h) => ({ label: h, description: "over the tailnet", host: h })),
             ],
-            {
-              title: `Transport ${shortLabel(agent)} — to which machine?`,
-              placeHolder: "The agent is CLONED; the source keeps running",
-            }
+            { title: `${title} — to which machine?`,
+              placeHolder: "Agents are CLONED; the sources keep running" }
           );
-          if (!where) return;
+          if (!where) return null;
           host = where.host;
         }
 
@@ -538,33 +531,70 @@ function activate(context) {
           vscode.window.showWarningMessage(
             `Squad: no .code-workspace files found${host ? ` on ${host}` : " in ~/Projects or ~"}.`
           );
-          return;
+          return null;
         }
         const pick = await vscode.window.showQuickPick(
           files.map((f) => ({ label: path.basename(f, ".code-workspace"), description: f })),
           {
-            title: `Transport ${shortLabel(agent)} to which workspace${host ? ` on ${host}` : ""}?`,
-            placeHolder: "Refuses if the repo is dirty or unpushed",
+            title: `${title} — which workspace${host ? ` on ${host}` : ""}?`,
+            placeHolder: "Refuses any repo that is dirty or unpushed",
           }
         );
-        if (!pick) return;
+        if (!pick) return null;
+        return { host, file: pick.description, label: pick.label, sh };
+  };
 
-        // Runs in a visible terminal rather than fire-and-forget: transport
-        // REFUSES on a dirty or unpushed tree, and that refusal is something
-        // the operator must read, not a silently-swallowed exit code.
-        const t = vscode.window.createTerminal({
-          name: `transport → ${host ? host + ":" : ""}${pick.label}`,
-          iconPath: new vscode.ThemeIcon("arrow-right"),
-          color: new vscode.ThemeColor("terminal.ansiCyan"),
-        });
-        t.show(true);
-        sendWhenReady(
-          t,
-          `${SQUAD} transport ${agent} --to ${JSON.stringify(pick.description)}` +
-            (host ? ` --host ${host}` : "")
+  // Runs in a visible terminal rather than fire-and-forget: transport REFUSES
+  // on a dirty or unpushed tree, and that refusal is something the operator
+  // must read, not a silently-swallowed exit code.
+  const runTransport = (label, cmd) => {
+    const t = vscode.window.createTerminal({
+      name: `transport → ${label}`,
+      iconPath: new vscode.ThemeIcon("arrow-right"),
+      color: new vscode.ThemeColor("terminal.ansiCyan"),
+    });
+    t.show(true);
+    sendWhenReady(t, cmd);
+  };
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("squad.transport", (...args) =>
+      withAgents(args, async (agents) => {
+        if (agents.length !== 1) {
+          vscode.window.showWarningMessage("Squad: transport one agent at a time.");
+          return;
+        }
+        const agent = agents[0];
+        const target = await pickTarget(`Transport ${shortLabel(agent)}`);
+        if (!target) return;
+        runTransport(
+          `${target.host ? target.host + ":" : ""}${target.label}`,
+          `${SQUAD} transport ${agent} --to ${JSON.stringify(target.file)}` +
+            (target.host ? ` --host ${target.host}` : "")
         );
       })
     )
+  );
+
+  // Squad-level clone. A bulk clone is expensive and partly irreversible, so
+  // the DRY RUN is shown first and the operator confirms against the real
+  // eligibility list — ineligible agents are named, never silently dropped.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("squad.transportAll", async () => {
+      const target = await pickTarget("Transport ALL agents");
+      if (!target) return;
+      const base =
+        `${SQUAD} transport all --to ${JSON.stringify(target.file)}` +
+        (target.host ? ` --host ${target.host}` : "");
+      const preview = target.sh(`${base} --dry-run 2>&1`) || "(no output)";
+      const go = await vscode.window.showWarningMessage(
+        `Clone the squad into ${target.label}${target.host ? ` on ${target.host}` : ""}?`,
+        { modal: true, detail: preview },
+        "Transport"
+      );
+      if (go !== "Transport") return;
+      runTransport(`${target.host ? target.host + ":" : ""}${target.label} (all)`, base);
+    })
   );
 
   // ---- standard claude slash commands (typed into the agent's pane) ----
