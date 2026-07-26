@@ -2141,15 +2141,32 @@ case "${1:-help}" in
               done
             }
             load_wait_flags() {
-              # Harvest (TTL-gated — shares the 60s scan budget with board) then
-              # read the cache: agent US epoch US flag US text. The painter only
-              # needs the flag; board renders the text.
+              # 🙋 authority is the HUB CARD QUEUE (decisions-open.json,
+              # daemon-written): an open card = a hand, nothing else does.
+              # The recap-phrase flags are only the FALLBACK when the cache
+              # is stale/absent (daemons down) — they linger until the agent
+              # next takes a turn, which is exactly the stuck-hand class the
+              # operator toured every pane failing to clear (2026-07-26).
               usage_refresh
-              local wa we wf wrest
+              local wa we wf wrest hubnames=""
               WWAIT=()
-              while IFS=$'\037' read -r wa we wf wrest; do
-                [ -n "$wa" ] && [ "$wf" = 1 ] && WWAIT[$wa]=1
-              done < "$HOME/.mcp-hub/board-recap.cache" 2>/dev/null || true
+              hubnames="$(python3 -c '
+import json, sys, time
+try:
+    d = json.load(open(sys.argv[1]))
+    if time.time() - d.get("ts", 0) < 300:
+        names = sorted({c.get("agent", "") for c in d.get("cards", [])})
+        print("FRESH " + " ".join(n for n in names if n))
+except Exception:
+    pass
+' "$HOME/.mcp-hub/decisions-open.json" 2>/dev/null)"
+              if [ "${hubnames%% *}" = "FRESH" ] || [ "$hubnames" = "FRESH" ]; then
+                for wa in ${hubnames#FRESH}; do WWAIT[$wa]=1; done
+              else
+                while IFS=$'\037' read -r wa we wf wrest; do
+                  [ -n "$wa" ] && [ "$wf" = 1 ] && WWAIT[$wa]=1
+                done < "$HOME/.mcp-hub/board-recap.cache" 2>/dev/null || true
+              fi
             }
             who_badge() {   # State -> VSCode tab, two channels per agent:
               # 1. per-session set-titles-string prefix: 🔴 lands INSIDE the
@@ -2465,9 +2482,14 @@ for name in order:
         continue
     if a.get("next"):
         w = 1 if (WRE and re.search(WRE, a["next"], re.I)) else 0
-        txt = a["next"][:300 if w else 120]
+        # hub queue is AUTHORITATIVE when the cache is fresh: no open card
+        # = no hand, full stop. Labelling legacy flags "(stale?)" still
+        # showed a 🙋 and the operator toured every pane trying to clear
+        # hands that nothing could clear (2026-07-26 late). Phrase-flags
+        # only raise hands as a FALLBACK when daemons are not reporting.
         if w and dec_fresh:
-            txt = "(no card on hub — stale?) " + txt
+            w = 0
+        txt = a["next"][:300 if w else 120]
         # flagged rows are the ones the operator must actually read — give a
         # structured DECISION line room for its RISK/SCORE tail (2026-07-26)
         rows.append((0, 0, "%s\x1f%s\x1fbio\x1f\x1f%d\x1f%s" % (name, deaf, w, txt)))
@@ -2485,12 +2507,15 @@ for name in order:
         m = re.search(r"(?:(?<=[.!?] )|^)((?:Next|Waiting|Blocked|DECISION)\b.*)", txt)
         if m: txt = m.group(1)
         age = max(0, now - ep)
+        # hub queue is authoritative (see the bio branch): a fresh cache
+        # with no open card for this agent means NO hand, however loudly
+        # the recap prose reads as waiting
+        if w and dec_fresh:
+            w = 0
         # a structured block must keep its SCORE tail through display
         # truncation — the card renderer downstream needs every field
         lim = 480 if ("DECISION" in txt and "ASK:" in txt) else (300 if w else 120)
         txt = txt[:lim]
-        if w and dec_fresh:
-            txt = "(no card on hub — stale?) " + txt
         rows.append((1, age, "%s\x1f%s\x1frecap\x1f%s\x1f%d\x1f%s" % (name, deaf, age_h(age), w, txt)))
     else:
         missing += 1
