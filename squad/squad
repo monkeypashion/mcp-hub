@@ -855,18 +855,39 @@ dest_state_dir() { printf '%s/.claude/projects/%s' "$1" "$(enc_project_dir "$2")
 transport_agent() {
   local a="$1" wsfile="$2" dest="$3" host="${4:-}" port="${5:-}" sfx="${6:-}"
   local src label branch name url reason repo proj args class
-  local rsh="" remote=0 stage rhome="$HOME" dstate
+  local rsh="" remote=0 stage rhome="$HOME" dstate rsh_override="${7:-}"
   src="$(untilde "$(field "$a" 2)")"
   [ -d "$src" ] || { echo "!! $a: missing worktree $src"; return 1; }
   [ -n "$host" ] && remote=1
   wsfile="$(untilde "$wsfile")"
 
-  # SSH transport for the remote leg. tailscale ssh needs no key distribution
-  # (dev-vm-1 and prod-1 advertise host keys); plain ssh covers everything else,
-  # including a loopback target for testing.
+  # Remote shell for the remote leg. PROBE, don't assume: a tailnet peer running
+  # `tailscale up --ssh` mints ephemeral host keys, so plain ssh to it dies with
+  # "Host key verification failed" even though the box is perfectly reachable —
+  # exactly what happened on the first real cross-machine run (dev-vm-1,
+  # 2026-07-26), where hardcoded `ssh` reported "cannot reach" a host that
+  # `tailscale ssh` reaches fine. rsync rides either (verified: rsync -e
+  # "tailscale ssh" round-trips a file).
   if [ "$remote" = 1 ]; then
-    if [ -n "$port" ]; then rsh="ssh -p $port"; else rsh="ssh"; fi
-    $rsh "$host" true 2>/dev/null || { echo "!! cannot reach $host over ssh"; return 1; }
+    if [ -n "$rsh_override" ]; then
+      rsh="$rsh_override"
+    elif [ -n "$port" ]; then
+      rsh="ssh -p $port"
+    else
+      rsh="ssh -o BatchMode=yes -o ConnectTimeout=8"
+    fi
+    if ! $rsh "$host" true 2>/dev/null; then
+      if [ -z "$rsh_override" ] && [ -z "$port" ] && command -v tailscale >/dev/null \
+         && tailscale ssh "$host" true 2>/dev/null; then
+        rsh="tailscale ssh"
+        echo "  (plain ssh refused $host; using tailscale ssh)"
+      else
+        echo "!! cannot reach $host — tried: $rsh${rsh_override:+ (--rsh override)}"
+        echo "   If it's a tailnet peer, check \`tailscale ssh $host true\`."
+        echo "   Otherwise pass --rsh '<command>' (e.g. --rsh 'ssh -J jump')."
+        return 1
+      fi
+    fi
     rhome="$($rsh "$host" 'printf %s "$HOME"')"
     [ -n "$rhome" ] || { echo "!! could not resolve \$HOME on $host"; return 1; }
   else
@@ -1964,14 +1985,15 @@ sys.stdout.write("".join("%s\x1f%d\x1f%d\n" % r for r in out))
   handoff)  a="$(need_agent "${2:-}")" || exit 1; handoff "$a" ;;
   transport) # squad transport <agent|all> --to <workspace-file> [--dest <dir>]
              #                                [--host <host>] [--port N] [--dry-run]
-            shift; ws_arg=""; dest_arg=""; a_arg=""; host_arg=""; port_arg=""; dry=0
+            shift; ws_arg=""; dest_arg=""; a_arg=""; host_arg=""; port_arg=""; rsh_arg=""; dry=0
             while [ $# -gt 0 ]; do case "$1" in
               --to)      ws_arg="${2:-}"; shift 2 ;;
               --dest)    dest_arg="${2:-}"; shift 2 ;;
               --host)    host_arg="${2:-}"; shift 2 ;;
               --port)    port_arg="${2:-}"; shift 2 ;;
+              --rsh)     rsh_arg="${2:-}"; shift 2 ;;
               --dry-run) dry=1; shift ;;
-              -*)  echo "!! unknown transport flag '$1' (valid: --to, --dest, --host, --port, --dry-run)" >&2; exit 1 ;;
+              -*)  echo "!! unknown transport flag '$1' (valid: --to, --dest, --host, --port, --rsh, --dry-run)" >&2; exit 1 ;;
               *)   a_arg="$1"; shift ;;
             esac; done
             [ -n "$ws_arg" ] || { echo "usage: $CMD transport <agent|all> --to <file.code-workspace> [--dest <dir>] [--host <host>] [--dry-run]" >&2; exit 1; }
@@ -2004,7 +2026,7 @@ sys.stdout.write("".join("%s\x1f%d\x1f%d\n" % r for r in out))
                   ok=$((ok+1)); continue
                 fi
                 echo "  ---- $t ----"
-                if transport_agent "$t" "$ws_arg" "$dd" "$host_arg" "$port_arg" "$sfx" 2>&1 | sed 's/^/    /'; then
+                if transport_agent "$t" "$ws_arg" "$dd" "$host_arg" "$port_arg" "$sfx" "$rsh_arg" 2>&1 | sed 's/^/    /'; then
                   ok=$((ok+1))
                 else
                   printf '  FAIL  %-38s transport errored\n' "$t"; skipped=$((skipped+1))
@@ -2028,7 +2050,7 @@ sys.stdout.write("".join("%s\x1f%d\x1f%d\n" % r for r in out))
               fi
               exit 0
             fi
-            transport_agent "$a" "$ws_arg" "$dest_arg" "$host_arg" "$port_arg" ;;
+            transport_agent "$a" "$ws_arg" "$dest_arg" "$host_arg" "$port_arg" "" "$rsh_arg" ;;
   add-folder) add_folder "${2:-}" ;;
   ext-align) ext_align ;;
   add)      add_agent "${2:-}" "${3:-}" "${4:-}" ;;
