@@ -2497,10 +2497,10 @@ print("\n".join(r[2] for r in rows))
                       # both the | separators and flattened markdown **)
                       printf '%s\n' "$nx" \
                         | sed -E -e 's/\*\*//g' -e 's/ *\|+ */ /g' \
-                                 -e 's/(^| )(ASK|WHY|VALUE|RISK|SCORE):/\n\2:/g' \
+                                 -e 's/(^| )(ASK|WHY|VALUE|RISK|SCORE|TAGS):/\n\2:/g' \
                         | while IFS= read -r fl; do
                             case "$fl" in
-                              ASK:*|WHY:*|VALUE:*|RISK:*|SCORE:*)
+                              ASK:*|WHY:*|VALUE:*|RISK:*|SCORE:*|TAGS:*)
                                 printf '     \033[1m%-7s\033[0m%s\n' "${fl%%:*}:" "${fl#*:}" ;;
                             esac
                           done ;;
