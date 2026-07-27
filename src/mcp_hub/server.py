@@ -1172,8 +1172,22 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             "correct from_agent; the record was not written."
         )
 
-    # Exposed for tests — call_tool can't inject a Context, so the gate's
-    # logic is verified directly against seeded registry bindings.
+    # Exposed for tests, to verify the gate's LOGIC directly against seeded
+    # registry bindings.
+    #
+    # It does NOT follow that a tool's refusal can only be tested this way —
+    # the note that used to sit here said call_tool can't inject a Context, and
+    # that is false. ToolManager.call_tool takes a third `context` parameter
+    # and Tool.run passes it as the tool's ctx kwarg, outside pydantic
+    # validation, so a fake session works. What couldn't inject one was the
+    # tests' own _call_tool helper, which never passed the argument.
+    #
+    # The distinction is load-bearing: calling this directly proves the gate
+    # refuses when asked, and nothing about whether a given tool ASKS. Only a
+    # through-the-boundary call can prove a tool consults it — see
+    # test_set_team_refuses_to_move_another_agent, whose DB assertion is the
+    # part a direct call could never make. Believing otherwise cost a declared
+    # "untestable" coverage gap that was never untestable.
     mcp._hub_attribution = _attribution  # type: ignore[attr-defined]
 
     # Plain HTTP health/version probe: `curl http://<hub>/health` returns the

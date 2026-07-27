@@ -277,14 +277,51 @@ async def test_set_team_can_clear_so_a_first_assignment_is_not_one_way(server):
     assert "everyone now" in after, f"clearing the team deafened it:\n{after}"
 
 
-# NOT TESTED HERE, deliberately: that set_team refuses to move ANOTHER agent.
-# It defers to _attribution exactly as unregister does, but call_tool cannot
-# inject a Context (dev's note at the gate's definition), so a test through the
-# tool boundary always grades 'asserted' and would pass whether set_team
-# consulted the gate or not. Calling _attribution directly instead would test
-# the gate — which dev's three tests already cover — while implying coverage of
-# set_team that does not exist. An assertion that cannot fail for the reason it
-# names is worse than the gap it papers over.
+class _FakeSess:
+    _write_stream = object()
+
+    async def send_ping(self):
+        return None
+
+
+class _FakeCtx:
+    def __init__(self, session):
+        self.session = session
+
+
+async def test_set_team_refuses_to_move_another_agent(server, tmp_path):
+    """Moving someone else's team is the destructive form here: they'd be cut
+    out of their squad's broadcasts while still believing they were listening —
+    the silent-failure sibling of the accidental-impersonation class unregister
+    is gated against.
+
+    Reachable through the real boundary, contrary to a comment I wrote here
+    earlier: ToolManager.call_tool takes a third `context` parameter and Tool.run
+    injects it as the tool's ctx kwarg outside pydantic validation, so a fake
+    passes. The "call_tool can't inject a Context" belief was true of this
+    file's helper, which simply never passed one — not of the boundary. Found by
+    dev; verified against the signature before use.
+
+    The DB assertion is the half a direct _attribution call could never make:
+    it proves set_team CONSULTS the gate, not merely that the gate refuses when
+    asked."""
+    await _squad(server)
+    sess = _FakeSess()
+    server._hub_registry.bind("hub", sess)
+
+    result = await server._tool_manager.call_tool(
+        "set_team", {"name": "pm", "team": "hijacked"}, context=_FakeCtx(sess),
+    )
+    out = str(getattr(result, "content", result))
+    assert "REFUSED" in out, f"a bound session moved another agent's team:\n{out}"
+
+    import sqlite3
+    conn = sqlite3.connect(tmp_path / "test.db")
+    team = conn.execute(
+        "SELECT team FROM agents WHERE name = 'pm'"
+    ).fetchone()[0]
+    conn.close()
+    assert team == "dreamteam", f"refused but wrote anyway — pm is now {team!r}"
 
 
 # ---- team persistence -----------------------------------------------------
