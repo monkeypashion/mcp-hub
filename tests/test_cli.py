@@ -1301,6 +1301,68 @@ def test_waiting_regex_matches_prose_ask():
     assert not _WAITING_ON_OP_RE.search("waiting on CI to finish")
 
 
+# -- item 30: the three false-positive mechanisms confirmed in the field ----
+# Every negative case here carries a CONTRAST assertion — the bare regex DOES
+# match the text — so a test cannot go green by the refined check simply
+# never matching anything (the vacuous-fixture failure fb caught 2026-07-26).
+
+from mcp_hub.cli import _card_nag_grace, _reads_as_waiting_on_operator  # noqa: E402
+
+
+def test_negated_waiting_is_not_an_ask():
+    for s in (
+        "All done. Nothing waiting on you tonight.",
+        "Status green — not blocked on you at all.",
+        "Nothing needs your attention here.",
+    ):
+        assert _WAITING_ON_OP_RE.search(s), s          # contrast: old code nags
+        assert not _reads_as_waiting_on_operator(s), s
+
+
+def test_negation_in_earlier_clause_does_not_reach_the_ask():
+    s = "Nothing is broken, but I'm waiting on your call before deploying."
+    assert _reads_as_waiting_on_operator(s)
+
+
+def test_quoted_phrase_is_mention_not_use():
+    for s in (
+        'The regex wrongly matches "waiting on you" inside negations.',
+        "fo's report shows `blocked on you` firing with no ask present.",
+        "The nag fired on “awaiting your” in a bug description.",
+    ):
+        assert _WAITING_ON_OP_RE.search(s), s          # contrast: old code nags
+        assert not _reads_as_waiting_on_operator(s), s
+
+
+def test_the_actual_sentence_that_nagged_the_hub_agent():
+    # Verbatim shape of the 2026-07-27 self-demonstration: a report ABOUT
+    # the nag's negation bug, containing the trigger only in quotes.
+    s = ('the regex is negation-blind — "Nothing waiting on you" '
+         'literally contains "waiting on you" and matches.')
+    assert _WAITING_ON_OP_RE.search(s)
+    assert not _reads_as_waiting_on_operator(s)
+
+
+def test_genuine_ask_survives_a_quote_elsewhere():
+    s = ('fo quoted "waiting on you" in the report. Separately, I am '
+         "blocked on you approving the deploy.")
+    assert _reads_as_waiting_on_operator(s)
+
+
+def test_card_nag_grace_one_nag_then_one_turn_of_grace(tmp_path, monkeypatch):
+    monkeypatch.setenv("MCP_HUB_STATE_DIR", str(tmp_path))
+    assert _card_nag_grace("alice", True) is True       # nag fires
+    assert _card_nag_grace("alice", True) is False      # immediate repeat held
+    assert _card_nag_grace("alice", True) is True       # new episode nags again
+
+
+def test_card_nag_grace_clears_on_nag_free_stop(tmp_path, monkeypatch):
+    monkeypatch.setenv("MCP_HUB_STATE_DIR", str(tmp_path))
+    assert _card_nag_grace("alice", True) is True       # nag, flag set
+    assert _card_nag_grace("alice", False) is False     # episode over, flag cleared
+    assert _card_nag_grace("alice", True) is True       # fresh episode nags at once
+
+
 def _write_transcript(tmp_path, records):
     p = tmp_path / "t.jsonl"
     p.write_text("\n".join(json.dumps(r, separators=(",", ":")) for r in records))

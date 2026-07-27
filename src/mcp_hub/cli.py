@@ -78,6 +78,66 @@ _WAITING_ON_OP_RE = re.compile(
     re.I,
 )
 
+# The waiting-language check is a pattern over prose, and prose fights back
+# (item 30, 2026-07-27): "Nothing waiting on you" contains "waiting on you",
+# and a turn that QUOTES the trigger phrase — a bug report about this very
+# nag — reads identically to a turn that uses it. A regex cannot see context,
+# so the two carve-outs below remove the contexts where the phrase provably
+# is NOT an ask: mentioned text (quotes / code spans) and negated fragments.
+_MENTION_SPAN_RE = re.compile(
+    r"```.*?```"            # fenced code block
+    r"|`[^`\n]*`"           # inline code
+    r'|"[^"\n]{1,160}"'     # straight-quoted span
+    r"|“[^”\n]{1,160}”",    # curly-quoted span
+    re.S,
+)
+# A negation earlier in the SAME fragment flips the match's meaning. The
+# fragment ends at any clause punctuation: "nothing is blocked, but I'm
+# waiting on your call" must still read as an ask.
+_NEGATED_BEFORE_RE = re.compile(
+    r"\b(?:nothing|no|not|none|nor|never|nobody|without|isn'?t|aren'?t)\b"
+    r"[^.!?,;:\n]{0,40}$",
+    re.I,
+)
+
+
+def _reads_as_waiting_on_operator(turn_text: str) -> bool:
+    """True when the turn genuinely reads as waiting on the operator —
+    _WAITING_ON_OP_RE minus the two false-positive contexts confirmed in
+    the field (item 30): use/mention, and negation."""
+    prose = _MENTION_SPAN_RE.sub(" ", turn_text)
+    return any(
+        not _NEGATED_BEFORE_RE.search(prose, 0, m.start())
+        for m in _WAITING_ON_OP_RE.finditer(prose)
+    )
+
+
+def _card_nag_grace(agent_name: str, would_nag: bool) -> bool:
+    """One nag, then one turn of grace. Returns whether the nag may fire.
+
+    A nag re-delivered at the very next Stop reads as "file a card to make
+    it stop", which manufactures exactly the hollow cards the convention
+    bans (fo's report, item 30) — the agent already saw the nag and chose
+    prose; repeating it within the same episode changes nothing but the
+    pressure. The flag file remembers "nagged last Stop"; a Stop that finds
+    it suppresses the repeat and clears it, and any nag-free Stop (card
+    filed, ask answered, phrasing gone) also clears it, so a NEW episode
+    two turns later nags again. Fail-open toward nagging: state trouble
+    must never silence the courier entirely."""
+    flag = _state_dir() / f"card-nag.{agent_name}"
+    try:
+        if not would_nag:
+            flag.unlink(missing_ok=True)
+            return False
+        if flag.exists():
+            flag.unlink(missing_ok=True)
+            return False
+        flag.parent.mkdir(parents=True, exist_ok=True)
+        flag.write_text("1", encoding="utf-8")
+    except OSError:
+        pass
+    return would_nag
+
 
 def _read_last_assistant_text(transcript_path: str | None) -> str:
     """Text of the LAST assistant message in the transcript, '' on any
@@ -1433,9 +1493,14 @@ def stop_hook_command(args: argparse.Namespace) -> int:
     last_turn = _read_last_assistant_text(payload.get("transcript_path"))
     card = _extract_decision_card(last_turn)
     decided = "" if card else _extract_decided(last_turn)
-    card_nag = bool(last_turn) and not card and not decided and bool(
-        _WAITING_ON_OP_RE.search(last_turn)
+    card_nag = bool(last_turn) and not card and not decided and (
+        _reads_as_waiting_on_operator(last_turn)
     )
+    # Grace bookkeeping runs on every natural Stop — a nag-free Stop must
+    # CLEAR the flag, not just a nagging one set it. Backstop Stops
+    # (stop_hook_active) are skipped: they are the same natural turn.
+    if not stop_hook_active:
+        card_nag = _card_nag_grace(name, card_nag)
 
     try:
         messages_text, broadcasts_text, is_online = asyncio.run(
