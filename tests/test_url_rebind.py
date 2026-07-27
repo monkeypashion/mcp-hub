@@ -107,11 +107,13 @@ def test_rebind_url_dry_run_writes_nothing(tmp_path, monkeypatch):
     assert "agent=" not in url
 
 
-def test_rebind_url_finds_user_scope_config(tmp_path, monkeypatch):
-    """Hand-configured seats keep the hub in ~/.claude.json, not a repo
-    .mcp.json — a rollout that only knew the repo file would silently skip
-    them (measured on the maintainer's own seat, 2026-07-27). Unrelated
-    state in that file must survive the edit."""
+def test_rebind_url_refuses_the_shared_global_scope(tmp_path, monkeypatch):
+    """The user-global mcpServers.hub is shared by EVERY seat on the box —
+    stamping one seat's identity into it made every reconnecting agent on
+    dev-vm-1 announce itself as that seat (the 2026-07-27 cross-delivery
+    incident: dt received the hub maintainer's DMs within the hour). The
+    global scope must never be a stamping target, even when it is the only
+    hub config present."""
     home = tmp_path / "home"
     home.mkdir()
     work = tmp_path / "repo"
@@ -126,10 +128,35 @@ def test_rebind_url_finds_user_scope_config(tmp_path, monkeypatch):
         "mcpServers": {"hub": {"url": "http://h/mcp"}},
     }))
     rc = rebind_url_command(argparse.Namespace(cwd=str(work), dry_run=False))
+    assert rc == 1
+    data = json.loads((home / ".claude.json").read_text())
+    assert "agent=" not in data["mcpServers"]["hub"]["url"]  # untouched
+    assert data["someOtherSetting"] == {"keep": "me"}
+
+
+def test_rebind_url_stamps_per_project_override(tmp_path, monkeypatch):
+    """~/.claude.json's per-project override denotes ONE seat (keyed by cwd)
+    — that scope is safe to stamp even though the file is user-level."""
+    home = tmp_path / "home"
+    home.mkdir()
+    work = tmp_path / "repo"
+    work.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.setattr(
+        "mcp_hub.cli._derive_agent_identity",
+        lambda cwd: ("mcp-hub-test-host", "org/mcp-hub"),
+    )
+    (home / ".claude.json").write_text(json.dumps({
+        "mcpServers": {"hub": {"url": "http://global/mcp"}},
+        "projects": {str(work): {"mcpServers": {"hub": {"url": "http://mine/mcp"}}}},
+    }))
+    rc = rebind_url_command(argparse.Namespace(cwd=str(work), dry_run=False))
     assert rc == 0
     data = json.loads((home / ".claude.json").read_text())
-    assert data["mcpServers"]["hub"]["url"].endswith("?agent=mcp-hub-test-host")
-    assert data["someOtherSetting"] == {"keep": "me"}
+    assert "agent=mcp-hub-test-host" in (
+        data["projects"][str(work)]["mcpServers"]["hub"]["url"]
+    )
+    assert "agent=" not in data["mcpServers"]["hub"]["url"]  # global untouched
 
 
 def test_rebind_url_prefers_repo_scope_over_user_scope(tmp_path, monkeypatch):

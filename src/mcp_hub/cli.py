@@ -1418,16 +1418,18 @@ def _ephemeral_hub_url(url: str) -> str:
 
 
 def _hub_config_candidates(cwd: str) -> list[tuple[pathlib.Path, list[str]]]:
-    """Where a seat's hub server URL may live, in precedence order:
-    the repo-scoped `.mcp.json` (what transport generates), then the
-    user-scoped `~/.claude.json` — either global `mcpServers.hub` or a
-    per-project override. Hand-configured seats use the user scope, so a
-    rollout tool that only knew about `.mcp.json` would silently skip them
-    (measured on this very seat, 2026-07-27)."""
+    """Where a seat's hub URL may be stamped, in precedence order: the
+    repo-scoped `.mcp.json`, then ~/.claude.json's PER-PROJECT override.
+
+    The user-global `mcpServers.hub` is DELIBERATELY not a candidate. It is
+    shared by every seat on the box, and stamping one seat's identity into
+    it made every reconnecting agent on dev-vm-1 announce itself as that
+    seat — the 2026-07-27 cross-delivery incident (dt received the hub
+    maintainer's DMs within the hour; fb measured the poisoned file). An
+    identity stamp belongs only in scopes that denote ONE seat."""
     return [
         (pathlib.Path(cwd) / ".mcp.json", ["mcpServers", "hub"]),
         (pathlib.Path.home() / ".claude.json", ["projects", cwd, "mcpServers", "hub"]),
-        (pathlib.Path.home() / ".claude.json", ["mcpServers", "hub"]),
     ]
 
 
