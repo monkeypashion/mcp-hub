@@ -464,6 +464,43 @@ def init_db(db_path: Path = DB_PATH) -> None:
     except sqlite3.OperationalError:
         pass  # Column already exists
 
+    # Migrate: TEAM — the squad an agent belongs to, and the unit a broadcast
+    # is scoped to.
+    #
+    # NOT the project, and not the org. Measured 2026-07-27: one squad's
+    # investigation spanned dreamteam-ai-labs/{pm,factory-operations,dreamteam,
+    # spike} AND monkeypashion/vps-hetzner — four projects across two orgs,
+    # collaborating legitimately. Scoping by project would have severed them
+    # from each other; scoping by org would have put vps with mcp-hub, i.e.
+    # joined to the agents that should have been excluded and cut off from the
+    # squad it actually works with. Both cut across the real boundary.
+    #
+    # The real unit is the WORKSPACE — it is already what squad scopes tabs,
+    # transport and teardown by — but workspace FILES are machine-local and
+    # their names differ per machine, so the name cannot be the identifier. An
+    # explicit team is the smallest thing that survives crossing machines.
+    #
+    # Empty means "no declared team", which deliberately behaves exactly as
+    # today: an agent with no team broadcasts fleet-wide, because a group we
+    # cannot name is not a group we may silently exclude people from.
+    try:
+        conn.execute("ALTER TABLE agents ADD COLUMN team TEXT NOT NULL DEFAULT ''")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    # Migrate: AUDIENCE — who a broadcast was for, recorded ON THE ROW at send
+    # time rather than recomputed from the sender later. A sender's team can
+    # change; a message's audience must not move retroactively, or the Stop-hook
+    # catch-up would show an agent history it was never party to (or hide
+    # history it was). Empty = fleet-wide, which is what every pre-existing row
+    # was, so the default is also the correct backfill.
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN audience TEXT NOT NULL DEFAULT ''")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
     # Migrate: add idle-tracking columns. Used by the Case 1 wake-on-low-prio
     # path: low-prio DMs to an idle recipient fire wake (so soft asks
     # surface immediately) while staying queue-only for running recipients
@@ -1368,7 +1405,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     @mcp.tool()
     def register(
         name: str, project: str = "", bio: str = "", meta: str = "{}",
-        ctx: Context | None = None,
+        team: str = "", ctx: Context | None = None,
     ) -> str:
         """Register this agent session with the hub.
 
@@ -1381,6 +1418,12 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         Args:
             name: Your agent name (e.g. 'dreamteam-lead', 'reliable-ai-dev').
             project: Project you're working on (e.g. 'dreamteam', 'mcp-hub').
+            team: The squad you belong to (e.g. 'dreamteam'). Broadcasts are
+                  scoped to a team by default, so this decides who hears you
+                  and whose chatter reaches you. NOT the project — one squad
+                  routinely spans several projects and even several orgs.
+                  Empty preserves any stored value and means "no declared
+                  team", which behaves exactly as before: fleet-wide.
             bio: Short description of your role/skills so other agents know what you do.
             meta: Optional JSON metadata about this agent.
         """
@@ -1404,17 +1447,22 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             (_BROADCAST_CHANNEL,),
         ).fetchone()["m"]
 
+        # team follows the same rule as bio: an empty value on re-register
+        # PRESERVES what is stored, so an agent that hasn't learned to send one
+        # yet cannot silently drop itself out of its squad on a reconnect.
+        # Clearing a team is therefore deliberate, via update_team.
         conn.execute(
             """INSERT INTO agents (name, project, bio, status, registered,
-                                   last_seen, meta, last_broadcast_seen_id)
-               VALUES (?, ?, ?, 'online', ?, ?, ?, ?)
+                                   last_seen, meta, last_broadcast_seen_id, team)
+               VALUES (?, ?, ?, 'online', ?, ?, ?, ?, ?)
                ON CONFLICT(name) DO UPDATE SET
                    project=excluded.project,
                    bio=CASE WHEN excluded.bio = '' THEN agents.bio ELSE excluded.bio END,
+                   team=CASE WHEN excluded.team = '' THEN agents.team ELSE excluded.team END,
                    status='online',
                    last_seen=excluded.last_seen,
                    meta=excluded.meta""",
-            (name, project, bio, now, now, meta, max_broadcast_id),
+            (name, project, bio, now, now, meta, max_broadcast_id, team),
         )
         conn.commit()
         _close_coverage_gap(conn, name)
@@ -1749,7 +1797,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     @mcp.tool()
     async def broadcast(
         from_agent: str, message: str, priority: str = "normal",
-        ctx: Context | None = None,
+        scope: str = "team", ctx: Context | None = None,
     ) -> str:
         """Post a broadcast every agent will see.
 
@@ -1779,12 +1827,22 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             from_agent: Your agent name.
             message: The message body.
             priority: One of "low" | "normal" | "urgent". Defaults to "normal".
+            scope: "team" (default) reaches only agents in your team; "fleet"
+                  reaches everyone. Default changed 2026-07-27: an untargeted
+                  fleet-wide default meant one squad's multi-turn investigation
+                  woke every agent on the hub, and three copies of an
+                  uninvolved agent answered into a lane whose context they did
+                  not hold. A sender with NO declared team still reaches
+                  everyone — a group we cannot name is not one we may silently
+                  exclude people from.
         """
         if priority not in _VALID_PRIORITIES:
             return (
                 f"Invalid priority '{priority}'. "
                 f"Use one of: {sorted(_VALID_PRIORITIES)}."
             )
+        if scope not in ("team", "fleet"):
+            return f"Invalid scope '{scope}'. Use 'team' or 'fleet'."
 
         now = time.time()
         conn = _get_db(db_path)
@@ -1795,6 +1853,17 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         if attr_err:
             return attr_err
 
+        # The audience is resolved HERE and stored on the row, so it can never
+        # move later. An unknown sender, or one with no team, gets '' = fleet.
+        # Sits below the attribution gate deliberately: a refused caller must
+        # not reach the DB at all. It is a read, so it cannot rebind — the gate
+        # only has to precede touch_session, which it still does.
+        sender = conn.execute(
+            "SELECT team FROM agents WHERE name = ?", (from_agent,)
+        ).fetchone()
+        sender_team = (sender["team"] if sender else "") or ""
+        audience = sender_team if scope == "team" else ""
+
         # Auto-bind sender's session for drift self-heal.
         touch_session(from_agent, ctx)
 
@@ -1803,8 +1872,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         )
         cursor = conn.execute(
             "INSERT INTO messages (ts, from_agent, channel, body, priority, "
-            "attribution) VALUES (?, ?, ?, ?, ?, ?)",
-            (now, from_agent, _BROADCAST_CHANNEL, message, priority, grade),
+            "attribution, audience) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (now, from_agent, _BROADCAST_CHANNEL, message, priority, grade, audience),
         )
         broadcast_id = cursor.lastrowid
 
@@ -1827,7 +1896,19 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 f"agents will see it via get_broadcasts())."
             )
 
+        # BOTH delivery paths must filter or the fix is cosmetic. A broadcast
+        # reaches an agent live here, AND via the Stop-hook cursor catch-up in
+        # get_broadcasts_for_agent. Several of the messages that caused
+        # 2026-07-27's cross-lane replies arrived through the SECOND path.
         recipients = [a for a in registry.names() if a != from_agent]
+        if audience:
+            in_team = {
+                r["name"]
+                for r in conn.execute(
+                    "SELECT name FROM agents WHERE team = ?", (audience,)
+                ).fetchall()
+            }
+            recipients = [a for a in recipients if a in in_team]
 
         # Parallel fan-out. Each push_channel involves an async send through
         # the recipient's MCP write stream; serializing them means broadcast
@@ -2393,11 +2474,20 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 
         cursor = row["last_broadcast_seen_id"]
 
+        # Second delivery path — see the note in broadcast(). An agent catches
+        # up on fleet-wide rows (audience = '') plus its own team's. The cursor
+        # still advances past everything, so a filtered-out row is never
+        # re-offered: it was not for this agent, at the time it was sent.
+        my_team = conn.execute(
+            "SELECT team FROM agents WHERE name = ?", (agent_name,)
+        ).fetchone()
+        my_team = (my_team["team"] if my_team else "") or ""
         rows = conn.execute(
             """SELECT id, ts, from_agent, body, priority FROM messages
                WHERE channel = ? AND id > ?
+                 AND (audience = '' OR audience = ?)
                ORDER BY id ASC LIMIT ?""",
-            (_BROADCAST_CHANNEL, cursor, limit),
+            (_BROADCAST_CHANNEL, cursor, my_team, limit),
         ).fetchall()
 
         if not rows:
