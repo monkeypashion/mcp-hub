@@ -1540,6 +1540,50 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         return f"Bio updated for '{name}'."
 
     @mcp.tool()
+    def set_team(name: str, team: str, ctx: Context | None = None) -> str:
+        """Set — or clear — the squad you belong to.
+
+        register(team=...) merges: an empty value there PRESERVES the stored
+        team, so a reconnecting agent that doesn't send one cannot silently
+        drop out of its squad. That rule is right for register and it leaves
+        no way to say "remove me", because empty already means "no opinion".
+        Hence this tool, where the value passed is AUTHORITATIVE — including
+        empty, which clears. The two compose, and no magic sentinel string is
+        needed. Same split as update_bio against register's bio merge.
+
+        Without it, a first team assignment would be one-way, and `team` is a
+        live parameter the moment this deploys: the first agent to try
+        register(team="test") by hand would be stuck in "test" permanently.
+
+        Args:
+            name: Your agent name.
+            team: The squad to join. Empty string CLEARS your team, which
+                  returns you to hearing (and reaching) every agent — the
+                  pre-scoping behaviour.
+        """
+        # A bound session may only set ITS OWN team — same class as
+        # unregister. Setting someone else's would quietly cut them out of
+        # their squad's broadcasts, which is the destructive form here: they
+        # would go on believing they were listening. Ephemeral/unbound
+        # callers unchanged, as everywhere else.
+        _grade, attr_err = _attribution(ctx, name)
+        if attr_err:
+            return attr_err
+        conn = _get_db(db_path)
+        row = conn.execute("SELECT 1 FROM agents WHERE name = ?", (name,)).fetchone()
+        if not row:
+            return f"Agent '{name}' not found. Register first with register()."
+        conn.execute("UPDATE agents SET team = ? WHERE name = ?", (team, name))
+        conn.commit()
+        touch_session(name, ctx)
+        if not team:
+            return (
+                f"Team cleared for '{name}' — now reaching and hearing every "
+                f"agent, as before scoping."
+            )
+        return f"Team set to '{team}' for '{name}'."
+
+    @mcp.tool()
     def unregister(name: str, ctx: Context | None = None) -> str:
         """Mark an agent as offline.
 
@@ -1842,6 +1886,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                   not hold. A sender with NO declared team still reaches
                   everyone — a group we cannot name is not one we may silently
                   exclude people from.
+
+                  NOT CONFIDENTIALITY. This scopes DELIVERY — who is woken and
+                  whose catch-up it lands in. It is noise reduction, and that
+                  is all it is. get_broadcasts() and get_history('#general')
+                  are deliberately unfiltered, so any agent can still read any
+                  team's broadcasts by asking for them. Never put something in
+                  a team-scoped broadcast that the fleet may not read.
         """
         if priority not in _VALID_PRIORITIES:
             return (
@@ -2482,9 +2533,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         cursor = row["last_broadcast_seen_id"]
 
         # Second delivery path — see the note in broadcast(). An agent catches
-        # up on fleet-wide rows (audience = '') plus its own team's. The cursor
-        # still advances past everything, so a filtered-out row is never
-        # re-offered: it was not for this agent, at the time it was sent.
+        # up on fleet-wide rows (audience = '') plus its own team's.
         my_team = conn.execute(
             "SELECT team FROM agents WHERE name = ?", (agent_name,)
         ).fetchone()
@@ -2497,19 +2546,44 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             (_BROADCAST_CHANNEL, cursor, my_team, limit),
         ).fetchall()
 
-        if not rows:
-            return ""
-
         # Advance cursor to the max id we're returning. Atomic with the read
         # — if the agent's Stop hook crashes after this commit, the cursor
         # is already advanced, mirroring how get_messages marks DMs read on
         # consume.
-        max_id = max(r["id"] for r in rows)
-        conn.execute(
-            "UPDATE agents SET last_broadcast_seen_id = ? WHERE name = ?",
-            (max_id, agent_name),
-        )
-        conn.commit()
+        #
+        # TRAILING FILTERED ROWS need absorbing separately, and this is why the
+        # advance now happens BEFORE the empty return rather than after it.
+        # Advancing only to the max id RETURNED means a filtered row is skipped
+        # past only when some visible row happens to lie beyond it. A
+        # team-scoped broadcast is usually the NEWEST row at send time, so
+        # without this every non-member's cursor stalls beneath it forever:
+        # they re-scan it on every Stop hook, and — the real damage — the
+        # filter compares against the agent's CURRENT team, so joining that
+        # team later would dump every historical row above the stall point
+        # into their context at once.
+        #
+        # Guarded on len(rows) < limit, which is what proves the scan reached
+        # the end of the feed rather than being cut short by LIMIT. When LIMIT
+        # did cut it short there may be visible rows further on, and jumping to
+        # MAX(id) would skip them — a silent message loss, which is strictly
+        # worse than the stall being fixed. Those tails are absorbed by the
+        # next call instead. Filtered rows BETWEEN visible ones need nothing:
+        # returned-max already covers them.
+        advance_to = max((r["id"] for r in rows), default=0)
+        if len(rows) < limit:
+            advance_to = max(advance_to, conn.execute(
+                "SELECT COALESCE(MAX(id), 0) AS m FROM messages WHERE channel = ?",
+                (_BROADCAST_CHANNEL,),
+            ).fetchone()["m"])
+        if advance_to > cursor:
+            conn.execute(
+                "UPDATE agents SET last_broadcast_seen_id = ? WHERE name = ?",
+                (advance_to, agent_name),
+            )
+            conn.commit()
+
+        if not rows:
+            return ""
 
         lines = []
         capped = 0
