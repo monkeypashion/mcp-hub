@@ -649,6 +649,106 @@ def _workspace_suffix(cwd: str) -> str | None:
     return None
 
 
+def _resolve_squads(cwd: str) -> list[str]:
+    """Squads this worktree belongs to, from WORKSPACE TYPE. Never raises.
+
+    A `.code-workspace` file is typed by listing it here with the squad it
+    names:
+
+        {"squad_workspaces": {"/home/me/Projects/dreamteam.code-workspace":
+                              "dreamteam"}}
+
+    A FACULTY workspace needs no entry at all — it is an assembly of unrelated
+    agents gathered for convenience, and confers no membership. Faculty is the
+    absence of a squad, not a kind of one, so "not listed" is exactly the right
+    representation and there is nothing to keep in sync.
+
+    An agent in three squad workspaces is in three squads: that is where
+    multi-membership comes from, and why nothing here needs a per-agent list.
+    Put the folder in the workspace and the membership follows — one
+    bookkeeping step, not two.
+
+    Only workspace files named in the config are read, so this never searches
+    the filesystem and cannot be surprised by a stray file. A workspace that has
+    been deleted or moved is skipped rather than fatal: losing a squad is a
+    smaller failure than refusing to register at all.
+    """
+    table = _load_hub_config().get("squad_workspaces")
+    if not isinstance(table, dict):
+        return []
+    target = _norm_path(cwd)
+    found: set[str] = set()
+    for ws_path, squad in table.items():
+        if not (isinstance(ws_path, str) and isinstance(squad, str) and squad.strip()):
+            continue
+        for folder in _workspace_folders(ws_path):
+            if _norm_path(folder) == target:
+                found.add(squad.strip())
+                break
+    return sorted(found)
+
+
+def _workspace_folders(ws_path: str) -> list[str]:
+    """Absolute folder paths listed in a .code-workspace file. [] on any error.
+
+    These files are JSONC — VSCode tolerates comments and trailing commas, and
+    the operator's are hand-formatted, so a strict json.loads fails on real
+    ones. Comments are stripped before parsing rather than the file being
+    rewritten: transport already learned that lesson the other way round, where
+    a load-and-dump would have destroyed the formatting.
+
+    Relative folder paths are resolved against the workspace file's directory,
+    which is how VSCode itself interprets them.
+    """
+    try:
+        raw = pathlib.Path(ws_path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    # Strip // and /* */ comments outside string literals, then trailing commas.
+    out, i, n, in_str, esc = [], 0, len(raw), False, False
+    while i < n:
+        ch = raw[i]
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+        elif raw.startswith("//", i):
+            i = raw.find("\n", i)
+            if i == -1:
+                break
+        elif raw.startswith("/*", i):
+            j = raw.find("*/", i + 2)
+            i = n if j == -1 else j + 2
+        else:
+            out.append(ch)
+            i += 1
+    text = re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    folders = data.get("folders") if isinstance(data, dict) else None
+    if not isinstance(folders, list):
+        return []
+    base = pathlib.Path(ws_path).parent
+    paths = []
+    for entry in folders:
+        p = entry.get("path") if isinstance(entry, dict) else None
+        if isinstance(p, str) and p:
+            paths.append(str(p if os.path.isabs(p) else (base / p)))
+    return paths
+
+
 def _parse_org_repo(url: str) -> tuple[str, str] | None:
     """Parse (org, repo) from a git remote URL, ignoring the host entirely.
 
@@ -1770,12 +1870,24 @@ def session_start_command(args: argparse.Namespace) -> int:
     that gets injected into the agent's context before the first turn.
     Claude reads it and acts on it proactively.
     """
-    name, project = _resolve_agent_identity(args)
+    # Read stdin ONCE and pass it in — it is not re-readable, and the squad
+    # resolution below needs the SAME cwd the identity was derived from.
+    payload = _read_hook_stdin()
+    name, project = _resolve_agent_identity(args, payload)
     if name is None:
         return 0  # no marker → silent no-op
 
     project_str = f', project="{project}"' if project else ""
-    register_call = f'mcp__hub__register(name="{name}"{project_str})'
+    # Squads ride the SAME path as name and project: derived here, injected
+    # into the register call, so no agent has to learn anything new. Empty is
+    # omitted rather than sent as "" — register treats empty as "no opinion"
+    # and preserves, so sending it explicitly would be a no-op that only
+    # made the instruction noisier.
+    squads = _resolve_squads(payload.get("cwd") or os.getcwd())
+    squads_str = f', squads="{",".join(squads)}"' if squads else ""
+    register_call = (
+        f'mcp__hub__register(name="{name}"{project_str}{squads_str})'
+    )
 
     context = (
         f"You are the hub agent **{name}**"
@@ -1821,12 +1933,18 @@ def session_rewake_command(args: argparse.Namespace) -> int:
     Reads `<cwd>/.claude/hub-agent.json`; silent no-op (exit 0) if no
     marker found, so non-hub projects don't get spurious wake events.
     """
-    name, project = _resolve_agent_identity(args)
+    payload = _read_hook_stdin()
+    name, project = _resolve_agent_identity(args, payload)
     if name is None:
         return 0  # no marker → exit 0, no wake
 
     project_str = f', project="{project}"' if project else ""
-    register_call = f'mcp__hub__register(name="{name}"{project_str})'
+    # Same derivation as session-start — see the note there.
+    squads = _resolve_squads(payload.get("cwd") or os.getcwd())
+    squads_str = f', squads="{",".join(squads)}"' if squads else ""
+    register_call = (
+        f'mcp__hub__register(name="{name}"{project_str}{squads_str})'
+    )
     msg = (
         f"Hub auto-register: call `{register_call}` now to bind your "
         f"interactive MCP session for channel-push wake. The heartbeat "
