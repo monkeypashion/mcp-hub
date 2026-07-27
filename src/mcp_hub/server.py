@@ -1450,7 +1450,14 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # team follows the same rule as bio: an empty value on re-register
         # PRESERVES what is stored, so an agent that hasn't learned to send one
         # yet cannot silently drop itself out of its squad on a reconnect.
-        # Clearing a team is therefore deliberate, via update_team.
+        #
+        # The cost of that rule, stated plainly because it is a real gap: there
+        # is currently NO way to clear a team once set. Empty means "no opinion",
+        # so it cannot also mean "remove me". Un-teaming needs an explicit tool
+        # (or a sentinel value) and neither exists yet — a first team assignment
+        # is effectively one-way until one does. Deliberately not built here:
+        # the client side that would set a team in the first place isn't built
+        # either, so nothing on the hub can reach this state yet.
         conn.execute(
             """INSERT INTO agents (name, project, bio, status, registered,
                                    last_seen, meta, last_broadcast_seen_id, team)
