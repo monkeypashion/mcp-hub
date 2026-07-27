@@ -995,6 +995,20 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             fought — register() and touch_session own that path.
         Binding marks the agent online and closes its coverage gap, so the
         fleet returns ⚡ from a deploy with zero agent involvement."""
+        # DISARMED 2026-07-27 ~19:00 pending re-arm via MCP_HUB_URL_REBIND=1.
+        # The stamp was removed from every config, but every LONG-RUNNING
+        # client on dev-vm-1 loaded the poisoned URL at startup and keeps
+        # announcing it from process memory on every reconnect — and a
+        # reconnecting session is UNOWNED for the seconds before its agent
+        # re-registers, which is exactly the window the cross-identity guard
+        # cannot cover (post-deploy, pm's tagged-but-unowned transport was
+        # bound under the maintainer's name and became the second sink).
+        # With zero legitimately-stamped seats, ANY ?agent= is stale poison;
+        # the sweep stays dark until stamps are re-issued per-seat with
+        # relaunches coordinated, then re-armed explicitly via the env var.
+        if os.environ.get("MCP_HUB_URL_REBIND") != "1":
+            logger.info("url-rebind sweep DISARMED (MCP_HUB_URL_REBIND != 1)")
+            return
         while True:
             try:
                 await anyio.sleep(10.0)
