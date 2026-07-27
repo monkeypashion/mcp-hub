@@ -361,6 +361,42 @@ async def test_wake_dead_drop_marks_offline_and_queues_guidance(tmp_path: Path):
     inbox = await _call_tool(server, "get_messages", {"agent_name": "alice"})
     assert "hub" in inbox and "RELAUNCH" in inbox
     assert "re-register" in inbox.lower() or "register()" in inbox
+    # The guidance names BOTH classes and hands the agent the discriminator
+    # (2026-07-27: most drops were healthy busy sessions; the old wording
+    # prescribed relaunch unconditionally and spent an operator action on a
+    # healthy seat).
+    assert "FALSE ALARM" in inbox
+    assert "TWO causes" in inbox
+
+
+def test_wake_ack_horizon_spans_a_working_turn():
+    """90s false-verdicted mid-turn agents (11 drops on 2026-07-27, most
+    against healthy sessions). The horizon must exceed a long working turn —
+    an agent's ack arrives at its next Stop."""
+    assert SessionRegistry.WAKE_ACK_TIMEOUT_SECONDS >= 900.0
+
+
+def test_wake_ack_drop_logs_at_warning(caplog):
+    """A binding drop is the event the detector exists to report; INFO made
+    it invisible to level-keyed alerting (zero WARNING in 78k lines while 11
+    drops happened, vps 2026-07-27)."""
+    import logging
+    import time as _t
+
+    reg = SessionRegistry()
+    reg.WAKE_ACK_TIMEOUT_SECONDS = 0.01
+    reg.bind("alice", _FakeSess())
+    with caplog.at_level(logging.WARNING, logger="mcp_hub.session_registry"):
+        for _ in range(2):
+            reg.expect_wake_ack("alice")
+            with reg._lock:
+                reg._wake_expect["alice"] = _t.time() - 1.0
+            reg.sweep_wake_acks()
+    assert any(
+        r.levelno == logging.WARNING and "wake-ack: dropping" in r.message
+        for r in caplog.records
+    )
+    reg.close()
 
 
 async def test_get_messages_acks_pending_wake_expectation(tmp_path: Path):

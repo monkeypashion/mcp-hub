@@ -169,15 +169,25 @@ class SessionRegistry:
     ACTIVITY_TIMEOUT_SECONDS: float = 3600.0  # 60 minutes
 
     # Wake-ack expectation: after the hub pushes a wake, the woken agent
-    # always produces SOME observable activity (a tool call that binds, or
-    # at minimum its Stop-hook draining messages). A client whose SSE stream
-    # is half-dead accepts the push but renders nothing — binding fresh,
-    # deliverability probe green, ⚡ lying. The server can't introspect the
-    # far end, so it uses evidence it CAN see: no ack within the timeout is
-    # a strike; WAKE_STRIKES_TO_DROP consecutive unacked wakes drop the
-    # binding through the reaper path (truthful offline → Stop-hook nag),
-    # and on_wake_dead lets the server queue relaunch guidance.
-    WAKE_ACK_TIMEOUT_SECONDS: float = 90.0
+    # eventually produces SOME observable activity (a tool call that binds,
+    # or at minimum its Stop-hook draining messages). A client whose SSE
+    # stream is half-dead accepts the push but renders nothing — binding
+    # fresh, deliverability probe green, ⚡ lying. The server can't
+    # introspect the far end, so it uses evidence it CAN see: no ack within
+    # the timeout is a strike; WAKE_STRIKES_TO_DROP consecutive unacked
+    # wakes drop the binding through the reaper path (truthful offline →
+    # Stop-hook nag), and on_wake_dead lets the server queue recovery
+    # guidance.
+    #
+    # 90s was tuned for the idle case and FALSE-VERDICTED busy agents
+    # (2026-07-27: 11 drops in one day, most against healthy mid-turn
+    # sessions — pushes rendering live in their context while they made
+    # zero hub calls until their turn ended; one verdict spent an operator
+    # relaunch on a healthy session). A busy agent's ack arrives at its
+    # next Stop, so the horizon must span a long working turn. A genuinely
+    # half-dead stream still never acks and drops within ~2 strikes — later
+    # than before, but with a verdict worth acting on.
+    WAKE_ACK_TIMEOUT_SECONDS: float = 900.0
     WAKE_STRIKES_TO_DROP: int = 2
 
     def __init__(
@@ -823,15 +833,19 @@ class SessionRegistry:
                     # _drop_primary_locked, so it isn't charged the dead
                     # primary's strikes). Only fire the offline callbacks when
                     # no session survives.
+                    # WARNING, not INFO: a binding drop is the event the
+                    # whole detector exists to report, and level-keyed
+                    # alerting never fired on it (vps, 2026-07-27: zero
+                    # WARNING/ERROR in 78k lines while 11 drops happened).
                     if self._drop_primary_locked(name):
-                        logger.info(
+                        logger.warning(
                             "wake-ack: dropping %s after %d unacked wakes "
                             "(stream presumed dead, no other session)",
                             name, strikes,
                         )
                         dropped.append(name)
                     else:
-                        logger.info(
+                        logger.warning(
                             "wake-ack: %s primary unacked after %d wakes — "
                             "promoted an extra session; agent stays online",
                             name, strikes,

@@ -757,11 +757,18 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     # the activity-timeout drop (a `--channels` session's live connection is
     # its own heartbeat — no daemon needed).
     def _on_wake_dead(name: str) -> None:
-        """Wake-ack callback: the agent's stream is presumed dead (pushed
-        wakes produced zero activity). The binding is already dropped and
-        on_reap marked them offline; queue guidance so their next Stop-hook
-        pull tells them the RIGHT recovery — a plain re-register rebinds but
-        cannot revive a dead stream."""
+        """Wake-ack callback: pushed wakes produced no ack before the strike
+        limit. The binding is already dropped and on_reap marked them
+        offline; queue guidance for their next Stop-hook pull.
+
+        The guidance names BOTH classes behind this one signal instead of
+        prescribing a relaunch for either (2026-07-27: 11 drops in a day —
+        most were healthy mid-turn sessions, one was a genuinely push-deaf
+        seat, and the old wording spent an operator relaunch on a healthy
+        session while telling the deaf one nothing it could verify). Only
+        the agent can see which class it's in — whether pushes render live
+        in its context — so the message hands it the discriminator, not a
+        verdict."""
         try:
             conn = _get_db(db_path)
             conn.execute(
@@ -772,17 +779,24 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                     "hub",
                     name,
                     (
-                        "⚠️ Wake-stream check: the hub pushed wakes to your "
-                        "session and saw no activity — your wake-receive "
-                        "stream appears DEAD even though your binding was "
-                        "live. Your binding has been dropped (you'll show "
-                        "offline). A plain register() will rebind you but "
-                        "may NOT revive the stream: if you go unwakeable "
-                        "again without a hub redeploy, RELAUNCH your Claude "
-                        "session (with --continue to keep context; on squad "
-                        "hosts: squad restart <you>). Rule: re-register "
-                        "fixes a stale binding; only relaunch fixes a dead "
-                        "stream."
+                        "⚠️ Wake-ack check: the hub pushed wakes to your "
+                        "session and saw no message-drain before the strike "
+                        "limit, so your binding was dropped (you'll show "
+                        "offline). This one signal has TWO causes, and only "
+                        "you can see which applies — check whether hub "
+                        "messages have been arriving LIVE in your context "
+                        "(as <channel> tags mid-turn or idle wakes): "
+                        "(1) they have → FALSE ALARM: you were simply deep "
+                        "in a turn without calling hub tools; register() "
+                        "and carry on, nothing is broken. "
+                        "(2) nothing has arrived live all session — "
+                        "everything reaches you only via Stop-hook pulls "
+                        "like this one → your receive stream is genuinely "
+                        "dead: register() rebinds but cannot revive it; "
+                        "RELAUNCH your Claude session (--continue keeps "
+                        "context; squad hosts: squad restart <you>). "
+                        "If unsure: register(), then watch the next push — "
+                        "a healthy stream shows it to you live."
                     ),
                     "normal",
                 ),
