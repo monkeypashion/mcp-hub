@@ -130,9 +130,31 @@ const vscode = {
   },
 };
 
+// Some commands TYPE into the tab (attaching is a property of that terminal)
+// and others run in the BACKGROUND via squadExec -> child_process.execFile.
+// Capturing only the first made background commands look like no-ops, so stub
+// child_process too and record both. `execSync` stays real: the preview/dry-run
+// paths legitimately shell out and expect output.
+const execs = [];
+const realCp = require("child_process");
+const cpStub = {
+  ...realCp,
+  execFile(file, args, opts, cb) {
+    execs.push([file, ...(Array.isArray(args) ? args : [])].join(" "));
+    const done = typeof opts === "function" ? opts : cb;
+    if (typeof done === "function") done(null, "", "");
+    return { on() {}, unref() {} };
+  },
+  spawn(file, args) {
+    execs.push([file, ...(Array.isArray(args) ? args : [])].join(" "));
+    return { on() {}, unref() {}, stdout: { on() {} }, stderr: { on() {} } };
+  },
+};
+
 const origRequire = Module.prototype.require;
 Module.prototype.require = function (id) {
   if (id === "vscode") return vscode;
+  if (id === "child_process") return cpStub;
   return origRequire.apply(this, arguments);
 };
 
@@ -168,16 +190,16 @@ ext.activate({ subscriptions: [] });
       // withAgents() invokes its callback WITHOUT awaiting it, so the command
       // returns before any dialog has run. Drain the microtask/timer queues
       // until nothing new arrives, rather than guessing a sleep.
-      for (let i = 0, last = -1; i < 40 && last !== sent.length + shown.length; i++) {
-        last = sent.length + shown.length;
+      for (let i = 0, last = -1; i < 40 && last !== sent.length + shown.length + execs.length; i++) {
+        last = sent.length + shown.length + execs.length;
         await new Promise((r) => setTimeout(r, 25));
       }
     } catch (e) {
-      console.log(JSON.stringify({ error: String((e && e.message) || e), sent, shown }));
+      console.log(JSON.stringify({ error: String((e && e.message) || e), sent, shown, execs }));
       process.exitCode = 3;
       return;
     }
-    console.log(JSON.stringify({ sent, shown }));
+    console.log(JSON.stringify({ sent, shown, execs }));
     return;
   }
   console.log(JSON.stringify({ error: `unknown mode: ${mode}` }));
