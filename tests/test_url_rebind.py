@@ -235,6 +235,29 @@ async def test_gap_notice_surfaces_once_then_clears(tmp_path):
     assert "Coverage gap" not in again
 
 
+async def test_gap_notice_ignores_the_agents_own_traffic(tmp_path):
+    """You cannot miss your own messages. Found by the notice's first live
+    firing (2026-07-27): it reported one missed message to the seat that
+    shipped it — that seat's own deploy broadcast, sent during its gap."""
+    server = create_server(db_path=tmp_path / "t.db")
+    await _call_tool(server, "register", {"name": "alice", "project": "p"})
+    import sqlite3
+    import time as _t
+    conn = sqlite3.connect(tmp_path / "t.db")
+    conn.execute(
+        "UPDATE agents SET status='offline', offline_since=? WHERE name='alice'",
+        (_t.time() - 60,),
+    )
+    conn.commit()
+    conn.close()
+    await _call_tool(server, "broadcast",
+                     {"from_agent": "alice", "message": "my own announcement"})
+    await _call_tool(server, "register", {"name": "alice", "project": "p"})
+    assert "Coverage gap" not in await _call_tool(
+        server, "get_messages", {"agent_name": "alice"}
+    )
+
+
 async def test_no_gap_no_notice(tmp_path):
     server = create_server(db_path=tmp_path / "t.db")
     await _call_tool(server, "register", {"name": "alice", "project": "p"})
