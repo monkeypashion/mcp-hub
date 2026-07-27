@@ -261,11 +261,19 @@ async def test_set_team_can_clear_so_a_first_assignment_is_not_one_way(server):
     out = await _call(server, "set_team", {"name": "hub", "team": ""})
     assert "cleared" in out.lower(), out
 
-    # Back to hearing everyone — a fleet post reaches it, a team post does not.
+    # The discriminator has to be a TEAM post. Asserting that a FLEET post
+    # still arrives proves nothing — fleet rows carry audience='' and reach
+    # everyone whether or not the clear worked. (That was this test's first
+    # version, and a mutant that made set_team merge-on-empty sailed through
+    # it.) After a real clear, hub is no longer in dreamteam, so a dreamteam
+    # post must NOT reach it; if the clear silently did nothing, it will.
+    await _call(server, "broadcast", {"from_agent": "pm", "message": "squad only now"})
     await _call(server, "broadcast",
                 {"from_agent": "pm", "message": "everyone now", "scope": "fleet"})
     after = await _call(server, "get_broadcasts_for_agent",
                         {"agent_name": "hub", "bind": False})
+    assert "squad only now" not in after, \
+        f"still in the team after clearing it:\n{after}"
     assert "everyone now" in after, f"clearing the team deafened it:\n{after}"
 
 
