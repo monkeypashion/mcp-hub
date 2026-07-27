@@ -125,7 +125,7 @@ def test_teardown_declined_at_the_confirm_sends_nothing(box, tmp_path):
     ws.write_text('{"folders":[],"settings":{}}', encoding="utf-8")
     out = _drive(box, "run", "squad.teardownWorkspace",
                  answers=["delete the transported clones"], wsfile=str(ws))
-    assert out["sent"] == [], "declining must not run anything"
+    assert out["sent"] == [] and out["execs"] == [], "declining must not run anything"
     assert any("Tear down" in s for s in out["shown"]), "but it must have asked"
 
 
@@ -229,11 +229,49 @@ def test_start_and_attach_on_a_non_agent_tab_warns(box):
     assert any("no squad agent" in s for s in out["shown"]), out
 
 
+# ---- the destructive one, and the two everyday ones ----------------------
+
+def test_retire_asks_before_removing_an_agent_everywhere(box):
+    """`retire` is the one that unenrols everywhere, not just from a workspace.
+
+    Two entries with two consequences: "Remove from this workspace" is reversible
+    and local; this one is neither. It must ask.
+    """
+    declined = _drive(box, "run", "squad.retire", terminal="demo · idle")
+    # BOTH channels: retire runs in the BACKGROUND, so asserting only on the
+    # terminal text passed happily against a mutant that retired without asking.
+    assert declined["sent"] == [] and declined["execs"] == [], \
+        "no confirmation ⇒ nothing runs, by either route"
+    assert declined["shown"], "and it must have asked"
+
+    ok = _drive(box, "run", "squad.retire", answers=["Retire"], terminal="demo · idle")
+    assert any("rm demo" in s for s in ok["execs"]), ok
+
+
+def test_clone_from_github_cancelled_enrols_nothing(box):
+    """The picker's own cancel path: an abandoned dialog must leave no trace."""
+    out = _drive(box, "run", "squad.addFromGitHub", answers=[])
+    assert out["sent"] == []
+
+
+@pytest.mark.parametrize("command,expect", [
+    ("squad.stop", "stop"),
+    ("squad.restartResume", "restart"),
+])
+def test_everyday_lifecycle_commands_target_the_clicked_agent(box, command, expect):
+    """Whatever else changes, these must act on the tab you right-clicked and
+    name that agent explicitly — never the active terminal by accident."""
+    out = _drive(box, "run", command, terminal="demo · idle")
+    ran = out["sent"] + out["execs"]
+    assert ran, f"{command} did nothing at all"
+    assert any(f"{expect} demo" in s for s in ran), out
+
+
 def test_bulk_transport_requires_confirmation(box):
     """A bulk clone is expensive and partly irreversible: ask, then act."""
     declined = _drive(box, "run", "squad.transportAll",
                       answers=["New workspace", "bulk"], terminal="demo · idle")
-    assert declined["sent"] == [], "no confirmation ⇒ nothing runs"
+    assert declined["sent"] == [] and declined["execs"] == [], "no confirmation ⇒ nothing runs"
     assert any("bulk" in s for s in declined["shown"]), declined
 
     accepted = _drive(box, "run", "squad.transportAll",
