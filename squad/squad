@@ -3045,16 +3045,43 @@ print("\n".join(r[2] for r in rows))
             # Closes a cloned squad down. Worktree deletion is gated on the agent
             # having a transport-registered identity suffix, so this can never
             # delete an original — see teardown_workspace.
-            shift; ws_arg=""; del=0; dry=0; rmws=0; yes=0
+            shift; ws_arg=""; del=0; dry=0; rmws=0; yes=0; host_arg=""; port_arg=""; rsh_arg=""
             while [ $# -gt 0 ]; do case "$1" in
               workspace)          ws_arg="${2:-}"; shift 2 ;;
               --delete-worktrees) del=1; shift ;;
               --remove-workspace) rmws=1; shift ;;
               --dry-run)          dry=1; shift ;;
               --yes)              yes=1; shift ;;
-              -*) echo "!! unknown teardown flag '$1' (valid: --delete-worktrees, --remove-workspace, --dry-run, --yes)" >&2; exit 1 ;;
+              --host)             host_arg="${2:-}"; shift 2 ;;
+              --port)             port_arg="${2:-}"; shift 2 ;;
+              --rsh)              rsh_arg="${2:-}"; shift 2 ;;
+              -*) echo "!! unknown teardown flag '$1' (valid: --delete-worktrees, --remove-workspace, --dry-run, --yes, --host, --port, --rsh)" >&2; exit 1 ;;
               *)  ws_arg="$1"; shift ;;
             esac; done
+
+            # REMOTE TEARDOWN — transport reaches across machines and teardown
+            # did not, so cleaning up a migration on the far box was hand work
+            # with no dry run and no confirmation. Rather than reimplement the
+            # verb remotely, run THIS verb there: the destination already has
+            # squad (bootstrap guarantees it), which means the provenance gate
+            # runs on the machine that actually owns the roster and the suffix
+            # map. A gate deciding from the wrong box's data is not a gate.
+            if [ -n "$host_arg" ]; then
+              [ -n "$ws_arg" ] || {
+                echo "usage: $CMD teardown workspace <ws> --host <h> [...]" >&2; exit 1; }
+              rsh="$(resolve_rsh "$host_arg" "$port_arg" "$rsh_arg")" || exit 1
+              far_squad="$($rsh "$host_arg" 'command -v squad 2>/dev/null || printf "%s/.local/bin/squad" "$HOME"')"
+              $rsh "$host_arg" "[ -x '$far_squad' ]" 2>/dev/null || {
+                echo "!! no squad on $host_arg — '$CMD bootstrap --host $host_arg' installs it" >&2
+                exit 1; }
+              echo "== on $host_arg =="
+              $rsh "$host_arg" "'$far_squad' teardown workspace '$ws_arg'\
+                ${del:+$([ "$del" = 1 ] && echo ' --delete-worktrees')}\
+                ${rmws:+$([ "$rmws" = 1 ] && echo ' --remove-workspace')}\
+                ${dry:+$([ "$dry" = 1 ] && echo ' --dry-run')}\
+                ${yes:+$([ "$yes" = 1 ] && echo ' --yes')}"
+              exit $?
+            fi
             [ -n "$ws_arg" ] || {
               echo "usage: $CMD teardown workspace <file.code-workspace> [--delete-worktrees] [--remove-workspace] [--dry-run] [--yes]" >&2; exit 1; }
             # Anything that removes bytes needs a second, explicit act. The dry
