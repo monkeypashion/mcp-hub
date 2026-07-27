@@ -1011,6 +1011,15 @@ _HISTORY_LOCATED_FIELDS = ("cwd",)
 _ABS_PATH_RE = re.compile(r"^(?:/[^/\s]|[A-Za-z]:[\\/])")
 
 
+def _path_under(path: str, base: str) -> bool:
+    """Is `path` `base` itself, or inside it? Boundary-aware, NOT a substring
+    test — `<base>-2` is a sibling worktree, not a child, and the fan-out
+    genuinely creates those when two clones of one repo land together.
+    """
+    base = base.rstrip("/")
+    return path == base or path.startswith(base + "/")
+
+
 def _history_unclassified_paths(obj: Any, dest: str) -> list[str]:
     """Dotted paths of structural fields carrying a path this module has not
     classified — the check that survives a coupling nobody predicted.
@@ -1029,13 +1038,22 @@ def _history_unclassified_paths(obj: Any, dest: str) -> list[str]:
             if root in _HISTORY_CONTENT_FIELDS or root in _HISTORY_ENV_FIELDS:
                 return
             if root in _HISTORY_LOCATED_FIELDS:
-                if o != dest:
+                # A session may be launched in a SUBDIRECTORY of its worktree, so
+                # "inside the destination" is the invariant, not "equal to it".
+                # Demanding equality contradicted the re-key branch, which
+                # preserves subdirs — one of them had to yield.
+                if not _path_under(o, dest):
                     found.append(prefix)
                 return
             found.append(prefix)
         elif isinstance(o, dict):
             for k, v in o.items():
                 child = f"{prefix}.{k}" if prefix else str(k)
+                # KEYS as well as values: trackedFileBackups is a dict keyed BY
+                # absolute path, and a guard that exists for couplings nobody
+                # predicted cannot be blind to half the structure it walks.
+                if isinstance(k, str):
+                    walk(k, child, root or str(k))
                 walk(v, child, root or str(k))
         elif isinstance(o, list):
             for v in o:
@@ -1140,8 +1158,15 @@ def _rekey_transcript(text: str, old_cwd: str, new_cwd: str) -> tuple[str, dict[
         # destination is the same claim the source-path rewrite already makes,
         # applied completely instead of partially.
         cwd_val = d.get("cwd")
-        if isinstance(cwd_val, str) and cwd_val and cwd_val != new[1]:
-            d["cwd"] = new[1] if old[1] not in cwd_val else cwd_val.replace(old[1], new[1])
+        if isinstance(cwd_val, str) and cwd_val and not _path_under(cwd_val, new[1]):
+            # Under the source ⇒ keep the subdirectory (a session can be launched
+            # below its worktree root). Anything else is a third path, and the
+            # clone's copy should name the clone. Boundary-aware, so a sibling
+            # `<old>-2` is treated as the third path it is, not as the source.
+            d["cwd"] = (
+                new[1] + cwd_val[len(old[1].rstrip("/")):]
+                if _path_under(cwd_val, old[1]) else new[1]
+            )
             stats["cwd"] += 1
 
         # Same reasoning as the snapshot journal above: a delta names a backup
@@ -1194,7 +1219,13 @@ def _rekey_transcript(text: str, old_cwd: str, new_cwd: str) -> tuple[str, dict[
 
         for field in _history_stale_fields(after, old):
             root = field.split(".")[0].split("[")[0]
-            if root not in _HISTORY_CONTENT_FIELDS:
+            # ENVIRONMENT is exempt here too, or "never re-keyed, never refused"
+            # is only half true. A hook command that lives INSIDE the transported
+            # worktree contains the source path by construction — which is the
+            # mcp-hub agent itself, i.e. the one most likely to be migrated when
+            # a machine is retired. It refused, and squad reads a refusal as
+            # "transported WITHOUT history" while reporting success.
+            if root not in _HISTORY_CONTENT_FIELDS and root not in _HISTORY_ENV_FIELDS:
                 stats["completeness_violations"] += 1
 
         # The same question asked of FIELDS rather than of one path string, so a

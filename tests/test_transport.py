@@ -278,6 +278,71 @@ def test_a_slash_command_in_prose_is_not_mistaken_for_a_path(tmp_path, monkeypat
     assert json.loads(dst.read_text().splitlines()[0])["lastPrompt"] == "/compact"
 
 
+def test_a_hook_inside_the_transported_worktree_does_not_refuse(tmp_path, monkeypatch):
+    """Found by dev-vm-1 verifying my guard, and it bit THEIR box, not mine.
+
+    ENVIRONMENT was exempt in the new guard but not in the older completeness
+    loop, so "never re-keyed, never refused" was only half true. A hook command
+    living INSIDE the transported worktree contains the source path by
+    construction — which is the mcp-hub agent itself, the one most likely to be
+    migrated when a machine is retired.
+
+    My own live tests could not catch it: this seat's source is the /mnt/d tree
+    while its hooks name /home/monke, so the two differ here and coincide there.
+    A works-on-my-machine that only a second machine could find.
+    """
+    rc, dst = _run_transport_history(
+        tmp_path, monkeypatch,
+        [js({"type": "user", "cwd": OLD,
+             "hookInfos": [{"command": f"{OLD}/.venv/bin/mcp-hub stop-hook"}]})],
+    )
+    assert rc == 0, "a hook path inside the worktree must not refuse the transport"
+    rec = json.loads(dst.read_text())
+    assert rec["hookInfos"][0]["command"] == f"{OLD}/.venv/bin/mcp-hub stop-hook", \
+        "and it must stay byte-exact — it records what ran, on the box that ran it"
+
+
+def test_a_session_launched_below_the_worktree_root_keeps_its_subdirectory(tmp_path, monkeypatch):
+    """LOCATED means "inside the destination", not "equal to it".
+
+    Demanding equality contradicted the re-key branch, which preserves subdirs:
+    one rewrote `<old>/skills/x` to `<dest>/skills/x` and the other then refused
+    it. Both cannot be right.
+    """
+    rc, dst = _run_transport_history(
+        tmp_path, monkeypatch, [js({"type": "user", "cwd": f"{OLD}/skills/memory-sync"})]
+    )
+    assert rc == 0
+    assert json.loads(dst.read_text())["cwd"] == f"{NEW}/skills/memory-sync"
+
+
+def test_a_sibling_worktree_is_not_mistaken_for_the_source(tmp_path, monkeypatch):
+    """`<old>-2` is a SIBLING, not a child — and the fan-out genuinely creates
+    those when two clones of one repo land together. A substring test read it as
+    the source and produced `<dest>-2`."""
+    rc, dst = _run_transport_history(
+        tmp_path, monkeypatch, [js({"type": "user", "cwd": f"{OLD}-2"})]
+    )
+    assert rc == 0
+    assert json.loads(dst.read_text())["cwd"] == NEW, "a sibling is a third path"
+
+
+def test_an_unclassified_path_is_caught_as_a_dict_KEY_too(tmp_path, monkeypatch):
+    """The guard walked values only, so half the structure was blind to it.
+
+    trackedFileBackups is a dict keyed BY absolute path — the very shape this
+    exists to catch. It is emptied before the check today, so nothing known hits
+    it, but a guard whose whole purpose is the coupling nobody predicted cannot
+    inspect only half of what it walks.
+    """
+    rc, dst = _run_transport_history(
+        tmp_path, monkeypatch,
+        [js({"type": "user", "cwd": OLD, "mystery": {"/some/third/path": 1}})],
+    )
+    assert rc == 1, "a third path as a KEY must refuse exactly as a value does"
+    assert not dst.exists()
+
+
 def test_transport_history_dry_run_writes_nothing(tmp_path, monkeypatch):
     rc, dst = _run_transport_history(
         tmp_path, monkeypatch, [js({"type": "user", "cwd": OLD})], dry_run=True
