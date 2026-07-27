@@ -182,14 +182,15 @@ def test_unparseable_line_is_preserved_not_dropped():
 # ------------------------------------------------- command-level behaviour
 
 
-def _run_transport_history(tmp_path, monkeypatch, lines, dry_run=False):
+def _run_transport_history(tmp_path, monkeypatch, lines, dry_run=False,
+                           old=OLD, new=NEW):
     monkeypatch.setattr(cli.pathlib.Path, "home", classmethod(lambda cls: tmp_path))
-    src_dir = tmp_path / ".claude" / "projects" / cli._claude_project_dirname(OLD)
+    src_dir = tmp_path / ".claude" / "projects" / cli._claude_project_dirname(old)
     src_dir.mkdir(parents=True)
     (src_dir / "sess.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    args = cli.argparse.Namespace(from_cwd=OLD, to_cwd=NEW, dry_run=dry_run)
+    args = cli.argparse.Namespace(from_cwd=old, to_cwd=new, dry_run=dry_run)
     rc = cli.transport_history_command(args)
-    dst = tmp_path / ".claude" / "projects" / cli._claude_project_dirname(NEW) / "sess.jsonl"
+    dst = tmp_path / ".claude" / "projects" / cli._claude_project_dirname(new) / "sess.jsonl"
     return rc, dst
 
 
@@ -325,6 +326,55 @@ def test_a_sibling_worktree_is_not_mistaken_for_the_source(tmp_path, monkeypatch
     )
     assert rc == 0
     assert json.loads(dst.read_text())["cwd"] == NEW, "a sibling is a third path"
+
+
+# The destination of a SAME-MACHINE transport is a sibling of the source by
+# construction: the original owns the canonical path, so the clone lands at
+# `<repo>-<label>`. That makes the source a PREFIX of the destination — the one
+# arrangement the substring-based leak check could not read.
+SIBLING = f"{OLD}-sidecar"
+
+
+def test_a_destination_that_extends_the_source_is_not_read_as_a_leak(tmp_path, monkeypatch):
+    """The default same-machine destination, refused by its own guard.
+
+    `<old>` is a prefix of `<old>-sidecar`, so a correctly-rewritten `cwd` still
+    CONTAINS the source path and the substring test called it a structural leak.
+    Every same-machine transport therefore landed with no conversation history —
+    and not visibly, because squad treats a re-key refusal as "transported
+    WITHOUT history" while reporting the transport itself as done. Found by
+    running the showcase, not by a fixture: no fixture here had ever used a
+    destination derived the way the real one is.
+    """
+    rc, dst = _run_transport_history(
+        tmp_path, monkeypatch, [js({"type": "user", "cwd": OLD})], new=SIBLING
+    )
+    assert rc == 0, "the ordinary same-machine destination must not be refused"
+    assert json.loads(dst.read_text())["cwd"] == SIBLING
+
+
+def test_stale_fields_excuses_the_destination_but_not_the_source():
+    """The positive control for the test above, asked of the guard directly.
+
+    Excusing destination-shaped text is only safe if the SAME prefix arrangement
+    still catches a genuine reference to the source. Written at this level
+    deliberately: the first draft of this control went through the command and
+    passed against a completely blinded guard, because the refusal it observed
+    came from the unclassified-path check instead — green for the wrong reason.
+    """
+    old = (cli._claude_project_dirname(OLD), OLD)
+    new = (cli._claude_project_dirname(SIBLING), SIBLING)
+
+    # the destination contains the source as a prefix, and is not a leak
+    assert cli._history_stale_fields({"cwd": SIBLING}, old, new) == []
+    assert cli._history_stale_fields({"cwd": f"{SIBLING}/src"}, old, new) == []
+    # the source itself still is, in that same arrangement
+    assert cli._history_stale_fields({"cwd": OLD}, old, new) == ["cwd"]
+    assert cli._history_stale_fields({"x": f"{OLD}/memory"}, old, new) == ["x"]
+    # and in ENCODED form, where '-' is itself the separator — which is why this
+    # masks the destination rather than checking for a path boundary
+    assert cli._history_stale_fields({"p": f"/h/.claude/projects/{new[0]}/m"}, old, new) == []
+    assert cli._history_stale_fields({"p": f"/h/.claude/projects/{old[0]}/m"}, old, new) == ["p"]
 
 
 def test_an_unclassified_path_is_caught_as_a_dict_KEY_too(tmp_path, monkeypatch):

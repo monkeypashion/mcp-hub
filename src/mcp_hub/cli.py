@@ -1140,12 +1140,34 @@ def _rekey_deep(obj: Any, old: tuple[str, str], new: tuple[str, str]) -> Any:
     return obj
 
 
-def _history_stale_fields(obj: Any, old: tuple[str, str]) -> list[str]:
-    """Dotted paths of every field still referencing the source path."""
+def _history_stale_fields(
+    obj: Any, old: tuple[str, str], new: tuple[str, str] | None = None
+) -> list[str]:
+    """Dotted paths of every field still referencing the source path.
+
+    `new` is the destination pair, and it is needed because the default
+    destination for a same-machine transport is a SIBLING of the source:
+    the original owns the canonical path, so the clone lands at
+    `<repo>-<label>`, which contains `<repo>` as a prefix. A plain substring
+    test reads the correctly-rewritten `cwd` as a leak and the whole transcript
+    is refused — silently shipping a clone with no conversation history while
+    the transport reports success. Mask the legitimate destination references
+    first, then ask whether anything STILL points at the source.
+
+    A boundary check would not do: in the ENCODED dirname form the separator is
+    itself '-', so `…-demo-app` inside `…-demo-app-sidecar` looks like a
+    path-boundary match. Masking is the question actually being asked.
+    """
     found: list[str] = []
 
     def stale(s: Any) -> bool:
-        return isinstance(s, str) and (old[0] in s or old[1] in s)
+        if not isinstance(s, str):
+            return False
+        if new is not None:
+            for ref in new:
+                if ref:
+                    s = s.replace(ref, "\x00")
+        return old[0] in s or old[1] in s
 
     def walk(o: Any, prefix: str) -> None:
         if isinstance(o, str):
@@ -1277,7 +1299,7 @@ def _rekey_transcript(text: str, old_cwd: str, new_cwd: str) -> tuple[str, dict[
         if blank(before) != blank(after):
             stats["content_touched"] += 1
 
-        for field in _history_stale_fields(after, old):
+        for field in _history_stale_fields(after, old, new):
             root = field.split(".")[0].split("[")[0]
             # ENVIRONMENT is exempt here too, or "never re-keyed, never refused"
             # is only half true. A hook command that lives INSIDE the transported
