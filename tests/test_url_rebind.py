@@ -253,6 +253,87 @@ async def test_broadcast_stamps_attribution_too(tmp_path):
     assert row[0] == "asserted"
 
 
+async def test_post_stamps_attribution_too(tmp_path):
+    """Second member of the same exposure class as broadcast() — found by dev
+    running the generalisation, not by reading. Dropping `attribution` from
+    post()'s INSERT left the suite green."""
+    server = create_server(db_path=tmp_path / "t.db")
+    await _call_tool(server, "register", {"name": "alice", "project": "p"})
+    await _call_tool(
+        server, "create_channel", {"name": "topic", "created_by": "alice"},
+    )
+    out = await _call_tool(
+        server, "post",
+        {"from_agent": "alice", "channel": "topic", "message": "hi"},
+    )
+    assert "not found" not in out, out  # the fixture actually posted
+    import sqlite3
+    conn = sqlite3.connect(tmp_path / "t.db")
+    row = conn.execute(
+        "SELECT attribution FROM messages WHERE channel='topic'"
+    ).fetchone()
+    assert row is not None, "post wrote no row"
+    assert row[0] == "asserted"
+
+
+_ATTR_CARD = (
+    "**DECISION**\n"
+    "**ASK:** approve the widget rebuild\n"
+    "**WHY:** the current one is broken\n"
+    "**VALUE:** dashboards work again [7/10]\n"
+    "**RISK:** an hour lost if wrong [3/10]\n"
+)
+
+
+async def test_decision_put_stamps_attribution_on_fresh_insert(tmp_path):
+    """Third member of the class. decision_put has TWO writers and both stamp;
+    this covers the fresh INSERT."""
+    server = create_server(db_path=tmp_path / "t.db")
+    await _call_tool(server, "register", {"name": "alice", "project": "p"})
+    out = await _call_tool(
+        server, "decision_put", {"from_agent": "alice", "card": _ATTR_CARD},
+    )
+    assert "opened" in out, out  # fresh INSERT path, not the update path
+    import sqlite3
+    conn = sqlite3.connect(tmp_path / "t.db")
+    row = conn.execute("SELECT attribution FROM decisions").fetchone()
+    assert row is not None, "decision_put wrote no row"
+    assert row[0] == "asserted"
+
+
+async def test_decision_put_stamps_attribution_on_the_update_path(tmp_path):
+    """The update-in-place path stamps too, and the obvious test for it is
+    VACUOUS: call_tool cannot inject a Context, so both writes grade
+    'asserted', and a dropped column on the UPDATE would simply leave the
+    INSERT's identical value behind — passing while testing nothing.
+
+    So the stored value is first replaced with a sentinel. If the UPDATE stops
+    writing attribution, the sentinel survives and this fails."""
+    server = create_server(db_path=tmp_path / "t.db")
+    await _call_tool(server, "register", {"name": "alice", "project": "p"})
+    await _call_tool(
+        server, "decision_put", {"from_agent": "alice", "card": _ATTR_CARD},
+    )
+    import sqlite3
+    conn = sqlite3.connect(tmp_path / "t.db")
+    conn.execute("UPDATE decisions SET attribution = 'SENTINEL'")
+    conn.commit()
+    conn.close()
+
+    # Same ask, different score — token overlap keeps it on the UPDATE path
+    # rather than superseding into a second row.
+    out = await _call_tool(
+        server, "decision_put",
+        {"from_agent": "alice", "card": _ATTR_CARD.replace("[7/10]", "[9/10]")},
+    )
+    assert "updated" in out, out  # precondition: the UPDATE path really ran
+
+    conn = sqlite3.connect(tmp_path / "t.db")
+    rows = conn.execute("SELECT attribution FROM decisions").fetchall()
+    assert len(rows) == 1, f"expected one row (update, not supersede): {rows}"
+    assert rows[0][0] == "asserted", "the UPDATE left the sentinel in place"
+
+
 # ---------------------------------------------------------------------------
 # Coverage-gap notice — one-shot awareness of non-delivery
 # ---------------------------------------------------------------------------
