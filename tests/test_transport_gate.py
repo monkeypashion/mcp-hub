@@ -471,3 +471,90 @@ def test_the_whole_remote_leg_runs_end_to_end(env, tmp_path):
     cfg = json.loads((pathlib.Path(e["HOME"]) / ".mcp-hub" / "config.json").read_text())
     assert str(dest) in (cfg.get("workspaces") or {}), "no identity suffix registered"
     assert "STOPPED" in res.stdout, "a transported agent must never land running"
+
+
+def _behind_origin(work: pathlib.Path) -> str:
+    """Advance origin past the source, the way a twin's push does.
+
+    Returns the source's own HEAD — the commit the clone must come out on.
+    """
+    src_head = subprocess.run(["git", "-C", str(work), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, check=True).stdout.strip()
+    # a second checkout pushes one more commit, leaving `work` behind its remote
+    url = subprocess.run(["git", "-C", str(work), "remote", "get-url", "origin"],
+                         capture_output=True, text=True, check=True).stdout.strip()
+    other = work.parent / (work.name + "-twin")
+    subprocess.run(["git", "clone", "-q", url, str(other)], check=True, capture_output=True)
+    _git(other, "config", "user.email", "t@t")
+    _git(other, "config", "user.name", "t")
+    (other / "LATER.md").write_text("pushed after the source stopped looking\n", encoding="utf-8")
+    _git(other, "add", "-A")
+    _git(other, "commit", "-qm", "newer than the source")
+    _git(other, "push", "-q", "origin", "HEAD")
+    return src_head
+
+
+def test_the_clone_lands_on_the_sources_commit_not_origins_tip(env, tmp_path):
+    """A copy must not come out NEWER than the agent it copied.
+
+    Measured on the first real transport of this repo: the source was several
+    commits behind origin, and `git clone --branch master` gave a clone at the
+    remote tip. Nothing was lost — the gate guarantees that — but "move this
+    agent" then handed back something the agent had never been. Being a few
+    commits behind a remote is the ordinary case, so this cannot be fixed by
+    refusing it.
+    """
+    e, conf = env
+    work = _pushed_repo(tmp_path, rewrite_origin=False)
+    src_head = _behind_origin(work)
+    _enrol(conf, "demo-box", work)
+
+    res = _run(env, "transport", "demo-box", "--to", str(_ws(tmp_path)))
+    assert res.returncode == 0, res.stdout + res.stderr
+    dest = pathlib.Path(e["HOME"]) / "Projects" / "code" / "remotes" / "demo"
+    landed = subprocess.run(["git", "-C", str(dest), "rev-parse", "HEAD"],
+                            capture_output=True, text=True, check=True).stdout.strip()
+    assert landed == src_head, "the clone is not on the source's commit"
+    assert not (dest / "LATER.md").exists(), "it picked up a commit the source never had"
+    # the branch NAME must survive, or the clone is detached and its next commit
+    # goes nowhere
+    branch = subprocess.run(["git", "-C", str(dest), "branch", "--show-current"],
+                            capture_output=True, text=True, check=True).stdout.strip()
+    assert branch, f"clone left on a detached HEAD: {res.stdout}"
+    assert "pinned to the source's commit" in res.stdout, "it must say it moved the clone back"
+
+
+def test_a_source_level_with_origin_is_not_reported_as_pinned(env, tmp_path):
+    """The ordinary case must stay quiet — a note that always fires says nothing."""
+    e, conf = env
+    work = _pushed_repo(tmp_path, rewrite_origin=False)
+    _enrol(conf, "demo-box", work)
+    res = _run(env, "transport", "demo-box", "--to", str(_ws(tmp_path)))
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "pinned" not in res.stdout, res.stdout
+
+
+def test_the_remote_leg_pins_the_clone_too(env, tmp_path):
+    """Same rule across the network — and this branch is the one quoting breaks.
+
+    The pin runs inside a double-quoted ssh command, so the source's sha has to
+    expand HERE while the destination's HEAD expands THERE. Get it backwards and
+    the comparison silently compares a string to itself.
+    """
+    e, conf = env
+    work = _pushed_repo(tmp_path, rewrite_origin=False)
+    src_head = _behind_origin(work)
+    _enrol(conf, "demo-box", work)
+    _make_ready(pathlib.Path(e["HOME"]))
+    shim = tmp_path / "fake-ssh"
+    shim.write_text(FAKE_SSH, encoding="utf-8")
+    shim.chmod(0o755)
+
+    res = _run(env, "transport", "demo-box", "--to", str(_ws(tmp_path, "far")),
+               "--host", "pretend-host", "--rsh", str(shim))
+    assert res.returncode == 0, res.stdout + res.stderr
+    dest = pathlib.Path(e["HOME"]) / "Projects" / "code" / "remotes" / "demo"
+    landed = subprocess.run(["git", "-C", str(dest), "rev-parse", "HEAD"],
+                            capture_output=True, text=True, check=True).stdout.strip()
+    assert landed == src_head, f"remote clone not pinned: {res.stdout}"
+    assert not (dest / "LATER.md").exists()
