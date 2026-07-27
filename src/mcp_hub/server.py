@@ -652,6 +652,7 @@ def is_interactive_client(session: Any) -> bool:
 # idempotent, process-global, one seam.
 
 _URL_AGENT_ATTR = "_hub_url_agent"
+_URL_SEEN_ATTR = "_hub_url_seen"
 _handle_request_patched = False
 
 
@@ -683,6 +684,15 @@ def _ensure_url_identity_patched() -> None:
                     transport = getattr(self, "_server_instances", {}).get(sid)
                     if transport is not None:
                         setattr(transport, _URL_AGENT_ATTR, agent)
+                        # Recency stamp: the sweep must track the CURRENT
+                        # transport, not the first one it saw. Claude Code
+                        # cycles sessions silently; an abandoned transport
+                        # stays warm server-side with its GET key registered,
+                        # so "bound + deliverable" can outlive the client's
+                        # actual attachment (proven 2026-07-27 18:22: the
+                        # shipped seat went deaf 30 min after its one-shot
+                        # bind while ⚡ showed green).
+                        setattr(transport, _URL_SEEN_ATTR, time.time())
         except Exception:  # noqa: BLE001
             logger.exception("url-identity capture failed; request unaffected")
         return await original(self, scope, receive, send)
@@ -1000,6 +1010,21 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                     for s in live_server_sessions()
                 }
                 conn = _get_db(db_path)
+                # Group candidates per name and pick the BEST — newest
+                # recency stamp, GET-holders (live wake channels) always
+                # outranking transports without one. Binding once and
+                # standing pat re-created the zombie class this feature
+                # was meant to retire: the client cycles its wake channel
+                # silently, the abandoned transport keeps its GET key, and
+                # the one-shot binding stays "deliverable" while routing
+                # pushes into a stream nobody reads (2026-07-27 18:22, the
+                # shipped seat itself). URL identity is therefore
+                # CONTINUOUSLY authoritative: whenever the newest
+                # GET-holding transport differs from the bound session,
+                # rebind — an idle agent's client refreshes its wake
+                # channel without ever making a tool call, and the sweep
+                # must follow it.
+                best: dict[str, tuple[tuple[int, float], Any]] = {}
                 for transport in list(instances.values()):
                     name = getattr(transport, _URL_AGENT_ATTR, "")
                     if not name:
@@ -1009,16 +1034,23 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                     )
                     if session is None or not is_interactive_client(session):
                         continue
+                    has_get = GET_STREAM_KEY in getattr(
+                        transport, "_request_streams", {}
+                    )
+                    seen = getattr(transport, _URL_SEEN_ATTR, 0.0)
+                    rank = (1 if has_get else 0, seen)
+                    if name not in best or rank > best[name][0]:
+                        best[name] = (rank, session)
+                for name, (_rank, session) in best.items():
                     current = registry.get(name)
                     if current is session:
-                        continue
-                    if current is not None and _can_deliver_push(current):
                         continue
                     row = conn.execute(
                         "SELECT name FROM agents WHERE name = ?", (name,)
                     ).fetchone()
                     if row is None:
                         continue
+                    was_bound = current is not None
                     registry.bind(name, session, source="url")
                     conn.execute(
                         "UPDATE agents SET status = 'online', last_seen = ? "
@@ -1027,8 +1059,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                     conn.commit()
                     _close_coverage_gap(conn, name)
                     logger.info(
-                        "url-rebind: bound %s from transport identity "
-                        "(no agent turn)", name,
+                        "url-rebind: %s %s to current transport identity "
+                        "(no agent turn)",
+                        "re-pointed" if was_bound else "bound", name,
                     )
             except anyio.get_cancelled_exc_class():
                 raise
