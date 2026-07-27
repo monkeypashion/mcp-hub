@@ -200,6 +200,40 @@ async def test_list_orders_by_net_desc_nulls_last(server):
     assert listing.index("high") < listing.index("low") < listing.index("unscored")
 
 
+async def test_all_listing_labels_history_rows(server):
+    """A mixed-status listing must SAY which rows are closed — in a real
+    `all` render on 2026-07-27, 25 of 28 rows were history and none said
+    so, and the reader tallied ledger rows as live queue."""
+    await _call_tool(server, "register", {"name": "alice", "project": "p"})
+    await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
+    await _call_tool(server, "decision_answer", {"decision": "yes", "agent": "alice"})
+    await _call_tool(server, "decision_put", {"from_agent": "bob", "card": CARD_V2})
+    for _ in range(3):
+        await _call_tool(server, "decision_clear", {"from_agent": "bob"})
+    await _call_tool(server, "decision_put", {"from_agent": "carol", "card": CARD_V2})
+    listing = await _call_tool(server, "decision_list", {"status": "all"})
+    assert "· DECIDED" in listing
+    assert "· WITHDRAWN" in listing
+    # a withdrawn row shows its departure provenance, not just the label
+    assert "[auto] 3 consecutive cardless turns" in listing
+    # the live row carries no status tag — open is the unmarked default
+    carol = [ln for ln in listing.splitlines() if "carol" in ln][0]
+    assert "OPEN" not in carol
+
+
+async def test_superseded_rows_are_labeled_and_filterable(server):
+    await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
+    different = CARD_V2.replace(
+        "approve the widget rebuild", "tear down the legacy ingest cluster"
+    )
+    await _call_tool(server, "decision_put", {"from_agent": "alice", "card": different})
+    listing = await _call_tool(server, "decision_list", {"status": "superseded"})
+    assert "widget rebuild" in listing
+    assert "· SUPERSEDED" in await _call_tool(
+        server, "decision_list", {"status": "all"}
+    )
+
+
 # ---------------------------------------------------------------------------
 # decision_answer — close + DM the asker (the answer leg)
 # ---------------------------------------------------------------------------

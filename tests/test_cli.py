@@ -1356,6 +1356,31 @@ def test_card_nag_grace_one_nag_then_one_turn_of_grace(tmp_path, monkeypatch):
     assert _card_nag_grace("alice", True) is True       # new episode nags again
 
 
+def test_waiting_analysis_reports_which_carveout_held(tmp_path):
+    from mcp_hub.cli import _waiting_analysis
+    assert _waiting_analysis("routine report, all green") == (False, "no_match", "")
+    genuine, reason, phrase = _waiting_analysis("I'm blocked on you approving this.")
+    assert genuine and reason == "match" and "blocked on you" in phrase
+    _, reason, _ = _waiting_analysis("Nothing waiting on you tonight.")
+    assert reason == "suppressed_negation"
+    _, reason, _ = _waiting_analysis('the bug fires on "waiting on you" in prose')
+    assert reason == "suppressed_mention"
+
+
+def test_log_nag_event_appends_queryable_jsonl(tmp_path, monkeypatch):
+    from mcp_hub.cli import _log_nag_event
+    monkeypatch.setenv("MCP_HUB_STATE_DIR", str(tmp_path))
+    _log_nag_event("alice", "nagged", "blocked on you")
+    _log_nag_event("alice", "suppressed_negation", "waiting on you")
+    lines = (tmp_path / "card-nag-log.jsonl").read_text().splitlines()
+    assert len(lines) == 2
+    rec = json.loads(lines[1])
+    assert rec["agent"] == "alice"
+    assert rec["outcome"] == "suppressed_negation"
+    assert rec["phrase"] == "waiting on you"
+    assert isinstance(rec["ts"], float)
+
+
 def test_card_nag_grace_clears_on_nag_free_stop(tmp_path, monkeypatch):
     monkeypatch.setenv("MCP_HUB_STATE_DIR", str(tmp_path))
     assert _card_nag_grace("alice", True) is True       # nag, flag set

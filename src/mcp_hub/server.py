@@ -2207,7 +2207,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         """List decision cards, best net score first (age as tiebreak).
 
         Args:
-            status: 'open' (default), 'decided', 'withdrawn', or 'all'.
+            status: 'open' (default), 'decided', 'withdrawn', 'superseded',
+                or 'all'.
             limit: Max cards.
             format: 'text' for human triage, 'json' for machinery.
         """
@@ -2232,11 +2233,20 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                      f"{age // 3600}h" if age < 86400 else f"{age // 86400}d")
             net = f"net {r['net_score']:+d}" if r["net_score"] is not None else "net ?"
             tags = f" [{r['tags']}]" if r["tags"] else ""
+            # A mixed-status listing must SAY which rows are history — an
+            # unlabeled superseded row is indistinguishable from a live ask,
+            # and a reader tallying "open" cards from an `all` view counts
+            # ledger rows as queue (measured 2026-07-27: 25 of 28 rows in an
+            # `all` render were closed, none said so).
+            status_tag = "" if r["status"] == "open" else f" · {r['status'].upper()}"
+            closure = ""
+            if r["status"] == "decided":
+                closure = f"\n   -> {r['decision']} {r['decision_note']}".rstrip()
+            elif r["status"] != "open" and (r["decision_note"] or r["decision"]):
+                closure = f"\n   -> {r['decision_note'] or r['decision']}"
             lines.append(
-                f"#{r['id']} {net} · {r['agent']} · {age_h}{tags}\n"
-                f"   ASK: {r['ask'] or _summarise(r['raw'])}"
-                + (f"\n   -> {r['decision']} {r['decision_note']}".rstrip()
-                   if r["status"] == "decided" else "")
+                f"#{r['id']} {net} · {r['agent']} · {age_h}{tags}{status_tag}\n"
+                f"   ASK: {r['ask'] or _summarise(r['raw'])}" + closure
             )
         return "\n".join(lines)
 

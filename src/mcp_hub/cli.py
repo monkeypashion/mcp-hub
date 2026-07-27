@@ -101,15 +101,59 @@ _NEGATED_BEFORE_RE = re.compile(
 )
 
 
+def _waiting_analysis(turn_text: str) -> tuple[bool, str, str]:
+    """(genuine, reason, phrase) for the waiting-language check.
+
+    reason: 'no_match' (regex never fired — the uninteresting bulk),
+    'match' (genuine ask language), or which carve-out suppressed it
+    ('suppressed_mention' / 'suppressed_negation'). The split exists for
+    telemetry: the item-30 fix shipped on anecdotes ("it nagged fo four
+    times"), and whether the carve-outs actually cut the false-positive
+    rate should be a query over a log, not another anecdote."""
+    raw = _WAITING_ON_OP_RE.search(turn_text)
+    if not raw:
+        return False, "no_match", ""
+    prose = _MENTION_SPAN_RE.sub(" ", turn_text)
+    negated = None
+    for m in _WAITING_ON_OP_RE.finditer(prose):
+        if _NEGATED_BEFORE_RE.search(prose, 0, m.start()):
+            negated = m
+            continue
+        return True, "match", m.group(0)
+    if negated is not None:
+        return False, "suppressed_negation", negated.group(0)
+    return False, "suppressed_mention", raw.group(0)
+
+
 def _reads_as_waiting_on_operator(turn_text: str) -> bool:
     """True when the turn genuinely reads as waiting on the operator —
     _WAITING_ON_OP_RE minus the two false-positive contexts confirmed in
     the field (item 30): use/mention, and negation."""
-    prose = _MENTION_SPAN_RE.sub(" ", turn_text)
-    return any(
-        not _NEGATED_BEFORE_RE.search(prose, 0, m.start())
-        for m in _WAITING_ON_OP_RE.finditer(prose)
-    )
+    return _waiting_analysis(turn_text)[0]
+
+
+def _log_nag_event(agent_name: str, outcome: str, phrase: str) -> None:
+    """Append one telemetry record for a raw-match turn. Fail-open: the
+    log must never block a Stop.
+
+    Only turns where the bare regex fired are logged (tens per day per
+    box, so no rotation), and the outcome says how the turn resolved:
+    card_filed / decided (authoring worked), nagged (delivered),
+    suppressed_negation / suppressed_mention (carve-out held it),
+    suppressed_grace (declined last Stop, not re-pressured). The
+    false-positive rate of the nag is a query over this file."""
+    try:
+        path = _state_dir() / "card-nag-log.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": round(time.time(), 1),
+                "agent": agent_name,
+                "outcome": outcome,
+                "phrase": phrase,
+            }, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
 
 
 def _card_nag_grace(agent_name: str, would_nag: bool) -> bool:
@@ -1493,14 +1537,21 @@ def stop_hook_command(args: argparse.Namespace) -> int:
     last_turn = _read_last_assistant_text(payload.get("transcript_path"))
     card = _extract_decision_card(last_turn)
     decided = "" if card else _extract_decided(last_turn)
-    card_nag = bool(last_turn) and not card and not decided and (
-        _reads_as_waiting_on_operator(last_turn)
+    genuine, reason, phrase = (
+        _waiting_analysis(last_turn) if last_turn else (False, "no_match", "")
     )
+    card_nag = not card and not decided and genuine
     # Grace bookkeeping runs on every natural Stop — a nag-free Stop must
     # CLEAR the flag, not just a nagging one set it. Backstop Stops
-    # (stop_hook_active) are skipped: they are the same natural turn.
+    # (stop_hook_active) are skipped: they are the same natural turn, and
+    # skipping them also keeps the telemetry at one record per turn.
     if not stop_hook_active:
         card_nag = _card_nag_grace(name, card_nag)
+        if reason != "no_match":
+            outcome = ("card_filed" if card else "decided" if decided else
+                       reason if not genuine else
+                       "nagged" if card_nag else "suppressed_grace")
+            _log_nag_event(name, outcome, phrase)
 
     try:
         messages_text, broadcasts_text, is_online = asyncio.run(
