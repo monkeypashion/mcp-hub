@@ -354,3 +354,29 @@ def test_unknown_workspace_is_refused(env, tmp_path):
     res = _run(env, "teardown", "workspace", str(tmp_path / "nope.code-workspace"))
     assert res.returncode != 0
     assert "no such workspace file" in res.stderr
+
+
+def test_a_roster_row_outside_the_workspace_does_not_kill_the_run(env, tmp_path):
+    """Found by running the showcase: teardown exited 1 and printed NOTHING.
+
+    `ws_agents` ends in a loop, so its status was the LAST agent's membership
+    test — and with `set -euo pipefail` the assignment `list="$(ws_agents ...)"`
+    took that status and killed the script before its first line of output.
+    The trigger is ordinary: any roster row that lives in some other workspace
+    and sorts last. Every fixture here had enrolled only agents that WERE in the
+    workspace, so the condition was never created.
+    """
+    e, conf = env
+    clone = _pushed_repo(tmp_path, "monkeypashion", "demo")
+    outsider = _pushed_repo(tmp_path, "monkeypashion", "elsewhere")
+    _enrol(conf, "demo-box", clone)
+    _register_suffix(e["HOME"], clone, "side")
+    _enrol(conf, "zz-outsider", outsider)      # last row, and NOT in the workspace
+    ws = _workspace(tmp_path, clone)
+
+    res = _run(env, "teardown", "workspace", str(ws), "--delete-worktrees", "--dry-run")
+    assert res.returncode == 0, f"silent exit: {res.returncode} {res.stderr!r}"
+    assert res.stdout.strip(), "teardown produced no output at all"
+    assert "demo-box" in res.stdout
+    assert "zz-outsider" not in res.stdout, "teardown is scoped to the workspace"
+    assert outsider.is_dir()

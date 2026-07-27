@@ -939,6 +939,12 @@ ws_agents() {
     d="$(untilde "$(field "$a" 2)")"
     printf '%s\n' "$folders" | grep -qxF -- "$d" && echo "$a"
   done
+  # The loop's status is the LAST agent's grep, so a roster whose final row
+  # lives in some other workspace made this return 1 — and `list="$(ws_agents)"`
+  # under `set -e` then killed teardown before it printed a single line. Silent
+  # exit 1, nothing torn down, no reason given. Never let the last iteration
+  # decide the function's verdict.
+  return 0
 }
 
 # Drop a folder entry from a .code-workspace. Surgical: these files carry
@@ -3122,6 +3128,11 @@ print("\n".join(r[2] for r in rows))
             esac; done
             add_folder "$d_arg" "$(untilde "$ws_arg")" ;;
   ext-align) ext_align ;;
+  showcase) # squad showcase [--fast] [--keep] — the transporter, demonstrated
+            # live against a throwaway HOME and a throwaway git host. Runs THIS
+            # squad, so it demonstrates what you have rather than what was
+            # written down: two live defects were found by running it.
+            shift; exec bash "$SELF_DIR/showcase" "$@" ;;
   add)      # squad add <org>/<repo> [--to <file.code-workspace>]
             # Clone from GitHub into the RIGHT account folder (org_alias picks the
             # ssh alias, i.e. which GitHub identity; pull_local picks the path),
@@ -3250,6 +3261,10 @@ workspaces (a "workspace" is a .code-workspace file; the cockpit shows a tab per
   $CMD ext-align                name the cockpit extension's install dir after its manifest
                                 (VSCode caches on the FOLDER NAME — a stale name means new
                                 menu items silently never appear). Reload Window after.
+  $CMD showcase [--fast|--keep] watch transport work end to end: the gate refusing, an agent
+                                landing, its identity re-derived, teardown declining to delete
+                                the original. Real squad, throwaway HOME — your fleet is
+                                untouched. --keep leaves the sandbox to poke at.
 
 helpers
   $CMD pull-local <org>/<repo>  clone/pull into the right account folder, no enrollment

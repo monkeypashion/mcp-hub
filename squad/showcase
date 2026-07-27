@@ -1,0 +1,439 @@
+#!/usr/bin/env bash
+# The agent transporter, demonstrated live.
+#
+# This is not a slideshow. Every command below is the REAL `squad` you use every
+# day, run against a throwaway HOME with a throwaway git host — so you can watch
+# the gate refuse things, watch an agent land, watch its identity get re-derived
+# and watch teardown decline to delete the original, without any of it touching
+# the fleet.
+#
+#   squad/showcase            # paced — Enter between acts
+#   squad/showcase --fast     # no pauses
+#   squad/showcase --keep     # leave the sandbox on disk to poke at
+#
+# The one thing that is NOT real: the network. `--rsh` is pointed at a four-line
+# shim that drops the host argument and runs the command locally, so the remote
+# code path executes on one box. The genuine cross-machine run was done against
+# dev-vm-1 over the tailnet; this proves the same lines execute, not that a
+# network exists.
+set -uo pipefail
+
+SELF="$(readlink -f "$0")"; SELF_DIR="$(dirname "$SELF")"
+SQUAD="$SELF_DIR/squad"
+[ -x "$SQUAD" ] || { echo "!! squad not found beside showcase" >&2; exit 1; }
+command -v mcp-hub >/dev/null || { echo "!! mcp-hub not on PATH" >&2; exit 1; }
+
+PACE=auto; KEEP=0
+while [ $# -gt 0 ]; do case "$1" in
+  --fast|--no-pause) PACE=off; shift ;;
+  --keep)            KEEP=1; shift ;;
+  -h|--help)         sed -n '2,18p' "$SELF" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) echo "!! unknown flag '$1' (valid: --fast, --keep)" >&2; exit 1 ;;
+esac; done
+[ "$PACE" = auto ] && { [ -t 0 ] && [ -t 1 ] && PACE=on || PACE=off; }
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  R=$'\033[0m'; B=$'\033[1m'; D=$'\033[2m'
+  CY=$'\033[36m'; GN=$'\033[32m'; RD=$'\033[31m'; YL=$'\033[33m'; MG=$'\033[35m'
+else R=""; B=""; D=""; CY=""; GN=""; RD=""; YL=""; MG=""; fi
+
+ACT=0
+act() {
+  ACT=$((ACT+1))
+  printf '\n%s\n' "${B}${CY}━━━ ACT $ACT · $1${R}"
+  [ -n "${2:-}" ] && printf '%s\n' "      ${D}$2${R}"
+  printf '\n'
+}
+say()  { printf '      %s\n' "$*"; }
+note() { printf '      %s\n' "${D}$*${R}"; }
+good() { printf '      %s\n' "${GN}$*${R}"; }
+bad()  { printf '      %s\n' "${RD}$*${R}"; }
+
+# Show the command, then run it indented. Never hides a failure: the exit code
+# is reported when it is not what the act expects.
+run() {
+  printf '      %s\n' "${YL}\$ $*${R}"
+  ( "$@" ) 2>&1 | sed 's/^/        /'
+  return "${PIPESTATUS[0]}"
+}
+runq() { ( "$@" ) >/dev/null 2>&1; }
+
+pause() {
+  [ "$PACE" = on ] || return 0
+  printf '\n%s' "      ${D}[Enter]${R}"
+  read -r _ </dev/tty || true
+  printf '\r%*s\r' 30 ''
+}
+
+# ── sandbox ────────────────────────────────────────────────────────────────
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/squad-showcase.XXXXXX")"
+CLEANED=0
+cleanup() {
+  [ "$CLEANED" = 1 ] && return 0
+  CLEANED=1
+  # The demo namespaces its tmux onto its own socket, so this can never touch
+  # the real squad — but an aborted run must not leave a server behind either.
+  tmux -L showcase kill-server 2>/dev/null || true
+  if [ "$KEEP" = 1 ]; then
+    printf '\n%s\n' "      ${D}sandbox kept: $TMP${R}"
+    printf '%s\n'   "      ${D}remove it with: rm -rf $TMP${R}"
+  else
+    chmod -R u+w "$TMP" 2>/dev/null || true
+    rm -rf "$TMP"
+  fi
+}
+# EXIT alone is not enough: an untrapped Ctrl-C at one of the pauses kills the
+# shell without running it, and the whole point of a sandbox is that walking
+# away from it costs nothing.
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM HUP
+
+HOME="$TMP/home"; export HOME
+export SQUAD_CONF="$HOME/.config/squad/squad.conf"
+export SQUAD_SOCKET="showcase"
+export GIT_AUTHOR_NAME=showcase GIT_AUTHOR_EMAIL=showcase@example
+export GIT_COMMITTER_NAME=showcase GIT_COMMITTER_EMAIL=showcase@example
+unset MCP_HUB_URL
+
+ORG=monkeypashion; REPO=demo-app
+SRC="$HOME/Projects/code/$ORG/$REPO"
+BARE="$TMP/github/$ORG/$REPO.git"
+WS="$TMP/sidecar.code-workspace"
+FARWS="$TMP/farbox.code-workspace"
+enc() { printf '%s' "$1" | sed -e 's:[/\\:]:-:g' -e 's/-*$//'; }
+
+mkdir -p "$HOME/.config/squad" "$HOME/.mcp-hub" "$HOME/Projects/code/$ORG" \
+         "$(dirname "$BARE")" "$TMP/bin"
+: > "$SQUAD_CONF"
+printf '{"projects":["%s/%s"]}\n' "$ORG" "$REPO" > "$HOME/.mcp-hub/config.json"
+
+# The fake ssh. Four lines, and it is the whole reason the remote leg is
+# testable at all.
+cat > "$TMP/bin/fake-ssh" <<'EOF'
+#!/bin/sh
+shift
+exec /bin/sh -c "$*"
+EOF
+chmod +x "$TMP/bin/fake-ssh"
+RSH="$TMP/bin/fake-ssh"
+
+# A throwaway "GitHub", laid out <org>/<repo>.git so identity derives from the
+# remote URL exactly as it does in production — the path's last two components.
+runq git init -q --bare "$BARE"
+git config --global init.defaultBranch master
+git config --global advice.detachedHead false
+
+runq git clone -q "$BARE" "$SRC"
+printf 'demo-app\n' > "$SRC/README.md"
+mkdir -p "$SRC/src"; printf 'print("hi")\n' > "$SRC/src/app.py"
+runq git -C "$SRC" add -A
+runq git -C "$SRC" commit -qm "the work so far"
+runq git -C "$SRC" push -q origin HEAD
+
+# Memory + one conversation transcript, in the real place with the real names.
+STATE="$HOME/.claude/projects/$(enc "$SRC")"
+mkdir -p "$STATE/memory"
+cat > "$STATE/memory/MEMORY.md" <<'EOF'
+# Active
+- [project_release_plan](project_release_plan.md) — cut 2.0 after the parser lands
+- [feedback_ask_before_deleting](feedback_ask_before_deleting.md) — HARD RULE
+EOF
+printf -- '---\nname: project_release_plan\n---\n\nCut 2.0 after the parser lands.\n' \
+  > "$STATE/memory/project_release_plan.md"
+printf -- '---\nname: feedback_ask_before_deleting\n---\n\nAlways ask first.\n' \
+  > "$STATE/memory/feedback_ask_before_deleting.md"
+
+python3 - "$STATE" "$SRC" <<'PY'
+import json, pathlib, sys
+state, src = pathlib.Path(sys.argv[1]), sys.argv[2]
+enc = src.replace("/", "-").replace("\\", "-").replace(":", "-").rstrip("-")
+J = dict(separators=(",", ":"), ensure_ascii=False)
+lines = [
+    {"type": "user", "cwd": src, "message": {"role": "user", "content": [
+        {"type": "text", "text": f"look at {src}/src/app.py and tell me what breaks"}]}},
+    {"type": "assistant", "cwd": src, "message": {"role": "assistant", "content": [
+        {"type": "text", "text": f"Nothing yet — {src}/src/app.py only prints."}]}},
+    {"type": "file-history-delta", "cwd": src,
+     "trackingPath": f"/home/whoever/.claude/projects/{enc}/memory/MEMORY.md",
+     "backup": {"realParentDir": f"/home/whoever/.claude/projects/{enc}/memory"}},
+    {"type": "file-history-snapshot", "cwd": src, "snapshot": {"trackedFileBackups": {
+        f"{src}/src/app.py": {"backupPath": f"/home/whoever/.claude/backups/app.py"}}}},
+]
+(state / "8f2c1a44-demo.jsonl").write_text(
+    "".join(json.dumps(o, **J) + "\n" for o in lines), encoding="utf-8")
+PY
+
+AGENT="$(mcp-hub identity --cwd "$SRC" --any 2>/dev/null)"
+printf '%s|%s|||\n' "$AGENT" "$SRC" >> "$SQUAD_CONF"
+
+# ── curtain up ─────────────────────────────────────────────────────────────
+clear 2>/dev/null || true
+cat <<EOF
+
+  ${B}${MG}THE AGENT TRANSPORTER${R}
+  ${D}Move a whole agent — code, memory, conversation history, launch args and
+  its own hub identity — into another workspace, or onto another machine.${R}
+
+  ${D}Everything below is the real squad, run against a sandbox HOME at${R}
+  ${D}$TMP${R}
+  ${D}Nothing here can touch your fleet.${R}
+EOF
+pause
+
+# ── ACT 1 ──────────────────────────────────────────────────────────────────
+act "One agent, minding its own business" \
+    "A repo with a remote, some memory, one conversation. The ordinary case."
+say "worktree : $SRC"
+say "agent    : ${B}$AGENT${R}   ${D}(derived: <repo>-<hostname>)${R}"
+say "memory   : $(ls -1 "$STATE/memory"/*.md | wc -l) files"
+say "history  : $(ls -1 "$STATE"/*.jsonl | wc -l) transcript, $(wc -l < "$STATE/8f2c1a44-demo.jsonl") lines"
+printf '\n'
+note "Nobody configured that name. It is derived from the git remote and the"
+note "hostname, which is why two clones of one repo can never collide."
+pause
+
+# ── ACT 2 ──────────────────────────────────────────────────────────────────
+act "The gate: it moves what is PUSHED, or it moves nothing" \
+    "A clone is only provably identical if the remote can reconstruct it."
+
+printf 'half-finished edit\n' >> "$SRC/README.md"
+run "$SQUAD" transport "$AGENT" --to "$WS" --dry-run
+printf '\n'
+runq git -C "$SRC" checkout -- README.md
+
+printf 'scratch\n' > "$SRC/notes.txt"
+run "$SQUAD" transport "$AGENT" --to "$WS" --dry-run
+printf '\n'
+rm -f "$SRC/notes.txt"
+
+printf 'a real commit\n' >> "$SRC/README.md"
+runq git -C "$SRC" commit -qam "work that never left this laptop"
+run "$SQUAD" transport "$AGENT" --to "$WS" --dry-run
+printf '\n'
+note "That last one is the one that matters. The tree is CLEAN — every other"
+note "tool would call this ready. It refuses because a commit exists here and"
+note "nowhere else, and a clone made from origin would silently lack it."
+printf '\n'
+pause
+
+runq git -C "$SRC" push -q origin HEAD
+run "$SQUAD" transport "$AGENT" --to "$WS" --dry-run
+printf '\n'
+good "Now it will move — and it told you the destination and the identity"
+good "suffix BEFORE writing a single byte."
+pause
+
+# ── ACT 3 ──────────────────────────────────────────────────────────────────
+act "Move it" \
+    "The workspace does not exist yet. That is the normal opening move."
+run "$SQUAD" transport "$AGENT" --to "$WS"
+RC=$?
+[ "$RC" = 0 ] || { bad "transport failed (exit $RC) — stopping"; exit 1; }
+CLONE="$(awk -F'|' -v a="$AGENT" '$1!=a && $2!="" {print $2}' "$SQUAD_CONF" | tail -1)"
+CLONE_AGENT="$(awk -F'|' -v a="$AGENT" '$1!=a {print $1}' "$SQUAD_CONF" | tail -1)"
+printf '\n'
+note "Note the destination: the original already owns the canonical path, so"
+note "the clone was filed alongside it as ${B}$(basename "$CLONE")${R}${D} rather than landing on top."
+pause
+
+say "${B}the workspace file it created${R}"
+sed 's/^/        /' "$WS"
+printf '\n'
+say "${B}the roster${R}"
+sed 's/^/        /' "$SQUAD_CONF"
+printf '\n'
+note "Two rows, two worktrees, one repo. The clone landed STOPPED — starting it"
+note "is your call, never the transporter's."
+pause
+
+# ── ACT 4 ──────────────────────────────────────────────────────────────────
+act "Identity is re-derived, never copied" \
+    "Copy an agent's name and the second one hijacks the first one's wake binding."
+run mcp-hub identity --cwd "$SRC" --json --any
+printf '\n'
+run mcp-hub identity --cwd "$CLONE" --json --any
+printf '\n'
+say "${B}~/.mcp-hub/config.json${R}"
+python3 -c 'import json,sys;print(json.dumps(json.load(open(sys.argv[1])),indent=2))' \
+  "$HOME/.mcp-hub/config.json" | sed 's/^/        /'
+printf '\n'
+note "One entry, keyed by absolute path. Absent, derivation is unchanged — which"
+note "is why adding a clone cannot rename the fleet you already have."
+pause
+
+# ── ACT 5 ──────────────────────────────────────────────────────────────────
+act "History travels as a record, not as a copy" \
+    "A transcript embeds its absolute path in four structural fields. Only those four move."
+CSTATE="$HOME/.claude/projects/$(enc "$CLONE")"
+python3 - "$STATE/8f2c1a44-demo.jsonl" "$CSTATE/8f2c1a44-demo.jsonl" <<'PY'
+import json, sys
+old = [json.loads(l) for l in open(sys.argv[1], encoding="utf-8") if l.strip()]
+new = [json.loads(l) for l in open(sys.argv[2], encoding="utf-8") if l.strip()]
+def show(label, a, b):
+    print(f"        {label}")
+    print(f"          before  {a}")
+    print(f"          after   {b}")
+def txt(r):
+    return r["message"]["content"][0]["text"]
+show("cwd", old[0]["cwd"], new[0]["cwd"])
+print()
+show("what you actually said", txt(old[0])[:64] + "…", txt(new[0])[:64] + "…")
+print("          " + ("✓ byte-identical — the record is not edited"
+                      if txt(old[0]) == txt(new[0]) else "✗ CONTENT CHANGED"))
+print()
+show("file-history-delta.trackingPath",
+     old[2]["trackingPath"], repr(new[2]["trackingPath"]))
+show("file-history-delta.backup.realParentDir",
+     old[2]["backup"]["realParentDir"], repr(new[2]["backup"]["realParentDir"]))
+print("          ↑ blanked, not repointed: those backups do not travel, and")
+print("            repointing them aimed a rewind at the receiving agent's tree")
+print()
+show("trackedFileBackups keys",
+     list(old[3]["snapshot"]["trackedFileBackups"]),
+     list(new[3]["snapshot"]["trackedFileBackups"]))
+PY
+printf '\n'
+note "Two guards run on every line: FAITHFULNESS (nothing outside those four"
+note "fields changed) and COMPLETENESS (every surviving mention of the old path"
+note "sits in a content field). The second is the only one that can catch a"
+note "coupling nobody thought of — so watch it catch one:"
+pause
+
+POISON="$TMP/poison"; PSTATE="$POISON/.claude/projects/$(enc "$SRC")"
+mkdir -p "$PSTATE"
+python3 - "$PSTATE/deadly.jsonl" "$SRC" <<'PY'
+import json, sys
+J = dict(separators=(",", ":"), ensure_ascii=False)
+src = sys.argv[2]
+# A field nobody classified, holding a live pointer at the source machine.
+rec = {"type": "user", "cwd": src, "sidecarWorkingDir": f"{src}/src",
+       "message": {"role": "user", "content": [{"type": "text", "text": "hello"}]}}
+open(sys.argv[1], "w", encoding="utf-8").write(json.dumps(rec, **J) + "\n")
+PY
+run env HOME="$POISON" mcp-hub transport-history --from-cwd "$SRC" --to-cwd "$CLONE" --out-dir "$TMP/staging"
+printf '\n'
+good "It refused, and it refused to WRITE. A clone with a live pointer into the"
+good "original's memory dir is worse than a clone with no history at all."
+pause
+
+# ── ACT 6 ──────────────────────────────────────────────────────────────────
+act "The clone works out what it is" \
+    "Memory is written in the first person. Copy it and the copy believes it is the original."
+say "${B}${CLONE_AGENT}'s memory index, first three lines${R}"
+head -3 "$CSTATE/memory/MEMORY.md" | sed 's/^/        /'
+printf '\n'
+say "${B}the marker it now reads first${R}"
+sed -n '1,14p' "$CSTATE/memory/000_you_are_a_transported_clone.md" | sed 's/^/        /'
+printf '\n'
+note "Live proof, twice, on two machines: the transported clone identified"
+note "itself unprompted — and one of them went further, reasoning that the"
+note "original's unpushed commits could not be in its body, because transport"
+note "clones from origin. It was right, and nobody had told it that."
+pause
+
+# ── ACT 7 ──────────────────────────────────────────────────────────────────
+act "Another machine" \
+    "Same verb, one more flag. First it asks whether that box can host an agent at all."
+run "$SQUAD" preflight --host farbox --rsh "$RSH"
+printf '\n'
+note "A brand-new server is offered by the cockpit before it can host anything."
+note "Checking AFTER the bytes have moved is a post-mortem, not a check — you"
+note "get a half-wired agent on a box you were told was a valid destination."
+pause
+
+# What `squad bootstrap` installs, minus the parts that would pip-install into
+# a sandbox: it also clones mcp-hub, builds a venv and puts squad on PATH.
+mkdir -p "$HOME/.claude"
+printf '{"hooks":{"Stop":[{"matcher":"*","hooks":[{"type":"command","command":"mcp-hub stop-hook"}]}]}}\n' \
+  > "$HOME/.claude/settings.json"
+printf '{"projects":{}}\n' > "$HOME/.claude.json"
+note "(\`squad bootstrap --host farbox\` is the one command that fixes all of"
+note " that — clone, venv, PATH, hooks, opt-in. Here the demo writes the"
+note " per-home pieces directly rather than pip-installing into a sandbox.)"
+printf '\n'
+run "$SQUAD" preflight --host farbox --rsh "$RSH"
+pause
+
+# A hand-authored workspace file, comments and all — the thing a load-and-dump
+# would quietly destroy.
+cat > "$FARWS" <<'EOF'
+{
+  // the far box. keep the ordering — I read this top to bottom
+  "folders": [
+    { "path": "/opt/notes" }        // scratch, not an agent
+  ],
+  "settings": {
+    "terminal.integrated.fontSize": 13
+  }
+}
+EOF
+say "${B}farbox.code-workspace, hand-written, before${R}"
+sed 's/^/        /' "$FARWS"
+pause
+
+run "$SQUAD" transport "$AGENT" --to "$FARWS" --host farbox --rsh "$RSH"
+printf '\n'
+say "${B}after${R}"
+sed 's/^/        /' "$FARWS"
+printf '\n'
+good "Comments intact, formatting intact, one folder added. It is a surgical"
+good "insert precisely because these files are hand-kept."
+pause
+
+# ── ACT 8 ──────────────────────────────────────────────────────────────────
+act "Teardown knows which one is the copy" \
+    "Both worktrees are clean and pushed. Nothing on disk says which came first."
+python3 - "$WS" "$SRC" <<'PY'
+import json, re, sys
+p = sys.argv[1]
+t = open(p, encoding="utf-8").read()
+t = t.replace('"folders": [', '"folders": [\n    { "path": "%s" },' % sys.argv[2], 1)
+open(p, "w", encoding="utf-8").write(t)
+PY
+say "The original has been added to the sidecar workspace too, so teardown has"
+say "to choose between two indistinguishable-looking folders:"
+printf '\n'
+run "$SQUAD" teardown workspace "$WS" --delete-worktrees --dry-run
+printf '\n'
+note "It is not guessing. Only the clone has a transport-registered identity"
+note "suffix — provenance, recorded at the moment it was created. Clean-and-"
+note "pushed cannot tell an original from a copy; that record can."
+pause
+
+run "$SQUAD" teardown workspace "$WS" --delete-worktrees --yes
+printf '\n'
+say "${B}on disk now${R}"
+[ -d "$SRC" ]   && good "  original still here : $SRC" \
+                || bad  "  ORIGINAL GONE      : $SRC"
+[ -d "$CLONE" ] && bad  "  clone still here   : $CLONE" \
+                || good "  clone removed      : $CLONE"
+printf '\n'
+say "${B}the roster${R}"
+sed 's/^/        /' "$SQUAD_CONF"
+printf '\n'
+note "The original left the roster with the workspace — that is what tearing a"
+note "workspace down means — but its code is untouched and it is one"
+note "\`add-folder\` away from being enrolled again. Deleting is the part that"
+note "cannot be undone, and that is the part it refused to do."
+pause
+
+# ── curtain ────────────────────────────────────────────────────────────────
+cat <<EOF
+
+  ${B}${MG}THAT IS THE WHOLE THING${R}
+
+    ${GN}refuses${R} anything the remote could not reconstruct — a clean tree with
+            one unpushed commit included
+    ${GN}refuses${R} a destination that cannot host an agent, before bytes move
+    ${GN}moves${R}   code from origin, memory, re-keyed history, args, class
+    ${GN}derives${R} a fresh identity instead of copying one
+    ${GN}tells${R}   the clone what it is, in the first place it will read
+    ${GN}keeps${R}   your hand-written workspace files exactly as you left them
+    ${GN}deletes${R} only what it can prove it created
+
+  ${D}From the cockpit: agent tab → Transport to workspace… / Transport ALL…
+  From a shell:      squad transport <agent> --to <ws> [--host <box>] [--bootstrap]
+                     squad teardown workspace <ws> --delete-worktrees${R}
+
+EOF
