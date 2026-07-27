@@ -69,7 +69,7 @@ async def test_send_rejects_invalid_priority(server):
 async def test_broadcast_rejects_invalid_priority(server):
     out = await _call_tool(
         server, "broadcast",
-        {"from_agent": "alice", "message": "hi", "priority": "spicy"},
+        {"scope": "fleet", "from_agent": "alice", "message": "hi", "priority": "spicy"},
     )
     assert "Invalid priority" in out
 
@@ -98,7 +98,7 @@ async def test_broadcast_low_priority_skips_channel_push(server):
     with patch.object(registry, "push", AsyncMock(return_value=False)) as push:
         out = await _call_tool(
             server, "broadcast",
-            {"from_agent": "alice", "message": "EOD recap", "priority": "low"},
+            {"scope": "fleet", "from_agent": "alice", "message": "EOD recap", "priority": "low"},
         )
     push.assert_not_called()
     assert "no wake" in out.lower()
@@ -670,11 +670,21 @@ async def test_broadcasts_for_agent_new_registration_starts_at_now(server):
     await _call_tool(server, "register", {"name": "old-agent", "project": "x"})
     await _call_tool(
         server, "broadcast",
-        {"from_agent": "old-agent", "message": "ancient history 1", "priority": "low"},
+        {
+            "scope": "fleet",
+            "from_agent": "old-agent",
+            "message": "ancient history 1",
+            "priority": "low",
+        },
     )
     await _call_tool(
         server, "broadcast",
-        {"from_agent": "old-agent", "message": "ancient history 2", "priority": "low"},
+        {
+            "scope": "fleet",
+            "from_agent": "old-agent",
+            "message": "ancient history 2",
+            "priority": "low",
+        },
     )
 
     # Now alice registers fresh
@@ -697,11 +707,11 @@ async def test_broadcasts_for_agent_returns_unseen_then_advances(server):
     # Bob broadcasts twice after alice registered
     await _call_tool(
         server, "broadcast",
-        {"from_agent": "bob", "message": "first", "priority": "low"},
+        {"scope": "fleet", "from_agent": "bob", "message": "first", "priority": "low"},
     )
     await _call_tool(
         server, "broadcast",
-        {"from_agent": "bob", "message": "second", "priority": "low"},
+        {"scope": "fleet", "from_agent": "bob", "message": "second", "priority": "low"},
     )
 
     # First call: alice sees both
@@ -720,7 +730,7 @@ async def test_broadcasts_for_agent_returns_unseen_then_advances(server):
     # Third broadcast lands → alice's NEXT call returns just that one
     await _call_tool(
         server, "broadcast",
-        {"from_agent": "bob", "message": "third", "priority": "low"},
+        {"scope": "fleet", "from_agent": "bob", "message": "third", "priority": "low"},
     )
     third = await _call_tool(
         server, "get_broadcasts_for_agent", {"agent_name": "alice"},
@@ -757,7 +767,7 @@ async def test_broadcasts_compact_clips_long_bodies(server):
     long_body = "line one of the broadcast\n" + ("x" * 4000)
     await _call_tool(
         server, "broadcast",
-        {"from_agent": "bob", "message": long_body, "priority": "low"},
+        {"scope": "fleet", "from_agent": "bob", "message": long_body, "priority": "low"},
     )
     out = await _call_tool(
         server, "get_broadcasts_for_agent",
@@ -780,7 +790,7 @@ async def test_broadcasts_compact_summarises_past_budget(server):
     for i in range(n):
         await _call_tool(
             server, "broadcast",
-            {"from_agent": "bob",
+            {"scope": "fleet", "from_agent": "bob",
              "message": f"broadcast {i} headline\nbody detail line {i}",
              "priority": "low"},
         )
@@ -805,7 +815,7 @@ async def test_broadcasts_default_stays_verbatim(server):
     long_body = "headline\n" + ("y" * 2000)
     await _call_tool(
         server, "broadcast",
-        {"from_agent": "bob", "message": long_body, "priority": "low"},
+        {"scope": "fleet", "from_agent": "bob", "message": long_body, "priority": "low"},
     )
     out = await _call_tool(
         server, "get_broadcasts_for_agent", {"agent_name": "alice"},
@@ -820,7 +830,7 @@ async def test_broadcasts_compact_short_bodies_untouched_no_footer(server):
     await _call_tool(server, "register", {"name": "bob", "project": "y"})
     await _call_tool(
         server, "broadcast",
-        {"from_agent": "bob", "message": "short and sweet", "priority": "low"},
+        {"scope": "fleet", "from_agent": "bob", "message": "short and sweet", "priority": "low"},
     )
     out = await _call_tool(
         server, "get_broadcasts_for_agent",
@@ -1030,7 +1040,12 @@ async def test_broadcast_advances_sender_cursor(server):
     await _call_tool(server, "register", {"name": "alice", "project": "x"})
     await _call_tool(
         server, "broadcast",
-        {"from_agent": "alice", "message": "my own announcement", "priority": "low"},
+        {
+            "scope": "fleet",
+            "from_agent": "alice",
+            "message": "my own announcement",
+            "priority": "low",
+        },
     )
     # Alice's first call after sending should return nothing — her cursor
     # advanced past the broadcast she just authored.
@@ -1066,7 +1081,7 @@ async def test_broadcast_successful_push_advances_recipient_cursor(server):
     with patch.object(registry, "push", side_effect=selective_push):
         await _call_tool(
             server, "broadcast",
-            {"from_agent": "publisher", "message": "fanout test"},
+            {"scope": "fleet", "from_agent": "publisher", "message": "fanout test"},
         )
 
     # We didn't register publisher; treat alice and bob as recipients.
@@ -1099,7 +1114,7 @@ async def test_low_priority_broadcast_does_not_advance_recipient_cursors(server)
 
     await _call_tool(
         server, "broadcast",
-        {"from_agent": "alice", "message": "fyi", "priority": "low"},
+        {"scope": "fleet", "from_agent": "alice", "message": "fyi", "priority": "low"},
     )
 
     # Bob hasn't read yet — should see the broadcast via auto-pull
@@ -1124,7 +1139,7 @@ async def test_broadcasts_for_agent_isolates_per_agent_cursors(server):
 
     await _call_tool(
         server, "broadcast",
-        {"from_agent": "publisher", "message": "shared news", "priority": "low"},
+        {"scope": "fleet", "from_agent": "publisher", "message": "shared news", "priority": "low"},
     )
 
     # Alice consumes — her cursor advances

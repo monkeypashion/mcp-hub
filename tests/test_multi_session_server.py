@@ -212,7 +212,7 @@ async def test_broadcast_cursor_not_advanced_on_extra_only(server):
 
     await _call_tool(
         server, "broadcast",
-        {"from_agent": "alice", "message": "fleet-wide"},
+        {"scope": "fleet", "from_agent": "alice", "message": "fleet-wide"},
     )
     assert len(live.sends) == 1, "the live extra should still be woken"
 
@@ -238,7 +238,7 @@ async def test_broadcast_cursor_advances_when_primary_delivers(server):
 
     await _call_tool(
         server, "broadcast",
-        {"from_agent": "alice", "message": "fleet-wide"},
+        {"scope": "fleet", "from_agent": "alice", "message": "fleet-wide"},
     )
     after = conn.execute(
         "SELECT last_broadcast_seen_id FROM agents WHERE name = 'pm'"

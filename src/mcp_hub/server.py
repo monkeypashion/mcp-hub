@@ -101,6 +101,13 @@ class _PushOutcome(NamedTuple):
 _VALID_PRIORITIES = {"low", "normal", "urgent"}
 _NO_WAKE_PRIORITIES = {"low"}
 
+# broadcast(scope=...) takes a SQUAD NAME, so one word has to be reserved for
+# "everyone". A squad actually called "fleet" would make `scope="fleet"` mean
+# two things at once, so the name is refused at the point of joining rather
+# than resolved by precedence later — an ambiguity you cannot create is better
+# than one you have to remember the rule for.
+_FLEET_SCOPE = "fleet"
+
 # Stop-hook (compact) rendering budget. The Stop hook fires at EVERY turn
 # boundary and its output lands verbatim in the agent's context, so an
 # unbounded dump is a recurring context tax paid by every agent all day.
@@ -464,30 +471,62 @@ def init_db(db_path: Path = DB_PATH) -> None:
     except sqlite3.OperationalError:
         pass  # Column already exists
 
-    # Migrate: TEAM — the squad an agent belongs to, and the unit a broadcast
-    # is scoped to.
+    # SQUADS — who a broadcast reaches. An agent belongs to ANY NUMBER of them
+    # (operator, 2026-07-27: "like a human developer can"), so membership is a
+    # table, not a column.
     #
-    # NOT the project, and not the org. Measured 2026-07-27: one squad's
+    # NOT the project and NOT the org. Measured 2026-07-27: one squad's
     # investigation spanned dreamteam-ai-labs/{pm,factory-operations,dreamteam,
     # spike} AND monkeypashion/vps-hetzner — four projects across two orgs,
-    # collaborating legitimately. Scoping by project would have severed them
-    # from each other; scoping by org would have put vps with mcp-hub, i.e.
-    # joined to the agents that should have been excluded and cut off from the
-    # squad it actually works with. Both cut across the real boundary.
+    # collaborating legitimately. Scoping by project would have severed them;
+    # scoping by org would have joined vps to mcp-hub, i.e. to the very agents
+    # that needed excluding. Both cut across the real boundary.
     #
-    # The real unit is the WORKSPACE — it is already what squad scopes tabs,
-    # transport and teardown by — but workspace FILES are machine-local and
-    # their names differ per machine, so the name cannot be the identifier. An
-    # explicit team is the smallest thing that survives crossing machines.
+    # Membership comes from WORKSPACE TYPE on the client side. A workspace is
+    # typed `squad` (its agents are members of the squad it names) or `faculty`
+    # (unrelated agents assembled for convenience — confers NO membership). An
+    # agent sitting in three squad workspaces is in three squads; that is where
+    # multi-membership comes from, and why a faculty workspace needs no record
+    # here at all. Faculty is the ABSENCE of membership, not a kind of it.
     #
-    # Empty means "no declared team", which deliberately behaves exactly as
-    # today: an agent with no team broadcasts fleet-wide, because a group we
-    # cannot name is not a group we may silently exclude people from.
+    # The boundary that must hold (2026-07-25 incident, squad/squad:64): type
+    # decides GROUPING, never CAPABILITY. Whether an agent can actually receive
+    # a live message is read from its launch args. Conflating the two is what
+    # let the hub report "delivered live" to an agent with no channels flag.
+    #
+    # muted is per (agent, squad): a member of three squads can silence one and
+    # stay in the others. It suppresses BOTH delivery paths — push and catch-up.
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS squad_members (
+               agent  TEXT NOT NULL,
+               squad  TEXT NOT NULL,
+               muted  INTEGER NOT NULL DEFAULT 0,
+               joined REAL NOT NULL DEFAULT 0,
+               PRIMARY KEY (agent, squad)
+           )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_squad_members_squad ON squad_members(squad)"
+    )
+    conn.commit()
+
+    # Legacy: `agents.team` was the single-squad column shipped earlier the same
+    # day (ba515ea) and superseded within hours by multi-membership. It is left
+    # in place rather than dropped — SQLite column drops are fiddly and it is
+    # harmless — but nothing reads it. Any value it holds is migrated once into
+    # the table below, so a hub that briefly ran the single-squad build keeps
+    # its memberships instead of silently losing them.
     try:
         conn.execute("ALTER TABLE agents ADD COLUMN team TEXT NOT NULL DEFAULT ''")
         conn.commit()
     except sqlite3.OperationalError:
         pass  # Column already exists
+    conn.execute(
+        """INSERT OR IGNORE INTO squad_members (agent, squad, muted, joined)
+           SELECT name, team, 0, ? FROM agents WHERE team != ''""",
+        (time.time(),),
+    )
+    conn.commit()
 
     # Migrate: AUDIENCE — who a broadcast was for, recorded ON THE ROW at send
     # time rather than recomputed from the sender later. A sender's team can
@@ -1172,6 +1211,24 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             "correct from_agent; the record was not written."
         )
 
+    def _squads_of(conn: sqlite3.Connection, agent: str,
+                   include_muted: bool = True) -> list[str]:
+        """Squads this agent belongs to, sorted.
+
+        include_muted=False is the DELIVERY view — a muted squad is one you are
+        still a member of but do not hear, so mute belongs here rather than at
+        each call site, where one of the two delivery paths would eventually
+        forget it.
+        """
+        sql = "SELECT squad FROM squad_members WHERE agent = ?"
+        if not include_muted:
+            sql += " AND muted = 0"
+        return sorted(r["squad"] for r in conn.execute(sql, (agent,)).fetchall())
+
+    def _parse_squads(squads: str) -> list[str]:
+        """Comma-separated squad names → clean, de-duplicated, sorted list."""
+        return sorted({s.strip() for s in squads.split(",") if s.strip()})
+
     # Exposed for tests, to verify the gate's LOGIC directly against seeded
     # registry bindings.
     #
@@ -1419,7 +1476,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     @mcp.tool()
     def register(
         name: str, project: str = "", bio: str = "", meta: str = "{}",
-        team: str = "", ctx: Context | None = None,
+        squads: str = "", ctx: Context | None = None,
     ) -> str:
         """Register this agent session with the hub.
 
@@ -1432,15 +1489,26 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         Args:
             name: Your agent name (e.g. 'dreamteam-lead', 'reliable-ai-dev').
             project: Project you're working on (e.g. 'dreamteam', 'mcp-hub').
-            team: The squad you belong to (e.g. 'dreamteam'). Broadcasts are
-                  scoped to a team by default, so this decides who hears you
-                  and whose chatter reaches you. NOT the project — one squad
+            squads: Comma-separated squads you belong to (e.g. 'dreamteam,hub').
+                  Broadcasts are confined to a squad, so this decides who hears
+                  you and whose chatter reaches you. NOT the project — one squad
                   routinely spans several projects and even several orgs.
-                  Empty preserves any stored value and means "no declared
-                  team", which behaves exactly as before: fleet-wide.
+                  You may belong to any number.
+
+                  EMPTY PRESERVES what is stored — it means "no opinion", not
+                  "remove me", so an agent that hasn't learned to send this yet
+                  cannot silently drop out of its squads on a reconnect (and
+                  every agent reconnects constantly). Leaving is deliberate,
+                  via set_squads.
             bio: Short description of your role/skills so other agents know what you do.
             meta: Optional JSON metadata about this agent.
         """
+        wanted = _parse_squads(squads)
+        if _FLEET_SCOPE in wanted:
+            return (
+                f"'{_FLEET_SCOPE}' is reserved — it is what broadcast(scope=...) "
+                f"means by 'everyone', so it cannot also name a squad."
+            )
         now = time.time()
         conn = _get_db(db_path)
 
@@ -1461,30 +1529,33 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             (_BROADCAST_CHANNEL,),
         ).fetchone()["m"]
 
-        # team follows the same rule as bio: an empty value on re-register
-        # PRESERVES what is stored, so an agent that hasn't learned to send one
-        # yet cannot silently drop itself out of its squad on a reconnect.
-        #
-        # The cost of that rule, stated plainly because it is a real gap: there
-        # is currently NO way to clear a team once set. Empty means "no opinion",
-        # so it cannot also mean "remove me". Un-teaming needs an explicit tool
-        # (or a sentinel value) and neither exists yet — a first team assignment
-        # is effectively one-way until one does. Deliberately not built here:
-        # the client side that would set a team in the first place isn't built
-        # either, so nothing on the hub can reach this state yet.
         conn.execute(
             """INSERT INTO agents (name, project, bio, status, registered,
-                                   last_seen, meta, last_broadcast_seen_id, team)
-               VALUES (?, ?, ?, 'online', ?, ?, ?, ?, ?)
+                                   last_seen, meta, last_broadcast_seen_id)
+               VALUES (?, ?, ?, 'online', ?, ?, ?, ?)
                ON CONFLICT(name) DO UPDATE SET
                    project=excluded.project,
                    bio=CASE WHEN excluded.bio = '' THEN agents.bio ELSE excluded.bio END,
-                   team=CASE WHEN excluded.team = '' THEN agents.team ELSE excluded.team END,
                    status='online',
                    last_seen=excluded.last_seen,
                    meta=excluded.meta""",
-            (name, project, bio, now, now, meta, max_broadcast_id, team),
+            (name, project, bio, now, now, meta, max_broadcast_id),
         )
+
+        # Squads follow bio's rule: empty PRESERVES. Additive on purpose — a
+        # register that names two squads must not evict a third the agent was
+        # put in from elsewhere (a settings dialogue, another workspace). The
+        # authoritative form, which CAN remove, is set_squads.
+        #
+        # Mute survives re-registration: INSERT OR IGNORE leaves an existing row
+        # alone, so an agent that silenced a squad does not get un-silenced
+        # every time its session restarts.
+        for sq in wanted:
+            conn.execute(
+                "INSERT OR IGNORE INTO squad_members (agent, squad, muted, joined) "
+                "VALUES (?, ?, 0, ?)",
+                (name, sq, now),
+            )
         conn.commit()
         _close_coverage_gap(conn, name)
 
@@ -1554,48 +1625,146 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         return f"Bio updated for '{name}'."
 
     @mcp.tool()
-    def set_team(name: str, team: str, ctx: Context | None = None) -> str:
-        """Set — or clear — the squad you belong to.
+    def set_squads(name: str, squads: str, ctx: Context | None = None) -> str:
+        """Set the FULL list of squads an agent belongs to. Authoritative.
 
-        register(team=...) merges: an empty value there PRESERVES the stored
-        team, so a reconnecting agent that doesn't send one cannot silently
-        drop out of its squad. That rule is right for register and it leaves
-        no way to say "remove me", because empty already means "no opinion".
-        Hence this tool, where the value passed is AUTHORITATIVE — including
-        empty, which clears. The two compose, and no magic sentinel string is
-        needed. Same split as update_bio against register's bio merge.
+        register(squads=...) is additive and treats empty as "no opinion", so
+        that a reconnect cannot drop an agent out of its squads. That rule is
+        right for register and it leaves no way to say "remove me". Hence this
+        tool, where the list passed REPLACES what is stored — including the
+        empty list, which leaves every squad. Same split as update_bio against
+        register's bio merge.
 
-        Without it, a first team assignment would be one-way, and `team` is a
-        live parameter the moment this deploys: the first agent to try
-        register(team="test") by hand would be stuck in "test" permanently.
+        Mute is preserved for squads you stay in: leaving and re-joining is how
+        you reset it, and a settings dialogue rewriting the whole list must not
+        silently un-mute what the operator silenced.
 
         Args:
-            name: Your agent name.
-            team: The squad to join. Empty string CLEARS your team, which
-                  returns you to hearing (and reaching) every agent — the
-                  pre-scoping behaviour.
+            name: The agent whose membership is being set.
+            squads: Comma-separated squad names. EMPTY LEAVES ALL SQUADS,
+                  after which the agent can no longer broadcast at all —
+                  it must use send() or be given a squad. That is deliberate:
+                  an agent in no squad has no group to address, and silently
+                  reaching the whole fleet instead is the incident this
+                  feature exists to prevent.
         """
-        # A bound session may only set ITS OWN team — same class as
-        # unregister. Setting someone else's would quietly cut them out of
-        # their squad's broadcasts, which is the destructive form here: they
-        # would go on believing they were listening. Ephemeral/unbound
-        # callers unchanged, as everywhere else.
+        # A bound session may only set ITS OWN membership — same class as
+        # unregister. Moving someone else would quietly cut them out of their
+        # squads' broadcasts while they went on believing they were listening.
+        # Ephemeral/unbound callers unchanged, as everywhere else.
         _grade, attr_err = _attribution(ctx, name)
         if attr_err:
             return attr_err
+        wanted = _parse_squads(squads)
+        if _FLEET_SCOPE in wanted:
+            return (
+                f"'{_FLEET_SCOPE}' is reserved — it is what broadcast(scope=...) "
+                f"means by 'everyone', so it cannot also name a squad."
+            )
         conn = _get_db(db_path)
         row = conn.execute("SELECT 1 FROM agents WHERE name = ?", (name,)).fetchone()
         if not row:
             return f"Agent '{name}' not found. Register first with register()."
-        conn.execute("UPDATE agents SET team = ? WHERE name = ?", (team, name))
+
+        now = time.time()
+        current = set(_squads_of(conn, name))
+        for gone in current - set(wanted):
+            conn.execute(
+                "DELETE FROM squad_members WHERE agent = ? AND squad = ?", (name, gone)
+            )
+        for sq in wanted:
+            conn.execute(
+                "INSERT OR IGNORE INTO squad_members (agent, squad, muted, joined) "
+                "VALUES (?, ?, 0, ?)",
+                (name, sq, now),
+            )
         conn.commit()
         touch_session(name, ctx)
-        if not team:
+        if not wanted:
             return (
-                f"Team cleared for '{name}' — now reaching and hearing every "
-                f"agent, as before scoping."
+                f"'{name}' now belongs to no squad — it can still send and "
+                f"receive direct messages, but cannot broadcast until it joins one."
             )
-        return f"Team set to '{team}' for '{name}'."
+        return f"'{name}' now belongs to: {', '.join(wanted)}."
+
+    @mcp.tool()
+    def mute_squad(
+        name: str, squad: str, muted: bool = True, ctx: Context | None = None
+    ) -> str:
+        """Stop (or resume) hearing one squad's broadcasts, without leaving it.
+
+        Membership and attention are different things: an agent can be a proper
+        member of a squad — reachable, listed, able to broadcast to it — while
+        deliberately not being interrupted by its traffic. Leaving the squad to
+        get quiet would also remove your ability to address it, which is not
+        what "not right now" means.
+
+        Muting suppresses BOTH delivery paths, live push and Stop-hook
+        catch-up. It is not a delay: muted broadcasts are not queued up to
+        arrive later, because a mute that merely defers the interruption has
+        not removed it.
+
+        Args:
+            name: Your agent name.
+            squad: Which squad to silence. You must be a member.
+            muted: True to silence, False to start hearing it again.
+        """
+        _grade, attr_err = _attribution(ctx, name)
+        if attr_err:
+            return attr_err
+        conn = _get_db(db_path)
+        row = conn.execute(
+            "SELECT 1 FROM squad_members WHERE agent = ? AND squad = ?", (name, squad)
+        ).fetchone()
+        if not row:
+            joined = _squads_of(conn, name)
+            belongs = ", ".join(joined) if joined else "no squads"
+            return (
+                f"'{name}' is not in squad '{squad}' — currently in {belongs}. "
+                f"Join it before muting it."
+            )
+        conn.execute(
+            "UPDATE squad_members SET muted = ? WHERE agent = ? AND squad = ?",
+            (1 if muted else 0, name, squad),
+        )
+        conn.commit()
+        touch_session(name, ctx)
+        verb = "muted" if muted else "unmuted"
+        return f"Squad '{squad}' {verb} for '{name}'."
+
+    @mcp.tool()
+    def list_squads(agent: str = "") -> str:
+        """Show squads and their members, or one agent's memberships.
+
+        Args:
+            agent: Optional — show only this agent's squads, with mute state.
+        """
+        conn = _get_db(db_path)
+        if agent:
+            rows = conn.execute(
+                "SELECT squad, muted FROM squad_members WHERE agent = ? "
+                "ORDER BY squad",
+                (agent,),
+            ).fetchall()
+            if not rows:
+                return (
+                    f"'{agent}' belongs to no squad — it can send and receive "
+                    f"direct messages, but cannot broadcast until it joins one."
+                )
+            return f"{agent} is in:\n" + "\n".join(
+                f"  {r['squad']}" + ("  (muted)" if r["muted"] else "") for r in rows
+            )
+        rows = conn.execute(
+            "SELECT squad, COUNT(*) AS n, SUM(muted) AS m FROM squad_members "
+            "GROUP BY squad ORDER BY squad"
+        ).fetchall()
+        if not rows:
+            return "No squads yet. Broadcasts need one — agents join via register(squads=...)."
+        return "\n".join(
+            f"**{r['squad']}** — {r['n']} member(s)"
+            + (f", {r['m']} muted" if r["m"] else "")
+            for r in rows
+        )
 
     @mcp.tool()
     def unregister(name: str, ctx: Context | None = None) -> str:
@@ -1862,9 +2031,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     @mcp.tool()
     async def broadcast(
         from_agent: str, message: str, priority: str = "normal",
-        scope: str = "team", ctx: Context | None = None,
+        scope: str = "", ctx: Context | None = None,
     ) -> str:
-        """Post a broadcast every agent will see.
+        """Post a broadcast to your squad.
 
         Broadcasts are global — they hit every connected agent regardless
         of which channels they're paying attention to. Use this when the
@@ -1892,29 +2061,34 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             from_agent: Your agent name.
             message: The message body.
             priority: One of "low" | "normal" | "urgent". Defaults to "normal".
-            scope: "team" (default) reaches only agents in your team; "fleet"
-                  reaches everyone. Default changed 2026-07-27: an untargeted
-                  fleet-wide default meant one squad's multi-turn investigation
-                  woke every agent on the hub, and three copies of an
+            scope: WHICH SQUAD this is for. Leave empty and the hub infers it
+                  when that is unambiguous — you are in exactly one squad.
+                  Name a squad to address it directly. Pass "fleet" to reach
+                  every agent on the hub, which is now something you have to
+                  ask for by name.
+
+                  If you are in SEVERAL squads it is refused, not guessed: the
+                  hub cannot know which colleagues you meant, and picking one
+                  would be the same untargeted broadcast this feature exists to
+                  stop. If you are in NONE it is also refused — an agent with no
+                  squad has no group to address, and quietly reaching everyone
+                  instead is exactly the 2026-07-27 incident, where one squad's
+                  investigation woke the whole hub and three copies of an
                   uninvolved agent answered into a lane whose context they did
-                  not hold. A sender with NO declared team still reaches
-                  everyone — a group we cannot name is not one we may silently
-                  exclude people from.
+                  not hold.
 
                   NOT CONFIDENTIALITY. This scopes DELIVERY — who is woken and
                   whose catch-up it lands in. It is noise reduction, and that
                   is all it is. get_broadcasts() and get_history('#general')
                   are deliberately unfiltered, so any agent can still read any
-                  team's broadcasts by asking for them. Never put something in
-                  a team-scoped broadcast that the fleet may not read.
+                  squad's broadcasts by asking for them. Never put something in
+                  a squad broadcast that the fleet may not read.
         """
         if priority not in _VALID_PRIORITIES:
             return (
                 f"Invalid priority '{priority}'. "
                 f"Use one of: {sorted(_VALID_PRIORITIES)}."
             )
-        if scope not in ("team", "fleet"):
-            return f"Invalid scope '{scope}'. Use 'team' or 'fleet'."
 
         now = time.time()
         conn = _get_db(db_path)
@@ -1926,15 +2100,37 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             return attr_err
 
         # The audience is resolved HERE and stored on the row, so it can never
-        # move later. An unknown sender, or one with no team, gets '' = fleet.
-        # Sits below the attribution gate deliberately: a refused caller must
-        # not reach the DB at all. It is a read, so it cannot rebind — the gate
-        # only has to precede touch_session, which it still does.
-        sender = conn.execute(
-            "SELECT team FROM agents WHERE name = ?", (from_agent,)
-        ).fetchone()
-        sender_team = (sender["team"] if sender else "") or ""
-        audience = sender_team if scope == "team" else ""
+        # move later — a sender's membership changes, a sent message's audience
+        # must not. Sits below the attribution gate deliberately: a refused
+        # caller must not reach the DB at all. These are reads, so they cannot
+        # rebind — the gate only has to precede touch_session, which it does.
+        mine = _squads_of(conn, from_agent)
+        if scope == _FLEET_SCOPE:
+            audience = ""                      # explicit, and it had to be typed
+        elif scope:
+            if scope not in mine:
+                belongs = ", ".join(mine) if mine else "no squads"
+                return (
+                    f"'{from_agent}' is not in squad '{scope}' — currently in "
+                    f"{belongs}. You can only broadcast to a squad you belong to."
+                )
+            audience = scope
+        elif len(mine) == 1:
+            audience = mine[0]
+        elif not mine:
+            return (
+                f"'{from_agent}' belongs to no squad, so there is no group to "
+                f"broadcast to. Use send() for a specific agent, join a squad, "
+                f"or pass scope=\"{_FLEET_SCOPE}\" if you really do mean every "
+                f"agent on the hub."
+            )
+        else:
+            return (
+                f"'{from_agent}' is in {len(mine)} squads ({', '.join(mine)}) — "
+                f"name the one you mean with scope=\"<squad>\", or "
+                f"scope=\"{_FLEET_SCOPE}\" for everyone. Not guessed on purpose: "
+                f"picking one for you is how a message reaches the wrong lane."
+            )
 
         # Auto-bind sender's session for drift self-heal.
         touch_session(from_agent, ctx)
@@ -1972,15 +2168,20 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # reaches an agent live here, AND via the Stop-hook cursor catch-up in
         # get_broadcasts_for_agent. Several of the messages that caused
         # 2026-07-27's cross-lane replies arrived through the SECOND path.
+        #
+        # muted = 0 belongs in BOTH filters too: a muted member must not be
+        # woken here and must not find it waiting at the next Stop boundary,
+        # or "muted" would only mean "delayed".
         recipients = [a for a in registry.names() if a != from_agent]
         if audience:
-            in_team = {
-                r["name"]
+            listening = {
+                r["agent"]
                 for r in conn.execute(
-                    "SELECT name FROM agents WHERE team = ?", (audience,)
+                    "SELECT agent FROM squad_members WHERE squad = ? AND muted = 0",
+                    (audience,),
                 ).fetchall()
             }
-            recipients = [a for a in recipients if a in in_team]
+            recipients = [a for a in recipients if a in listening]
 
         # Parallel fan-out. Each push_channel involves an async send through
         # the recipient's MCP write stream; serializing them means broadcast
@@ -2547,11 +2748,11 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         cursor = row["last_broadcast_seen_id"]
 
         # Second delivery path — see the note in broadcast(). An agent catches
-        # up on fleet-wide rows (audience = '') plus its own team's.
-        my_team = conn.execute(
-            "SELECT team FROM agents WHERE name = ?", (agent_name,)
-        ).fetchone()
-        my_team = (my_team["team"] if my_team else "") or ""
+        # up on fleet-wide rows (audience = '') plus those of every squad it is
+        # in AND listening to. include_muted=False is the whole mute feature on
+        # this path: a silenced squad's rows are filtered out here exactly as
+        # they were skipped at push time.
+        my_squads = _squads_of(conn, agent_name, include_muted=False)
 
         # THE FENCE MUST BE READ BEFORE THE SCAN. Do not "simplify" this by
         # moving it down next to the code that uses it.
@@ -2575,12 +2776,15 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             (_BROADCAST_CHANNEL,),
         ).fetchone()["m"]
 
+        # The IN list is built from the membership rather than parameterised as
+        # one value, so an agent in three squads catches up on all three.
+        placeholders = ",".join("?" * len(my_squads)) if my_squads else "NULL"
         rows = conn.execute(
-            """SELECT id, ts, from_agent, body, priority FROM messages
+            f"""SELECT id, ts, from_agent, body, priority FROM messages
                WHERE channel = ? AND id > ?
-                 AND (audience = '' OR audience = ?)
-               ORDER BY id ASC LIMIT ?""",
-            (_BROADCAST_CHANNEL, cursor, my_team, limit),
+                 AND (audience = '' OR audience IN ({placeholders}))
+               ORDER BY id ASC LIMIT ?""",  # noqa: S608 - placeholders are '?' only
+            (_BROADCAST_CHANNEL, cursor, *my_squads, limit),
         ).fetchall()
 
         # Advance cursor to the max id we're returning. Atomic with the read

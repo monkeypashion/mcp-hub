@@ -57,9 +57,9 @@ def _cursor_of(tmp_path: Path, name: str) -> int:
     return row[0]
 
 
-async def _enrol(server, name: str, project: str, team: str = "") -> None:
+async def _enrol(server, name: str, project: str, squads: str = "") -> None:
     await _call(server, "register",
-                {"name": name, "project": project, "team": team})
+                {"name": name, "project": project, "squads": squads})
 
 
 async def _squad(server) -> None:
@@ -99,15 +99,26 @@ async def test_a_team_broadcast_reaches_the_team_across_projects_and_orgs(server
     assert _recipients(out) == 2, out
 
 
-async def test_a_sender_with_no_team_still_reaches_everyone(server):
-    """Backwards compatibility, and the safety rule: a group we cannot NAME is
-    not a group we may silently exclude people from."""
+async def test_a_sender_with_no_squad_is_REFUSED_not_sent_fleet_wide(server):
+    """This assertion is INVERTED from the version shipped hours earlier, and
+    the inversion is the point.
+
+    That build let a squadless sender reach everyone, reasoning that a group we
+    cannot NAME is not one we may silently exclude people from. The operator's
+    model reverses which way the danger runs: with squads explicit, an agent
+    that belongs to none is precisely the one that must NOT reach the whole
+    fleet — a squadless broadcast going everywhere IS the 2026-07-27 incident.
+
+    So it refuses, loudly, naming the alternatives. Loud-and-instructive beats
+    silent-and-fleet-wide."""
     await _squad(server)
-    await _enrol(server, "stranger", "someone/else")      # no team
+    await _enrol(server, "stranger", "someone/else")      # no squad
     with patch.object(server._hub_registry, "names", lambda: FLEET + ["stranger"]):
         out = await _call(server, "broadcast",
                           {"from_agent": "stranger", "message": "hub redeploying"})
-    assert _recipients(out) == len(FLEET), out
+    assert "belongs to no squad" in out, out
+    assert "send()" in out and "fleet" in out, f"refusal must say what to do instead: {out}"
+    assert "woke" not in out, f"refused but delivered anyway: {out}"
 
 
 async def test_scope_fleet_stays_available_and_explicit(server):
@@ -122,11 +133,12 @@ async def test_scope_fleet_stays_available_and_explicit(server):
     assert _recipients(team) == 2 and _recipients(fleet) == 4, (team, fleet)
 
 
-async def test_an_unknown_scope_is_refused(server):
+async def test_broadcasting_to_a_squad_you_are_not_in_is_refused(server):
     await _squad(server)
     out = await _call(server, "broadcast",
-                      {"from_agent": "pm", "message": "x", "scope": "everyone"})
-    assert "Invalid scope" in out
+                      {"from_agent": "pm", "message": "x", "scope": "hublane"})
+    assert "not in squad 'hublane'" in out, out
+    assert "woke" not in out, f"refused but delivered anyway: {out}"
 
 
 # ---- the Stop-hook catch-up path — the one that actually bit --------------
@@ -220,7 +232,7 @@ async def test_joining_a_team_later_does_not_dump_its_backlog(server):
     await _call(server, "get_broadcasts_for_agent", {"agent_name": "hub", "bind": False})
 
     # hub now joins the squad it was never part of when that was sent.
-    await _call(server, "set_team", {"name": "hub", "team": "dreamteam"})
+    await _call(server, "set_squads", {"name": "hub", "squads": "dreamteam"})
     await _call(server, "broadcast", {"from_agent": "pm", "message": "fresh squad business"})
 
     out = await _call(server, "get_broadcasts_for_agent",
@@ -316,36 +328,159 @@ async def test_a_broadcast_arriving_mid_call_is_not_silently_absorbed(server, tm
     )
 
 
-# ---- clearing a team ------------------------------------------------------
+# ---- multi-squad membership ------------------------------------------------
 
-async def test_set_team_can_clear_so_a_first_assignment_is_not_one_way(server):
-    """register(team=...) merges on empty, so empty cannot also mean "remove
-    me". Without a tool where the value is authoritative, the first agent to
-    try register(team="test") by hand would be stuck in "test" forever — and
-    team is a live parameter the moment this deploys."""
+async def test_an_agent_can_belong_to_several_squads_and_hears_all_of_them(server):
+    """Operator, 2026-07-27: "an agent can be in any number of squads (like a
+    human developer can)". That is why membership is a table and not a column,
+    and it is where the workspace model lands — an agent sitting in three squad
+    workspaces is in three squads."""
     await _squad(server)
-    await _call(server, "set_team", {"name": "hub", "team": "dreamteam"})
-    await _call(server, "broadcast", {"from_agent": "pm", "message": "squad ping"})
-    assert "squad ping" in await _call(
-        server, "get_broadcasts_for_agent", {"agent_name": "hub", "bind": False})
+    await _call(server, "set_squads", {"name": "hub", "squads": "dreamteam, hublane"})
 
-    out = await _call(server, "set_team", {"name": "hub", "team": ""})
-    assert "cleared" in out.lower(), out
-
-    # The discriminator has to be a TEAM post. Asserting that a FLEET post
-    # still arrives proves nothing — fleet rows carry audience='' and reach
-    # everyone whether or not the clear worked. (That was this test's first
-    # version, and a mutant that made set_team merge-on-empty sailed through
-    # it.) After a real clear, hub is no longer in dreamteam, so a dreamteam
-    # post must NOT reach it; if the clear silently did nothing, it will.
-    await _call(server, "broadcast", {"from_agent": "pm", "message": "squad only now"})
+    await _call(server, "broadcast", {"from_agent": "pm", "message": "from dreamteam"})
     await _call(server, "broadcast",
-                {"from_agent": "pm", "message": "everyone now", "scope": "fleet"})
+                {"from_agent": "hub-clone", "message": "from hublane"})
+
+    out = await _call(server, "get_broadcasts_for_agent",
+                      {"agent_name": "hub", "bind": False})
+    assert "from dreamteam" in out and "from hublane" in out, \
+        f"a member of two squads must hear both:\n{out}"
+
+
+async def test_a_sender_in_several_squads_must_say_which_one(server):
+    """Not guessed on purpose. Picking one for the sender is how a message
+    reaches the wrong lane — the failure this whole feature exists to stop."""
+    await _squad(server)
+    await _call(server, "set_squads", {"name": "hub", "squads": "dreamteam,hublane"})
+
+    out = await _call(server, "broadcast", {"from_agent": "hub", "message": "which?"})
+    assert "name the one you mean" in out, out
+    assert "dreamteam" in out and "hublane" in out, f"refusal must list them: {out}"
+    assert "woke" not in out, f"refused but delivered anyway: {out}"
+
+    ok = await _call(server, "broadcast",
+                     {"from_agent": "hub", "message": "this one", "scope": "hublane"})
+    assert "woke" in ok, f"naming the squad should have worked: {ok}"
+
+
+async def test_set_squads_is_authoritative_and_can_empty_the_list(server):
+    """register(squads=) is additive and treats empty as "no opinion", so it can
+    never remove. This is the tool that can — including all the way to none."""
+    await _squad(server)
+    await _call(server, "set_squads", {"name": "hub", "squads": "dreamteam,hublane"})
+    out = await _call(server, "set_squads", {"name": "hub", "squads": "hublane"})
+    assert "hublane" in out and "dreamteam" not in out, out
+
+    await _call(server, "broadcast", {"from_agent": "pm", "message": "dreamteam only"})
     after = await _call(server, "get_broadcasts_for_agent",
                         {"agent_name": "hub", "bind": False})
-    assert "squad only now" not in after, \
-        f"still in the team after clearing it:\n{after}"
-    assert "everyone now" in after, f"clearing the team deafened it:\n{after}"
+    assert "dreamteam only" not in after, f"still in dreamteam after removal:\n{after}"
+
+    emptied = await _call(server, "set_squads", {"name": "hub", "squads": ""})
+    assert "no squad" in emptied, emptied
+
+
+async def test_register_is_additive_so_a_reconnect_cannot_evict_a_squad(server):
+    """A register naming two squads must not remove a third the agent was put in
+    from somewhere else — a settings dialogue, or another workspace. Every agent
+    reconnects constantly; a reconnect must never be a membership edit."""
+    await _squad(server)
+    await _call(server, "set_squads", {"name": "hub", "squads": "dreamteam,hublane"})
+    await _enrol(server, "hub", "monkeypashion/mcp-hub", "hublane")   # reconnect
+
+    out = await _call(server, "list_squads", {"agent": "hub"})
+    assert "dreamteam" in out and "hublane" in out, \
+        f"a reconnect evicted a squad it did not name:\n{out}"
+
+
+# ---- mute: membership and attention are different things -------------------
+
+async def test_muting_a_squad_silences_BOTH_delivery_paths(server):
+    """Operator: "individual members of the squad can switch off from receiving
+    the broadcasts". Muting only the push would leave the whole thread waiting
+    at the next Stop boundary, which is not being switched off — it is being
+    delayed. Both paths, or it is not a mute."""
+    await _squad(server)
+    await _call(server, "mute_squad", {"name": "fo", "squad": "dreamteam"})
+
+    with patch.object(server._hub_registry, "names", lambda: list(FLEET)):
+        out = await _call(server, "broadcast",
+                          {"from_agent": "pm", "message": "noisy thread"})
+    assert _recipients(out) == 1, f"muted member was still woken: {out}"   # vps only
+
+    caught = await _call(server, "get_broadcasts_for_agent",
+                         {"agent_name": "fo", "bind": False})
+    assert "noisy thread" not in caught, \
+        f"muted on push but delivered at the Stop boundary:\n{caught}"
+
+
+async def test_mute_is_per_squad_not_per_agent(server):
+    """Stay in three squads, silence one. Muting the agent instead of the pair
+    would make "not right now" mean "leave everything"."""
+    await _squad(server)
+    await _call(server, "set_squads", {"name": "hub", "squads": "dreamteam,hublane"})
+    await _call(server, "mute_squad", {"name": "hub", "squad": "dreamteam"})
+
+    # Markers must not be substrings of one another: the first version used
+    # "muted one"/"unmuted one", and "muted one" IS inside "unmuted one", so the
+    # leak assertion could never fail for the reason it named.
+    await _call(server, "broadcast", {"from_agent": "pm", "message": "ALPHA-thread"})
+    await _call(server, "broadcast",
+                {"from_agent": "hub-clone", "message": "BETA-thread"})
+    out = await _call(server, "get_broadcasts_for_agent",
+                      {"agent_name": "hub", "bind": False})
+    assert "ALPHA-thread" not in out, f"mute leaked across squads:\n{out}"
+    assert "BETA-thread" in out, f"muting one squad deafened the other:\n{out}"
+
+
+async def test_a_muted_member_is_still_a_member(server):
+    """Mute is attention, not membership: you can still ADDRESS a squad you have
+    silenced, and you still appear in it."""
+    await _squad(server)
+    await _call(server, "mute_squad", {"name": "fo", "squad": "dreamteam"})
+
+    out = await _call(server, "broadcast",
+                      {"from_agent": "fo", "message": "I can still speak"})
+    assert "woke" in out, f"a muted member lost the ability to broadcast: {out}"
+    assert "dreamteam" in await _call(server, "list_squads", {"agent": "fo"})
+
+
+async def test_unmuting_does_not_backfill_what_was_muted(server):
+    """A mute that merely defers the interruption has not removed it. Rows sent
+    while muted are gone for that agent, not queued behind the unmute."""
+    await _squad(server)
+    await _call(server, "mute_squad", {"name": "fo", "squad": "dreamteam"})
+    await _call(server, "broadcast", {"from_agent": "pm", "message": "while muted"})
+    await _call(server, "get_broadcasts_for_agent", {"agent_name": "fo", "bind": False})
+
+    await _call(server, "mute_squad",
+                {"name": "fo", "squad": "dreamteam", "muted": False})
+    await _call(server, "broadcast", {"from_agent": "pm", "message": "after unmute"})
+    out = await _call(server, "get_broadcasts_for_agent",
+                      {"agent_name": "fo", "bind": False})
+    assert "after unmute" in out, f"unmute did not restore delivery:\n{out}"
+    assert "while muted" not in out, f"unmute backfilled the muted rows:\n{out}"
+
+
+async def test_muting_a_squad_you_are_not_in_is_refused(server):
+    await _squad(server)
+    out = await _call(server, "mute_squad", {"name": "hub", "squad": "dreamteam"})
+    assert "not in squad" in out, out
+
+
+# ---- the reserved name -----------------------------------------------------
+
+async def test_fleet_cannot_be_used_as_a_squad_name(server):
+    """scope="fleet" means everyone. A squad of that name would make one word
+    mean two things, so it is refused where it would be created rather than
+    resolved by a precedence rule nobody will remember."""
+    out = await _call(server, "register",
+                      {"name": "x", "project": "p", "squads": "fleet"})
+    assert "reserved" in out, out
+    await _enrol(server, "y", "p", "real")
+    out2 = await _call(server, "set_squads", {"name": "y", "squads": "fleet"})
+    assert "reserved" in out2, out2
 
 
 class _FakeSess:
@@ -360,45 +495,39 @@ class _FakeCtx:
         self.session = session
 
 
-async def test_set_team_refuses_to_move_another_agent(server, tmp_path):
-    """Moving someone else's team is the destructive form here: they'd be cut
-    out of their squad's broadcasts while still believing they were listening —
-    the silent-failure sibling of the accidental-impersonation class unregister
-    is gated against.
+async def test_set_squads_refuses_to_move_another_agent(server, tmp_path):
+    """Moving someone else's membership is the destructive form here: they'd be
+    cut out of their squads' broadcasts while still believing they were
+    listening — the silent-failure sibling of the impersonation class that
+    unregister is gated against.
 
-    Reachable through the real boundary, contrary to a comment I wrote here
-    earlier: ToolManager.call_tool takes a third `context` parameter and Tool.run
-    injects it as the tool's ctx kwarg outside pydantic validation, so a fake
-    passes. The "call_tool can't inject a Context" belief was true of this
-    file's helper, which simply never passed one — not of the boundary. Found by
-    dev; verified against the signature before use.
-
-    The DB assertion is the half a direct _attribution call could never make:
-    it proves set_team CONSULTS the gate, not merely that the gate refuses when
-    asked."""
+    Reachable through the real boundary: ToolManager.call_tool takes a third
+    `context` parameter and Tool.run injects it as the tool's ctx kwarg outside
+    pydantic validation, so a fake passes. The DB assertion is the half a direct
+    _attribution call could never make — it proves set_squads CONSULTS the gate,
+    not merely that the gate refuses when asked."""
     await _squad(server)
     sess = _FakeSess()
     server._hub_registry.bind("hub", sess)
 
     result = await server._tool_manager.call_tool(
-        "set_team", {"name": "pm", "team": "hijacked"}, context=_FakeCtx(sess),
+        "set_squads", {"name": "pm", "squads": "hijacked"}, context=_FakeCtx(sess),
     )
     out = str(getattr(result, "content", result))
-    assert "REFUSED" in out, f"a bound session moved another agent's team:\n{out}"
+    assert "REFUSED" in out, f"a bound session moved another agent's squads:\n{out}"
 
     import sqlite3
     conn = sqlite3.connect(tmp_path / "test.db")
-    team = conn.execute(
-        "SELECT team FROM agents WHERE name = 'pm'"
-    ).fetchone()[0]
+    rows = [r[0] for r in conn.execute(
+        "SELECT squad FROM squad_members WHERE agent = 'pm'").fetchall()]
     conn.close()
-    assert team == "dreamteam", f"refused but wrote anyway — pm is now {team!r}"
+    assert rows == ["dreamteam"], f"refused but wrote anyway — pm is now in {rows}"
 
 
-# ---- team persistence -----------------------------------------------------
+# ---- membership persistence ------------------------------------------------
 
-async def test_re_registering_without_a_team_does_not_drop_you_from_it(server):
-    """An agent that hasn't learned to send a team yet must not silently leave
+async def test_re_registering_without_squads_does_not_drop_you_from_them(server):
+    """An agent that hasn't learned to send squads yet must not silently leave
     its squad on a reconnect — and today every agent reconnects constantly."""
     await _enrol(server, "fo", "dreamteam-ai-labs/factory-operations", "dreamteam")
     await _call(server, "register",

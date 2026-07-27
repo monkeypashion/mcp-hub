@@ -354,7 +354,7 @@ async def test_broadcast_push_render_is_clipped(server):
     await _call_tool(server, "register", {"name": "bob", "project": "p"})
     long = "headline\n" + "y" * 4000
     content = await _captured_push_content(
-        server, "broadcast", {"from_agent": "alice", "message": long},
+        server, "broadcast", {"scope": "fleet", "from_agent": "alice", "message": long},
     )
     assert len(content) < 1000
     assert "(full text: get_history)" in content
@@ -391,7 +391,7 @@ async def test_long_broadcast_without_tldr_gets_advisory(server):
     await _call_tool(server, "register", {"name": "alice", "project": "p"})
     body = "word " * 400  # one giant 2000-char line, no summary lead
     out = await _call_tool(
-        server, "broadcast", {"from_agent": "alice", "message": body},
+        server, "broadcast", {"scope": "fleet", "from_agent": "alice", "message": body},
     )
     assert "📏 Advisory" in out
 
@@ -400,7 +400,7 @@ async def test_long_broadcast_with_tldr_lead_no_advisory(server):
     await _call_tool(server, "register", {"name": "alice", "project": "p"})
     body = "TL;DR: the short version.\n" + ("detail " * 400)
     out = await _call_tool(
-        server, "broadcast", {"from_agent": "alice", "message": body},
+        server, "broadcast", {"scope": "fleet", "from_agent": "alice", "message": body},
     )
     assert "Advisory" not in out
 
@@ -424,7 +424,7 @@ async def test_long_tldr_line_is_still_compliance(server):
             + "\n" + ("detail " * 400))
     assert len(body.splitlines()[0]) > 200
     out = await _call_tool(
-        server, "broadcast", {"from_agent": "alice", "message": body},
+        server, "broadcast", {"scope": "fleet", "from_agent": "alice", "message": body},
     )
     assert "Advisory" not in out
 
@@ -434,7 +434,7 @@ async def test_bold_summary_marker_counts_too(server):
     body = ("**Summary** — " + "the gist stated at some length " * 8
             + "\n" + ("detail " * 400))
     out = await _call_tool(
-        server, "broadcast", {"from_agent": "alice", "message": body},
+        server, "broadcast", {"scope": "fleet", "from_agent": "alice", "message": body},
     )
     assert "Advisory" not in out
 

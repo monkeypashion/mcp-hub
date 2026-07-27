@@ -190,7 +190,7 @@ async def test_push_channel_gates_silent_drop(tmp_path: Path) -> None:
 
     out = await _call_tool(
         server, "broadcast",
-        {"from_agent": "alice", "message": "hi", "priority": "normal"},
+        {"scope": "fleet", "from_agent": "alice", "message": "hi", "priority": "normal"},
     )
 
     # The gate must have caught the stale binding: woke=0 despite bob being

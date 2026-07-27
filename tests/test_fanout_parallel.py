@@ -96,7 +96,12 @@ async def test_broadcast_fans_out_in_parallel(server):
         t0 = time.monotonic()
         out = await _call_tool(
             server, "broadcast",
-            {"from_agent": "sender", "message": "hello fleet", "priority": "normal"},
+            {
+                "scope": "fleet",
+                "from_agent": "sender",
+                "message": "hello fleet",
+                "priority": "normal",
+            },
         )
         elapsed = time.monotonic() - t0
 
@@ -180,7 +185,7 @@ async def test_broadcast_advances_cursor_only_for_successful_pushes(server):
     with patch.object(registry, "push", side_effect=_mixed_push):
         out = await _call_tool(
             server, "broadcast",
-            {"from_agent": "sender", "message": "x", "priority": "normal"},
+            {"scope": "fleet", "from_agent": "sender", "message": "x", "priority": "normal"},
         )
 
     assert "woke 2/3" in out

@@ -240,7 +240,8 @@ async def test_broadcast_stamps_attribution_too(tmp_path):
     exactly the shape that loses one quietly."""
     server = create_server(db_path=tmp_path / "t.db")
     await _call_tool(server, "register", {"name": "alice", "project": "p"})
-    await _call_tool(server, "broadcast", {"from_agent": "alice", "message": "hi"})
+    await _call_tool(server, "broadcast", {
+        "scope": "fleet", "from_agent": "alice", "message": "hi"})
     import sqlite3
 
     from mcp_hub.server import _BROADCAST_CHANNEL
@@ -381,7 +382,7 @@ async def test_gap_notice_ignores_the_agents_own_traffic(tmp_path):
     conn.commit()
     conn.close()
     await _call_tool(server, "broadcast",
-                     {"from_agent": "alice", "message": "my own announcement"})
+                     {"scope": "fleet", "from_agent": "alice", "message": "my own announcement"})
     await _call_tool(server, "register", {"name": "alice", "project": "p"})
     assert "Coverage gap" not in await _call_tool(
         server, "get_messages", {"agent_name": "alice"}
