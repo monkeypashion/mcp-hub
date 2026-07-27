@@ -107,6 +107,52 @@ def test_rebind_url_dry_run_writes_nothing(tmp_path, monkeypatch):
     assert "agent=" not in url
 
 
+def test_rebind_url_finds_user_scope_config(tmp_path, monkeypatch):
+    """Hand-configured seats keep the hub in ~/.claude.json, not a repo
+    .mcp.json — a rollout that only knew the repo file would silently skip
+    them (measured on the maintainer's own seat, 2026-07-27). Unrelated
+    state in that file must survive the edit."""
+    home = tmp_path / "home"
+    home.mkdir()
+    work = tmp_path / "repo"
+    work.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.setattr(
+        "mcp_hub.cli._derive_agent_identity",
+        lambda cwd: ("mcp-hub-test-host", "org/mcp-hub"),
+    )
+    (home / ".claude.json").write_text(json.dumps({
+        "someOtherSetting": {"keep": "me"},
+        "mcpServers": {"hub": {"url": "http://h/mcp"}},
+    }))
+    rc = rebind_url_command(argparse.Namespace(cwd=str(work), dry_run=False))
+    assert rc == 0
+    data = json.loads((home / ".claude.json").read_text())
+    assert data["mcpServers"]["hub"]["url"].endswith("?agent=mcp-hub-test-host")
+    assert data["someOtherSetting"] == {"keep": "me"}
+
+
+def test_rebind_url_prefers_repo_scope_over_user_scope(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    work = tmp_path / "repo"
+    work.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.setattr(
+        "mcp_hub.cli._derive_agent_identity",
+        lambda cwd: ("mcp-hub-test-host", "org/mcp-hub"),
+    )
+    (home / ".claude.json").write_text(json.dumps(
+        {"mcpServers": {"hub": {"url": "http://user-scope/mcp"}}}))
+    (work / ".mcp.json").write_text(json.dumps(
+        {"mcpServers": {"hub": {"url": "http://repo-scope/mcp"}}}))
+    assert rebind_url_command(argparse.Namespace(cwd=str(work), dry_run=False)) == 0
+    assert "agent=" in json.loads((work / ".mcp.json").read_text())[
+        "mcpServers"]["hub"]["url"]
+    assert "agent=" not in json.loads((home / ".claude.json").read_text())[
+        "mcpServers"]["hub"]["url"]
+
+
 # ---------------------------------------------------------------------------
 # Verify-when-bound — the attribution gate (item 34, fo's specimen)
 # ---------------------------------------------------------------------------

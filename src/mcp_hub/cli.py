@@ -1417,25 +1417,54 @@ def _ephemeral_hub_url(url: str) -> str:
         return url
 
 
+def _hub_config_candidates(cwd: str) -> list[tuple[pathlib.Path, list[str]]]:
+    """Where a seat's hub server URL may live, in precedence order:
+    the repo-scoped `.mcp.json` (what transport generates), then the
+    user-scoped `~/.claude.json` — either global `mcpServers.hub` or a
+    per-project override. Hand-configured seats use the user scope, so a
+    rollout tool that only knew about `.mcp.json` would silently skip them
+    (measured on this very seat, 2026-07-27)."""
+    return [
+        (pathlib.Path(cwd) / ".mcp.json", ["mcpServers", "hub"]),
+        (pathlib.Path.home() / ".claude.json", ["projects", cwd, "mcpServers", "hub"]),
+        (pathlib.Path.home() / ".claude.json", ["mcpServers", "hub"]),
+    ]
+
+
+def _dig(data: Any, path: list[str]) -> Any:
+    for key in path:
+        if not isinstance(data, dict):
+            return None
+        data = data.get(key)
+    return data
+
+
 def rebind_url_command(args: argparse.Namespace) -> int:
-    """Stamp ?agent=<derived name> into this repo's .mcp.json hub URL — the
-    per-seat rollout leg of transport-level auto-rebind."""
+    """Stamp ?agent=<derived name> into this seat's hub URL — the per-seat
+    rollout leg of transport-level auto-rebind."""
     cwd = args.cwd or os.getcwd()
     name, _project = _derive_agent_identity(cwd)
     if not name:
         print(f"no derived identity for {cwd} (not opted in?) — nothing written")
         return 1
-    mcp_json = pathlib.Path(cwd) / ".mcp.json"
-    try:
-        data = json.loads(mcp_json.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError) as exc:
-        print(f"cannot read {mcp_json}: {exc}")
+    mcp_json = None
+    data: Any = None
+    hub_path: list[str] = []
+    for candidate, path in _hub_config_candidates(cwd):
+        try:
+            candidate_data = json.loads(candidate.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue
+        hub_entry = _dig(candidate_data, path)
+        if isinstance(hub_entry, dict) and hub_entry.get("url"):
+            mcp_json, data, hub_path = candidate, candidate_data, path
+            break
+    if mcp_json is None:
+        looked = ", ".join(str(c) for c, _ in _hub_config_candidates(cwd))
+        print(f"no hub server URL found (looked in: {looked}) — nothing written")
         return 1
-    hub = (data.get("mcpServers") or {}).get("hub") or {}
-    url = hub.get("url")
-    if not url:
-        print(f"{mcp_json} has no mcpServers.hub.url (stdio config?) — nothing written")
-        return 1
+    hub = _dig(data, hub_path)
+    url = hub["url"]
     from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
     parts = urlsplit(url)
     query = [(k, v) for k, v in parse_qsl(parts.query) if k != "agent"]
@@ -1444,13 +1473,15 @@ def rebind_url_command(args: argparse.Namespace) -> int:
     if new_url == url:
         print(f"already stamped: {url}")
         return 0
+    where = f"{mcp_json}:{'.'.join(hub_path)}"
     if args.dry_run:
-        print(f"would rewrite {mcp_json}: {url} -> {new_url}")
+        print(f"would rewrite {where}: {url} -> {new_url}")
         return 0
+    # Mutate in place — these files carry unrelated state (~/.claude.json
+    # holds every project's settings), so only the one key changes.
     hub["url"] = new_url
-    data.setdefault("mcpServers", {})["hub"] = hub
     mcp_json.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    print(f"stamped {mcp_json}: {new_url}")
+    print(f"stamped {where}: {new_url}")
     print("(takes effect at the session's next MCP reconnect or relaunch)")
     return 0
 
