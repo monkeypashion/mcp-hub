@@ -357,7 +357,7 @@ def test_no_messages_outputs_nothing(capsys):
     args = argparse.Namespace(name="alice", project=None, hub_url="http://x/mcp")
 
     async def _fake_query(_url, _name):
-        return ("", "", True)  # no DMs, no broadcasts, bound
+        return ("", "", True, "")  # no DMs, no broadcasts, bound, no card
 
     with patch("mcp_hub.cli._query_hub", side_effect=_fake_query):
         rc = stop_hook_command(args)
@@ -373,7 +373,7 @@ def test_messages_present_outputs_valid_hook_json(capsys):
     )
 
     async def _fake_query(*_a, **_k):
-        return ("[10:00] **bob**: hello", "", True)  # DM, no broadcasts, bound
+        return ("[10:00] **bob**: hello", "", True, "")  # DM, bound, no card
 
     with patch("mcp_hub.cli._query_hub", side_effect=_fake_query):
         rc = stop_hook_command(args)
@@ -1347,6 +1347,46 @@ def test_genuine_ask_survives_a_quote_elsewhere():
     s = ('fo quoted "waiting on you" in the report. Separately, I am '
          "blocked on you approving the deploy.")
     assert _reads_as_waiting_on_operator(s)
+
+
+def test_body_mention_does_not_nag_but_closing_ask_does():
+    """dt's fourth mechanism (2026-07-27): waiting language in a post-mortem
+    body sentence, with an all-clear closing line. Contrast: the same body
+    plus a genuine closing ask still fires."""
+    from mcp_hub.cli import _waiting_analysis
+    body = ("From your side that's indistinguishable from me still "
+            "waiting on you.\n\nAll resolved now.\n\nBoard is clear — "
+            "nothing of mine is open.")
+    assert _WAITING_ON_OP_RE.search(body)                # contrast: raw match
+    genuine, reason, _ = _waiting_analysis(body)
+    assert not genuine and reason == "suppressed_body_only"
+    asking = body + "\n\nSeparately: I'm blocked on you approving the deploy."
+    genuine, reason, _ = _waiting_analysis(asking)
+    assert genuine and reason == "match"
+
+
+def test_card_notice_suppresses_nag_and_renders():
+    """An open card makes 'you have no card' factually wrong — the notice
+    replaces the nag (live specimen: the nag told this repo's agent to file
+    a card while its #79 sat open)."""
+    response = build_hook_response(
+        agent_name="alice", project="p", messages_text="",
+        is_online=True, card_nag=True,
+        card_notice="Card #79 kept open (cardless turn 1/3): approve the thing",
+    )
+    assert response is not None
+    assert "no DECISION card" not in response["reason"]   # nag suppressed
+    assert "Card #79 kept open" in response["reason"]
+    assert "DECIDED:" in response["reason"]               # tells the agent how
+
+
+def test_card_notice_respects_loop_backstop():
+    response = build_hook_response(
+        agent_name="alice", project="p", messages_text="",
+        is_online=True, stop_hook_active=True,
+        card_notice="Card #79 kept open (cardless turn 1/3): approve the thing",
+    )
+    assert response is None
 
 
 def test_card_nag_grace_one_nag_then_one_turn_of_grace(tmp_path, monkeypatch):

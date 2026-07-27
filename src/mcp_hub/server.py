@@ -359,7 +359,8 @@ def init_db(db_path: Path = DB_PATH) -> None:
             decided_at   REAL,
             decision     TEXT NOT NULL DEFAULT '',
             decision_note TEXT NOT NULL DEFAULT '',
-            clear_strikes INTEGER NOT NULL DEFAULT 0
+            clear_strikes INTEGER NOT NULL DEFAULT 0,
+            stale        INTEGER NOT NULL DEFAULT 0
         );
     """)
     conn.commit()
@@ -370,6 +371,21 @@ def init_db(db_path: Path = DB_PATH) -> None:
         conn.execute(
             "ALTER TABLE decisions ADD COLUMN "
             "clear_strikes INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    # Migrate: stale flag. Three cardless turns stopped meaning "withdraw"
+    # on 2026-07-27 — ~25 asks evaporated unanswered in one day because
+    # strikes measure the SENDER's turn rate, nothing else (pm's finding:
+    # the harder a blocked lane works, the faster it loses its ask). A
+    # stale card stays status='open' — visible to the operator and every
+    # existing open-reader — just demoted in sort order. Only an operator
+    # answer, an agent DECIDED, or supersession by a new ask closes a card.
+    try:
+        conn.execute(
+            "ALTER TABLE decisions ADD COLUMN stale INTEGER NOT NULL DEFAULT 0"
         )
         conn.commit()
     except sqlite3.OperationalError:
@@ -2114,7 +2130,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             conn.execute(
                 """UPDATE decisions SET updated_at=?, raw=?, ask=?, why=?,
                    value_text=?, risk_text=?, value_score=?, risk_score=?,
-                   net_score=?, tags=?, clear_strikes=0,
+                   net_score=?, tags=?, clear_strikes=0, stale=0,
                    project=CASE WHEN ?='' THEN project ELSE ? END
                    WHERE id=?""",
                 (now, card, f["ask"], f["why"], f["value_text"], f["risk_text"],
@@ -2137,50 +2153,56 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 
     @mcp.tool()
     def decision_clear(from_agent: str, source: str = "stop-hook") -> str:
-        """Register a cardless turn against the agent's open card; withdraw
-        after 3 consecutive ones.
+        """Register a cardless turn against the agent's open card; mark it
+        STALE after 3 consecutive ones — never withdraw it.
 
-        One cardless turn is NOT evidence the agent moved on — agents take
-        turns constantly while still waiting (answering peer DMs, heal
-        nudges, the Stop hook's own surfaced items). Instant withdrawal
-        made live asks evaporate unanswered while the operator's queue
-        showed empty — the delete-project stall of 2026-07-26 late, an
-        hour of four lanes each believing the other side was the blocker.
-        Three consecutive cardless turns is the same evidence standard as
-        the wake-ack strikes. A restatement (decision_put) resets the
-        count; a DECIDED marker (decision_resolve) or operator answer
-        closes immediately regardless.
+        Withdrawal-at-3-strikes was the 2026-07-26 fix for instant
+        evaporation; on 2026-07-27 it proved to be the same defect at a
+        different threshold: ~25 asks auto-withdrew unanswered in one day,
+        because strikes measure the SENDER's turn rate and nothing else —
+        "the harder a blocked lane works, the faster it loses the ask it
+        is blocked on" (pm). Worst on live investigations, where turn rate
+        rises BECAUSE the ask got more urgent (dt's #101). So 3 strikes now
+        DEMOTES instead of removing: stale=1, status stays 'open', the card
+        stays on the operator's board sorted last. Only an operator answer,
+        an agent DECIDED (decision_resolve), or supersession by a new ask
+        closes a card — an unanswered ask is impossible to lose.
+
+        The return string is the owner-notice channel: the Stop hook
+        surfaces it to the agent, because the other 2026-07-27 lesson was
+        that silent state changes leave agents waiting on an operator who
+        has nothing in front of them.
 
         Only touches cards of the given source — an api-submitted service
-        card is not the agent's to auto-withdraw."""
+        card is not the agent's to mark."""
         conn = _get_db(db_path)
         row = conn.execute(
-            "SELECT id, clear_strikes FROM decisions "
+            "SELECT id, ask, clear_strikes, stale FROM decisions "
             "WHERE agent=? AND status='open' AND source=?",
             (from_agent, source),
         ).fetchone()
         if row is None:
             return ""
+        ask = (row["ask"] or "")[:80]
+        if row["stale"]:
+            return f"Card #{row['id']} is STALE on the board: {ask}"
         strikes = (row["clear_strikes"] or 0) + 1
         if strikes >= 3:
-            # Stamp WHY the row left the queue (vps, 2026-07-26): without
-            # provenance, "operator answered in-pane" and "system dropped a
-            # live ask" both render as GONE — which is precisely the
-            # ambiguity that let a wrong causal claim ride tonight's stall.
             conn.execute(
-                "UPDATE decisions SET status='withdrawn', decided_at=?, "
-                "decision_note='[auto] 3 consecutive cardless turns' "
-                "WHERE id=?",
-                (time.time(), row["id"]),
+                "UPDATE decisions SET stale=1, clear_strikes=? WHERE id=?",
+                (strikes, row["id"]),
             )
             conn.commit()
-            return "1 card(s) withdrawn (3 consecutive cardless turns)."
+            return (
+                f"Card #{row['id']} marked STALE after {strikes} cardless "
+                f"turns — still on the operator's board, sorted last: {ask}"
+            )
         conn.execute(
             "UPDATE decisions SET clear_strikes=? WHERE id=?",
             (strikes, row["id"]),
         )
         conn.commit()
-        return f"Card kept open (cardless turn {strikes}/3)."
+        return f"Card #{row['id']} kept open (cardless turn {strikes}/3): {ask}"
 
     @mcp.tool()
     def decision_resolve(from_agent: str, verdict: str, source: str = "stop-hook") -> str:
@@ -2217,7 +2239,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         args: tuple = () if status == "all" else (status,)
         rows = conn.execute(
             f"""SELECT * FROM decisions {where}
-                ORDER BY net_score IS NULL, net_score DESC, submitted_at ASC
+                ORDER BY stale ASC, net_score IS NULL, net_score DESC,
+                         submitted_at ASC
                 LIMIT ?""",
             (*args, limit),
         ).fetchall()
@@ -2239,6 +2262,11 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             # ledger rows as queue (measured 2026-07-27: 25 of 28 rows in an
             # `all` render were closed, none said so).
             status_tag = "" if r["status"] == "open" else f" · {r['status'].upper()}"
+            if r["status"] == "open" and r["stale"]:
+                # Demoted, not gone: the sender kept taking turns without
+                # restating, so it sorts last — but an unanswered ask never
+                # leaves the board (2026-07-27 evaporation incident).
+                status_tag = " · STALE"
             closure = ""
             if r["status"] == "decided":
                 closure = f"\n   -> {r['decision']} {r['decision_note']}".rstrip()

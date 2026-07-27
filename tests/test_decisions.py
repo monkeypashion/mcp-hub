@@ -126,18 +126,57 @@ async def test_put_opens_then_restate_updates_in_place(server):
     assert "net +6" in listing  # 9 - 3, recomputed on restate
 
 
-async def test_clear_withdraws_only_after_three_strikes(server):
-    """One cardless turn is not evidence of moving on — agents answer DMs
-    and heal nudges while genuinely waiting. Instant withdrawal made live
-    asks evaporate unanswered (the 2026-07-26 delete-project stall)."""
+async def test_clear_marks_stale_after_three_strikes_never_withdraws(server):
+    """Three cardless turns DEMOTES a card, never removes it. Withdrawal-at-3
+    was the 2026-07-27 evaporation incident: strikes measure the sender's
+    turn rate, so ~25 asks — including live ones — vanished unanswered in a
+    day. An unanswered ask must be impossible to lose."""
     await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
     for expected in ("1/3", "2/3"):
         out = await _call_tool(server, "decision_clear", {"from_agent": "alice"})
         assert f"kept open (cardless turn {expected})" in out
         assert "alice" in await _call_tool(server, "decision_list", {})
     out = await _call_tool(server, "decision_clear", {"from_agent": "alice"})
-    assert "withdrawn (3 consecutive cardless turns)" in out
-    assert "No open decision cards" in await _call_tool(server, "decision_list", {})
+    assert "marked STALE" in out
+    listing = await _call_tool(server, "decision_list", {})
+    assert "alice" in listing            # STILL on the board
+    assert "· STALE" in listing
+    # Further cardless turns: notice repeats, nothing changes state.
+    out = await _call_tool(server, "decision_clear", {"from_agent": "alice"})
+    assert "is STALE" in out
+    assert "alice" in await _call_tool(server, "decision_list", {})
+
+
+async def test_stale_card_revived_by_restatement(server):
+    await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
+    for _ in range(3):
+        await _call_tool(server, "decision_clear", {"from_agent": "alice"})
+    assert "· STALE" in await _call_tool(server, "decision_list", {})
+    await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
+    listing = await _call_tool(server, "decision_list", {})
+    assert "alice" in listing
+    assert "STALE" not in listing        # fresh again, strikes reset
+
+
+async def test_stale_card_still_answerable_and_sorts_last(server):
+    """The whole point: the operator can still answer a stale card, and a
+    stale high-net card must not outrank a fresh low-net one."""
+    await _call_tool(server, "register", {"name": "alice", "project": "p"})
+    await _call_tool(server, "decision_put",
+                     {"from_agent": "alice",
+                      "card": CARD_V2.replace("[7/10]", "[10/10]")})
+    for _ in range(3):
+        await _call_tool(server, "decision_clear", {"from_agent": "alice"})
+    await _call_tool(server, "decision_put",
+                     {"from_agent": "bob",
+                      "card": CARD_V2.replace("[7/10]", "[4/10]")})
+    listing = await _call_tool(server, "decision_list", {})
+    assert listing.index("bob") < listing.index("alice")  # fresh beats stale
+    out = await _call_tool(
+        server, "decision_answer", {"decision": "yes", "agent": "alice"},
+    )
+    assert "decided: yes" in out
+    assert "alice" not in await _call_tool(server, "decision_list", {})
 
 
 async def test_restatement_resets_clear_strikes(server):
@@ -203,7 +242,10 @@ async def test_list_orders_by_net_desc_nulls_last(server):
 async def test_all_listing_labels_history_rows(server):
     """A mixed-status listing must SAY which rows are closed — in a real
     `all` render on 2026-07-27, 25 of 28 rows were history and none said
-    so, and the reader tallied ledger rows as live queue."""
+    so, and the reader tallied ledger rows as live queue. (Withdrawn rows
+    can no longer be minted — stale replaced withdrawal — but legacy rows
+    in the prod DB still render through the same generic non-open branch
+    that SUPERSEDED exercises here.)"""
     await _call_tool(server, "register", {"name": "alice", "project": "p"})
     await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
     await _call_tool(server, "decision_answer", {"decision": "yes", "agent": "alice"})
@@ -211,14 +253,20 @@ async def test_all_listing_labels_history_rows(server):
     for _ in range(3):
         await _call_tool(server, "decision_clear", {"from_agent": "bob"})
     await _call_tool(server, "decision_put", {"from_agent": "carol", "card": CARD_V2})
+    different = CARD_V2.replace(
+        "approve the widget rebuild", "tear down the legacy ingest cluster"
+    )
+    await _call_tool(server, "decision_put", {"from_agent": "carol", "card": different})
     listing = await _call_tool(server, "decision_list", {"status": "all"})
     assert "· DECIDED" in listing
-    assert "· WITHDRAWN" in listing
-    # a withdrawn row shows its departure provenance, not just the label
-    assert "[auto] 3 consecutive cardless turns" in listing
+    assert "· SUPERSEDED" in listing
+    assert "· STALE" in listing          # bob's, demoted not removed
     # the live row carries no status tag — open is the unmarked default
-    carol = [ln for ln in listing.splitlines() if "carol" in ln][0]
-    assert "OPEN" not in carol
+    carol_headers = [ln for ln in listing.splitlines() if "carol" in ln]
+    assert any(
+        all(tag not in ln for tag in ("SUPERSEDED", "STALE", "DECIDED"))
+        for ln in carol_headers
+    )
 
 
 async def test_superseded_rows_are_labeled_and_filterable(server):

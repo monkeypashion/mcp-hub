@@ -101,19 +101,38 @@ _NEGATED_BEFORE_RE = re.compile(
 )
 
 
+def _closing_section(turn_text: str) -> str:
+    """The turn's last two non-empty paragraph blocks — where the DECISION
+    convention puts asks. Two blocks, not one, so a sign-off line after the
+    ask doesn't hide it."""
+    blocks = [b for b in turn_text.split("\n\n") if b.strip()]
+    return "\n\n".join(blocks[-2:])
+
+
 def _waiting_analysis(turn_text: str) -> tuple[bool, str, str]:
     """(genuine, reason, phrase) for the waiting-language check.
 
     reason: 'no_match' (regex never fired — the uninteresting bulk),
     'match' (genuine ask language), or which carve-out suppressed it
-    ('suppressed_mention' / 'suppressed_negation'). The split exists for
-    telemetry: the item-30 fix shipped on anecdotes ("it nagged fo four
-    times"), and whether the carve-outs actually cut the false-positive
-    rate should be a query over a log, not another anecdote."""
+    ('suppressed_body_only' / 'suppressed_mention' /
+    'suppressed_negation'). The split exists for telemetry: the item-30
+    fix shipped on anecdotes ("it nagged fo four times"), and whether the
+    carve-outs actually cut the false-positive rate should be a query over
+    a log, not another anecdote.
+
+    Only the CLOSING SECTION is eligible to fire the nag. The convention
+    puts asks at the end of the turn, and the body is where the fourth
+    false-positive mechanism lives (dt, 2026-07-27): retrospective
+    self-reference — "that's indistinguishable from me still waiting on
+    you" describing an already-resolved block, in a turn whose closing
+    line said all-clear. A body mention is telemetry, not a nag."""
     raw = _WAITING_ON_OP_RE.search(turn_text)
     if not raw:
         return False, "no_match", ""
-    prose = _MENTION_SPAN_RE.sub(" ", turn_text)
+    closing = _closing_section(turn_text)
+    if not _WAITING_ON_OP_RE.search(closing):
+        return False, "suppressed_body_only", raw.group(0)
+    prose = _MENTION_SPAN_RE.sub(" ", closing)
     negated = None
     for m in _WAITING_ON_OP_RE.finditer(prose):
         if _NEGATED_BEFORE_RE.search(prose, 0, m.start()):
@@ -314,6 +333,7 @@ async def _query_hub(
             # put (upserts); else -> clear (idempotent, verdict-less
             # withdrawal). Fail-soft: an older hub without these tools must
             # not break message surfacing (version skew during deploys).
+            card_notice = ""
             try:
                 if decided:
                     await session.call_tool(
@@ -327,9 +347,16 @@ async def _query_hub(
                          "project": project or ""},
                     )
                 else:
-                    await session.call_tool(
+                    # The clear response is the owner-notice channel: a
+                    # cardless turn against an open card comes back as
+                    # "card #N kept open (n/3)" / "marked STALE" — surfaced
+                    # to the agent instead of counting silent strikes
+                    # (2026-07-27: dt only discovered a lost ask by
+                    # defensively polling the board).
+                    clear_result = await session.call_tool(
                         "decision_clear", {"from_agent": agent_name},
                     )
+                    card_notice = _extract_text(clear_result)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -353,7 +380,7 @@ async def _query_hub(
     # "is this agent bound?" signal; ⚡ is not.
     is_online = f"**{agent_name}**" in agents_text
 
-    return messages_text, broadcasts_text, is_online
+    return messages_text, broadcasts_text, is_online, card_notice
 
 
 def _extract_text(call_tool_result: Any) -> str:
@@ -386,6 +413,7 @@ def build_hook_response(
     is_online: bool,
     stop_hook_active: bool = False,
     card_nag: bool = False,
+    card_notice: str = "",
 ) -> dict[str, Any] | None:
     """Decide whether to emit a hook block and what the reason should be.
 
@@ -416,19 +444,29 @@ def build_hook_response(
     has_broadcasts = bool(broadcasts_text.strip())
     has_content = has_messages or has_broadcasts
 
+    # An open card makes the "you have no card" nag factually wrong — the
+    # right prompt is the notice ("card #N still open / STALE"), which the
+    # server returns from the same decision_clear that used to count silent
+    # strikes. Live specimen 2026-07-27: the nag told this repo's own agent
+    # to file a card while its #79 sat open (and then evaporated).
+    card_notice = card_notice.strip()
+    if card_notice:
+        card_nag = False
+
     # Loop backstop: never re-block a Stop that's only firing because a prior
     # block fired, when there's nothing new to surface. Guards against any
-    # content-less block (rebind nag, card nag) wedging the agent in a
-    # re-block loop, independent of the online/⚡ fix above. The card nag in
-    # particular gets exactly ONE shot per natural Stop: if the agent's
-    # nag-response turn still lacks a card, we let it go rather than loop.
+    # content-less block (rebind nag, card nag, card notice) wedging the
+    # agent in a re-block loop, independent of the online/⚡ fix above. The
+    # card nag in particular gets exactly ONE shot per natural Stop: if the
+    # agent's nag-response turn still lacks a card, we let it go rather than
+    # loop.
     if stop_hook_active and not has_content:
         return None
 
     # No work needed: online + nothing queued + no correction owed.
     # (Online — not ⚡ — is the gate: an idle agent legitimately lacks ⚡
     # between turns.)
-    if not has_content and is_online and not card_nag:
+    if not has_content and is_online and not card_nag and not card_notice:
         return None
 
     parts: list[str] = []
@@ -478,6 +516,21 @@ def build_hook_response(
                 "no DECISION card — end your reply with the DECISION block "
                 "(**DECISION** / **ASK:** / **WHY:** / **VALUE:** …[n/10] / "
                 "**RISK:** …[n/10]) so the ask reaches their triage board."
+            ),
+        ])
+
+    # Owner notice — the anti-silent-removal leg (2026-07-27): the agent
+    # hears its card's state from the same round-trip that used to count
+    # strikes in silence. Answered in-pane is the common case the reminder
+    # exists for; a card nobody remembers is closed by DECIDED, not by decay.
+    if card_notice:
+        parts.extend([
+            "",
+            (
+                f"📌 {card_notice}\n"
+                "If the operator already answered in-pane, end your reply "
+                "with **DECIDED:** <their verdict>. If you're still waiting, "
+                "restate the card to keep it fresh."
             ),
         ])
 
@@ -1554,7 +1607,7 @@ def stop_hook_command(args: argparse.Namespace) -> int:
             _log_nag_event(name, outcome, phrase)
 
     try:
-        messages_text, broadcasts_text, is_online = asyncio.run(
+        messages_text, broadcasts_text, is_online, card_notice = asyncio.run(
             _query_hub(args.hub_url, name, project or "", card, decided)
         )
     except Exception as exc:  # noqa: BLE001
@@ -1570,6 +1623,7 @@ def stop_hook_command(args: argparse.Namespace) -> int:
         is_online=is_online,
         stop_hook_active=stop_hook_active,
         card_nag=card_nag,
+        card_notice=card_notice,
     )
 
     if response is None:
