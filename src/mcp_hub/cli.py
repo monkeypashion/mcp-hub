@@ -2276,7 +2276,40 @@ def _status_cache_path(agent_name: str) -> pathlib.Path:
     return _state_dir() / f"status-{safe}.json"
 
 
-def _write_status_cache(agent_name: str, agents_text: str) -> None:
+def _parse_squads_for_status(squads_text: str) -> dict[str, Any]:
+    """Parse `list_squads(agent=...)` output into {squads, muted}.
+
+    Reads what the HUB believes, not what the local config would derive. That
+    distinction is the whole point of showing it: an agent whose workspace says
+    'dreamteam' but which hasn't relaunched yet is still squadless on the hub,
+    and the statusline must show the state that governs delivery rather than
+    the one that will govern it after a restart.
+
+    Rendered shape:
+        <name> is in:
+          dreamteam
+          hublane  (muted)
+    or a single line containing "belongs to no squad".
+    """
+    if "belongs to no squad" in squads_text:
+        return {"squads": [], "muted": []}
+    squads, muted = [], []
+    for line in squads_text.splitlines()[1:]:
+        entry = line.strip()
+        if not entry:
+            continue
+        is_muted = entry.endswith("(muted)")
+        name = entry.removesuffix("(muted)").strip()
+        if name:
+            squads.append(name)
+            if is_muted:
+                muted.append(name)
+    return {"squads": squads, "muted": muted}
+
+
+def _write_status_cache(
+    agent_name: str, agents_text: str, squads_text: str = "",
+) -> None:
     """Parse `agents_text` and atomically write this agent's status snapshot.
 
     Fail-soft by contract: a parse/write error must NEVER propagate into the
@@ -2286,6 +2319,14 @@ def _write_status_cache(agent_name: str, agents_text: str) -> None:
     """
     try:
         status = _parse_status_from_agents(agents_text, agent_name)
+        # Squads are OMITTED, not defaulted to [], when the caller had nothing
+        # to pass — an older daemon or a hub without list_squads. The reader
+        # must be able to tell "this agent is in no squad" from "this snapshot
+        # doesn't know", because the first is a fact worth showing and the
+        # second is a missing instrument. Defaulting to [] would render the
+        # second as the first.
+        if squads_text:
+            status.update(_parse_squads_for_status(squads_text))
         status["agent"] = agent_name
         status["ts"] = int(time.time())
         path = _status_cache_path(agent_name)
@@ -2596,7 +2637,20 @@ async def _heartbeat_loop(hub_url: str, agent_name: str) -> bool:
                                     return True
                         agents_result = await session.call_tool("list_agents", {})
                         agents_text = _extract_text(agents_result)
-                        _write_status_cache(agent_name, agents_text)
+                        # Squad membership for the statusline. Fail-soft: an
+                        # older hub has no list_squads, and a missing squad
+                        # segment is cosmetic where a broken heartbeat drops
+                        # the binding.
+                        squads_text = ""
+                        try:
+                            squads_text = _extract_text(
+                                await session.call_tool(
+                                    "list_squads", {"agent": agent_name}
+                                )
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                        _write_status_cache(agent_name, agents_text, squads_text)
                         _write_fleet_board(agent_name, agents_text)
                         # Open decision cards → local cache, so the board can
                         # tell a hub-backed 🙋 from a legacy recap flag.

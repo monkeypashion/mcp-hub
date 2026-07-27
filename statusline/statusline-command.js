@@ -158,6 +158,36 @@ process.stdin.on('end', () => {
       } else {
         hubSeg = paint(`⚡ ${fleet}`, C.green);
       }
+
+      // ── Squad segment ────────────────────────────────────────────
+      // Only when the snapshot actually carries membership. `squads`
+      // ABSENT means an older daemon or a hub without list_squads — it
+      // must not render as "no squad", which is a fact about the agent
+      // rather than about the instrument.
+      //
+      // Suppressed on the ✖ states above: those already say the agent
+      // is not reachable, and which squad an unreachable agent belongs
+      // to is not the thing to fix first.
+      if (Array.isArray(st.squads) && age <= 150 && st.online && st.wakeable) {
+        const muted = new Set(st.muted || []);
+        if (st.squads.length === 0) {
+          // Dimmed, not red: faculty seats are legitimately squadless by
+          // design, so this is information, not a fault. What makes it
+          // actionable is the operator knowing which seats SHOULD have one.
+          hubSeg += ' ' + paint('·no squad', C.dim);
+        } else {
+          const shown = st.squads[0] + (st.squads.length > 1
+            ? `+${st.squads.length - 1}` : '');
+          // A muted squad is the state most likely to be mistaken for a
+          // broken hub ("why am I not hearing anything?"), so it gets a
+          // marker rather than looking identical to a listening member.
+          const allMuted = st.squads.every((s) => muted.has(s));
+          hubSeg += ' ' + paint(
+            '·' + shown + (allMuted ? ' 🔇' : (muted.size ? ' 🔇?' : '')),
+            allMuted ? C.dim : C.green,
+          );
+        }
+      }
     }
   } catch { /* not a hub agent / no snapshot yet → no hub segment */ }
 

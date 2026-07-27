@@ -26,6 +26,7 @@ from mcp_hub.cli import (
     _heartbeat_pidfile,
     _is_live_daemon,
     _parse_org_repo,
+    _parse_squads_for_status,
     _parse_status_from_agents,
     _release_singleton,
     _resolve_agent_identity,
@@ -1191,6 +1192,60 @@ def test_parse_status_self_absent_is_offline():
     # Fleet totals are still computed for everyone else.
     assert s["fleet_total"] == 4
     assert s["fleet_wakeable"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Squad membership in the status snapshot — the statusline's squad segment
+# ---------------------------------------------------------------------------
+
+
+def test_parse_squads_reads_membership_and_mute():
+    text = (
+        "alice is in:\n"
+        "  dreamteam\n"
+        "  hublane  (muted)\n"
+    )
+    s = _parse_squads_for_status(text)
+    assert s["squads"] == ["dreamteam", "hublane"]
+    assert s["muted"] == ["hublane"]
+
+
+def test_parse_squads_no_squad_is_an_empty_list_not_a_failure():
+    s = _parse_squads_for_status(
+        "'alice' belongs to no squad — it can send and receive direct messages, "
+        "but cannot broadcast until it joins one."
+    )
+    assert s == {"squads": [], "muted": []}
+
+
+def test_status_cache_OMITS_squads_when_it_does_not_know(tmp_path, monkeypatch):
+    """The distinction the statusline depends on: an agent that is in NO squad
+    is a fact worth showing; a snapshot written by an older daemon, or against
+    a hub with no list_squads, KNOWS NOTHING and must not render as the same
+    thing. Defaulting to [] would turn a missing instrument into a finding."""
+    monkeypatch.setattr("mcp_hub.cli._state_dir", lambda: tmp_path)
+    _write_status_cache("alice", _AGENTS_SAMPLE)          # no squads_text
+    data = json.loads((tmp_path / "status-alice.json").read_text())
+    assert "squads" not in data, "absent knowledge rendered as a known-empty list"
+
+
+def test_status_cache_records_squads_when_it_does_know(tmp_path, monkeypatch):
+    monkeypatch.setattr("mcp_hub.cli._state_dir", lambda: tmp_path)
+    _write_status_cache(
+        "alice", _AGENTS_SAMPLE, "alice is in:\n  dreamteam\n"
+    )
+    data = json.loads((tmp_path / "status-alice.json").read_text())
+    assert data["squads"] == ["dreamteam"]
+    assert data["muted"] == []
+
+
+def test_status_cache_records_a_known_empty_membership(tmp_path, monkeypatch):
+    """A faculty seat: the hub answered, and the answer was 'none'. That IS
+    knowledge and must be recorded as [], distinct from the omission above."""
+    monkeypatch.setattr("mcp_hub.cli._state_dir", lambda: tmp_path)
+    _write_status_cache("alice", _AGENTS_SAMPLE, "'alice' belongs to no squad — x")
+    data = json.loads((tmp_path / "status-alice.json").read_text())
+    assert data["squads"] == []
 
 
 def test_parse_status_bio_markers_do_not_skew_counts():
