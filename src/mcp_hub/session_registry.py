@@ -51,6 +51,7 @@ import logging
 import threading
 import time
 import uuid
+import weakref
 from typing import Any, Callable
 
 import anyio
@@ -114,6 +115,47 @@ def _ensure_aexit_patched() -> None:
 # patch is a single method replacement; no overhead until sessions actually
 # close.
 _ensure_aexit_patched()
+
+
+# ---------------------------------------------------------------------------
+# Live-session tracking (URL-identity auto-rebind support)
+# ---------------------------------------------------------------------------
+
+# Every live ServerSession, whether or not it is bound to an agent name. The
+# URL-rebind sweep needs to find the UNBOUND session that belongs to a
+# transport whose request URL carried ?agent=<name> — the registry's own
+# indexes only know sessions after a bind, which is exactly the step the
+# sweep exists to perform. WeakSet: sessions vanish on GC, and the __aexit__
+# hook above handles deterministic close for the bound ones.
+_live_server_sessions: "weakref.WeakSet[ServerSession]" = None  # type: ignore[assignment]
+_session_init_patched = False
+_original_session_init: Callable[..., Any] | None = None
+
+
+def _ensure_session_tracking_patched() -> None:
+    """Track ServerSession instances from birth. Idempotent, same contract
+    as the __aexit__ patch."""
+    global _session_init_patched, _original_session_init, _live_server_sessions
+    if _session_init_patched:
+        return
+    _live_server_sessions = weakref.WeakSet()
+    _original_session_init = ServerSession.__init__
+
+    def patched_init(self: ServerSession, *args: Any, **kwargs: Any) -> None:
+        assert _original_session_init is not None
+        _original_session_init(self, *args, **kwargs)
+        _live_server_sessions.add(self)
+
+    ServerSession.__init__ = patched_init  # type: ignore[method-assign]
+    _session_init_patched = True
+
+
+_ensure_session_tracking_patched()
+
+
+def live_server_sessions() -> list[ServerSession]:
+    """Snapshot of every ServerSession currently alive in this process."""
+    return list(_live_server_sessions)
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +305,19 @@ class SessionRegistry:
         self._on_wake_dead = on_wake_dead
         self._wake_expect: dict[str, float] = {}
         self._wake_strikes: dict[str, int] = {}
+        # Binding provenance per name: "register" | "touch" | "url". Read by
+        # the attribution grading and included in drop diagnostics.
+        self._bind_source: dict[str, str] = {}
+        # Optional context probe for drop diagnostics: (name, primary_session)
+        # -> short string (idle state, deliverability) appended to wake-ack
+        # drop lines, so a verdict arrives pre-classified instead of costing
+        # an afternoon of cross-seat forensics (2026-07-27). Injected by the
+        # server, which owns DB + transport visibility.
+        # CONTRACT: called while the registry lock is HELD (the state being
+        # probed dies with the drop) — the probe must NOT call back into
+        # registry methods (get/bind_source/...) or it deadlocks on the
+        # non-reentrant lock; it receives the session directly instead.
+        self.context_probe: Callable[[str, Any], str] | None = None
 
         _ensure_aexit_patched()
         # Note: we do NOT auto-subscribe `_on_session_close` to the global
@@ -283,8 +338,14 @@ class SessionRegistry:
 
     # -- mutation ------------------------------------------------------------
 
-    def bind(self, name: str, session: ServerSession) -> None:
+    def bind(self, name: str, session: ServerSession,
+             source: str = "register") -> None:
         """Bind `name` to `session`, making it the PRIMARY for `name`.
+
+        `source` is provenance for the attribution grading and the bind-diag
+        log: "register" (explicit tool call), "touch" (identifying tool
+        call), or "url" (transport-level identity from ?agent= — the
+        auto-rebind sweep, no agent turn involved).
 
         Re-binding the same name to the same session is a no-op for the
         index but still refreshes the activity timestamp — that's the
@@ -301,6 +362,7 @@ class SessionRegistry:
         """
         now = time.time()
         with self._lock:
+            self._bind_source[name] = source
             old = self._by_name.get(name)
             if old is session:
                 # Same session — refresh activity, don't touch indexes.
@@ -341,6 +403,20 @@ class SessionRegistry:
             self._undeliverable_beats.pop(name, None)
             self._wake_expect.pop(name, None)
             self._wake_strikes.pop(name, None)
+
+    def names_for_session(self, session: ServerSession) -> set[str]:
+        """Agent names this session is bound to (empty for unbound /
+        ephemeral sessions). The verify-when-bound attribution gate keys on
+        this: a session that owns identity X asserting from_agent=Y is a
+        mis-attribution at the tool boundary (fo's accidental impersonation,
+        2026-07-27)."""
+        with self._lock:
+            return set(self._by_session_id.get(id(session), set()))
+
+    def bind_source(self, name: str) -> str:
+        """Provenance of `name`'s current binding ('' if unbound)."""
+        with self._lock:
+            return self._bind_source.get(name, "") if name in self._by_name else ""
 
     def unbind_name(self, name: str) -> None:
         """Drop binding for `name` (if any). Idempotent."""
@@ -837,18 +913,38 @@ class SessionRegistry:
                     # whole detector exists to report, and level-keyed
                     # alerting never fired on it (vps, 2026-07-27: zero
                     # WARNING/ERROR in 78k lines while 11 drops happened).
+                    # The context probe makes the verdict self-classifying:
+                    # idle state, activity age and deliverability at drop
+                    # time are exactly the discriminators the 2026-07-27
+                    # four-class forensics had to reconstruct by hand.
+                    # Compose registry-internal fields from direct dict reads
+                    # (we hold the lock); the injected probe adds DB/transport
+                    # facts and must not re-enter the registry (see contract).
+                    act = self._last_activity.get(name)
+                    parts = [
+                        f"act_ago={int(now - act)}s" if act else "act_ago=?",
+                        f"bind_src={self._bind_source.get(name, '?')}",
+                    ]
+                    if self.context_probe is not None:
+                        try:
+                            parts.append(
+                                self.context_probe(name, self._by_name.get(name))
+                            )
+                        except Exception:  # noqa: BLE001
+                            parts.append("probe-failed")
+                    probe = " [" + " ".join(parts) + "]"
                     if self._drop_primary_locked(name):
                         logger.warning(
                             "wake-ack: dropping %s after %d unacked wakes "
-                            "(stream presumed dead, no other session)",
-                            name, strikes,
+                            "(stream presumed dead, no other session)%s",
+                            name, strikes, probe,
                         )
                         dropped.append(name)
                     else:
                         logger.warning(
                             "wake-ack: %s primary unacked after %d wakes — "
-                            "promoted an extra session; agent stays online",
-                            name, strikes,
+                            "promoted an extra session; agent stays online%s",
+                            name, strikes, probe,
                         )
                 else:
                     self._wake_strikes[name] = strikes

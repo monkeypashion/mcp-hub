@@ -27,7 +27,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.streamable_http import GET_STREAM_KEY
 from pydantic import BaseModel
 
-from .session_registry import SessionRegistry
+from .session_registry import SessionRegistry, live_server_sessions
 
 logger = logging.getLogger(__name__)
 
@@ -376,6 +376,28 @@ def init_db(db_path: Path = DB_PATH) -> None:
     except sqlite3.OperationalError:
         pass  # Column already exists
 
+    # Migrate: coverage-gap tracking (2026-07-27 — fo's five-lane false alarm:
+    # a disconnected client produces an agent that BELIEVES it has seen
+    # everything; "delivery and awareness of non-delivery are different
+    # events, and only the hub can supply the second"). offline_since stamps
+    # when an agent's binding died; on the next coming-online the hub counts
+    # what arrived in the gap and get_messages surfaces it ONCE.
+    for ddl in (
+        "ALTER TABLE agents ADD COLUMN offline_since REAL",
+        "ALTER TABLE agents ADD COLUMN gap_notice TEXT NOT NULL DEFAULT ''",
+        # Attribution grading (item 34): 'session-verified' when the calling
+        # session was bound to exactly the asserted from_agent; 'asserted'
+        # otherwise (ephemeral/unbound callers — stop-hook, daemons). The
+        # ledger reads attribution strength instead of presuming it.
+        "ALTER TABLE messages ADD COLUMN attribution TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE decisions ADD COLUMN attribution TEXT NOT NULL DEFAULT ''",
+    ):
+        try:
+            conn.execute(ddl)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
     # Migrate: stale flag. Three cardless turns stopped meaning "withdraw"
     # on 2026-07-27 — ~25 asks evaporated unanswered in one day because
     # strikes measure the SENDER's turn rate, nothing else (pm's finding:
@@ -616,6 +638,63 @@ def is_interactive_client(session: Any) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# URL-identity capture (auto-rebind, 2026-07-27)
+# ---------------------------------------------------------------------------
+
+# A seat's .mcp.json hub URL may carry ?agent=<name>. Claude Code's transport
+# layer reconnects on its own after a hub restart — no agent turn involved —
+# and every request it sends carries that query string. Capturing it onto the
+# transport gives the rebind sweep a name to bind the new session to, which
+# is what turns a deploy from a fleet event (every seat drops, gets nagged,
+# burns a re-register turn) into a non-event.
+#
+# Same monkey-patch discipline as session_registry's __aexit__ hook:
+# idempotent, process-global, one seam.
+
+_URL_AGENT_ATTR = "_hub_url_agent"
+_handle_request_patched = False
+
+
+def _ensure_url_identity_patched() -> None:
+    global _handle_request_patched
+    if _handle_request_patched:
+        return
+    from urllib.parse import parse_qs
+
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+    original = StreamableHTTPSessionManager.handle_request
+
+    async def patched_handle_request(self, scope, receive, send):  # type: ignore[no-untyped-def]
+        try:
+            qs = parse_qs((scope.get("query_string") or b"").decode("latin-1"))
+            agent = (qs.get("agent") or [""])[0]
+            if agent:
+                sid = ""
+                for k, v in scope.get("headers") or ():
+                    if k.lower() == b"mcp-session-id":
+                        sid = v.decode("latin-1")
+                        break
+                # The FIRST initialize POST has no session id yet — the
+                # follow-up requests (initialized notification, GET stream)
+                # arrive within a second and do, so association lags birth
+                # by one round-trip at most.
+                if sid:
+                    transport = getattr(self, "_server_instances", {}).get(sid)
+                    if transport is not None:
+                        setattr(transport, _URL_AGENT_ATTR, agent)
+        except Exception:  # noqa: BLE001
+            logger.exception("url-identity capture failed; request unaffected")
+        return await original(self, scope, receive, send)
+
+    StreamableHTTPSessionManager.handle_request = patched_handle_request  # type: ignore[method-assign]
+    _handle_request_patched = True
+
+
+_ensure_url_identity_patched()
+
+
+# ---------------------------------------------------------------------------
 # Server
 # ---------------------------------------------------------------------------
 
@@ -632,6 +711,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     # at boot; register() flips them back to 'online' as they reconnect. This
     # makes 🟢 mean "connected to THIS instance" rather than "ever registered".
     _boot_conn = _get_db(db_path)
+    # Stamp the gap start for agents this restart just disconnected — the
+    # redeploy is the single biggest producer of silent coverage gaps, and
+    # COALESCE keeps an earlier (deeper) gap start if one is already open.
+    _boot_conn.execute(
+        "UPDATE agents SET offline_since = COALESCE(offline_since, ?) "
+        "WHERE status = 'online'", (time.time(),)
+    )
     _boot_conn.execute("UPDATE agents SET status = 'offline'")
     _boot_conn.commit()
 
@@ -744,11 +830,52 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         try:
             conn = _get_db(db_path)
             conn.execute(
-                "UPDATE agents SET status = 'offline' WHERE name = ?", (name,)
+                "UPDATE agents SET status = 'offline', "
+                "offline_since = COALESCE(offline_since, ?) WHERE name = ?",
+                (time.time(), name),
             )
             conn.commit()
         except Exception:  # noqa: BLE001
             logger.exception("reaper offline-mark for %s failed", name)
+
+    def _close_coverage_gap(conn: Any, name: str) -> None:
+        """Coming-online leg of gap tracking (2026-07-27): if a gap was open,
+        count what arrived during it and queue a ONE-SHOT notice for the
+        agent's next drain. The notice converts a silent gap into a known
+        gap — the agent can choose to get_history() instead of trusting a
+        queue it had no reason to doubt. Redelivery is NOT needed (DMs queue
+        and the broadcast cursor catches up); awareness is the missing half.
+        Best-effort: never worth failing a register."""
+        try:
+            row = conn.execute(
+                "SELECT offline_since FROM agents WHERE name = ?", (name,)
+            ).fetchone()
+            since = row["offline_since"] if row else None
+            if not since:
+                return
+            n = conn.execute(
+                "SELECT COUNT(*) AS n FROM messages WHERE ts > ? AND "
+                "(to_agent = ? OR channel = ?)",
+                (since, name, _BROADCAST_CHANNEL),
+            ).fetchone()["n"]
+            notice = ""
+            if n:
+                t1 = time.strftime("%H:%M", time.gmtime(since))
+                t2 = time.strftime("%H:%M", time.gmtime())
+                notice = (
+                    f"⚠️ Coverage gap: your binding was down {t1}–{t2} UTC "
+                    f"and {n} message(s) arrived in that window. They are in "
+                    "your queue/cursor, but anything you reasoned about "
+                    "during the gap may be missing context — "
+                    "get_history() holds the record."
+                )
+            conn.execute(
+                "UPDATE agents SET offline_since = NULL, gap_notice = ? "
+                "WHERE name = ?", (notice, name),
+            )
+            conn.commit()
+        except Exception:  # noqa: BLE001
+            logger.exception("coverage-gap close for %s failed", name)
 
     # liveness_probe is a late-binding lambda: `_can_deliver_push` is defined
     # further down in this scope, but the reaper only invokes the probe long
@@ -812,6 +939,133 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     )
     # Exposed for main() so it can spawn the reaper alongside the server.
     mcp._hub_registry = registry  # type: ignore[attr-defined]
+
+    def _drop_context_probe(name: str, session: Any) -> str:
+        """Snapshot the external discriminators a wake-ack drop needs to
+        arrive pre-classified (2026-07-27 four-class forensics, by hand,
+        once): was the recipient idle, and is their transport still
+        push-deliverable right now. Called under the registry lock — must
+        not call registry methods (act_ago/bind_src come from the registry
+        itself); DB and transport-manager access take no registry lock."""
+        parts: list[str] = []
+        try:
+            row = _get_db(db_path).execute(
+                "SELECT is_idle FROM agents WHERE name = ?", (name,)
+            ).fetchone()
+            parts.append(f"idle={row['is_idle'] if row else '?'}")
+        except Exception:  # noqa: BLE001
+            parts.append("idle=?")
+        parts.append(
+            f"deliverable={_can_deliver_push(session) if session else '?'}"
+        )
+        return " ".join(parts)
+
+    registry.context_probe = _drop_context_probe
+
+    async def _url_rebind_sweep() -> None:
+        """Bind URL-identified sessions without an agent turn — the
+        auto-rebind half of making deploys non-events.
+
+        Every ~10s: for each live streamable-http transport whose requests
+        carried ?agent=<name>, find its ServerSession (write-stream identity,
+        same traversal as _can_deliver_push) and bind it when ALL of:
+          * the session passes the interactive-client gate — the stop-hook /
+            heartbeat ephemeral clients connect with the same URL, and
+            binding one would clobber the real wake target (the exact bug
+            bind=False exists to prevent); the cli also strips the param,
+            so this gate is the second layer of a two-layer defence;
+          * the name exists in the agents DB (no phantom bindings — same
+            discipline as touch_session);
+          * the agent is currently UNBOUND, or bound to a session that is no
+            longer push-deliverable. A live deliverable binding is never
+            fought — register() and touch_session own that path.
+        Binding marks the agent online and closes its coverage gap, so the
+        fleet returns ⚡ from a deploy with zero agent involvement."""
+        while True:
+            try:
+                await anyio.sleep(10.0)
+                try:
+                    manager = mcp.session_manager
+                except RuntimeError:
+                    continue
+                instances = getattr(manager, "_server_instances", None)
+                if not instances:
+                    continue
+                sessions_by_stream = {
+                    id(getattr(s, "_write_stream", None)): s
+                    for s in live_server_sessions()
+                }
+                conn = _get_db(db_path)
+                for transport in list(instances.values()):
+                    name = getattr(transport, _URL_AGENT_ATTR, "")
+                    if not name:
+                        continue
+                    session = sessions_by_stream.get(
+                        id(getattr(transport, "_write_stream", None))
+                    )
+                    if session is None or not is_interactive_client(session):
+                        continue
+                    current = registry.get(name)
+                    if current is session:
+                        continue
+                    if current is not None and _can_deliver_push(current):
+                        continue
+                    row = conn.execute(
+                        "SELECT name FROM agents WHERE name = ?", (name,)
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    registry.bind(name, session, source="url")
+                    conn.execute(
+                        "UPDATE agents SET status = 'online', last_seen = ? "
+                        "WHERE name = ?", (time.time(), name),
+                    )
+                    conn.commit()
+                    _close_coverage_gap(conn, name)
+                    logger.info(
+                        "url-rebind: bound %s from transport identity "
+                        "(no agent turn)", name,
+                    )
+            except anyio.get_cancelled_exc_class():
+                raise
+            except Exception:  # noqa: BLE001
+                logger.exception("url-rebind sweep iteration failed")
+
+    # Exposed for main() to run alongside the reaper.
+    mcp._hub_url_rebind_sweep = _url_rebind_sweep  # type: ignore[attr-defined]
+
+    def _attribution(ctx: Context | None, from_agent: str) -> tuple[str, str]:
+        """Verify-when-bound (item 34, fo's accidental impersonation): the
+        transport's own binding is the one identity signal that is not
+        caller-asserted, so use it where it exists.
+
+        Returns (grade, error). grade is 'session-verified' when the calling
+        session is bound to exactly the asserted identity, 'asserted' when
+        the caller is unbound/ephemeral (stop-hook, daemons — unchanged
+        trust, by design). error is non-empty only when the session OWNS a
+        different identity than it asserts — the one case that is provably a
+        mis-attribution at the tool boundary."""
+        if ctx is None:
+            return "asserted", ""
+        try:
+            names = registry.names_for_session(ctx.session)
+        except Exception:  # noqa: BLE001
+            return "asserted", ""
+        if not names:
+            return "asserted", ""
+        if from_agent in names:
+            return "session-verified", ""
+        return "asserted", (
+            f"REFUSED: this session is bound to "
+            f"{' / '.join(sorted(names))} but asserted "
+            f"from_agent='{from_agent}' — identity mismatch. If the swap was "
+            "accidental (inverted from/to arguments), re-issue with the "
+            "correct from_agent; the record was not written."
+        )
+
+    # Exposed for tests — call_tool can't inject a Context, so the gate's
+    # logic is verified directly against seeded registry bindings.
+    mcp._hub_attribution = _attribution  # type: ignore[attr-defined]
 
     # Plain HTTP health/version probe: `curl http://<hub>/health` returns the
     # running git commit so the deployed version is verifiable without
@@ -1091,6 +1345,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             (name, project, bio, now, now, meta, max_broadcast_id),
         )
         conn.commit()
+        _close_coverage_gap(conn, name)
 
         # Bind the current MCP session so we can push channel notifications.
         # Re-registering from a new session replaces the old binding atomically.
@@ -1158,14 +1413,23 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         return f"Bio updated for '{name}'."
 
     @mcp.tool()
-    def unregister(name: str) -> str:
+    def unregister(name: str, ctx: Context | None = None) -> str:
         """Mark an agent as offline.
 
         Args:
             name: The agent name to take offline.
         """
+        # A bound session may only take ITSELF offline (verify-when-bound —
+        # unregistering someone else is the destructive form of fo's
+        # accidental-inversion class). Ephemeral/unbound callers unchanged.
+        _grade, attr_err = _attribution(ctx, name)
+        if attr_err:
+            return attr_err
         conn = _get_db(db_path)
-        conn.execute("UPDATE agents SET status = 'offline' WHERE name = ?", (name,))
+        # Deliberate departure: no coverage gap to report on return.
+        conn.execute(
+            "UPDATE agents SET status = 'offline', offline_since = NULL, "
+            "gap_notice = '' WHERE name = ?", (name,))
         conn.commit()
         return f"'{name}' is now offline."
 
@@ -1267,6 +1531,14 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         now = time.time()
         conn = _get_db(db_path)
 
+        # Verify-when-bound BEFORE touch_session: an inverted from/to call
+        # doesn't just mis-write a record — the touch below would also bind
+        # the caller's session to the ASSERTED name, hijacking the named
+        # agent's wake target (fo's 2026-07-27 specimen did exactly this).
+        grade, attr_err = _attribution(ctx, from_agent)
+        if attr_err:
+            return attr_err
+
         # Auto-bind sender's session — any tool call refreshes the binding
         # so drift across redeploys self-heals without explicit register().
         touch_session(from_agent, ctx)
@@ -1276,9 +1548,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             "UPDATE agents SET last_seen = ? WHERE name = ?", (now, from_agent)
         )
         cursor = conn.execute(
-            "INSERT INTO messages (ts, from_agent, to_agent, body, priority) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (now, from_agent, to, message, priority),
+            "INSERT INTO messages (ts, from_agent, to_agent, body, priority, "
+            "attribution) VALUES (?, ?, ?, ?, ?, ?)",
+            (now, from_agent, to, message, priority, grade),
         )
         message_id = cursor.lastrowid
         conn.commit()
@@ -1445,6 +1717,12 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         now = time.time()
         conn = _get_db(db_path)
 
+        # Verify-when-bound before the touch (see send() for why the order
+        # matters — a mismatched assert must not rebind the named agent).
+        grade, attr_err = _attribution(ctx, from_agent)
+        if attr_err:
+            return attr_err
+
         # Auto-bind sender's session for drift self-heal.
         touch_session(from_agent, ctx)
 
@@ -1452,9 +1730,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             "UPDATE agents SET last_seen = ? WHERE name = ?", (now, from_agent)
         )
         cursor = conn.execute(
-            "INSERT INTO messages (ts, from_agent, channel, body, priority) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (now, from_agent, _BROADCAST_CHANNEL, message, priority),
+            "INSERT INTO messages (ts, from_agent, channel, body, priority, "
+            "attribution) VALUES (?, ?, ?, ?, ?, ?)",
+            (now, from_agent, _BROADCAST_CHANNEL, message, priority, grade),
         )
         broadcast_id = cursor.lastrowid
 
@@ -1633,6 +1911,11 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         if not row:
             return f"Channel '{channel}' not found. Create it with create_channel()."
 
+        # Verify-when-bound before the touch (see send() for the ordering).
+        grade, attr_err = _attribution(ctx, from_agent)
+        if attr_err:
+            return attr_err
+
         # Auto-bind sender's session for drift self-heal.
         touch_session(from_agent, ctx)
 
@@ -1640,9 +1923,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             "UPDATE agents SET last_seen = ? WHERE name = ?", (now, from_agent)
         )
         conn.execute(
-            "INSERT INTO messages (ts, from_agent, channel, body, priority) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (now, from_agent, channel, message, priority),
+            "INSERT INTO messages (ts, from_agent, channel, body, priority, "
+            "attribution) VALUES (?, ?, ?, ?, ?, ?)",
+            (now, from_agent, channel, message, priority, grade),
         )
         conn.commit()
 
@@ -1849,6 +2132,21 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # Update last_seen
         conn.execute("UPDATE agents SET last_seen = ? WHERE name = ?", (now, agent_name))
 
+        # One-shot coverage-gap notice: queued at coming-online, delivered on
+        # the first drain after, then cleared. Delivered even with an empty
+        # queue — "nothing waiting" is exactly the claim a gap undermines.
+        gap_row = conn.execute(
+            "SELECT gap_notice FROM agents WHERE name = ? AND gap_notice != ''",
+            (agent_name,),
+        ).fetchone()
+        gap_notice = gap_row["gap_notice"] if gap_row else ""
+        if gap_notice:
+            conn.execute(
+                "UPDATE agents SET gap_notice = '' WHERE name = ?",
+                (agent_name,),
+            )
+            conn.commit()
+
         rows = conn.execute(
             """SELECT id, ts, from_agent, body, priority, pushed_gen FROM messages
                WHERE to_agent = ? AND read = 0
@@ -1857,7 +2155,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         ).fetchall()
 
         if not rows:
-            return ""
+            return gap_notice
 
         # Mark as read
         ids = [r["id"] for r in rows]
@@ -1934,6 +2232,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 f"({' and '.join(what)} — shortened to save context, and now "
                 f"marked read. Full text: get_history('{agent_name}'))"
             )
+        if gap_notice:
+            lines.insert(0, gap_notice)
         return "\n".join(lines)
 
     @mcp.tool()
@@ -2094,6 +2394,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         project: str = "",
         source: str = "stop-hook",
         tags: str = "",
+        ctx: Context | None = None,
     ) -> str:
         """Submit (or restate) a DECISION card for the operator's triage queue.
 
@@ -2105,6 +2406,12 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             tags: Extra comma-separated tags, merged with the card's TAGS line.
         """
         now = time.time()
+        # A card is an ask in the OPERATOR's queue under the asker's name —
+        # exactly the record class the attribution gate exists for. The
+        # stop-hook's ephemeral client stays 'asserted' (unbound, by design).
+        grade, attr_err = _attribution(ctx, from_agent)
+        if attr_err:
+            return attr_err
         # Defensive size cap: the harvester takes DECISION→end-of-turn, so a
         # convention-breaking turn (card followed by a ramble) could ship a
         # novel. The queue is for one-glance asks; the ledger keeps raw
@@ -2145,28 +2452,30 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 """UPDATE decisions SET updated_at=?, raw=?, ask=?, why=?,
                    value_text=?, risk_text=?, value_score=?, risk_score=?,
                    net_score=?, tags=?, clear_strikes=0, stale=0,
+                   attribution=?,
                    project=CASE WHEN ?='' THEN project ELSE ? END
                    WHERE id=?""",
                 (now, card, f["ask"], f["why"], f["value_text"], f["risk_text"],
                  f["value_score"], f["risk_score"], f["net_score"], all_tags,
-                 project, project, open_row["id"]),
+                 grade, project, project, open_row["id"]),
             )
             conn.commit()
             return f"Decision card #{open_row['id']} updated (net={f['net_score']})."
         cur = conn.execute(
             """INSERT INTO decisions (agent, project, source, submitted_at,
                updated_at, raw, ask, why, value_text, risk_text, value_score,
-               risk_score, net_score, tags)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               risk_score, net_score, tags, attribution)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (from_agent, project, source, now, now, card, f["ask"], f["why"],
              f["value_text"], f["risk_text"], f["value_score"],
-             f["risk_score"], f["net_score"], all_tags),
+             f["risk_score"], f["net_score"], all_tags, grade),
         )
         conn.commit()
         return f"Decision card #{cur.lastrowid} opened (net={f['net_score']})."
 
     @mcp.tool()
-    def decision_clear(from_agent: str, source: str = "stop-hook") -> str:
+    def decision_clear(from_agent: str, source: str = "stop-hook",
+                       ctx: Context | None = None) -> str:
         """Register a cardless turn against the agent's open card; mark it
         STALE after 3 consecutive ones — never withdraw it.
 
@@ -2189,6 +2498,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 
         Only touches cards of the given source — an api-submitted service
         card is not the agent's to mark."""
+        _grade, attr_err = _attribution(ctx, from_agent)
+        if attr_err:
+            return attr_err
         conn = _get_db(db_path)
         row = conn.execute(
             "SELECT id, ask, clear_strikes, stale FROM decisions "
@@ -2219,7 +2531,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         return f"Card #{row['id']} kept open (cardless turn {strikes}/3): {ask}"
 
     @mcp.tool()
-    def decision_resolve(from_agent: str, verdict: str, source: str = "stop-hook") -> str:
+    def decision_resolve(from_agent: str, verdict: str, source: str = "stop-hook",
+                         ctx: Context | None = None) -> str:
         """Close the agent's own open card WITH the verdict it just received
         in-pane — the smart half of answer capture (operator, 2026-07-26:
         "rather than relying on some flaky auto capture"). The agent that
@@ -2227,6 +2540,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         with `**DECIDED:** <verdict>` and the Stop hook ships it here. The
         verdict is agent-recorded, so it is stored with that provenance —
         distinct from a decision_answer verdict typed by the operator."""
+        _grade, attr_err = _attribution(ctx, from_agent)
+        if attr_err:
+            return attr_err
         conn = _get_db(db_path)
         cur = conn.execute(
             "UPDATE decisions SET status='decided', decided_at=?, "
@@ -2607,6 +2923,7 @@ _CLI_SUBCOMMANDS = {
     "memory-verify",
     "transport-history",
     "identity",
+    "rebind-url",
 }
 
 
@@ -2666,6 +2983,7 @@ def main():
         async def run_with_reaper() -> None:
             async with anyio.create_task_group() as tg:
                 tg.start_soon(registry.run_reaper)
+                tg.start_soon(server._hub_url_rebind_sweep)  # type: ignore[attr-defined]
                 try:
                     await server.run_streamable_http_async()
                 finally:

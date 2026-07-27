@@ -281,7 +281,7 @@ async def _query_hub(
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
 
-    async with streamablehttp_client(hub_url, timeout=10) as (read, write, _):
+    async with streamablehttp_client(_ephemeral_hub_url(hub_url), timeout=10) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
 
@@ -847,7 +847,7 @@ async def _memory_export(hub_url: str, name: str, project: str, cwd: str) -> int
         print(f"nothing to export — no .md files in {mem_dir}")
         return 0
 
-    async with streamablehttp_client(hub_url, timeout=15) as (read, write, _):
+    async with streamablehttp_client(_ephemeral_hub_url(hub_url), timeout=15) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
 
@@ -903,7 +903,7 @@ async def _memory_import(
 
     mem_dir = _claude_memory_dir(cwd)
 
-    async with streamablehttp_client(hub_url, timeout=15) as (read, write, _):
+    async with streamablehttp_client(_ephemeral_hub_url(hub_url), timeout=15) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
 
@@ -1018,7 +1018,7 @@ async def _memory_verify(hub_url: str, project: str, cwd: str) -> int:
 
     mem_dir = _claude_memory_dir(cwd)
 
-    async with streamablehttp_client(hub_url, timeout=15) as (read, write, _):
+    async with streamablehttp_client(_ephemeral_hub_url(hub_url), timeout=15) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool("memory_list", {"project": project})
@@ -1393,6 +1393,66 @@ def _rekey_transcript(text: str, old_cwd: str, new_cwd: str) -> tuple[str, dict[
         out.append(json.dumps(d, **_JS_JSON))
 
     return "\n".join(out) + ("\n" if out else ""), stats
+
+
+def _ephemeral_hub_url(url: str) -> str:
+    """Strip the ?agent= identity from a hub URL before an EPHEMERAL client
+    connects with it.
+
+    The parameter exists so the hub can auto-rebind an agent's interactive
+    session at the transport layer (deploys stop being fleet events). The
+    cli's own short-lived clients — stop-hook, heartbeat daemon, memory
+    scripts — connect with the same configured URL, and a binding claimed by
+    a session that is DELETEd seconds later is the classic clobbered-wake-
+    target bug (why bind=False exists). The hub's interactive-client gate is
+    the second layer; this strip means the claim never even reaches it."""
+    try:
+        from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+        parts = urlsplit(url)
+        if "agent=" not in (parts.query or ""):
+            return url
+        query = [(k, v) for k, v in parse_qsl(parts.query) if k != "agent"]
+        return urlunsplit(parts._replace(query=urlencode(query)))
+    except Exception:  # noqa: BLE001
+        return url
+
+
+def rebind_url_command(args: argparse.Namespace) -> int:
+    """Stamp ?agent=<derived name> into this repo's .mcp.json hub URL — the
+    per-seat rollout leg of transport-level auto-rebind."""
+    cwd = args.cwd or os.getcwd()
+    name, _project = _derive_agent_identity(cwd)
+    if not name:
+        print(f"no derived identity for {cwd} (not opted in?) — nothing written")
+        return 1
+    mcp_json = pathlib.Path(cwd) / ".mcp.json"
+    try:
+        data = json.loads(mcp_json.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        print(f"cannot read {mcp_json}: {exc}")
+        return 1
+    hub = (data.get("mcpServers") or {}).get("hub") or {}
+    url = hub.get("url")
+    if not url:
+        print(f"{mcp_json} has no mcpServers.hub.url (stdio config?) — nothing written")
+        return 1
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+    parts = urlsplit(url)
+    query = [(k, v) for k, v in parse_qsl(parts.query) if k != "agent"]
+    query.append(("agent", name))
+    new_url = urlunsplit(parts._replace(query=urlencode(query)))
+    if new_url == url:
+        print(f"already stamped: {url}")
+        return 0
+    if args.dry_run:
+        print(f"would rewrite {mcp_json}: {url} -> {new_url}")
+        return 0
+    hub["url"] = new_url
+    data.setdefault("mcpServers", {})["hub"] = hub
+    mcp_json.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    print(f"stamped {mcp_json}: {new_url}")
+    print("(takes effect at the session's next MCP reconnect or relaunch)")
+    return 0
 
 
 def identity_command(args: argparse.Namespace) -> int:
@@ -2334,7 +2394,9 @@ async def _heartbeat_loop(hub_url: str, agent_name: str) -> bool:
     baseline_head = _source_head()
     while True:
         try:
-            async with streamablehttp_client(hub_url, timeout=10) as (read, write, _):
+            async with streamablehttp_client(
+                _ephemeral_hub_url(hub_url), timeout=10
+            ) as (read, write, _):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     # Force a heartbeat on the first tick after each (re)connect.
@@ -2687,6 +2749,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    rebind = sub.add_parser(
+        "rebind-url",
+        help="Stamp ?agent=<derived name> into this repo's .mcp.json hub URL",
+        description=(
+            "Rewrites <cwd>/.mcp.json so the hub URL carries the seat's "
+            "derived identity as a query parameter. The hub reads it at "
+            "transport connect and auto-rebinds the session after every "
+            "deploy/restart — no register turn, no nag, no interruption. "
+            "The cli's own ephemeral clients strip the parameter before "
+            "connecting, so stop-hook/daemon traffic can never claim the "
+            "wake binding through it."
+        ),
+    )
+    rebind.add_argument("--cwd", default=None, help="Worktree (default: current directory)")
+    rebind.add_argument(
+        "--dry-run", action="store_true", help="Print the rewritten URL; write nothing"
+    )
+
     return parser
 
 
@@ -2726,6 +2806,8 @@ def main(argv: list[str] | None = None) -> int:
         return identity_command(args)
     if args.subcommand == "transport-history":
         return transport_history_command(args)
+    if args.subcommand == "rebind-url":
+        return rebind_url_command(args)
 
     parser.print_help()
     return 0

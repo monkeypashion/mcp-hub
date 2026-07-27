@@ -1,0 +1,213 @@
+"""URL-identity auto-rebind package (2026-07-27): ephemeral URL stripping,
+the .mcp.json rollout command, the verify-when-bound attribution gate, and
+the coverage-gap notice.
+
+The full sweep (transport → session → bind with no agent turn) needs a live
+streamable-http stack and is exercised in production; these tests pin the
+component contracts the sweep composes: identity comes off the URL only for
+sessions that could legitimately own it, a bound session cannot write the
+record under another name, and a closed gap surfaces exactly once.
+"""
+
+import argparse
+import json
+from pathlib import Path
+
+import pytest
+
+from mcp_hub.cli import _ephemeral_hub_url, rebind_url_command
+from mcp_hub.server import create_server
+
+pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+class _FakeSess:
+    _write_stream = object()
+
+    async def send_ping(self):
+        return None
+
+
+class _FakeCtx:
+    def __init__(self, session):
+        self.session = session
+
+
+async def _call_tool(server, name: str, args: dict) -> str:
+    result = await server._tool_manager.call_tool(name, args)
+    if hasattr(result, "content"):
+        for block in result.content:
+            if hasattr(block, "text"):
+                return block.text
+    if isinstance(result, list):
+        for block in result:
+            if hasattr(block, "text"):
+                return block.text
+    if isinstance(result, str):
+        return result
+    return str(result)
+
+
+# ---------------------------------------------------------------------------
+# Ephemeral URL stripping — the cli-side half of the two-layer defence
+# ---------------------------------------------------------------------------
+
+
+def test_ephemeral_url_strips_agent_param():
+    url = "http://hub:8090/mcp?agent=mcp-hub-dev-vm-1"
+    assert "agent=" not in _ephemeral_hub_url(url)
+    assert _ephemeral_hub_url(url).startswith("http://hub:8090/mcp")
+
+
+def test_ephemeral_url_preserves_other_params_and_plain_urls():
+    url = "http://hub:8090/mcp?agent=x&keep=1"
+    out = _ephemeral_hub_url(url)
+    assert "keep=1" in out and "agent=" not in out
+    plain = "http://hub:8090/mcp"
+    assert _ephemeral_hub_url(plain) == plain
+
+
+# ---------------------------------------------------------------------------
+# rebind-url — the per-seat rollout command
+# ---------------------------------------------------------------------------
+
+
+def _stamp(tmp_path: Path, monkeypatch, url: str, dry_run: bool = False) -> int:
+    monkeypatch.setattr(
+        "mcp_hub.cli._derive_agent_identity",
+        lambda cwd: ("mcp-hub-test-host", "org/mcp-hub"),
+    )
+    mcp_json = tmp_path / ".mcp.json"
+    mcp_json.write_text(json.dumps({"mcpServers": {"hub": {"url": url}}}))
+    args = argparse.Namespace(cwd=str(tmp_path), dry_run=dry_run)
+    return rebind_url_command(args)
+
+
+def test_rebind_url_stamps_identity(tmp_path, monkeypatch):
+    assert _stamp(tmp_path, monkeypatch, "http://hub:8090/mcp") == 0
+    data = json.loads((tmp_path / ".mcp.json").read_text())
+    assert data["mcpServers"]["hub"]["url"].endswith("?agent=mcp-hub-test-host")
+
+
+def test_rebind_url_is_idempotent_and_replaces_stale_identity(tmp_path, monkeypatch):
+    assert _stamp(tmp_path, monkeypatch, "http://h/mcp?agent=old-name") == 0
+    url = json.loads((tmp_path / ".mcp.json").read_text())["mcpServers"]["hub"]["url"]
+    assert url.count("agent=") == 1
+    assert "old-name" not in url
+
+
+def test_rebind_url_dry_run_writes_nothing(tmp_path, monkeypatch):
+    assert _stamp(tmp_path, monkeypatch, "http://h/mcp", dry_run=True) == 0
+    url = json.loads((tmp_path / ".mcp.json").read_text())["mcpServers"]["hub"]["url"]
+    assert "agent=" not in url
+
+
+# ---------------------------------------------------------------------------
+# Verify-when-bound — the attribution gate (item 34, fo's specimen)
+# ---------------------------------------------------------------------------
+
+
+def test_attribution_unbound_session_is_asserted_and_passes(tmp_path):
+    server = create_server(db_path=tmp_path / "t.db")
+    gate = server._hub_attribution
+    grade, err = gate(_FakeCtx(_FakeSess()), "anyone")
+    assert grade == "asserted" and err == ""
+    grade, err = gate(None, "anyone")  # no ctx at all (direct calls)
+    assert grade == "asserted" and err == ""
+
+
+def test_attribution_bound_session_verified_for_own_name(tmp_path):
+    server = create_server(db_path=tmp_path / "t.db")
+    sess = _FakeSess()
+    server._hub_registry.bind("alice", sess)
+    grade, err = server._hub_attribution(_FakeCtx(sess), "alice")
+    assert grade == "session-verified" and err == ""
+
+
+def test_attribution_bound_session_refused_for_other_name(tmp_path):
+    """fo's 2026-07-27 specimen: a session bound to its own identity asserted
+    a peer's name (inverted from/to) and wrote the record under it. The gate
+    refuses at the tool boundary."""
+    server = create_server(db_path=tmp_path / "t.db")
+    sess = _FakeSess()
+    server._hub_registry.bind("factory-operations", sess)
+    grade, err = server._hub_attribution(_FakeCtx(sess), "factory-data-model")
+    assert "REFUSED" in err
+    assert "factory-operations" in err  # names the identity it holds
+
+
+async def test_send_stamps_attribution_asserted_without_ctx(tmp_path):
+    """Ephemeral-style calls (no ctx) keep working and grade 'asserted'."""
+    server = create_server(db_path=tmp_path / "t.db")
+    await _call_tool(server, "register", {"name": "alice", "project": "p"})
+    await _call_tool(server, "register", {"name": "bob", "project": "p"})
+    out = await _call_tool(
+        server, "send", {"from_agent": "alice", "to": "bob", "message": "hi"},
+    )
+    assert "sent" in out.lower() or "queued" in out.lower()
+    import sqlite3
+    conn = sqlite3.connect(tmp_path / "t.db")
+    row = conn.execute(
+        "SELECT attribution FROM messages WHERE to_agent='bob'"
+    ).fetchone()
+    assert row[0] == "asserted"
+
+
+# ---------------------------------------------------------------------------
+# Coverage-gap notice — one-shot awareness of non-delivery
+# ---------------------------------------------------------------------------
+
+
+async def test_gap_notice_surfaces_once_then_clears(tmp_path):
+    server = create_server(db_path=tmp_path / "t.db")
+    await _call_tool(server, "register", {"name": "alice", "project": "p"})
+    await _call_tool(server, "register", {"name": "bob", "project": "p"})
+    import sqlite3
+    import time as _t
+    conn = sqlite3.connect(tmp_path / "t.db")
+    # Simulate a binding death 60s ago, with traffic arriving during the gap.
+    conn.execute(
+        "UPDATE agents SET status='offline', offline_since=? WHERE name='alice'",
+        (_t.time() - 60,),
+    )
+    conn.commit()
+    conn.close()
+    await _call_tool(server, "send", {"from_agent": "bob", "to": "alice",
+                                      "message": "arrived during the gap"})
+    # Coming back online closes the gap and queues the notice…
+    await _call_tool(server, "register", {"name": "alice", "project": "p"})
+    inbox = await _call_tool(server, "get_messages", {"agent_name": "alice"})
+    assert "Coverage gap" in inbox
+    assert "arrived during the gap" in inbox  # the queue itself still drains
+    # …exactly once.
+    again = await _call_tool(server, "get_messages", {"agent_name": "alice"})
+    assert "Coverage gap" not in again
+
+
+async def test_no_gap_no_notice(tmp_path):
+    server = create_server(db_path=tmp_path / "t.db")
+    await _call_tool(server, "register", {"name": "alice", "project": "p"})
+    await _call_tool(server, "register", {"name": "alice", "project": "p"})
+    assert await _call_tool(server, "get_messages", {"agent_name": "alice"}) == ""
+
+
+async def test_unregister_clears_gap_state(tmp_path):
+    """Deliberate departure: no coverage gap owed on return."""
+    server = create_server(db_path=tmp_path / "t.db")
+    await _call_tool(server, "register", {"name": "alice", "project": "p"})
+    import sqlite3
+    import time as _t
+    conn = sqlite3.connect(tmp_path / "t.db")
+    conn.execute(
+        "UPDATE agents SET offline_since=? WHERE name='alice'", (_t.time() - 60,)
+    )
+    conn.commit()
+    conn.close()
+    await _call_tool(server, "unregister", {"name": "alice"})
+    await _call_tool(server, "register", {"name": "alice", "project": "p"})
+    assert await _call_tool(server, "get_messages", {"agent_name": "alice"}) == ""
