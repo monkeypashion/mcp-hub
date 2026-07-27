@@ -1005,9 +1005,17 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 instances = getattr(manager, "_server_instances", None)
                 if not instances:
                     continue
+                # None-guard on BOTH sides of the identity match: any session
+                # and any transport lacking _write_stream would otherwise meet
+                # at id(None) and bind a name to an ARBITRARY session —
+                # cross-agent wake delivery, the worst failure this feature
+                # can produce (2026-07-27 18:22: a DM to this repo's
+                # maintainer surfaced in dreamteam's context).
+                # _can_deliver_push has carried this exact guard all along.
                 sessions_by_stream = {
-                    id(getattr(s, "_write_stream", None)): s
+                    id(ws): s
                     for s in live_server_sessions()
+                    if (ws := getattr(s, "_write_stream", None)) is not None
                 }
                 conn = _get_db(db_path)
                 # Group candidates per name and pick the BEST — newest
@@ -1029,10 +1037,23 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                     name = getattr(transport, _URL_AGENT_ATTR, "")
                     if not name:
                         continue
-                    session = sessions_by_stream.get(
-                        id(getattr(transport, "_write_stream", None))
+                    t_ws = getattr(transport, "_write_stream", None)
+                    session = (
+                        sessions_by_stream.get(id(t_ws))
+                        if t_ws is not None else None
                     )
                     if session is None or not is_interactive_client(session):
+                        continue
+                    # Hard invariant, independent of any matching bug: a
+                    # session that already owns a DIFFERENT identity is never
+                    # bound to this name. Whatever goes wrong upstream, a
+                    # wake for X must not land in Y's context.
+                    owners = registry.names_for_session(session)
+                    if owners and name not in owners:
+                        logger.warning(
+                            "url-rebind: REFUSING %s -> session owned by %s "
+                            "(cross-identity guard)", name, sorted(owners),
+                        )
                         continue
                     has_get = GET_STREAM_KEY in getattr(
                         transport, "_request_streams", {}
