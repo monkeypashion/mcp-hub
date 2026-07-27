@@ -290,6 +290,66 @@ def test_unreadable_claude_json_does_not_fail_the_teardown(env, tmp_path):
     assert not work.exists(), "the worktree deletion must still happen"
 
 
+def test_teardown_reaches_another_machine(env, tmp_path):
+    """Transport crossed machines and teardown did not, so cleaning up a
+    migration on the far box was hand work — no dry run, no confirmation.
+
+    It runs THIS verb over there rather than reimplementing it, which matters for
+    more than code size: the provenance gate then evaluates on the machine that
+    actually owns the roster and the suffix map. A gate deciding from the wrong
+    box's data is not a gate.
+    """
+    e, conf = env
+    far = tmp_path / "far"
+    (far / ".config" / "squad").mkdir(parents=True)
+    (far / ".mcp-hub").mkdir(parents=True)
+    clone = far / "Projects" / "code" / "monkeypashion" / "demo"
+    clone.mkdir(parents=True)
+    (clone / "f").write_text("x", encoding="utf-8")
+    (far / ".config" / "squad" / "squad.conf").write_text(
+        f"demo-far|{clone}|||\n", encoding="utf-8")
+    (far / ".mcp-hub" / "config.json").write_text(
+        json.dumps({"workspaces": {str(clone): "far"}}), encoding="utf-8")
+    ws = far / "far.code-workspace"
+    ws.write_text(json.dumps({"folders": [{"path": str(clone)}], "settings": {}}),
+                  encoding="utf-8")
+
+    # a shim that pretends to be ssh, and a `squad` on the far box's PATH
+    farbin = far / ".local" / "bin"
+    farbin.mkdir(parents=True)
+    (farbin / "squad").symlink_to(SQUAD)
+    shim = tmp_path / "fake-ssh"
+    # -u SQUAD_CONF: real ssh does NOT forward the caller's environment, and
+    # leaving it set made the "far" squad read THIS box's roster — the shim was
+    # more permissive than the thing it imitates.
+    shim.write_text(
+        f'#!/bin/sh\nshift\nexec env -u SQUAD_CONF -u SQUAD_SOCKET '
+        f'HOME="{far}" PATH="$PATH" /bin/sh -c "$*"\n', encoding="utf-8")
+    shim.chmod(0o755)
+
+    res = _run(env, "teardown", "workspace", str(ws), "--host", "farbox",
+               "--rsh", str(shim), "--dry-run")
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "on farbox" in res.stdout, res.stdout
+    assert "demo-far" in res.stdout, "the FAR box's roster is what gets reported"
+    assert clone.is_dir(), "a dry run must not touch the far machine"
+
+
+def test_remote_teardown_without_squad_there_says_how_to_fix_it(env, tmp_path):
+    far = tmp_path / "bare"
+    far.mkdir()
+    ws = far / "x.code-workspace"
+    ws.write_text('{"folders":[],"settings":{}}', encoding="utf-8")
+    shim = tmp_path / "fake-ssh"
+    shim.write_text(
+        f'#!/bin/sh\nshift\nexec env -u SQUAD_CONF -u SQUAD_SOCKET '
+        f'HOME="{far}" PATH=/nonexistent /bin/sh -c "$*"\n', encoding="utf-8")
+    shim.chmod(0o755)
+    res = _run(env, "teardown", "workspace", str(ws), "--host", "farbox", "--rsh", str(shim))
+    assert res.returncode != 0
+    assert "bootstrap --host farbox" in (res.stdout + res.stderr)
+
+
 def test_unknown_workspace_is_refused(env, tmp_path):
     res = _run(env, "teardown", "workspace", str(tmp_path / "nope.code-workspace"))
     assert res.returncode != 0

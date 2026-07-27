@@ -573,6 +573,32 @@ function activate(context) {
           host = where.host;
         }
 
+        // ---- step 1b: CAN that machine host an agent? ----
+        // Asked here, before a workspace is even chosen, because the answer
+        // changes what the operator is agreeing to. A brand-new server is
+        // offered by the list above (any online Linux peer), and without this
+        // the repo and memory ship before anything notices it cannot host them.
+        let needsBootstrap = false;
+        if (host) {
+          const report = sh(`${SQUAD} preflight --host ${host} 2>&1`);
+          if (!/READY/.test(report) || /NOT READY/.test(report)) {
+            const go = await vscode.window.showWarningMessage(
+              `${host} isn't set up to host agents yet. Set it up now?`,
+              {
+                modal: true,
+                detail:
+                  report +
+                  "\nThis installs mcp-hub and squad for your user on that machine, " +
+                  "adds the hub hooks, and leaves anything already there alone. " +
+                  "It never installs system packages.",
+              },
+              "Set it up, then transport"
+            );
+            if (go !== "Set it up, then transport") return null;
+            needsBootstrap = true;
+          }
+        }
+
         // ---- step 2: which workspace on that machine? ----
         const files = wsOn(host).filter(
           (f) => host || !here || canon(f) !== canon(here.fsPath)   // never offer where it already lives
@@ -596,7 +622,7 @@ function activate(context) {
           }
         );
         if (!pick) return null;
-        if (!pick.isNew) return { host, file: pick.description, label: pick.label, sh };
+        if (!pick.isNew) return { host, file: pick.description, label: pick.label, sh, needsBootstrap };
 
         const name = await vscode.window.showInputBox({
           title: `${title} — name the new workspace`,
@@ -620,7 +646,7 @@ function activate(context) {
         }
         // The file itself is created by transport at the far end, so there is
         // nothing to clean up if the operator cancels or the gate refuses.
-        return { host, file: `${home}/Projects/${name}.code-workspace`, label: name, sh };
+        return { host, file: `${home}/Projects/${name}.code-workspace`, label: name, sh, needsBootstrap };
   };
 
   // Runs in a visible terminal rather than fire-and-forget: transport REFUSES
@@ -649,7 +675,8 @@ function activate(context) {
         runTransport(
           `${target.host ? target.host + ":" : ""}${target.label}`,
           `${SQUAD} transport ${agent} --to ${JSON.stringify(target.file)}` +
-            (target.host ? ` --host ${target.host}` : "")
+            (target.host ? ` --host ${target.host}` : "") +
+        (target.needsBootstrap ? " --bootstrap" : "")
         );
       })
     )
@@ -664,7 +691,8 @@ function activate(context) {
       if (!target) return;
       const base =
         `${SQUAD} transport all --to ${JSON.stringify(target.file)}` +
-        (target.host ? ` --host ${target.host}` : "");
+        (target.host ? ` --host ${target.host}` : "") +
+        (target.needsBootstrap ? " --bootstrap" : "");
       const preview = target.sh(`${base} --dry-run 2>&1`) || "(no output)";
       const go = await vscode.window.showWarningMessage(
         `Clone the squad into ${target.label}${target.host ? ` on ${target.host}` : ""}?`,
@@ -773,7 +801,8 @@ function activate(context) {
       const base =
         `${SQUAD} transport workspace ${JSON.stringify(here.fsPath)}` +
         ` --to ${JSON.stringify(target.file)}` +
-        (target.host ? ` --host ${target.host}` : "");
+        (target.host ? ` --host ${target.host}` : "") +
+        (target.needsBootstrap ? " --bootstrap" : "");
       // Dry run FIRST, confirmed against the real eligibility list: a bulk clone
       // is expensive and partly irreversible, and ineligible agents must be read
       // rather than discovered afterwards.
