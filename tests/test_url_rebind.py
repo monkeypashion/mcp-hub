@@ -231,6 +231,28 @@ async def test_send_stamps_attribution_asserted_without_ctx(tmp_path):
     assert row[0] == "asserted"
 
 
+async def test_broadcast_stamps_attribution_too(tmp_path):
+    """send() had this covered; broadcast() did not — found by mutation while
+    merging broadcast scoping. Dropping `attribution` from broadcast's INSERT
+    left all 587 tests green, so the column could have been lost in a merge
+    without anything saying so. broadcast() writes the SAME row type as send()
+    and its INSERT now carries two independently-added columns, which is
+    exactly the shape that loses one quietly."""
+    server = create_server(db_path=tmp_path / "t.db")
+    await _call_tool(server, "register", {"name": "alice", "project": "p"})
+    await _call_tool(server, "broadcast", {"from_agent": "alice", "message": "hi"})
+    import sqlite3
+
+    from mcp_hub.server import _BROADCAST_CHANNEL
+    conn = sqlite3.connect(tmp_path / "t.db")
+    row = conn.execute(
+        "SELECT attribution FROM messages WHERE from_agent='alice' "
+        "AND channel=?", (_BROADCAST_CHANNEL,),
+    ).fetchone()
+    assert row is not None, "broadcast wrote no row"
+    assert row[0] == "asserted"
+
+
 # ---------------------------------------------------------------------------
 # Coverage-gap notice — one-shot awareness of non-delivery
 # ---------------------------------------------------------------------------

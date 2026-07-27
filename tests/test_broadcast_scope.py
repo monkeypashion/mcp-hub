@@ -19,8 +19,8 @@ caused the cross-lane replies arrived through the second.
 """
 from __future__ import annotations
 
-from pathlib import Path
 import re
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
