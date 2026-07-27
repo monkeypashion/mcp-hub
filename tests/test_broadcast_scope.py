@@ -206,7 +206,15 @@ async def test_joining_a_team_later_does_not_dump_its_backlog(server):
     that was not for you AT SEND TIME must never be re-offered, and the filter
     compares against your CURRENT team. Without the tail absorb, a stalled
     cursor plus a later join floods the agent with history it was never party
-    to."""
+    to.
+
+    THE BOUNDARY OF THIS GUARANTEE, stated because it is real: it holds because
+    the tail absorb advances the cursor at each catch-up, which assumes
+    catch-ups RAN between the team row landing and the join. An agent offline
+    for that entire interval, joining a team before its first catch-up, still
+    inherits whatever sits above its stalled cursor. Bounded by `limit`, and by
+    the fact that those rows were fleet-readable anyway (scope is delivery, not
+    confidentiality — see broadcast's docstring). Judged not worth code."""
     await _squad(server)
     await _call(server, "broadcast", {"from_agent": "pm", "message": "old squad business"})
     await _call(server, "get_broadcasts_for_agent", {"agent_name": "hub", "bind": False})
@@ -243,6 +251,69 @@ async def test_the_tail_absorb_never_skips_unread_rows_when_limit_bites(server):
     for i in range(5):
         assert f"fleet-{i}" in (first + rest), \
             f"fleet-{i} was skipped — the tail absorb ate an unread row"
+
+
+async def test_a_broadcast_arriving_mid_call_is_not_silently_absorbed(server, tmp_path):
+    """The tail absorb must not eat a row that landed WHILE this call ran.
+
+    These tools are sync defs on FastMCP's threadpool and _get_db connections
+    are thread-local, so each statement is its own transaction and a later one
+    sees commits an earlier one did not. Reading MAX(id) after the row scan
+    would absorb a broadcast that committed in between — advancing the cursor
+    past a row never returned, which no future catch-up can offer again
+    (id <= cursor). Silent loss, the mark-read-on-push class.
+
+    dev judged the race not practically unit-testable, being a two-thread
+    interleaving. It is testable deterministically by injecting the commit at
+    the exact point the other thread would have: immediately after the scan.
+    The scan's rows are materialised BEFORE the injection so the SELECT itself
+    cannot see the new row — otherwise this would test the wrong thing.
+
+    Against the racy order (fence read after the scan) this fails; the four
+    other cursor tests pass either way, which is precisely why it exists.
+    """
+    import time as _time
+
+    import mcp_hub.server as srv
+    await _squad(server)
+    await _call(server, "broadcast",
+                {"from_agent": "pm", "message": "before", "scope": "fleet"})
+
+    real = srv._get_db(tmp_path / "test.db")
+    fired = {"done": False}
+
+    class _Rows:
+        def __init__(self, rows): self._rows = rows
+        def fetchall(self): return self._rows
+        def fetchone(self): return self._rows[0] if self._rows else None
+
+    class _Proxy:
+        def __getattr__(self, n): return getattr(real, n)
+
+        def execute(self, sql, params=()):
+            if not fired["done"] and "ORDER BY id ASC LIMIT" in sql:
+                fired["done"] = True
+                rows = real.execute(sql, params).fetchall()   # materialise FIRST
+                real.execute(                                  # the other thread commits
+                    "INSERT INTO messages (ts, from_agent, channel, body, "
+                    "priority, audience) VALUES (?, ?, ?, ?, ?, ?)",
+                    (_time.time(), "pm", "general", "arrived mid-call", "normal", ""),
+                )
+                real.commit()
+                return _Rows(rows)
+            return real.execute(sql, params)
+
+    with patch.object(srv, "_get_db", lambda db_path=None: _Proxy()):
+        await _call(server, "get_broadcasts_for_agent",
+                    {"agent_name": "hub", "bind": False})
+    assert fired["done"], "injection never ran — the test proved nothing"
+
+    out = await _call(server, "get_broadcasts_for_agent",
+                      {"agent_name": "hub", "bind": False})
+    assert "arrived mid-call" in out, (
+        "a broadcast that landed mid-call was absorbed by the tail advance and "
+        f"can never be offered again:\n{out}"
+    )
 
 
 # ---- clearing a team ------------------------------------------------------

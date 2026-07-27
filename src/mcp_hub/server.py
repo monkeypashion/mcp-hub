@@ -2552,6 +2552,29 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             "SELECT team FROM agents WHERE name = ?", (agent_name,)
         ).fetchone()
         my_team = (my_team["team"] if my_team else "") or ""
+
+        # THE FENCE MUST BE READ BEFORE THE SCAN. Do not "simplify" this by
+        # moving it down next to the code that uses it.
+        #
+        # These tools are sync defs, so FastMCP runs them on a threadpool, and
+        # _get_db hands out THREAD-LOCAL connections — each statement is its own
+        # autocommit transaction, and a later statement sees other threads'
+        # commits that an earlier one did not. Reading MAX(id) AFTER the row
+        # scan therefore absorbs any broadcast that committed in between: the
+        # cursor advances past a row this call never returned, and since every
+        # future catch-up asks for id > cursor, that row can never be offered
+        # again. Silent message loss — the mark-read-on-push class, the worst
+        # bug in this hub's history — and catch-up is exactly the path the
+        # unbound, drifted agent depends on, so live push does not cover it.
+        #
+        # Reading it first makes every interleaving correct without depending
+        # on isolation semantics at all: anything committing later has an id
+        # above the fence, so it simply stays unabsorbed for the next call.
+        fence = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS m FROM messages WHERE channel = ?",
+            (_BROADCAST_CHANNEL,),
+        ).fetchone()["m"]
+
         rows = conn.execute(
             """SELECT id, ts, from_agent, body, priority FROM messages
                WHERE channel = ? AND id > ?
@@ -2578,17 +2601,14 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         #
         # Guarded on len(rows) < limit, which is what proves the scan reached
         # the end of the feed rather than being cut short by LIMIT. When LIMIT
-        # did cut it short there may be visible rows further on, and jumping to
-        # MAX(id) would skip them — a silent message loss, which is strictly
+        # did cut it short there may be visible rows further on, and absorbing
+        # the fence would skip them — a silent message loss, which is strictly
         # worse than the stall being fixed. Those tails are absorbed by the
         # next call instead. Filtered rows BETWEEN visible ones need nothing:
         # returned-max already covers them.
         advance_to = max((r["id"] for r in rows), default=0)
         if len(rows) < limit:
-            advance_to = max(advance_to, conn.execute(
-                "SELECT COALESCE(MAX(id), 0) AS m FROM messages WHERE channel = ?",
-                (_BROADCAST_CHANNEL,),
-            ).fetchone()["m"])
+            advance_to = max(advance_to, fence)
         if advance_to > cursor:
             conn.execute(
                 "UPDATE agents SET last_broadcast_seen_id = ? WHERE name = ?",
