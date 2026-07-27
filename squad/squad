@@ -1192,6 +1192,92 @@ resolve_rsh() {  # <host> <port> <override>
   printf '%s' "$rsh"
 }
 
+# ── preflight: can this machine actually RECEIVE an agent? ──────────────────
+# The cockpit offers any online Linux tailnet peer, so a brand-new server is
+# offered before it can host anything. Transport then clones the repo and
+# rsyncs memory across before transport-recv discovers there is no mcp-hub to
+# derive a name with — leaving a half-wired agent on a box the operator was
+# told was a valid destination.
+#
+# So: ASK FIRST, in one round trip, and report what is missing together with the
+# thing that fixes it. A destination check that runs after the bytes have moved
+# is not a check, it is a post-mortem.
+#
+# Prints one `key=value` line per capability; returns 0 only when the host can
+# take an agent today.
+preflight_host() {  # <rsh> <host>   (empty rsh+host = this machine)
+  local rsh="$1" host="$2" probe out
+  probe='
+for t in git python3 rsync tar; do
+  command -v "$t" >/dev/null && echo "$t=ok" || echo "$t=MISSING"
+done
+# mcp-hub derives the agent name at the destination. A non-login ssh shell does
+# not get ~/.local/bin, so check the real locations too rather than PATH alone.
+if command -v mcp-hub >/dev/null || [ -x "$HOME/.local/bin/mcp-hub" ]; then
+  echo "mcp-hub=ok"
+else
+  echo "mcp-hub=MISSING"
+fi
+if command -v squad >/dev/null || [ -x "$HOME/.local/bin/squad" ]; then
+  echo "squad=ok"
+else
+  echo "squad=MISSING"
+fi
+command -v claude >/dev/null && echo "claude=ok" || echo "claude=MISSING"
+# Separate from the binary: transport SEEDS folder-trust into ~/.claude.json so a
+# landed agent does not hang on the trust dialog. That seeding fails open, so a
+# box without the file takes an agent that then blocks forever on first launch.
+[ -f "$HOME/.claude.json" ] && echo "trustfile=ok" || echo "trustfile=MISSING"
+grep -q "stop-hook" "$HOME/.claude/settings.json" 2>/dev/null \
+  && echo "hooks=ok" || echo "hooks=MISSING"
+[ -f "$HOME/.mcp-hub/config.json" ] && echo "optin=ok" || echo "optin=MISSING"
+printf "home=%s\n" "$HOME"
+'
+  if [ -n "$host" ]; then
+    out="$($rsh "$host" "$probe" 2>/dev/null)" || { echo "reach=MISSING"; return 1; }
+  else
+    out="$(sh -c "$probe" 2>/dev/null)" || { echo "reach=MISSING"; return 1; }
+  fi
+  printf '%s\n' "$out"
+  printf '%s\n' "$out" | grep -q '=MISSING' && return 1
+  return 0
+}
+
+# Human-readable verdict, naming the FIX for each gap rather than only the gap.
+preflight_report() {  # <rsh> <host> <label>
+  local out rc=0
+  out="$(preflight_host "$1" "$2")" || rc=1
+  echo "== can ${3:-$2} receive an agent? =="
+  case "$out" in
+    *reach=MISSING*)
+      echo "  ✗ cannot reach $2 — check \`tailscale ssh $2 true\`, or pass --rsh '<command>'"
+      return 1 ;;
+  esac
+  printf '%s\n' "$out" | while IFS='=' read -r k v; do
+    [ -n "$k" ] || continue
+    case "$k" in home) continue ;; esac
+    if [ "$v" = ok ]; then
+      printf '  ✓ %s\n' "$k"
+    else
+      case "$k" in
+        git|python3|rsync|tar) printf '  ✗ %-8s — apt install %s\n' "$k" "$k" ;;
+        mcp-hub)  printf '  ✗ %-8s — needed to derive the agent name here\n' "$k" ;;
+        squad)    printf '  ✗ %-8s — needed to start the agent once it lands\n' "$k" ;;
+        claude)   printf '  ✗ %-9s — Claude Code is not installed; agents land but cannot start\n' "$k" ;;
+        trustfile) printf '  ✗ %-9s — no ~/.claude.json: a landed agent hangs on the trust dialog\n' "$k" ;;
+        hooks)    printf '  ✗ %-8s — no stop-hook: the agent lands mute on the hub\n' "$k" ;;
+        optin)    printf '  ✗ %-8s — no hub opt-in list yet\n' "$k" ;;
+      esac
+    fi
+  done
+  if [ "$rc" = 0 ]; then
+    echo "  READY"
+  else
+    echo "  NOT READY — '$CMD bootstrap --host $2' installs what's missing"
+  fi
+  return "$rc"
+}
+
 # Does a path exist — here or on the far end? $1 is deliberately unquoted: the
 # remote shell may be "tailscale ssh", i.e. two words.
 path_exists() {  # <rsh> <host> <path>
@@ -2739,7 +2825,7 @@ print("\n".join(r[2] for r in rows))
   handoff)  a="$(need_agent "${2:-}")" || exit 1; handoff "$a" ;;
   transport) # squad transport <agent|all|workspace <ws>> --to <file.code-workspace>
              #                 [--dest <dir>] [--host <h>] [--port N] [--rsh <cmd>] [--dry-run]
-            shift; ws_arg=""; dest_arg=""; a_arg=""; host_arg=""; port_arg=""; rsh_arg=""; dry=0; from_ws=""
+            shift; ws_arg=""; dest_arg=""; a_arg=""; host_arg=""; port_arg=""; rsh_arg=""; dry=0; from_ws=""; bootstrap=0
             while [ $# -gt 0 ]; do case "$1" in
               --to)      ws_arg="${2:-}"; shift 2 ;;
               --dest)    dest_arg="${2:-}"; shift 2 ;;
@@ -2747,8 +2833,9 @@ print("\n".join(r[2] for r in rows))
               --port)    port_arg="${2:-}"; shift 2 ;;
               --rsh)     rsh_arg="${2:-}"; shift 2 ;;
               --dry-run) dry=1; shift ;;
+              --bootstrap) bootstrap=1; shift ;;
               workspace) from_ws="${2:-}"; shift 2 ;;
-              -*)  echo "!! unknown transport flag '$1' (valid: --to, --dest, --host, --port, --rsh, --dry-run)" >&2; exit 1 ;;
+              -*)  echo "!! unknown transport flag '$1' (valid: --to, --dest, --host, --port, --rsh, --dry-run, --bootstrap)" >&2; exit 1 ;;
               *)   a_arg="$1"; shift ;;
             esac; done
             [ -n "$ws_arg" ] || { echo "usage: $CMD transport <agent|all|workspace <ws>> --to <file.code-workspace> [--dest <dir>] [--host <h>] [--dry-run]" >&2; exit 1; }
@@ -2759,6 +2846,41 @@ print("\n".join(r[2] for r in rows))
               echo "!! --dest names a single directory and cannot be used with 'all' or 'workspace'." >&2
               echo "   Destinations are derived per repo (~/Projects/code/<org>/<repo>)." >&2
               exit 1
+            fi
+
+            # PREFLIGHT BEFORE ANY BYTES MOVE, and resolve the remote shell ONCE
+            # for the whole run rather than per agent.
+            #
+            # The cockpit offers any online Linux tailnet peer, so a brand-new
+            # server is offered before it can host anything. Without this the
+            # repo is cloned and memory rsynced across, and only then does
+            # transport-recv find there is no mcp-hub to derive a name with —
+            # leaving a half-wired agent on a machine the operator was told was
+            # a valid destination. A destination check that runs after the bytes
+            # have moved is a post-mortem, not a check.
+            if [ -n "$host_arg" ] && [ "$dry" = 0 ]; then
+              [ -n "$rsh_arg" ] || rsh_arg="$(resolve_rsh "$host_arg" "$port_arg" "")" || exit 1
+              if ! preflight_report "$rsh_arg" "$host_arg" "$host_arg"; then
+                if [ "$bootstrap" = 1 ]; then
+                  echo
+                  echo "== setting $host_arg up first (--bootstrap) =="
+                  boot="$SELF_DIR/bootstrap-host"
+                  [ -f "$boot" ] || { echo "!! bootstrap-host missing beside squad" >&2; exit 1; }
+                  url="$(git -C "$SELF_DIR/.." remote get-url origin 2>/dev/null)"
+                  $rsh_arg "$host_arg" "bash -s '$url' '${MCP_HUB_URL:-}'" < "$boot" || exit 1
+                  echo
+                  preflight_report "$rsh_arg" "$host_arg" "$host_arg" || {
+                    echo "!! still not ready after bootstrap — nothing was transported" >&2
+                    exit 1; }
+                else
+                  echo
+                  echo "!! nothing transported — $host_arg cannot host an agent yet." >&2
+                  echo "   Fix it in one step:  $CMD transport ... --bootstrap" >&2
+                  echo "   Or separately:       $CMD bootstrap --host $host_arg" >&2
+                  exit 1
+                fi
+              fi
+              echo
             fi
 
             # A DRY RUN MUST PROBE THE FAR END. Resolved once here, for both the
@@ -2868,6 +2990,50 @@ print("\n".join(r[2] for r in rows))
               echo "  NOTE: this was a CLONE. The source workspace is untouched — retire it" && \
               echo "        deliberately (verify the destination first, then '$CMD rm <agent>')."
             exit 0 ;;
+  bootstrap) # squad bootstrap [--host <h>] [--port N] [--rsh <cmd>]
+            # Make a machine able to receive agents. Idempotent, so it is safe
+            # to run before every transport and safe to re-run on a half-set-up
+            # box. Never installs system packages — that needs sudo.
+            shift; host_arg=""; port_arg=""; rsh_arg=""
+            while [ $# -gt 0 ]; do case "$1" in
+              --host) host_arg="${2:-}"; shift 2 ;;
+              --port) port_arg="${2:-}"; shift 2 ;;
+              --rsh)  rsh_arg="${2:-}"; shift 2 ;;
+              -*) echo "!! unknown bootstrap flag '$1'" >&2; exit 1 ;;
+              *)  host_arg="$1"; shift ;;
+            esac; done
+            boot="$SELF_DIR/bootstrap-host"
+            [ -f "$boot" ] || { echo "!! bootstrap-host missing beside squad" >&2; exit 1; }
+            # The destination clones from the SAME remote this box uses, so a
+            # new machine joins the same repo rather than a guessed one.
+            url="$(git -C "$SELF_DIR/.." remote get-url origin 2>/dev/null)"
+            [ -n "$url" ] || { echo "!! cannot read this repo's origin to clone from" >&2; exit 1; }
+            echo "== bootstrapping ${host_arg:-this machine} =="
+            if [ -n "$host_arg" ]; then
+              rsh="$(resolve_rsh "$host_arg" "$port_arg" "$rsh_arg")" || exit 1
+              $rsh "$host_arg" "bash -s '$url' '${MCP_HUB_URL:-}'" < "$boot" || exit 1
+            else
+              bash "$boot" "$url" "${MCP_HUB_URL:-}" || exit 1
+            fi
+            echo
+            preflight_report "${rsh:-}" "$host_arg" "${host_arg:-this machine}"
+            exit $? ;;
+  preflight) # squad preflight [--host <h>] [--port N] [--rsh <cmd>]
+            # Can this machine receive an agent? Answered BEFORE any bytes move.
+            shift; host_arg=""; port_arg=""; rsh_arg=""
+            while [ $# -gt 0 ]; do case "$1" in
+              --host) host_arg="${2:-}"; shift 2 ;;
+              --port) port_arg="${2:-}"; shift 2 ;;
+              --rsh)  rsh_arg="${2:-}"; shift 2 ;;
+              -*) echo "!! unknown preflight flag '$1'" >&2; exit 1 ;;
+              *)  host_arg="$1"; shift ;;
+            esac; done
+            rsh=""
+            if [ -n "$host_arg" ]; then
+              rsh="$(resolve_rsh "$host_arg" "$port_arg" "$rsh_arg")" || exit 1
+            fi
+            preflight_report "$rsh" "$host_arg" "${host_arg:-this machine}"
+            exit $? ;;
   ws-new)   # squad ws-new <file.code-workspace> — create an empty target workspace
             shift
             [ -n "${1:-}" ] || { echo "usage: $CMD ws-new <file.code-workspace>" >&2; exit 1; }
@@ -3024,10 +3190,21 @@ workspaces (a "workspace" is a .code-workspace file; the cockpit shows a tab per
   $CMD ws-new <ws>              create an empty target workspace (transport creates it too)
   $CMD ws-remove [agent] --from <ws>
                                 drop the agent's FOLDER from that workspace. Stays enrolled.
+  $CMD preflight [--host <h>]   can that machine RECEIVE an agent? Asked before any bytes
+                                move, and it names the fix for each gap it finds.
+  $CMD bootstrap [--host <h>]   make a machine able to receive agents: clone mcp-hub,
+                                venv + install, link onto PATH, roster + hub opt-in,
+                                the three hooks (MERGED, never clobbering yours), and
+                                ~/.claude.json so a landed agent doesn't hang on the
+                                trust dialog. Idempotent. Never installs system
+                                packages — that needs sudo, so it prints the apt line.
   $CMD transport <agent|all|workspace <ws>> --to <ws>
                                 clone a whole agent — code, memory, history, launch args and
                                 its own hub identity — into another workspace. Lands STOPPED.
                                   --host <h>   another machine (over the tailnet)
+                                  --bootstrap  set that machine up first if it isn't
+                                               ready — brand-new server to running
+                                               agent in one step
                                   --dest <dir> override the destination (single agent only)
                                   --dry-run    report the gate verdict, write nothing
                                 Refuses unless the source is reconstructible FROM THE REMOTE:

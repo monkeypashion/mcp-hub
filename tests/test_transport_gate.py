@@ -37,6 +37,23 @@ exec /bin/sh -c "$*"
 """
 
 
+def _make_ready(home: pathlib.Path) -> None:
+    """The readiness markers `squad preflight` looks for.
+
+    Transport now REFUSES a destination that cannot host an agent, before any
+    bytes move — so a remote-leg test has to stand up a destination that passes,
+    exactly as an operator would with `squad bootstrap`. git/python3/mcp-hub/squad
+    come from the inherited PATH; these are the per-home pieces.
+    """
+    (home / ".claude").mkdir(parents=True, exist_ok=True)
+    (home / ".claude" / "settings.json").write_text(
+        '{"hooks":{"Stop":[{"matcher":"*","hooks":['
+        '{"type":"command","command":"mcp-hub stop-hook"}]}]}}', encoding="utf-8")
+    (home / ".claude.json").write_text('{"projects":{}}', encoding="utf-8")
+    (home / ".mcp-hub").mkdir(parents=True, exist_ok=True)
+    (home / ".mcp-hub" / "config.json").write_text('{"projects":[]}', encoding="utf-8")
+
+
 @pytest.fixture
 def env(tmp_path):
     home = tmp_path / "home"
@@ -191,6 +208,7 @@ def test_a_workspace_declaring_comms_off_lands_the_clone_without_them(env, tmp_p
     _enrol(conf, "demo-box", work,
            args="--continue --dangerously-load-development-channels server:hub")
     ws = _ws(tmp_path, "quiet", settings='{"squad.comms": false}')
+    _make_ready(pathlib.Path(e["HOME"]))
     shim = tmp_path / "fake-ssh"
     shim.write_text(FAKE_SSH, encoding="utf-8")
     shim.chmod(0o755)
@@ -313,11 +331,15 @@ def test_a_destination_without_mcp_hub_refuses_rather_than_guessing(env, tmp_pat
     out = res.stdout + res.stderr
     assert res.returncode != 0, f"should have refused:\n{out}"
     assert "127" not in out, f"died on a missing tool, not the intended refusal:\n{out}"
-    # Match the REFUSAL text specifically. "identity" alone also matches the
-    # successful "identity suffix:" line printed just above it, which would let
-    # this pass on the wrong evidence — the same mistake twice in one test.
-    assert "cannot derive the agent name" in out, \
-        f"refused for some other reason:\n{out[-600:]}"
+    # This used to be caught LATE, by transport-recv, after the repo and memory
+    # had already been shipped — "cannot derive the agent name". Preflight now
+    # catches it before any bytes move, which is strictly better: the operator
+    # gets a machine that is untouched rather than one holding a half-wired
+    # agent. Assert the EARLY refusal, and that nothing landed.
+    assert "nothing transported" in out, f"refused for some other reason:\n{out[-600:]}"
+    assert "mcp-hub" in out
+    dest_root = pathlib.Path(e["HOME"]) / "Projects" / "code"
+    assert not dest_root.exists(), "bytes moved despite the refusal"
     conf_text = conf.read_text()
     assert conf_text.count("demo-box") == 1, "a refusal must not add a roster row"
 
@@ -433,6 +455,7 @@ def test_the_whole_remote_leg_runs_end_to_end(env, tmp_path):
     mem = pathlib.Path(e["HOME"]) / ".claude" / "projects" / enc / "memory"
     mem.mkdir(parents=True)
     (mem / "a.md").write_text("remembered\n", encoding="utf-8")
+    _make_ready(pathlib.Path(e["HOME"]))
     shim = tmp_path / "fake-ssh"
     shim.write_text(FAKE_SSH, encoding="utf-8")
     shim.chmod(0o755)

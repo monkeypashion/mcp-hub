@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# bootstrap-host — make a machine able to RECEIVE agents.
+#
+# Run on the target (locally, or piped to `ssh bash -s`), same shape as
+# transport-recv. The operator's case is a brand-new Linux server: they want to
+# say "move that workspace across" and have it happen, not be handed a list of
+# things to install first.
+#
+# IDEMPOTENT throughout — every step no-ops if already done, so it is safe to
+# re-run on a half-set-up box, and safe to run before every transport.
+#
+# Deliberately does NOT install system packages. That needs sudo, and silently
+# acquiring root on someone's server is not a thing a transport tool should do.
+# git/python3 missing ⇒ refuse and print the exact apt line.
+#
+# Args: <repo-url> [hub-url]
+set -euo pipefail
+
+REPO_URL="${1:?repo url}"
+HUB_URL="${2:-}"
+CODE_DIR="$HOME/Projects/code/monkeypashion/mcp-hub"
+
+say() { printf '  %s\n' "$*"; }
+
+# ---- 1. system toolchain (report, never sudo) -------------------------------
+missing=""
+for t in git python3 rsync tar; do
+  command -v "$t" >/dev/null || missing="$missing $t"
+done
+if [ -n "$missing" ]; then
+  echo "!! this host is missing:$missing"
+  echo "   install them first, then re-run:"
+  echo "     sudo apt-get update && sudo apt-get install -y$missing"
+  echo "   (not done automatically — that would need sudo on your server)"
+  exit 1
+fi
+python3 -c 'import venv' 2>/dev/null || {
+  echo "!! python3 has no venv module"
+  echo "     sudo apt-get install -y python3-venv"
+  exit 1
+}
+
+# ---- 2. the mcp-hub clone, at the canonical account location ----------------
+if [ -d "$CODE_DIR/.git" ]; then
+  git -C "$CODE_DIR" fetch --quiet origin 2>/dev/null || true
+  say "mcp-hub already cloned ($(git -C "$CODE_DIR" rev-parse --short HEAD))"
+else
+  mkdir -p "$(dirname "$CODE_DIR")"
+  git clone --quiet "$REPO_URL" "$CODE_DIR" || {
+    echo "!! could not clone $REPO_URL"
+    echo "   this host needs read access to the repo (deploy key or agent-forwarded ssh)"
+    exit 1
+  }
+  say "cloned mcp-hub -> $CODE_DIR"
+fi
+
+# ---- 3. venv + editable install ---------------------------------------------
+if [ ! -x "$CODE_DIR/.venv/bin/mcp-hub" ]; then
+  python3 -m venv "$CODE_DIR/.venv"
+  "$CODE_DIR/.venv/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1 || true
+  "$CODE_DIR/.venv/bin/pip" install --quiet -e "$CODE_DIR" || {
+    echo "!! pip install failed — this host may have no network access to PyPI"
+    exit 1
+  }
+  say "installed mcp-hub into $CODE_DIR/.venv"
+else
+  say "mcp-hub venv already present"
+fi
+
+# ---- 4. on PATH. Symlinks, never copies: `git pull` then updates both. -------
+mkdir -p "$HOME/.local/bin"
+ln -sfn "$CODE_DIR/.venv/bin/mcp-hub" "$HOME/.local/bin/mcp-hub"
+ln -sfn "$CODE_DIR/squad/squad" "$HOME/.local/bin/squad"
+say "linked mcp-hub + squad into ~/.local/bin"
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) say "NOTE: ~/.local/bin is not on this shell's PATH — interactive shells" ;;
+esac
+
+# ---- 5. squad roster + hub opt-in list --------------------------------------
+mkdir -p "$HOME/.config/squad" "$HOME/.mcp-hub"
+[ -f "$HOME/.config/squad/squad.conf" ] || : > "$HOME/.config/squad/squad.conf"
+[ -f "$HOME/.mcp-hub/config.json" ] || printf '{\n  "projects": []\n}\n' > "$HOME/.mcp-hub/config.json"
+say "squad roster + hub opt-in list ready"
+
+# ---- 6. the three hooks, MERGED into settings.json --------------------------
+# Merge, never clobber: this file is the operator's, and a bootstrap that
+# replaced it would silently drop whatever else they run on Stop/SessionStart.
+python3 - "$HOME/.claude/settings.json" "$CODE_DIR/.venv/bin/mcp-hub" <<'PY'
+import json, os, pathlib, sys, tempfile
+
+p, binary = pathlib.Path(sys.argv[1]), sys.argv[2]
+p.parent.mkdir(parents=True, exist_ok=True)
+try:
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert isinstance(data, dict)
+except Exception:
+    data = {}
+
+hooks = data.setdefault("hooks", {})
+if not isinstance(hooks, dict):
+    hooks, data["hooks"] = {}, {}
+
+def ensure(event: str, entries: list[dict]) -> int:
+    """Add our commands to <event> without disturbing anything already there."""
+    added = 0
+    groups = hooks.setdefault(event, [])
+    if not isinstance(groups, list):
+        groups = hooks[event] = []
+    star = next((g for g in groups
+                 if isinstance(g, dict) and g.get("matcher") in ("*", None)), None)
+    if star is None:
+        star = {"matcher": "*", "hooks": []}
+        groups.append(star)
+    have = star.setdefault("hooks", [])
+    for want in entries:
+        if any(isinstance(h, dict) and h.get("command") == want["command"] for h in have):
+            continue
+        have.append(want)
+        added += 1
+    return added
+
+n = ensure("Stop", [{"type": "command", "command": f"{binary} stop-hook"}])
+n += ensure("SessionStart", [
+    {"type": "command", "command": f"{binary} session-start"},
+    # async: without it the hook runner kills the daemon when the command
+    # "returns", and the agent goes unwakeable a few minutes later.
+    {"type": "command", "command": f"{binary} heartbeat-daemon", "async": True},
+])
+
+fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".settings.json.")
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2)
+os.replace(tmp, p)
+print(f"  hub hooks: {n} added, {3 - n} already present")
+PY
+
+# ---- 6b. ~/.claude.json must EXIST for trust-seeding to work ----------------
+# transport seeds hasTrustDialogAccepted for the destination path so a landed
+# agent does not hang on the folder-trust dialog. That seeding is fail-open: on
+# a box with no ~/.claude.json it prints a warning and moves on, and the agent
+# then blocks forever on first launch — invisibly, because the pane looks alive.
+# Creating an empty registry costs nothing and closes that.
+if [ -f "$HOME/.claude.json" ]; then
+  say "~/.claude.json already present"
+else
+  printf '{\n  "projects": {}\n}\n' > "$HOME/.claude.json"
+  say "created ~/.claude.json (so transport can pre-approve folder trust)"
+fi
+
+# ---- 7. is Claude Code itself here? -----------------------------------------
+# Cannot install it (no unattended installer), but a transported agent that
+# cannot start is worth naming NOW rather than after the bytes have moved.
+if command -v claude >/dev/null; then
+  say "claude found: $(command -v claude)"
+else
+  echo "  !! claude not found on PATH — agents will land but cannot START here."
+  echo "     Install Claude Code on this host, then re-run; everything else is done."
+fi
+
+[ -n "$HUB_URL" ] && say "hub url: $HUB_URL"
+echo "  BOOTSTRAP COMPLETE — this machine can now receive agents"
