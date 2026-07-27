@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 
 import pytest
@@ -558,3 +559,249 @@ def test_the_remote_leg_pins_the_clone_too(env, tmp_path):
                             capture_output=True, text=True, check=True).stdout.strip()
     assert landed == src_head, f"remote clone not pinned: {res.stdout}"
     assert not (dest / "LATER.md").exists()
+
+
+TAB_TITLE = '"terminal.integrated.tabs.title": "${sequence}"'
+
+
+def _valid_jsonc(path: pathlib.Path) -> dict:
+    """The file must still be a workspace VSCode can load."""
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_a_generated_workspace_is_born_with_the_settings_the_cockpit_needs(env, tmp_path):
+    """Transport creates workspaces, so it must not create ones the cockpit warns about.
+
+    tabs.title = ${sequence} is load-bearing: under VSCode's default every
+    glyph/model/ctx% the painter pushes is silently discarded and tabs read
+    "tmux <something>". That cost a day of ghost-chasing once already, the
+    extension warns about it — and then transport started generating
+    `"settings": {}` and became a second source of the same fault.
+    """
+    e, conf = env
+    work = _pushed_repo(tmp_path, rewrite_origin=False)
+    _enrol(conf, "demo-box", work)
+    ws = tmp_path / "brandnew.code-workspace"
+    assert not ws.exists()
+
+    res = _run(env, "transport", "demo-box", "--to", str(ws))
+    assert res.returncode == 0, res.stdout + res.stderr
+    text = ws.read_text(encoding="utf-8")
+    assert TAB_TITLE in text, f"generated workspace lacks the painter's setting:\n{text}"
+    settings = _valid_jsonc(ws)["settings"]
+    assert settings["terminal.integrated.tabs.description"] == "${progress}"
+    # squad owns the tmux lifecycle; VSCode restoring its own idea of a pane on
+    # top of that is a second, stale truth
+    assert settings["terminal.integrated.enablePersistentSessions"] is False
+    # and the folder still landed — the settings must not have displaced it
+    assert _valid_jsonc(ws)["folders"], "no folder entry in the generated workspace"
+
+
+def test_an_existing_workspace_is_told_about_it_never_rewritten(env, tmp_path):
+    """A hand-kept file is the operator's. Report, don't 'help'."""
+    e, conf = env
+    work = _pushed_repo(tmp_path, rewrite_origin=False)
+    _enrol(conf, "demo-box", work)
+    ws = tmp_path / "mine.code-workspace"
+    original = ('{\n  // my ordering, my comments\n  "folders": [],\n'
+                '  "settings": { "terminal.integrated.fontSize": 13 }\n}\n')
+    ws.write_text(original, encoding="utf-8")
+
+    res = _run(env, "transport", "demo-box", "--to", str(ws))
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "tabs.title" in res.stdout, f"said nothing about it:\n{res.stdout}"
+    text = ws.read_text(encoding="utf-8")
+    assert "// my ordering, my comments" in text, "comments destroyed"
+    assert '"terminal.integrated.fontSize": 13' in text, "settings rewritten behind the operator"
+    assert TAB_TITLE not in text, "it edited settings it was only asked to report on"
+
+
+def test_the_far_side_generates_the_same_settings(env, tmp_path):
+    """transport-recv creates the workspace on the REMOTE, from its own copy of
+    the skeleton — two writers, one convention, and only a test keeps them in
+    step."""
+    e, conf = env
+    work = _pushed_repo(tmp_path, rewrite_origin=False)
+    _enrol(conf, "demo-box", work)
+    _make_ready(pathlib.Path(e["HOME"]))
+    shim = tmp_path / "fake-ssh"
+    shim.write_text(FAKE_SSH, encoding="utf-8")
+    shim.chmod(0o755)
+    ws = tmp_path / "faraway.code-workspace"
+    assert not ws.exists()
+
+    res = _run(env, "transport", "demo-box", "--to", str(ws),
+               "--host", "pretend-host", "--rsh", str(shim))
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert ws.is_file(), f"far side created no workspace: {res.stdout}"
+    assert TAB_TITLE in ws.read_text(encoding="utf-8")
+    assert _valid_jsonc(ws)["folders"], "folder entry missing on the far side"
+
+
+# ---- duplicate: a second seat, same workspace ------------------------------
+
+def _dup_env(env, tmp_path, ws_name="side"):
+    """An enrolled, pushed repo that IS a folder of a workspace under $HOME.
+
+    `squad duplicate` finds the workspace by scanning ~/Projects and ~, so the
+    file has to live where the real thing looks — a fixture that puts it in
+    tmp_path would exercise a lookup the operator never performs.
+    """
+    e, conf = env
+    work = _pushed_repo(tmp_path, rewrite_origin=False)
+    _enrol(conf, "demo-box", work)
+    home = pathlib.Path(e["HOME"])
+    (home / "Projects").mkdir(parents=True, exist_ok=True)
+    ws = home / "Projects" / f"{ws_name}.code-workspace"
+    ws.write_text('{\n  "folders": [\n    {\n      "name": "%s",\n      "path": "%s"\n    }\n  ],\n'
+                  '  "settings": {}\n}\n' % (work.name, work), encoding="utf-8")
+    return work, ws
+
+
+def test_duplicate_finds_its_workspace_and_takes_the_first_free_number(env, tmp_path):
+    e, conf = env
+    work, ws = _dup_env(env, tmp_path)
+    res = _run(env, "duplicate", "demo-box", "--dry-run")
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "id-sfx : side" in res.stdout, res.stdout
+    assert "id-sfx : side-2" not in res.stdout, "nothing is taken yet"
+
+
+def _register_suffix(home: str, worktree: pathlib.Path, suffix: str):
+    """What transport writes to mark a worktree as one of its clones."""
+    cfg = pathlib.Path(home) / ".mcp-hub" / "config.json"
+    data = json.loads(cfg.read_text()) if cfg.exists() else {}
+    data.setdefault("workspaces", {})[str(worktree)] = suffix
+    cfg.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def test_duplicate_skips_a_suffix_already_spoken_for(env, tmp_path):
+    """Taken means "a clone of THIS repo still holds that suffix on disk".
+
+    Read from the identity registry rather than the roster, because `squad rm`
+    drops the row but leaves both the repo and its registry entry — and handing
+    that number out again would leave two worktrees deriving ONE agent name.
+    """
+    e, conf = env
+    work, ws = _dup_env(env, tmp_path)
+    # a real second clone of the same origin, registered but NOT enrolled: this
+    # is precisely the post-`squad rm` state a roster-based check misses
+    url = subprocess.run(["git", "-C", str(work), "remote", "get-url", "origin"],
+                         capture_output=True, text=True, check=True).stdout.strip()
+    orphan = work.parent / "demo-side"
+    subprocess.run(["git", "clone", "-q", url, str(orphan)], check=True, capture_output=True)
+    _register_suffix(e["HOME"], orphan, "side")
+
+    res = _run(env, "duplicate", "demo-box", "--dry-run")
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "id-sfx : side-2" in res.stdout, res.stdout
+
+
+def test_duplicate_reuses_a_number_whose_worktree_is_gone(env, tmp_path):
+    """"Next FREE", not "one past the count".
+
+    Otherwise numbers drift upward forever and leave gaps nobody can explain.
+    Teardown deletes the worktree and unregisters, so the number must come back —
+    and a stale entry pointing at nothing must not pin one.
+    """
+    e, conf = env
+    work, ws = _dup_env(env, tmp_path)
+    url = subprocess.run(["git", "-C", str(work), "remote", "get-url", "origin"],
+                         capture_output=True, text=True, check=True).stdout.strip()
+    orphan = work.parent / "demo-side"
+    subprocess.run(["git", "clone", "-q", url, str(orphan)], check=True, capture_output=True)
+    _register_suffix(e["HOME"], orphan, "side")
+    assert "id-sfx : side-2" in _run(env, "duplicate", "demo-box", "--dry-run").stdout
+
+    shutil.rmtree(orphan)          # what teardown does to the bytes
+    out = _run(env, "duplicate", "demo-box", "--dry-run").stdout
+    assert "id-sfx : side" in out and "id-sfx : side-2" not in out, \
+        f"a freed number must come back, got:\n{out}"
+
+
+def test_duplicate_refuses_to_guess_between_two_workspaces(env, tmp_path):
+    """Guessing would put the copy in a window the operator wasn't looking at —
+    and the NAME it gets depends on which workspace it joins."""
+    e, conf = env
+    work, ws = _dup_env(env, tmp_path, ws_name="alpha")
+    second = pathlib.Path(e["HOME"]) / "Projects" / "beta.code-workspace"
+    second.write_text('{\n  "folders": [\n    {\n      "path": "%s"\n    }\n  ],\n'
+                      '  "settings": {}\n}\n' % work, encoding="utf-8")
+    res = _run(env, "duplicate", "demo-box", "--dry-run")
+    assert res.returncode != 0
+    both = res.stdout + res.stderr
+    assert "alpha.code-workspace" in both and "beta.code-workspace" in both, both
+    assert "--to" in both, "it must say how to resolve it"
+
+
+def test_duplicate_of_an_agent_in_no_workspace_says_so(env, tmp_path):
+    e, conf = env
+    work = _pushed_repo(tmp_path, rewrite_origin=False)
+    _enrol(conf, "demo-box", work)
+    res = _run(env, "duplicate", "demo-box", "--dry-run")
+    assert res.returncode != 0
+    assert "--to" in (res.stdout + res.stderr)
+
+
+def test_duplicate_lands_a_real_second_seat(env, tmp_path):
+    """End to end: its own worktree, its own identity, the SAME workspace, and a
+    marker naming the agent it was copied from."""
+    e, conf = env
+    work, ws = _dup_env(env, tmp_path)
+    enc = str(work).replace("/", "-")
+    mem = pathlib.Path(e["HOME"]) / ".claude" / "projects" / enc / "memory"
+    mem.mkdir(parents=True)
+    (mem / "a.md").write_text("remembered\n", encoding="utf-8")
+
+    res = _run(env, "duplicate", "demo-box")
+    assert res.returncode == 0, res.stdout + res.stderr
+    rows = [r for r in conf.read_text().splitlines() if r.strip()]
+    assert len(rows) == 2, f"expected a second roster row:\n{conf.read_text()}"
+    clone = pathlib.Path([r.split("|")[1] for r in rows if not r.startswith("demo-box|")][0])
+    assert clone != work and clone.is_dir()
+    cfg = json.loads((pathlib.Path(e["HOME"]) / ".mcp-hub" / "config.json").read_text())
+    assert cfg["workspaces"][str(clone)] == "side", "the copy needs its own identity"
+    # same workspace, now listing both
+    folders = ws.read_text(encoding="utf-8")
+    assert str(work) in folders and (str(clone) in folders or clone.name in folders), folders
+    marker = (pathlib.Path(e["HOME"]) / ".claude" / "projects"
+              / str(clone).replace("/", "-") / "memory"
+              / "000_you_are_a_transported_clone.md")
+    assert marker.is_file(), "a copy that doesn't know it's a copy is the whole hazard"
+    assert "demo-box" in marker.read_text(encoding="utf-8"), "the marker must name the parent"
+    assert "STOPPED" in res.stdout, "a duplicate must never land running"
+
+
+def test_duplicate_can_leave_the_workspace_file_untouched(env, tmp_path):
+    """--no-folder-entry: the caller owns the folder entry.
+
+    The cockpit needs this because VSCode reloads the window when a workspace it
+    has OPEN is edited externally. Everything ELSE must still happen — a flag
+    that quietly skipped the roster row or the identity would be far worse than
+    the reload it avoids.
+    """
+    e, conf = env
+    work, ws = _dup_env(env, tmp_path)
+    before = ws.read_text(encoding="utf-8")
+
+    res = _run(env, "duplicate", "demo-box", "--no-folder-entry")
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert ws.read_text(encoding="utf-8") == before, "the workspace file was edited"
+    assert "left to the caller" in res.stdout, res.stdout
+    # everything else still landed
+    rows = [r for r in conf.read_text().splitlines() if r.strip()]
+    assert len(rows) == 2, f"roster row missing:\n{conf.read_text()}"
+    clone = pathlib.Path([r.split("|")[1] for r in rows if not r.startswith("demo-box|")][0])
+    assert clone.is_dir(), "clone did not land"
+    cfg = json.loads((pathlib.Path(e["HOME"]) / ".mcp-hub" / "config.json").read_text())
+    assert cfg["workspaces"][str(clone)] == "side", "identity suffix not registered"
+
+
+def test_a_plain_transport_still_writes_the_folder_entry(env, tmp_path):
+    """The skip is opt-in. A CLI transport into a workspace that is NOT open has
+    nobody else to add the folder, so it must keep doing it itself."""
+    e, conf = env
+    work, ws = _dup_env(env, tmp_path)
+    res = _run(env, "duplicate", "demo-box")
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "workspace folder added" in res.stdout, res.stdout

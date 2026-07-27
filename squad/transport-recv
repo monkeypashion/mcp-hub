@@ -203,6 +203,17 @@ fi
 # 6. make it visible in the target workspace. JSONC with comments and
 #    hand-formatting, so this is a surgical insert — a load-and-dump would
 #    strip the operator's notes and reflow the file.
+#
+#    SKIPPED when arg 9 says the caller owns the folder entry. VSCode reacts to
+#    an EXTERNAL edit of a .code-workspace it currently has open by reloading the
+#    window on its own heuristic — which throws away the terminal panel the
+#    operator is watching the clone appear in. The cockpit's add and remove paths
+#    already avoid this by going through updateWorkspaceFolders, and `duplicate`
+#    always targets the workspace that IS open, so it hits the heuristic every
+#    time. Nothing changes for a CLI transport: no flag, no skip, same insert.
+if [ "${9:-}" = "skip-folder-entry" ]; then
+  echo "  workspace folder entry left to the caller (no external edit)"
+else
 python3 - "$WSFILE" "$DEST" <<'PY'
 import pathlib, re, sys
 ws, dest = pathlib.Path(sys.argv[1]), sys.argv[2]
@@ -213,7 +224,18 @@ if not ws.is_file():
     # into it" is the operator's own opening move.
     try:
         ws.parent.mkdir(parents=True, exist_ok=True)
-        ws.write_text('{\n  "folders": [],\n  "settings": {}\n}\n', encoding="utf-8")
+        # Born with the settings a squad workspace cannot work without — see
+        # WS_SKELETON in `squad`, and keep the two in step. tabs.title is
+        # load-bearing: under VSCode's default the painter's pushed titles are
+        # silently discarded and every tab reads "tmux <something>". A generated
+        # workspace that makes the cockpit warn about itself is a bug here.
+        ws.write_text(
+            '{\n  "folders": [],\n  "settings": {\n'
+            '    "terminal.integrated.tabs.title": "${sequence}",\n'
+            '    "terminal.integrated.tabs.description": "${progress}",\n'
+            '    "terminal.integrated.enablePersistentSessions": false,\n'
+            '    "terminal.integrated.hideOnStartup": "whenEmpty"\n'
+            "  }\n}\n", encoding="utf-8")
         print(f"  created workspace {ws.name}")
     except OSError as exc:
         print(f"  !! no workspace file at {ws} and could not create it ({exc})"
@@ -245,6 +267,7 @@ entry = ('\n    {\n      "name": "%s",\n      "path": "%s"\n    }'
 ws.write_text(text[:i] + entry + ("" if empty else ",") + text[i:], encoding="utf-8")
 print(f"  workspace folder added: {pathlib.Path(dest).name}")
 PY
+fi
 
 # 7. TELL THE CLONE IT IS A CLONE.
 # The identity suffix makes a clone distinguishable to US — roster row,

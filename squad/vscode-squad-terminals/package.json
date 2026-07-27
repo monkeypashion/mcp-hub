@@ -2,7 +2,7 @@
   "name": "squad-terminals",
   "displayName": "Squad Terminals",
   "description": "Auto-opens one plain terminal per squad agent (squad attach) with icon+color, and adds per-agent squad actions to the terminal tab context menu.",
-  "version": "0.21.0",
+  "version": "0.22.0",
   "publisher": "monkeypashion",
   "engines": {
     "vscode": "^1.90.0"
@@ -231,6 +231,11 @@
       {
         "command": "squad.transport",
         "title": "Transport to workspace\u2026",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.duplicate",
+        "title": "Duplicate agent (second seat, same workspace)",
         "category": "Squad"
       },
       {
@@ -574,8 +579,13 @@
           "when": "squad.isAgent"
         },
         {
+          "command": "squad.duplicate",
+          "group": "1_ws@2",
+          "when": "squad.isAgent"
+        },
+        {
           "command": "squad.transportWorkspace",
-          "group": "1_ws@2"
+          "group": "1_ws@3"
         },
         {
           "command": "squad.teardownWorkspace",
@@ -583,24 +593,24 @@
         },
         {
           "command": "squad.transportAll",
-          "group": "1_ws@3"
-        },
-        {
-          "command": "squad.addFolder",
           "group": "1_ws@4"
         },
         {
-          "command": "squad.addFromGitHub",
+          "command": "squad.addFolder",
           "group": "1_ws@5"
         },
         {
+          "command": "squad.addFromGitHub",
+          "group": "1_ws@6"
+        },
+        {
           "command": "squad.wsRemove",
-          "group": "1_ws@6",
+          "group": "1_ws@7",
           "when": "squad.isAgent"
         },
         {
           "command": "squad.retire",
-          "group": "1_ws@7",
+          "group": "1_ws@8",
           "when": "squad.isAgent"
         }
       ]

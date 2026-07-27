@@ -573,6 +573,28 @@ pull_local() {
 # Mirror of cli.py _sanitize_ident: lowercase, non [a-z0-9_-] -> '-', trim '-'.
 sanitize_ident() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9_-]/-/g' -e 's/^-*//' -e 's/-*$//'; }
 
+# Display name: the derived identity minus this machine's hostname. The hostname
+# is noise in a cockpit where every tab is on this box.
+#
+# MUST handle the hostname in the MIDDLE, not just at the end. A transported or
+# duplicated agent is <repo>-<host>-<suffix>, so an end-anchored strip returns
+# the whole raw name — the original showed as "mcp-hub" while its copy showed as
+# "mcp-hub-fireblade-wsl-windows", side by side in one panel. Same root cause as
+# the grey-icon bug (themeFor was made suffix-aware; this was not).
+#
+# Mirrored in extension.js shortLabel — CHANGE BOTH OR NEITHER. There is a test
+# that runs a table of names through both and fails if they disagree, which is
+# the only thing that reliably keeps two copies of one rule in step.
+short_label() {  # <agent> [sanitized-host]
+  local a="$1" h="${2:-}"
+  [ -n "$h" ] || h="$(sanitize_ident "$(hostname)")"
+  case "$a" in
+    *-"$h")   printf '%s' "${a%-$h}" ;;
+    *-"$h"-*) printf '%s' "${a%%-$h-*}-${a#*-$h-}" ;;
+    *)        printf '%s' "$a" ;;
+  esac
+}
+
 # Opt org/repo in/out of ~/.mcp-hub/config.json's projects list (idempotent).
 # Identity is DERIVED by the hub cli (repo-hostname / org/repo from the git
 # remote); this machine-local list is the only thing that opts a repo in.
@@ -947,6 +969,65 @@ ws_agents() {
   return 0
 }
 
+# Which workspace files list this worktree as a folder? One per line, possibly
+# none, possibly several — a worktree can legitimately appear in more than one.
+# Same two directories the cockpit enumerates, so what the CLI can find and what
+# the menu offers cannot drift apart.
+ws_of_worktree() {  # <worktree>
+  local d="$1" f
+  for f in "$HOME"/Projects/*.code-workspace "$HOME"/*.code-workspace; do
+    [ -f "$f" ] || continue
+    printf '%s\n' "$(ws_folders "$f")" | grep -qxF -- "$d" && printf '%s\n' "$f"
+  done
+  # The loop's status is the last file's grep; never let that decide the
+  # function's verdict (see ws_agents — that cost a silent teardown exit 1).
+  return 0
+}
+
+# Is <suffix> already spoken for by some clone of <org/repo>?
+#
+# Reads the IDENTITY REGISTRY, not the roster. The registry is what actually
+# decides an agent's name, and the two disagree in a case that matters: `squad
+# rm` drops the roster row but deliberately leaves the repo on disk AND its
+# registry entry. A roster-based check would call that suffix free, hand it to a
+# new copy, and leave two worktrees deriving ONE agent name — the exact identity
+# collision the suffix exists to prevent.
+#
+# A registered path that no longer exists is free, which is what makes numbers
+# come back after a teardown (teardown deletes the worktree and unregisters)
+# instead of a stale entry pinning a number forever. The mechanism is
+# worktree_project returning empty for a path git cannot read — the -d test below
+# is belt-and-braces, and deleting it changes nothing (verified by mutation).
+suffix_taken() {  # <org/repo> <suffix>
+  local p="$1" s="$2" d
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    [ -d "$d" ] || continue
+    [ "$(worktree_project "$d")" = "$p" ] || continue
+    return 0
+  done <<EOF
+$(ws_paths_with_suffix "$s")
+EOF
+  return 1
+}
+
+# Every registered worktree whose identity suffix is exactly <suffix>.
+ws_paths_with_suffix() {
+  python3 - "$HOME/.mcp-hub/config.json" "$1" <<'PYEOF'
+import json, pathlib, sys
+cfg, want = pathlib.Path(sys.argv[1]), sys.argv[2]
+try:
+    ws = (json.loads(cfg.read_text(encoding="utf-8")) or {}).get("workspaces") or {}
+except Exception:
+    raise SystemExit(0)
+if not isinstance(ws, dict):
+    raise SystemExit(0)
+for k, v in ws.items():
+    if isinstance(k, str) and v == want:
+        print(k.rstrip("/"))
+PYEOF
+}
+
 # Drop a folder entry from a .code-workspace. Surgical: these files carry
 # comments and hand-formatting that a load-and-dump would destroy.
 ws_del_folder() {
@@ -1161,8 +1242,42 @@ ws_create() {
   case "$ws" in *.code-workspace) ;; *) ws="$ws.code-workspace" ;; esac
   if [ -e "$ws" ]; then echo "$ws"; return 0; fi
   mkdir -p "$(dirname "$ws")" || { echo "!! cannot create $(dirname "$ws")" >&2; return 1; }
-  printf '{\n  "folders": [],\n  "settings": {}\n}\n' > "$ws" || return 1
+  printf '%s\n' "$WS_SKELETON" > "$ws" || return 1
   echo "$ws"
+}
+
+# The settings a squad workspace CANNOT WORK WITHOUT, so a generated one is born
+# with them instead of nagging the operator to hand-add them.
+#
+# tabs.title = ${sequence} is load-bearing: the whole cockpit look rides on
+# pushed titles, and under VSCode's default (${process}) every glyph/model/ctx%
+# the painter pushes is silently discarded and tabs read "tmux <something>". That
+# already cost a day of ghost-chasing once (2026-07-24, the general workspace),
+# and the extension warns about it — then transport started generating workspaces
+# with "settings": {} and became a second source of the same fault. A warning
+# about a file we ourselves just wrote is a bug in the writer, not a warning.
+#
+# enablePersistentSessions=false because squad owns the tmux lifecycle: VSCode
+# restoring its own idea of a pane on top of that is a second, stale truth.
+WS_SKELETON='{
+  "folders": [],
+  "settings": {
+    "terminal.integrated.tabs.title": "${sequence}",
+    "terminal.integrated.tabs.description": "${progress}",
+    "terminal.integrated.enablePersistentSessions": false,
+    "terminal.integrated.hideOnStartup": "whenEmpty"
+  }
+}'
+
+# Does an EXISTING workspace lack the setting the painter needs? Reported, never
+# silently fixed: a hand-kept file with comments and deliberate ordering is the
+# operator's, and rewriting its settings behind their back is exactly the kind of
+# help nobody asked for. Saying so at transport time beats finding out from a
+# toast three windows later.
+ws_lacks_tab_settings() {
+  [ -f "$1" ] || return 1
+  grep -q '"terminal\.integrated\.tabs\.title"[[:space:]]*:[[:space:]]*"\${sequence}"' "$1" && return 1
+  return 0
 }
 
 # Resolve a working remote shell for <host>. The command goes to STDOUT so a
@@ -1350,6 +1465,7 @@ dest_state_dir() { printf '%s/.claude/projects/%s' "$1" "$(enc_project_dir "$2")
 
 transport_agent() {
   local a="$1" wsfile="$2" dest="$3" host="${4:-}" port="${5:-}" nth="${6:-1}"
+  local skipfolder="${8:-}"
   local src label branch name url reason repo proj args class idsfx resolved
   local rsh="" remote=0 stage rhome="$HOME" dstate rsh_override="${7:-}"
   src="$(untilde "$(field "$a" 2)")"
@@ -1376,6 +1492,10 @@ transport_agent() {
     if [ ! -f "$wsfile" ]; then
       ws_create "$wsfile" >/dev/null || { echo "!! cannot create workspace $wsfile"; return 1; }
       echo "  created workspace $(ws_label "$wsfile")"
+    elif ws_lacks_tab_settings "$wsfile"; then
+      echo "  note: $(ws_label "$wsfile") does not set terminal.integrated.tabs.title"
+      echo "        = \"\${sequence}\" — its agent tabs will show process names instead"
+      echo "        of live status. Add it (and tabs.description = \"\${progress}\")."
     fi
   fi
 
@@ -1516,13 +1636,73 @@ transport_agent() {
   local recv; recv="$(dirname "$(readlink -f "$0")")/transport-recv"
   [ -f "$recv" ] || { echo "!! transport-recv missing beside squad"; return 1; }
   if [ "$remote" = 1 ]; then
-    $rsh "$host" "bash -s '$dest' '$wsfile' '$idsfx' '$proj' '$args' '$class' '${MCP_HUB_URL:-}' '$a'" \
+    $rsh "$host" "bash -s '$dest' '$wsfile' '$idsfx' '$proj' '$args' '$class' '${MCP_HUB_URL:-}' '$a' '$skipfolder'" \
       < "$recv" || return 1
   else
-    bash "$recv" "$dest" "$wsfile" "$idsfx" "$proj" "$args" "$class" "${MCP_HUB_URL:-}" "$a" || return 1
+    bash "$recv" "$dest" "$wsfile" "$idsfx" "$proj" "$args" "$class" "${MCP_HUB_URL:-}" "$a" "$skipfolder" || return 1
   fi
 
   echo "done${host:+ (on $host)} — the agent is STOPPED; start it from its tab in $label"
+}
+
+# ── Duplicate: a second seat on one repo, in the workspace you're already in ──
+#
+# Deliberately NOT a new mechanism. A duplicate is a transport whose destination
+# workspace is the source's own, so this is transport with the occurrence number
+# worked out for you — the one thing the operator cannot supply, because it
+# depends on what the workspace already holds.
+#
+# The number is the next FREE one, not one-past-the-count: tear a copy down and
+# its number comes back, so names stay dense instead of drifting upward forever.
+#
+# Naming is the existing suffix scheme (<label>, <label>-2, <label>-3), decided
+# after measuring the alternative: a dotted form like `…-showcase.1` cannot
+# survive. Identity sanitization turns '.' into '-' anyway, and tmux reads '.' as
+# its PANE separator — asked for a session named `agent.1` it silently creates
+# `agent_1` and then every target lookup fails with "can't find pane: 1", so
+# attach/stop/restart and the board's screen reads all miss an agent that is
+# running perfectly. Looks alive, isn't addressable: the worst class we have.
+#
+# Lineage is not lost by keeping the name flat — the clone marker records the
+# parent BY NAME in the copy's own memory index, which is where it gets read,
+# rather than in a string that has to fit a tab title.
+duplicate_agent() {  # <agent> <wsfile> <dry:0|1> <skipfolder>
+  local a="$1" ws="$2" dry="${3:-0}" skipfolder="${4:-}" src proj label n sfx rr
+  src="$(untilde "$(field "$a" 2)")"
+  [ -d "$src" ] || { echo "!! $a: missing worktree $src" >&2; return 1; }
+  ws="$(untilde "$ws")"
+  [ -f "$ws" ] || { echo "!! no such workspace file: $ws" >&2; return 1; }
+  proj="$(worktree_project "$src")"
+  [ -n "$proj" ] || {
+    echo "!! $a has no git origin, so there is nothing to duplicate FROM." >&2
+    echo "   Duplicating clones from the remote, like transport does." >&2
+    return 1; }
+  label="$(ws_label "$ws")"
+
+  n=1
+  while [ "$n" -le 64 ]; do
+    sfx="$(dest_suffix "$label" "$n")"
+    suffix_taken "$proj" "$sfx" || break
+    n=$((n+1))
+  done
+  [ "$n" -le 64 ] || { echo "!! no free identity suffix under '$label'" >&2; return 1; }
+
+  if [ "$dry" = 1 ]; then
+    if ! rr="$(transport_gate "$src" 2>/dev/null)"; then
+      echo "REFUSED: $a — $rr"; return 1
+    fi
+    echo "OK: $a would be duplicated into $label"
+    echo "  branch : $(git -C "$src" branch --show-current) @ $(git -C "$src" rev-parse --short HEAD)"
+    if rr="$(resolve_dest "" "" "$HOME" "$proj" "$label" "$(dest_minn "$n")")"; then
+      echo "  dest   : ${rr%%$'\t'*}"
+    else
+      echo "  dest   : $(dest_candidate "$HOME" "$proj" "$label" "$(dest_minn "$n")")"
+    fi
+    echo "  id-sfx : $sfx"
+    return 0
+  fi
+
+  transport_agent "$a" "$ws" "" "" "" "$n" "" "$skipfolder"
 }
 
 # ── Teardown: close a cloned squad down ─────────────────────────────────────
@@ -1999,12 +2179,17 @@ case "${1:-help}" in
                 # Same short-label rule as who_badge; ⏻ = down, matching the
                 # live-title look. Only when stdout is a real terminal.
                 if [ -t 1 ]; then
-                  printf '\033]0;%s · ⏻ down\a' "${a%-$(sanitize_ident "$(hostname)")}"
+                  printf '\033]0;%s · ⏻ down\a' "$(short_label "$a")"
                 fi
                 # `start`, not `up`: up deliberately skips faculty-class
                 # agents, so for exactly the terminals that show this message
                 # most, "run up" would be advice that does nothing.
-                echo "$a is down. Right-click this tab -> Squad -> Start & attach (resume conversation) or (fresh conversation)."
+                # "is down" reads as a fault, and for a freshly-transported or
+                # freshly-enrolled agent nothing has failed — it has simply never
+                # been started. Same words either way, describing the state
+                # rather than diagnosing it.
+                echo "$a is not started."
+                echo "Right-click this tab -> Squad -> Start & attach (resume conversation) or (fresh conversation)."
                 # Exit 3, not 0, so the caller can distinguish "attached, and
                 # you detached" from "never attached, agent is down". The
                 # cockpit uses it to decide whether to clear the pane: this
@@ -2378,7 +2563,7 @@ except Exception:
               for a in $(agents); do
                 # down faculty: no session, no clients, nothing to badge
                 if is_faculty "$a" && ! tm has-session -t "=$a" 2>/dev/null; then continue; fi
-                short="${a%-$hostsafe}"
+                short="$(short_label "$a" "$hostsafe")"
                 # glyph FIRST (right after the tab icon) so the status column
                 # lines up; 🔴 slots in after it when waiting — the name
                 # jumping right is deliberate attention-grabbing. ctx % rides
@@ -3149,6 +3334,36 @@ print("\n".join(r[2] for r in rows))
               *)    shift ;;
             esac; done
             add_folder "$d_arg" "$(untilde "$ws_arg")" ;;
+  duplicate) # squad duplicate <agent> [--to <file.code-workspace>] [--dry-run]
+            # A second seat on one repo, landing in the workspace the agent
+            # already lives in. --to is optional BECAUSE the common case has one
+            # answer; when it doesn't, this asks rather than picking for you.
+            shift; a_arg=""; ws_arg=""; dry=0; skipfolder=""
+            while [ $# -gt 0 ]; do case "$1" in
+              --to)      ws_arg="${2:-}"; shift 2 ;;
+              --dry-run) dry=1; shift ;;
+              # The cockpit owns the folder entry when it drives, because an
+              # external edit to the OPEN workspace file makes VSCode reload.
+              --no-folder-entry) skipfolder="skip-folder-entry"; shift ;;
+              -*) echo "!! unknown duplicate flag '$1' (valid: --to, --dry-run, --no-folder-entry)" >&2; exit 1 ;;
+              *)  a_arg="$1"; shift ;;
+            esac; done
+            a="$(need_agent "$a_arg")" || exit 1
+            if [ -z "$ws_arg" ]; then
+              # Ambiguity is the operator's to resolve. Guessing which workspace
+              # a duplicate joins would put an agent in a window they weren't
+              # looking at, and the name it gets depends on that choice.
+              found="$(ws_of_worktree "$(untilde "$(field "$a" 2)")")"
+              case "$(printf '%s\n' "$found" | grep -c .)" in
+                0) echo "!! $a is not a folder in any workspace — pass --to <file.code-workspace>" >&2; exit 1 ;;
+                1) ws_arg="$found" ;;
+                *) echo "!! $a lives in more than one workspace; say which:" >&2
+                   printf '%s\n' "$found" | sed 's/^/     /' >&2
+                   echo "   $CMD duplicate $a --to <one of those>" >&2; exit 1 ;;
+              esac
+            fi
+            duplicate_agent "$a" "$ws_arg" "$dry" "$skipfolder"
+            exit $? ;;
   ext-align) ext_align ;;
   showcase) # squad showcase [--fast] [--keep] — the transporter, demonstrated
             # live against a throwaway HOME and a throwaway git host. Runs THIS
@@ -3283,6 +3498,11 @@ workspaces (a "workspace" is a .code-workspace file; the cockpit shows a tab per
   $CMD ext-align                name the cockpit extension's install dir after its manifest
                                 (VSCode caches on the FOLDER NAME — a stale name means new
                                 menu items silently never appear). Reload Window after.
+  $CMD duplicate <agent>        a second seat on the same repo, landing in the workspace that
+       [--to <ws>] [--dry-run]  agent already lives in — its memory and conversation come with
+                                it, and it gets its own hub identity (<label>, <label>-2, …,
+                                next FREE number). --to only needed when the agent is in more
+                                than one workspace. The copy lands STOPPED.
   $CMD showcase [--fast|--keep] watch transport work end to end: the gate refusing, an agent
                                 landing, its identity re-derived, teardown declining to delete
                                 the original. Real squad, throwaway HOME — your fleet is

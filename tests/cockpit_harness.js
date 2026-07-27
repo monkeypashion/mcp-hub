@@ -97,10 +97,33 @@ const vscode = {
       return { get: () => undefined };
     },
     createFileSystemWatcher() {
-      return { onDidChange: ev, onDidCreate: ev, onDidDelete: ev, dispose() {} };
+      // Keep the callbacks so a test can fire them. With `ev` for all three the
+      // roster watcher was unreachable, which left the folder-adoption path
+      // uncovered — a mutant that adopted WITHOUT waiting for the roster row
+      // stayed green.
+      return {
+        onDidChange(cb) {
+          watcherCbs.push(cb);
+          return D;
+        },
+        onDidCreate(cb) {
+          watcherCbs.push(cb);
+          return D;
+        },
+        onDidDelete: ev,
+        dispose() {},
+      };
     },
     onDidChangeWorkspaceFolders: ev,
-    updateWorkspaceFolders() {
+    // Recorded, because "adds the folder through the API instead of editing the
+    // file" is the whole behaviour under test — and the API call is the only
+    // observable difference.
+    updateWorkspaceFolders(start, del, ...adds) {
+      folderOps.push({
+        start,
+        del,
+        add: adds.map((a) => (a && a.uri ? a.uri.fsPath : String(a))),
+      });
       return true;
     },
   },
@@ -136,6 +159,8 @@ const vscode = {
 // child_process too and record both. `execSync` stays real: the preview/dry-run
 // paths legitimately shell out and expect output.
 const execs = [];
+const folderOps = [];
+const watcherCbs = [];
 const realCp = require("child_process");
 const cpStub = {
   ...realCp,
@@ -148,6 +173,19 @@ const cpStub = {
   spawn(file, args) {
     execs.push([file, ...(Array.isArray(args) ? args : [])].join(" "));
     return { on() {}, unref() {}, stdout: { on() {} }, stderr: { on() {} } };
+  },
+  // Duplicate asks squad WHERE the copy will land before starting it, so this
+  // has to be stubbed or the test shells out to the real squad and depends on a
+  // sandbox worktree existing. HARNESS_EXEC_FAIL makes it throw the way a
+  // refused gate does, with the reason on stdout as execFileSync reports it.
+  execFileSync(file, args) {
+    execs.push([file, ...(Array.isArray(args) ? args : [])].join(" "));
+    if (process.env.HARNESS_EXEC_FAIL) {
+      const e = new Error("command failed");
+      e.stdout = process.env.HARNESS_EXEC_FAIL;
+      throw e;
+    }
+    return process.env.HARNESS_EXEC_OUT || "";
   },
 };
 
@@ -167,6 +205,12 @@ const ext = require(extPath);
 ext.activate({ subscriptions: [] });
 
 (async () => {
+  if (mode === "shortlabel") {
+    // The display rule is mirrored in squad's short_label(); this exposes the JS
+    // side so a test can prove the two agree instead of hoping.
+    console.log(JSON.stringify({ label: ext.shortLabel(target) }));
+    return;
+  }
   if (mode === "commands") {
     console.log(JSON.stringify({ registered: registered.sort() }));
     return;
@@ -195,11 +239,21 @@ ext.activate({ subscriptions: [] });
         await new Promise((r) => setTimeout(r, 25));
       }
     } catch (e) {
-      console.log(JSON.stringify({ error: String((e && e.message) || e), sent, shown, execs }));
+      console.log(JSON.stringify({ error: String((e && e.message) || e), sent, shown, execs, folderOps }));
       process.exitCode = 3;
       return;
     }
-    console.log(JSON.stringify({ sent, shown, execs }));
+    if (process.env.HARNESS_FIRE_ROSTER) {
+      for (const cb of watcherCbs) {
+        try {
+          await cb();
+        } catch (e) {
+          shown.push(`watcher threw: ${String((e && e.message) || e)}`);
+        }
+      }
+      for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 25));
+    }
+    console.log(JSON.stringify({ sent, shown, execs, folderOps }));
     return;
   }
   console.log(JSON.stringify({ error: `unknown mode: ${mode}` }));

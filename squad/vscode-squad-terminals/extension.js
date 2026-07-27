@@ -146,10 +146,42 @@ function themeFor(agent) {
   return best ? THEME[best] : FALLBACK;
 }
 
-// short label: strip the derived "-<hostname>" suffix (sanitized like cli.py)
+// An operator-editable list: one entry per line, "#" comments and blanks
+// dropped. Read on every use, never cached — an edit takes effect at the next
+// menu open, with no reload and no version bump.
+//
+// ONE function for both lists (~/.config/squad/prompts.txt and slash.txt) so
+// "same rules as prompts.txt" is structurally true rather than a claim in a
+// comment that can quietly stop being true.
+function readOperatorList(name) {
+  try {
+    return fs
+      .readFileSync(path.join(os.homedir(), ".config", "squad", name), "utf8")
+      .split("\n")
+      .map((s) => s.trim())
+      .filter((s) => s && !s.startsWith("#"));
+  } catch {
+    return [];
+  }
+}
+
+// short label: strip the derived "-<hostname>" (sanitized like cli.py) — from
+// the MIDDLE as well as the end.
+//
+// A transported or duplicated agent is <repo>-<host>-<suffix>, so an
+// end-anchored strip returned the whole raw name: the original rendered as
+// "mcp-hub" while its copy rendered as "mcp-hub-fireblade-wsl-windows", side by
+// side in one panel. Exactly the bug themeFor above was fixed for and this was
+// not — the derivation has to be suffix-aware everywhere or nowhere.
+//
+// Mirrored in squad's short_label() — CHANGE BOTH OR NEITHER. A test runs a
+// table of names through both implementations and fails if they disagree.
 function shortLabel(agent) {
   const host = os.hostname().toLowerCase().replace(/[^a-z0-9_-]/g, "-");
-  return agent.endsWith("-" + host) ? agent.slice(0, -(host.length + 1)) : agent;
+  if (agent.endsWith("-" + host)) return agent.slice(0, -(host.length + 1));
+  const mid = agent.indexOf("-" + host + "-");
+  if (mid !== -1) return agent.slice(0, mid) + agent.slice(mid + host.length + 1);
+  return agent;
 }
 
 // Resolve which agent a context-menu invocation targets. Prefer our creation
@@ -269,15 +301,7 @@ function activate(context) {
     ),
     vscode.commands.registerCommand("squad.stockPrompt", (...args) =>
       withAgents(args, async (agents) => {
-        const file = path.join(os.homedir(), ".config", "squad", "prompts.txt");
-        let prompts = [];
-        try {
-          prompts = fs
-            .readFileSync(file, "utf8")
-            .split("\n")
-            .map((s) => s.trim())
-            .filter((s) => s && !s.startsWith("#"));
-        } catch {}
+        const prompts = readOperatorList("prompts.txt");
         if (!prompts.length) {
           vscode.window.showWarningMessage("No stock prompts — add lines to ~/.config/squad/prompts.txt");
           return;
@@ -652,6 +676,37 @@ function activate(context) {
   // Runs in a visible terminal rather than fire-and-forget: transport REFUSES
   // on a dirty or unpushed tree, and that refusal is something the operator
   // must read, not a silently-swallowed exit code.
+  // Destinations this window has asked for and not yet adopted as folders.
+  // Populated by Duplicate, drained by the roster watcher below.
+  const pendingFolderAdds = new Set();
+
+  // Add any pending destination whose roster row has now appeared. Going through
+  // updateWorkspaceFolders is the whole point: it applies live and lets VSCode
+  // own the file, where an external write to an OPEN .code-workspace makes VSCode
+  // reload the window on its own heuristic and bin the terminal panel.
+  //
+  // Gated on the ROSTER ROW, not on a timer and not on the directory existing:
+  // transport-recv writes the row last and only after every other step
+  // succeeded, so the row is the success signal. A duplicate that fails leaves
+  // nothing behind.
+  const adoptPendingFolders = () => {
+    if (!pendingFolderAdds.size) return;
+    const rows = rosterRows();
+    const folders = vscode.workspace.workspaceFolders || [];
+    const have = new Set(folders.map((f) => canon(f.uri.fsPath)));
+    for (const dest of [...pendingFolderAdds]) {
+      if (!rows.some((r) => canon(r.worktree) === canon(dest))) continue;
+      pendingFolderAdds.delete(dest);
+      if (have.has(canon(dest))) continue;
+      vscode.workspace.updateWorkspaceFolders(folders.length, 0, {
+        uri: vscode.Uri.file(dest),
+        name: path.basename(dest),
+      });
+      // No buildCockpit() here: adding a folder fires
+      // onDidChangeWorkspaceFolders, which already rebuilds.
+    }
+  };
+
   const runTransport = (label, cmd) => {
     const t = vscode.window.createTerminal({
       name: `transport → ${label}`,
@@ -661,6 +716,69 @@ function activate(context) {
     t.show(true);
     sendWhenReady(t, cmd);
   };
+
+  // Duplicate: a second seat on one repo, landing in the workspace you are
+  // already looking at. No target picker, because there is no target to pick —
+  // that is the whole point of it being a separate entry from Transport. The
+  // occurrence number is worked out by `squad duplicate`, which is the one thing
+  // neither the operator nor this side can know: it depends on what the
+  // workspace already holds.
+  //
+  // Runs in its own terminal like the other transport-family actions rather than
+  // typing into the agent's tab — that tab may hold a LIVE claude, where a typed
+  // shell command becomes a prompt.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("squad.duplicate", (...args) =>
+      withAgents(args, async (agents) => {
+        if (agents.length !== 1) {
+          vscode.window.showWarningMessage("Squad: duplicate one agent at a time.");
+          return;
+        }
+        const ws = vscode.workspace.workspaceFile;
+        if (!ws) {
+          vscode.window.showWarningMessage(
+            "Squad: open a .code-workspace to duplicate into — a duplicate joins " +
+              "the workspace it is made in, and there isn't one here."
+          );
+          return;
+        }
+        const agent = agents[0];
+        // Ask where it WILL land before starting, so this side can add the
+        // folder itself. The dry run is also the gate check, so a refusal is
+        // reported here instead of scrolling past in a terminal.
+        let dest;
+        try {
+          const out = cp.execFileSync(
+            SQUAD,
+            ["duplicate", agent, "--to", ws.fsPath, "--dry-run"],
+            { encoding: "utf8", timeout: 30000 }
+          );
+          dest = (out.match(/^\s*dest\s*:\s*(.+)$/m) || [])[1];
+          if (dest) dest = dest.trim();
+        } catch (e) {
+          const why = String((e && (e.stdout || e.stderr || e.message)) || e).trim();
+          vscode.window.showWarningMessage(
+            `Squad: cannot duplicate ${shortLabel(agent)} — ${why.split("\n").pop()}`
+          );
+          return;
+        }
+        if (!dest) {
+          vscode.window.showWarningMessage(
+            "Squad: could not work out where the duplicate would land."
+          );
+          return;
+        }
+        // Adopt it only once the ROSTER ROW appears, which transport-recv writes
+        // last and only on success — so a failed duplicate never leaves a
+        // phantom folder pointing at nothing.
+        pendingFolderAdds.add(dest);
+        runTransport(
+          `duplicate ${shortLabel(agent)}`,
+          `${SQUAD} duplicate ${agent} --to ${JSON.stringify(ws.fsPath)} --no-folder-entry`
+        );
+      })
+    )
+  );
 
   context.subscriptions.push(
     vscode.commands.registerCommand("squad.transport", (...args) =>
@@ -1014,13 +1132,42 @@ function activate(context) {
         if (ok) agents.forEach((a) => squadExec(["cmd", a, "/clear"], a));
       })
     ),
+    // The nine built-ins above are menu contributions, so adding one costs two
+    // source edits, a version bump and an ext-align — which is why the list
+    // never grew. Stock PROMPTS were a file you edit, appearing instantly; this
+    // was a build step. Same menu, two rules for the operator.
+    //
+    // ~/.config/squad/slash.txt closes that. The saved list is offered first
+    // with "type one" at the top — the same shape the workspace picker uses for
+    // "➕ New workspace…", rather than a second near-identical menu entry.
+    //
+    // With NO file the quick pick is skipped entirely and this behaves exactly
+    // as it always did: one input box, no extra click, no nagging toast. A
+    // feature you haven't opted into must not make the old path longer.
     vscode.commands.registerCommand("squad.slash.custom", (...args) =>
       withAgents(args, async (agents) => {
-        const cmd = await vscode.window.showInputBox({
-          prompt: `Slash command for ${labels(agents)}`,
-          placeHolder: "/memory-sync, /review, …",
-          validateInput: (v) => (v.startsWith("/") ? undefined : "must start with /"),
-        });
+        const TYPE = "✎ Type one…";
+        // A line missing its leading "/" is a typo, not a different intent —
+        // normalise it, and show the normalised form so the list says exactly
+        // what will be sent.
+        const saved = readOperatorList("slash.txt").map((s) =>
+          s.startsWith("/") ? s : "/" + s
+        );
+        let cmd;
+        if (saved.length) {
+          const pick = await vscode.window.showQuickPick([TYPE, ...saved], {
+            placeHolder: `Slash command for ${labels(agents)}`,
+          });
+          if (!pick) return;
+          if (pick !== TYPE) cmd = pick;
+        }
+        if (!cmd) {
+          cmd = await vscode.window.showInputBox({
+            prompt: `Slash command for ${labels(agents)}`,
+            placeHolder: "/memory-sync, /review, …",
+            validateInput: (v) => (v.startsWith("/") ? undefined : "must start with /"),
+          });
+        }
         if (cmd) agents.forEach((a) => squadExec(["cmd", a, cmd], a));
       })
     )
@@ -1126,7 +1273,14 @@ function activate(context) {
     // nothing, because the start toast rides on onDidChangeActiveTerminal,
     // which never fires when the terminal you click is already active
     // (2026-07-26). attach exits 3 when down, so `&&` keeps the hint.
-    sendWhenReady(t, `squad attach --no-start ${agent} && clear`);
+    // LEADING clear as well as trailing. A shell echoes what is typed into it,
+    // so a down agent's pane read as a raw command line followed by a status
+    // report — which looks like a command that failed, not like a tab waiting to
+    // be started. Clearing FIRST wipes the echo, so what remains is only the
+    // hint. The trailing clear still does its own job (wiping a dead session's
+    // scrollback after a detach) and is still `&&`, so a down agent — where
+    // attach exits 3 — keeps the hint instead of being blanked.
+    sendWhenReady(t, `clear && squad attach --no-start ${agent} && clear`);
   }
 
   // hideOnStartup keeps VSCode from spawning a filler terminal into a
@@ -1157,8 +1311,14 @@ function activate(context) {
     );
     // change AND create: `squad transport` appends to the roster, but a fresh
     // machine may not have the file at all when the window opens.
-    confWatcher.onDidChange(() => buildCockpit());
-    confWatcher.onDidCreate(() => buildCockpit());
+    confWatcher.onDidChange(() => {
+      adoptPendingFolders();
+      buildCockpit();
+    });
+    confWatcher.onDidCreate(() => {
+      adoptPendingFolders();
+      buildCockpit();
+    });
     context.subscriptions.push(confWatcher);
   } catch {
     /* watcher unavailable (remote/virtual FS) — reload still works */
@@ -1254,4 +1414,4 @@ function activate(context) {
 
 function deactivate() {}
 
-module.exports = { activate, deactivate };
+module.exports = { activate, deactivate, shortLabel };
