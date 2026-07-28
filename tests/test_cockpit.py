@@ -528,6 +528,20 @@ def test_the_cockpit_opens_a_board_and_a_settings_tab(box, tmp_path):
     assert "settings --tui" in launched, out["sent"]
 
 
+def test_a_roster_change_does_not_yank_the_panel_to_the_board(box, tmp_path):
+    """Revealing the panel is a STARTUP concern. buildCockpit also runs from the
+    roster watcher, and every launch setting the operator changes writes
+    squad.conf — so this line pulled the panel to the board each time, throwing
+    them out of the settings tab mid-edit.
+    """
+    ws, work = _cockpit(box, tmp_path)
+    out = _drive(box, "run", "squad.stop", terminal="demo · idle",
+                 wsfile=str(ws), wsfolders=[work], fire_roster=True)
+    boards = [n for n in out["shown_terms"] if n == "squad-board"]
+    assert len(boards) <= 1, \
+        f"revealed the board {len(boards)} times — a rebuild stole the view"
+
+
 def test_the_settings_tab_is_scoped_to_the_open_workspace(box, tmp_path):
     """Same folder-membership rule the tabs themselves use, so the panel lists
     exactly the agents whose tabs are beside it — rather than every agent on

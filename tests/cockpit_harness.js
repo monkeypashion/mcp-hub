@@ -52,7 +52,10 @@ const vscode = {
       const t = {
         name: opts && opts.name,
         shellIntegration: true, // so sendWhenReady fires synchronously
-        show() {},
+        // Recorded: REVEALING a terminal is a visible act. The cockpit yanked
+        // the panel to the board on every roster write, which is invisible to
+        // any test that only checks which terminals exist.
+        show() { shown_terms.push(t.name); },
         sendText(x) {
           sent.push(x);
         },
@@ -231,6 +234,7 @@ const picks = [];
 const views = [];
 const panels = [];
 const revealed = [];
+const shown_terms = [];
 let settingsCalls = 0;
 const msgHandlers = [];
 const executed = [];
@@ -362,7 +366,7 @@ ext.activate({ subscriptions: [] });
         await new Promise((r) => setTimeout(r, 25));
       }
     } catch (e) {
-      console.log(JSON.stringify({ error: String((e && e.message) || e), sent, shown, execs, offered, opened, picks, views, executed, panelCount: panels.length, revealed, folderOps }));
+      console.log(JSON.stringify({ error: String((e && e.message) || e), sent, shown, execs, offered, opened, picks, views, executed, panelCount: panels.length, revealed, shown_terms, folderOps }));
       process.exitCode = 3;
       return;
     }
@@ -390,7 +394,7 @@ ext.activate({ subscriptions: [] });
       }
       for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 25));
     }
-    console.log(JSON.stringify({ sent, shown, execs, offered, opened, picks, views, executed, panelCount: panels.length, revealed, folderOps }));
+    console.log(JSON.stringify({ sent, shown, execs, offered, opened, picks, views, executed, panelCount: panels.length, revealed, shown_terms, folderOps }));
     return;
   }
   console.log(JSON.stringify({ error: `unknown mode: ${mode}` }));

@@ -67,6 +67,8 @@ const FALLBACK = ["terminal", "terminal.ansiBrightBlack"];
 // Terminal -> agent name, for context-menu target resolution
 const agentOf = new Map();
 let buildCockpitRef = null;   // set at activation so commands can refresh tabs
+// The panel is revealed once, at startup. See buildCockpit's tail.
+let revealedOnce = false;
 
 function rosterRows() {
   const conf = path.join(os.homedir(), ".config", "squad", "squad.conf");
@@ -1680,8 +1682,21 @@ function activate(context) {
   // restored-open empty panel (the recurring "bash <first-folder>" ghost
   // tab) — which means revealing the panel is OUR job now: once the cockpit
   // is built, show it with the board on top, without stealing focus.
-  const boardTerm = [...vscode.window.terminals].find((t) => t.name === BOARD);
-  if (boardTerm) boardTerm.show(true);
+  //
+  // ONCE. buildCockpit() also runs from the roster watcher, and every launch
+  // setting written by `squad comms/resume/launch` changes squad.conf — so
+  // this line yanked the panel to the board every time the operator changed a
+  // value in the settings tab ("I change any of the launch settings and it
+  // takes me out of the settings and the squad-board loads instead",
+  // 2026-07-28). Revealing the panel is a STARTUP concern; a rebuild triggered
+  // by someone editing a setting must leave the view where they put it.
+  if (!revealedOnce) {
+    const boardTerm = [...vscode.window.terminals].find((t) => t.name === BOARD);
+    if (boardTerm) {
+      boardTerm.show(true);
+      revealedOnce = true;
+    }
+  }
   };
 
   buildCockpitRef = buildCockpit;
