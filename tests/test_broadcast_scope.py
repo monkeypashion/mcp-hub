@@ -667,3 +667,32 @@ def test_legacy_clear_happens_even_when_the_import_inserts_nothing(tmp_path):
         "SELECT squad FROM squad_members WHERE agent='ghost'").fetchall()
     conn.close()
     assert rows == [], f"resurrected after removal: {rows}"
+
+
+# ---- the strings that TEACH the contract -----------------------------------
+#
+# Two of these were found in prod on 2026-07-28, hours apart, and they share a
+# shape worth naming: the CODE was right and the TEXT ABOUT the code was wrong.
+# A fleet of agents learns what a hub does by reading these strings, so a wrong
+# one regenerates the wrong belief in every agent that reads it, indefinitely.
+# Correcting the agents without correcting the string is a half-fix — we did
+# exactly that for a day and watched the belief come back.
+
+def test_the_instructions_blob_does_not_generalise_low_priority(server):
+    """The hub's top-level instructions — the first text every agent reads —
+    stated broadcast's low-priority rule as if it were global. A low send()
+    deliberately WAKES an idle recipient (Case 1). The whole fleet quoted the
+    wrong half for a weekend, including as the accepted explanation for an
+    all-drain canary result, which was true only because that test used
+    broadcasts."""
+    blob = server.instructions or ""
+    assert "low" in blob.lower()
+    # It must name the split. Mentioning wake at all is not enough — the old
+    # text mentioned wake, and that is precisely how it misled.
+    assert "idle" in blob.lower(), (
+        "instructions do not mention the idle-recipient exception for DMs:\n" + blob
+    )
+    assert "send" in blob.lower()
+    assert "queues these without firing a channel-push wake" not in blob, (
+        "instructions still state broadcast's rule as universal:\n" + blob
+    )

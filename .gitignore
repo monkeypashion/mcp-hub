@@ -12,3 +12,4 @@ build/
 # Personal Claude Code settings (per-machine permission grants etc.) — the
 # shared file is .claude/settings.json; the .local variant never gets committed.
 .claude/settings.local.json
+.mcp.json

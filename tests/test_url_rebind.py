@@ -411,3 +411,73 @@ async def test_unregister_clears_gap_state(tmp_path):
     await _call_tool(server, "unregister", {"name": "alice"})
     await _call_tool(server, "register", {"name": "alice", "project": "p"})
     assert await _call_tool(server, "get_messages", {"agent_name": "alice"}) == ""
+
+
+# ---------------------------------------------------------------------------
+# Orphan gate — a brand-new name registered from someone else's session
+# ---------------------------------------------------------------------------
+
+
+async def test_register_refuses_a_brand_new_name_from_an_owning_session(tmp_path):
+    """ra's #136 probe, 2026-07-27: a session bound to its own name registered
+    a throwaway name and the hub accepted it, leaving an agent that showed as
+    live in every roster while nobody was listening for it.
+
+    The refusal is deliberately narrow — see the sibling tests for everything
+    it must NOT break."""
+    server = create_server(db_path=tmp_path / "t.db")
+    sess = _FakeSess()
+    await _call_tool(server, "register", {"name": "ra", "project": "p"})
+    server._hub_registry.bind("ra", sess)
+
+    out = await server._tool_manager.call_tool(
+        "register",
+        {"name": "ra-impersonation-probe", "project": "p"},
+        context=_FakeCtx(sess),
+    )
+    text = out if isinstance(out, str) else str(out)
+    assert "REFUSED" in text, f"orphan gate did not fire: {text}"
+    assert "ra" in text  # names the identity the session actually holds
+
+    import sqlite3
+    conn = sqlite3.connect(tmp_path / "t.db")
+    row = conn.execute(
+        "SELECT 1 FROM agents WHERE name = 'ra-impersonation-probe'"
+    ).fetchone()
+    conn.close()
+    assert row is None, "refused but conjured the agent anyway"
+
+
+async def test_orphan_gate_does_not_touch_re_register_of_a_known_name(tmp_path):
+    """THE CASE THAT MATTERS MOST. Every agent re-registers constantly (session
+    resume, hub redeploy, reconnect), and multi-name aliasing is legal — parked
+    #17 refused a register-time gate three times because a false predicate here
+    could unbind the fleet. A KNOWN name must pass even from a session holding
+    another, which is what keeps this gate out of #17's territory."""
+    server = create_server(db_path=tmp_path / "t.db")
+    await _call_tool(server, "register", {"name": "alice", "project": "p"})
+    await _call_tool(server, "register", {"name": "bob", "project": "p"})
+
+    sess = _FakeSess()
+    server._hub_registry.bind("alice", sess)
+    out = await server._tool_manager.call_tool(
+        "register", {"name": "bob", "project": "p"}, context=_FakeCtx(sess),
+    )
+    text = out if isinstance(out, str) else str(out)
+    assert "REFUSED" not in text, f"gate hit a known name: {text}"
+    assert "Registered" in text
+
+
+async def test_orphan_gate_does_not_touch_a_new_agents_own_first_register(tmp_path):
+    """A genuinely new agent's first register comes from a session that owns
+    nothing yet, so `owners` is empty and the gate cannot reach it. If this
+    ever fails, onboarding is broken for every new seat."""
+    server = create_server(db_path=tmp_path / "t.db")
+    out = await server._tool_manager.call_tool(
+        "register",
+        {"name": "brand-new-seat", "project": "p"},
+        context=_FakeCtx(_FakeSess()),
+    )
+    text = out if isinstance(out, str) else str(out)
+    assert "REFUSED" not in text, f"gate blocked a legitimate first register: {text}"
+    assert "Registered" in text
