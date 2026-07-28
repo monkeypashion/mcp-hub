@@ -354,122 +354,204 @@ const labels = (agents) => agents.map(shortLabel).join(", ");
 // whether changing it affects this agent or every agent on the machine.
 // matchOnDetail makes those sources searchable too — "no workspace declares it"
 // finds every hand-set value in one keystroke.
-// Open the panel for one agent, reading the model fresh from the cli.
+// ---- the settings view: a real panel, docked beside the terminals ----
 //
-// A function rather than the command body because an edit REOPENS it: the panel
-// must show the state after the write, not the value that was sent. Those
-// differ whenever a write is rejected, clamped or normalised on the way in, and
-// a panel that showed the request would be confidently wrong exactly when it
-// mattered.
-function openSettings(agent, worktree) {
-  cp.execFile(
-    MCP_HUB,
-    ["settings", "--cwd", worktree, "--json"],
-    { timeout: 15000 },
-    (err, out, stderr) => {
-      if (err) {
-        vscode.window.showErrorMessage(
-          `Squad settings: ${(stderr || err.message || "").trim()}`
-        );
-        return;
-      }
-      let model;
-      try {
-        model = JSON.parse(out);
-      } catch {
-        vscode.window.showErrorMessage("Squad settings: unreadable output.");
-        return;
-      }
-      vscode.window
-        .showQuickPick(settingsItems(model), {
-          title: `Settings — ${shortLabel(agent)}`,
-          placeHolder: "type to filter · \u270f rows can be changed · Escape to close",
-          matchOnDescription: true,
-          matchOnDetail: true,
-        })
-        .then((pick) => {
-          // Picking a read-only row closes the list, the same as Escape. There
-          // is nothing a selection there could mean.
-          if (!pick || !pick.edit) return;
-          applyEdit(agent, worktree, pick);
-        });
-    }
+// Third presentation, and the first that fits. A webview in the EDITOR area is
+// a file tab ("it opened it as a file rather than a popup"); a quick pick is a
+// filter list that cannot lay anything out ("ok but very basic"). VSCode has no
+// modal webview, so the remaining question was only where it docks — and the
+// panel is where the cockpit already lives, beside the agent tabs.
+//
+// Values are rendered as SELECTS for editable rows and as plain text for the
+// rest, which makes editability visible in the control itself rather than in a
+// marker beside it. Sources get their own column: they are the point of the
+// panel, and a value alone cannot say whether changing it affects this agent or
+// every agent on the machine.
+
+const esc = (s) =>
+  String(s == null ? "" : s).replace(
+    /[&<>"']/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
   );
+
+function settingsHtml(model, nonce) {
+  const sections = (model.sections || [])
+    .map((sec, si) => {
+      const rows = (sec.rows || [])
+        .map((r, ri) => {
+          const control = r.edit
+            ? `<select data-row="${si}.${ri}">` +
+              r.edit.choices
+                .map(
+                  (c) =>
+                    `<option${c === r.value ? " selected" : ""}>${esc(c)}</option>`
+                )
+                .join("") +
+              (r.edit.choices.includes(r.value)
+                ? ""
+                : `<option selected>${esc(r.value)}</option>`) +
+              `</select>`
+            : `<span class="ro">${esc(r.value)}</span>`;
+          const when = r.edit ? `<em>${esc(r.edit.applies)}</em>` : "";
+          return `<tr><th>${esc(r.label)}</th><td>${control}</td>
+                  <td class="src">${esc(r.source)} ${when}</td></tr>`;
+        })
+        .join("");
+      const note = sec.note ? `<span class="note">${esc(sec.note)}</span>` : "";
+      return `<h2>${esc(sec.title)}${note}</h2><table>${rows}</table>`;
+    })
+    .join("");
+  return `<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none';
+ style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
+<style>
+ body{font-family:var(--vscode-font-family);color:var(--vscode-foreground);
+      font-size:var(--vscode-font-size);padding:.7rem 1rem 1.4rem}
+ h1{font-size:1.15em;margin:0 0 1rem;font-weight:600}
+ h2{font-size:.74em;letter-spacing:.10em;margin:1.3rem 0 .3rem;opacity:.75;
+    font-weight:600;border-bottom:1px solid var(--vscode-widget-border,
+    rgba(128,128,128,.22));padding-bottom:.25rem}
+ .note{text-transform:none;letter-spacing:0;font-weight:400;opacity:.7;
+       margin-left:.7rem}
+ table{border-collapse:collapse;width:100%}
+ th{text-align:left;font-weight:400;opacity:.85;padding:.3rem 1.2rem .3rem 0;
+    white-space:nowrap;width:1%;vertical-align:middle}
+ td{padding:.3rem 0;vertical-align:middle}
+ td:nth-child(2){width:1%;padding-right:1.4rem;white-space:nowrap}
+ .ro{font-family:var(--vscode-editor-font-family);opacity:.9;
+     word-break:break-all}
+ .src{opacity:.6;font-size:.88em;line-height:1.35}
+ .src em{font-style:normal;opacity:.85;margin-left:.4rem}
+ select{background:var(--vscode-dropdown-background);
+        color:var(--vscode-dropdown-foreground);
+        border:1px solid var(--vscode-dropdown-border,transparent);
+        border-radius:2px;padding:.15rem 1.4rem .15rem .4rem;
+        font-family:inherit;font-size:inherit;min-width:9rem}
+ select:focus{outline:1px solid var(--vscode-focusBorder)}
+ .empty{opacity:.6;padding:1.4rem .2rem;line-height:1.5}
+</style></head><body>
+<h1>${esc(model.agent)}</h1>
+${sections}
+<script nonce="${nonce}">
+ const vs = acquireVsCodeApi();
+ for (const el of document.querySelectorAll("select")) {
+   el.addEventListener("change", () =>
+     vs.postMessage({ type: "set", row: el.dataset.row, value: el.value }));
+ }
+</script>
+</body></html>`;
 }
 
-// Second step of the drill-down: choose a value, run the command the model
-// named, reopen the panel showing the result.
-//
-// The command comes from the MODEL — which binary, which argv, which choices —
-// so the cockpit never needs to know what a launch flag or a squad is. That is
-// what keeps a future web UI able to offer the same edits without
-// reimplementing them, and it means an edit the underlying verb cannot perform
-// simply never appears.
-function applyEdit(agent, worktree, pick) {
-  const edit = pick.edit;
-  vscode.window
-    .showQuickPick(edit.choices, {
-      title: `${pick.setting} — currently ${pick.description}`,
-      // Not decoration: a launch flag changes nothing until the agent
-      // restarts, while a mute lands on the hub at once. Saying which BEFORE
-      // the choice is the difference between an informed click and a surprise.
-      placeHolder: `applies ${edit.applies}`,
-    })
-    .then((choice) => {
-      if (!choice) return;
-      if (choice === pick.description) {
-        vscode.window.showInformationMessage(
-          `Squad: ${pick.setting} is already ${choice}.`
-        );
-        return;
-      }
-      const argv = edit.argv.map((a) => (a === "{}" ? choice : a));
-      const bin = edit.bin === "mcp-hub" ? MCP_HUB : SQUAD;
-      cp.execFile(bin, argv, { timeout: 20000 }, (err, _out, stderr) => {
+// Renders whichever agent was last asked for. One view, retargeted — a second
+// panel per agent would put the cockpit's own tab strip inside the panel that
+// already has one.
+class SettingsView {
+  constructor() {
+    this.view = undefined;
+    this.agent = undefined;
+    this.worktree = undefined;
+    this.model = undefined;
+    this.seq = 0;
+  }
+
+  resolveWebviewView(view) {
+    this.view = view;
+    view.webview.options = { enableScripts: true };
+    view.webview.onDidReceiveMessage((msg) => this.onMessage(msg));
+    this.render();
+  }
+
+  show(agent, worktree) {
+    this.agent = agent;
+    this.worktree = worktree;
+    this.render();
+  }
+
+  html(body) {
+    // A fresh nonce per render: a CSP nonce reused across renders is a nonce in
+    // name only.
+    return body;
+  }
+
+  render() {
+    if (!this.view) return;
+    if (!this.agent) {
+      this.view.webview.html =
+        `<body><p class="empty">Right-click an agent tab &rarr; Squad &rarr; Settings&hellip;</p></body>`;
+      return;
+    }
+    // Guards against an out-of-order reply retargeting the view: two quick
+    // clicks on different agents race, and the SLOWER cli call would otherwise
+    // win and render the agent you didn't ask for last.
+    const mine = ++this.seq;
+    const agent = this.agent;
+    cp.execFile(
+      MCP_HUB,
+      ["settings", "--cwd", this.worktree, "--json"],
+      { timeout: 15000 },
+      (err, out, stderr) => {
+        if (mine !== this.seq) return;
         if (err) {
           vscode.window.showErrorMessage(
-            `Squad: ${pick.setting} unchanged — ${(stderr || err.message || "").trim()}`
+            `Squad settings: ${(stderr || err.message || "").trim()}`
           );
           return;
         }
-        vscode.window.showInformationMessage(
-          `Squad: ${shortLabel(agent)} ${pick.setting} → ${choice} (applies ${edit.applies}).`
+        try {
+          this.model = JSON.parse(out);
+        } catch {
+          vscode.window.showErrorMessage("Squad settings: unreadable output.");
+          return;
+        }
+        const nonce = `n${mine}${String(agent).length}x`;
+        this.view.webview.html = this.html(settingsHtml(this.model, nonce));
+      }
+    );
+  }
+
+  onMessage(msg) {
+    if (!msg || msg.type !== "set" || !this.model) return;
+    const [si, ri] = String(msg.row).split(".").map(Number);
+    const section = (this.model.sections || [])[si];
+    const row = section && (section.rows || [])[ri];
+    // The row index is a claim from the page, so it is resolved against the
+    // model we actually rendered and refused if it names a row that is not
+    // editable — rather than trusted to address a command.
+    if (!row || !row.edit) return;
+    if (msg.value === row.value) return;
+    const argv = row.edit.argv.map((a) => (a === "{}" ? msg.value : a));
+    const bin = row.edit.bin === "mcp-hub" ? MCP_HUB : SQUAD;
+    cp.execFile(bin, argv, { timeout: 20000 }, (err, _o, stderr) => {
+      if (err) {
+        vscode.window.showErrorMessage(
+          `Squad: ${row.label} unchanged — ${(stderr || err.message || "").trim()}`
         );
-        // Reopen, re-reading from the cli rather than patching the row we have.
-        // A panel that showed the value it just sent would be reporting the
-        // REQUEST, not the state — and the two differ whenever the write is
-        // rejected, clamped, or normalised on the way in.
-        openSettings(agent, worktree);
-      });
+      } else {
+        vscode.window.showInformationMessage(
+          `Squad: ${shortLabel(this.agent)} ${row.label} → ${msg.value} (applies ${row.edit.applies}).`
+        );
+      }
+      // Re-read either way. On success the panel must show the state after the
+      // write rather than the value sent; on failure it must snap the control
+      // BACK, because the browser already moved it and the page would otherwise
+      // display a setting that was never applied.
+      this.render();
     });
+  }
 }
 
-function settingsItems(model) {
-  const items = [];
-  for (const section of model.sections || []) {
-    items.push({
-      label: section.note ? `${section.title} — ${section.note}` : section.title,
-      kind: SEPARATOR,
-    });
-    for (const row of section.rows || []) {
-      items.push({
-        // A pencil on the rows that can actually be changed. Most cannot —
-        // identity is derived, and squad membership comes from declaring a
-        // workspace — so without a marker every row invites a click and most
-        // of them do nothing, which reads as a broken panel rather than a
-        // deliberate read-only value.
-        label: row.edit ? `$(pencil) ${row.label}` : row.label,
-        description: row.value,
-        detail: row.source,
-        edit: row.edit,
-        setting: row.label,
-      });
-    }
-  }
-  return items;
-}
+const settingsView = new SettingsView();
 
 function activate(context) {
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider("squad.settingsView", settingsView, {
+      // The panel keeps its rendered state when you switch to a terminal tab
+      // and back. Without this the view is torn down on every hide and the
+      // settings you were reading are replaced by the placeholder.
+      webviewOptions: { retainContextWhenHidden: true },
+    })
+  );
+
   // ---- context-menu commands (registered in every window; they no-op
   // politely on non-agent terminals) ----
   // one-click answers to the approval dialog — `squad answer` parses the
@@ -581,7 +663,11 @@ function activate(context) {
             `Squad: settings are per agent — showing ${shortLabel(agent)}.`
           );
         }
-        openSettings(agent, row.worktree);
+        settingsView.show(agent, row.worktree);
+        // Reveal the panel. Without this the command looks like it did nothing
+        // whenever the Squad tab is not already the visible one — which is the
+        // normal case, since the operator is usually looking at an agent.
+        vscode.commands.executeCommand("squad.settingsView.focus");
       })
     ),
     vscode.commands.registerCommand("squad.interrupt", (...args) =>

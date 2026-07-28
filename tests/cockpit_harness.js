@@ -36,7 +36,11 @@ const vscode = {
       vscode._handlers[id] = fn;
       return D;
     },
-    executeCommand() {
+    executeCommand(id) {
+      // Recorded: revealing the panel is the difference between "Settings…"
+      // working and appearing to do nothing whenever the Squad tab is not the
+      // visible one — which is the normal case.
+      executed.push(id);
       return Promise.resolve();
     },
   },
@@ -108,6 +112,25 @@ const vscode = {
     async showTextDocument(doc) {
       opened.push((doc && doc.fsPath) || String(doc));
       return {};
+    },
+    // The settings view is a WebviewView, so the extension hands VSCode a
+    // PROVIDER and never sees a view until one is resolved. The harness plays
+    // VSCode's part: resolve it once with a stub whose html and message
+    // handler are both observable, because the rendered page IS the behaviour
+    // and the message handler is the only way an edit can be triggered.
+    registerWebviewViewProvider(id, provider) {
+      const view = {
+        webview: {
+          options: {},
+          set html(v) { views.push({ id, html: v }); },
+          get html() { return views.length ? views[views.length - 1].html : ""; },
+          onDidReceiveMessage(cb) { msgHandlers.push(cb); return D; },
+          postMessage() { return Promise.resolve(true); },
+        },
+        show() {},
+      };
+      providers.push({ id, provider, view });
+      return D;
     },
     onDidChangeTerminalShellIntegration: ev,
     onDidChangeActiveTerminal: ev,
@@ -193,6 +216,10 @@ const vscode = {
 const execs = [];
 const offered = [];
 const picks = [];
+const views = [];
+const providers = [];
+const msgHandlers = [];
+const executed = [];
 const opened = [];
 const folderOps = [];
 const watcherCbs = [];
@@ -261,6 +288,14 @@ const extPath = process.env.HARNESS_EXT || path.join(
 );
 const ext = require(extPath);
 ext.activate({ subscriptions: [] });
+// VSCode resolves a webview view when its container is first shown. Do it
+// straight after activation so the provider is live for the whole run —
+// otherwise every settings test would exercise the never-resolved path.
+for (const p of providers) {
+  if (typeof p.provider.resolveWebviewView === "function") {
+    p.provider.resolveWebviewView(p.view);
+  }
+}
 
 (async () => {
   if (mode === "shortlabel") {
@@ -270,7 +305,7 @@ ext.activate({ subscriptions: [] });
     return;
   }
   if (mode === "commands") {
-    console.log(JSON.stringify({ registered: registered.sort() }));
+    console.log(JSON.stringify({ registered: registered.sort(), views }));
     return;
   }
   if (mode === "run") {
@@ -297,9 +332,23 @@ ext.activate({ subscriptions: [] });
         await new Promise((r) => setTimeout(r, 25));
       }
     } catch (e) {
-      console.log(JSON.stringify({ error: String((e && e.message) || e), sent, shown, execs, offered, opened, picks, folderOps }));
+      console.log(JSON.stringify({ error: String((e && e.message) || e), sent, shown, execs, offered, opened, picks, views, executed, folderOps }));
       process.exitCode = 3;
       return;
+    }
+    // Simulates the operator changing a dropdown in the rendered page. The
+    // page can only act through postMessage, so this is the ONLY route by
+    // which an edit is reachable — without it the whole editable half of the
+    // panel is untestable.
+    if (process.env.HARNESS_WEBVIEW_MSG) {
+      for (const cb of msgHandlers) {
+        try {
+          await cb(JSON.parse(process.env.HARNESS_WEBVIEW_MSG));
+        } catch (e) {
+          shown.push(`message handler threw: ${String((e && e.message) || e)}`);
+        }
+      }
+      for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 25));
     }
     if (process.env.HARNESS_FIRE_ROSTER) {
       for (const cb of watcherCbs) {
@@ -311,7 +360,7 @@ ext.activate({ subscriptions: [] });
       }
       for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 25));
     }
-    console.log(JSON.stringify({ sent, shown, execs, offered, opened, picks, folderOps }));
+    console.log(JSON.stringify({ sent, shown, execs, offered, opened, picks, views, executed, folderOps }));
     return;
   }
   console.log(JSON.stringify({ error: `unknown mode: ${mode}` }));

@@ -47,7 +47,7 @@ def _drive(home: pathlib.Path, mode: str, target: str = "",
            answers=None, wsfile: str = "", terminal: str = "",
            exec_out: str = "", exec_fail: str = "", fire_roster: bool = False,
            not_attached: bool = False, settings_out: str = "",
-           settings_fail: str = "") -> dict:
+           settings_fail: str = "", webview_msg=None) -> dict:
     env = dict(
         os.environ,
         HOME=str(home),
@@ -58,6 +58,8 @@ def _drive(home: pathlib.Path, mode: str, target: str = "",
         env["HARNESS_SETTINGS_OUT"] = settings_out
     if settings_fail:
         env["HARNESS_SETTINGS_FAIL"] = settings_fail
+    if webview_msg is not None:
+        env["HARNESS_WEBVIEW_MSG"] = json.dumps(webview_msg)
     if exec_out:
         env["HARNESS_EXEC_OUT"] = exec_out
     if exec_fail:
@@ -488,19 +490,33 @@ def test_duplicate_adds_no_folder_when_the_copy_never_landed(box, tmp_path):
     assert added == [], f"adopted a folder for a copy that never landed: {added}"
 
 
-# ---- the settings panel (read-only) --------------------------------------
+# ---- the settings panel ---------------------------------------------------
 
 MODEL = json.dumps({
     "agent": "demo",
     "sections": [
         {"title": "SQUADS", "note": "decides who hears its broadcasts",
-         "rows": [{"label": "Squads", "value": "dreamteam",
-                   "source": "set on this agent — no workspace declares it"}]},
+         "rows": [{"label": "dreamteam", "value": "hearing it",
+                   "source": "set on this agent — no workspace declares it",
+                   "edit": {"kind": "mute", "choices": ["hear", "mute"],
+                            "bin": "mcp-hub", "applies": "immediately",
+                            "argv": ["mute", "--agent", "demo", "--squad",
+                                     "dreamteam", "--state", "{}"]}}]},
         {"title": "LAUNCH", "note": "",
-         "rows": [{"label": "Comms (hub wake)", "value": "on",
-                   "source": "set on this agent"}]},
+         "rows": [
+             {"label": "Comms (hub wake)", "value": "off",
+              "source": "set on this agent",
+              "edit": {"kind": "comms", "choices": ["on", "off"], "bin": "squad",
+                       "argv": ["comms", "{}", "demo"], "applies": "next restart"}},
+             {"label": "Worktree", "value": "/tmp/demo", "source": "roster"},
+         ]},
     ],
 })
+
+
+def _page(out):
+    assert out["views"], f"nothing was ever rendered: {out}"
+    return out["views"][-1]["html"]
 
 
 def test_settings_asks_the_cli_rather_than_reading_files_itself(box):
@@ -514,145 +530,145 @@ def test_settings_asks_the_cli_rather_than_reading_files_itself(box):
     assert "--json" in call and f"--cwd {box}/Projects/demo" in call, call
 
 
-def test_every_row_shows_its_value_AND_its_source(box):
-    """THE property. A value with no source cannot tell the operator whether
-    changing it affects this agent or every agent on the machine — which is the
-    only question worth asking before touching one.
-
-    Asserted per row rather than by searching a blob: a whole-output substring
-    check passes while some rows carry a source and others don't.
+def test_the_panel_is_revealed_not_merely_updated(box):
+    """The Squad tab is usually NOT the visible one — the operator is looking at
+    an agent. Rendering without revealing looks exactly like a dead menu entry.
     """
     out = _drive(box, "run", "squad.settings", terminal="demo · idle",
                  settings_out=MODEL)
-    assert len(out["picks"]) == 1, out
-    rows = [i for i in out["picks"][0] if not i["separator"]]
-    assert len(rows) == 2, rows
-    for row in rows:
-        assert row["description"], f"{row['label']} has no value"
-        assert row["detail"], f"{row['label']} has no source"
-    by_label = {r["label"]: r for r in rows}
-    assert by_label["Squads"]["description"] == "dreamteam"
-    assert by_label["Squads"]["detail"] == \
-        "set on this agent — no workspace declares it"
+    assert any("settingsView" in c for c in out["executed"]), out["executed"]
 
 
-def test_sections_are_separators_not_selectable_rows(box):
-    """A heading you can click is a heading that looks like a setting."""
+def test_every_row_shows_its_value_and_its_source(box):
     out = _drive(box, "run", "squad.settings", terminal="demo · idle",
                  settings_out=MODEL)
-    heads = [i for i in out["picks"][0] if i["separator"]]
-    assert [h["label"] for h in heads] == [
-        "SQUADS — decides who hears its broadcasts", "LAUNCH"], heads
+    html = _page(out)
+    for fragment in ("dreamteam", "hearing it", "Comms (hub wake)", "Worktree",
+                     "no workspace declares it", "set on this agent", "roster"):
+        assert fragment in html, f"missing from the page: {fragment}"
 
 
-def test_the_panel_does_nothing_to_the_agent(box):
-    """Read-only is what makes it safe to open freely. A settings panel that can
-    restart or retire is one you open carefully."""
+def test_editable_rows_render_a_control_and_read_only_ones_do_not(box):
+    """Editability is shown by the CONTROL, not by a marker beside it: a row you
+    can change looks changeable. Worktree is derived, so a dropdown there would
+    promise an edit that cannot happen."""
+    html = _page(_drive(box, "run", "squad.settings", terminal="demo · idle",
+                        settings_out=MODEL))
+    assert html.count("<select") == 2, html
+    worktree = html[html.index("Worktree"):]
+    assert "<select" not in worktree[:400], "offered a control on a derived value"
+
+
+def test_the_current_value_is_the_selected_option(box):
+    """A dropdown that opens on the wrong entry misreports the setting AND makes
+    the first change a no-op that looks like a change."""
+    html = _page(_drive(box, "run", "squad.settings", terminal="demo · idle",
+                        settings_out=MODEL))
+    assert '<option selected>off</option>' in html, html
+    assert '<option selected>on</option>' not in html, "two options marked selected"
+
+
+def test_when_a_change_takes_effect_is_shown_beside_it(box):
+    """A launch flag does nothing until restart; a mute lands at once. One word
+    for both would be wrong half the time about whether the change is in force.
+    """
+    html = _page(_drive(box, "run", "squad.settings", terminal="demo · idle",
+                        settings_out=MODEL))
+    assert "immediately" in html and "next restart" in html, html
+
+
+def test_values_are_escaped_into_the_page(box):
+    """Nothing in the model is authored by us: agent names come from directory
+    names, launch args from the roster, squads from the hub."""
+    hostile = json.dumps({"agent": "demo", "sections": [{"title": "LAUNCH",
+        "note": "", "rows": [{"label": "Launch args",
+                              "value": "<script>bad()</script>", "source": "roster"}]}]})
+    html = _page(_drive(box, "run", "squad.settings", terminal="demo · idle",
+                        settings_out=hostile))
+    assert "<script>bad()</script>" not in html, "raw markup reached the page"
+    assert "&lt;script&gt;" in html
+
+
+def test_changing_a_dropdown_runs_the_command_the_model_named(box):
+    """The page can only act through postMessage, and the cockpit does not know
+    what a launch flag is — the model says which binary and which argv."""
     out = _drive(box, "run", "squad.settings", terminal="demo · idle",
-                 settings_out=MODEL, answers=["Comms"])   # a row IS selected
-    assert out["sent"] == [], "typed into the agent's tab"
+                 settings_out=MODEL, webview_msg={"type": "set", "row": "1.0",
+                                                  "value": "on"})
+    assert any(e.endswith("comms on demo") for e in out["execs"]), out["execs"]
+
+
+def test_a_message_naming_a_read_only_row_is_refused(box):
+    """The row index is a CLAIM from the page. Resolved against the model that
+    was actually rendered and refused when it names a row with no edit —
+    trusting it to address a command would let any message run one."""
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=MODEL, webview_msg={"type": "set", "row": "1.1",
+                                                  "value": "/etc"})
+    assert [e for e in out["execs"] if "settings" not in e] == [], out["execs"]
+    # It must REFUSE, not crash on the way to refusing. Dropping the edit check
+    # leaves a throw on row.edit.argv, which runs no command either — so
+    # asserting only "nothing ran" cannot tell a guard from an exception, and a
+    # mutant with the check deleted passed until this line existed.
+    assert not any("threw" in m for m in out["shown"]), out["shown"]
+
+
+def test_a_message_naming_no_row_at_all_is_refused(box):
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=MODEL, webview_msg={"type": "set", "row": "9.9",
+                                                  "value": "on"})
+    assert [e for e in out["execs"] if "settings" not in e] == [], out["execs"]
+    assert not any("threw" in m for m in out["shown"]), out["shown"]
+
+
+def test_choosing_the_value_it_already_has_runs_nothing(box):
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=MODEL, webview_msg={"type": "set", "row": "1.0",
+                                                  "value": "off"})
     assert [e for e in out["execs"] if "settings" not in e] == [], out["execs"]
 
 
-def test_a_failed_settings_call_reports_instead_of_opening_a_panel(box):
-    """A non-zero exit means the model may be stale, partial, or about something
-    else — rendering it anyway shows the operator numbers with no warning that
-    they are wrong.
+def test_the_page_is_re_read_after_an_edit(box):
+    """It must show the state AFTER the write, not the value that was sent —
+    those differ whenever a write is rejected, clamped or normalised. On failure
+    it also snaps the control back, because the browser already moved it."""
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=MODEL, webview_msg={"type": "set", "row": "1.0",
+                                                  "value": "on"})
+    assert len([e for e in out["execs"] if "settings" in e]) == 2, out["execs"]
 
-    Deliberately supplies parseable stdout ALONGSIDE the failure. Without it the
-    error branch's early return is unfalsifiable: stdout is empty, so the
-    unparseable-output guard behind it catches the fall-through and the panel
-    stays closed either way. (Measured — a mutant deleting this return passed.)
-    """
+
+def test_a_failed_settings_call_reports_instead_of_rendering(box):
+    """A non-zero exit means the model may be stale or partial; rendering it
+    anyway shows values with no warning they are wrong.
+
+    Supplies parseable stdout ALONGSIDE the failure, or the error branch's early
+    return is masked by the parse guard behind it."""
     out = _drive(box, "run", "squad.settings", terminal="demo · idle",
                  settings_out=MODEL, settings_fail="not opted in")
-    assert out["picks"] == [], "rendered a model from a call that failed"
+    assert not any("dreamteam" in v["html"] for v in out["views"]), out["views"]
     assert any("not opted in" in s for s in out["shown"]), out["shown"]
 
 
 def test_unreadable_output_is_reported_not_rendered(box):
     out = _drive(box, "run", "squad.settings", terminal="demo · idle",
                  settings_out="this is not json")
-    assert out["picks"] == []
+    assert not any("SQUADS" in v["html"] for v in out["views"]), out["views"]
     assert any("unreadable" in s for s in out["shown"]), out["shown"]
-
-
-EDITABLE = json.dumps({
-    "agent": "demo",
-    "sections": [{"title": "LAUNCH", "note": "", "rows": [
-        {"label": "Comms (hub wake)", "value": "off", "source": "set on this agent",
-         "edit": {"kind": "comms", "choices": ["on", "off"], "bin": "squad",
-                  "argv": ["comms", "{}", "demo"], "applies": "next restart"}},
-        {"label": "Worktree", "value": "/tmp/demo", "source": "roster"},
-    ]}],
-})
-
-
-def test_editable_rows_are_marked_and_read_only_ones_are_not(box):
-    """Most rows CANNOT be changed — identity is derived, membership comes from
-    a workspace. Without a marker every row invites a click and most do nothing,
-    which reads as a broken panel rather than a deliberate read-only value."""
-    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
-                 settings_out=EDITABLE)
-    rows = {i["label"]: i for i in out["picks"][0] if not i["separator"]}
-    assert "$(pencil) Comms (hub wake)" in rows, rows
-    assert "Worktree" in rows, "a read-only row was marked editable"
-
-
-def test_choosing_a_value_runs_the_command_the_model_named(box):
-    """The cockpit does not know what a launch flag is; the model tells it which
-    binary and which argv. That is what lets a web UI offer the same edits
-    without reimplementing them."""
-    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
-                 settings_out=EDITABLE, answers=["Comms", "on"])
-    assert any(e.endswith("comms on demo") for e in out["execs"]), out["execs"]
-
-
-def test_the_placeholder_says_when_the_change_takes_effect(box):
-    """A launch flag does nothing until restart; a mute lands at once. Saying
-    which BEFORE the choice is the difference between an informed click and a
-    surprise."""
-    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
-                 settings_out=EDITABLE, answers=["Comms"])
-    assert len(out["picks"]) == 2, "no second picker was offered"
-    assert out["picks"][1][0]["label"] in ("on", "off")
-
-
-def test_cancelling_the_value_picker_changes_nothing(box):
-    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
-                 settings_out=EDITABLE, answers=["Comms"])
-    assert not any("comms" in e for e in out["execs"]), out["execs"]
-
-
-def test_choosing_the_value_it_already_has_runs_nothing(box):
-    """Every one of these verbs is idempotent, so this is not about safety — it
-    is about not reporting "changed" when nothing did."""
-    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
-                 settings_out=EDITABLE, answers=["Comms", "off"])
-    assert not any(e.endswith("comms off demo") for e in out["execs"]), out["execs"]
-    assert any("already" in s for s in out["shown"]), out["shown"]
-
-
-def test_picking_a_read_only_row_does_nothing_at_all(box):
-    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
-                 settings_out=EDITABLE, answers=["Worktree"])
-    assert len(out["picks"]) == 1, "offered to edit a read-only row"
-    assert [e for e in out["execs"] if "settings" not in e] == [], out["execs"]
-
-
-def test_the_panel_reopens_from_the_cli_after_an_edit(box):
-    """It must show the state AFTER the write, not the value that was sent —
-    those differ whenever a write is rejected, clamped or normalised. Re-reading
-    is the only way the panel can be right about that."""
-    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
-                 settings_out=EDITABLE, answers=["Comms", "on"])
-    assert len([e for e in out["execs"] if "settings" in e]) == 2, out["execs"]
 
 
 def test_settings_on_a_non_agent_tab_warns(box):
     out = _drive(box, "run", "squad.settings", settings_out=MODEL)
-    assert out["picks"] == [] and out["execs"] == []
+    assert not any("dreamteam" in v["html"] for v in out["views"])
     assert any("no squad agent" in s for s in out["shown"]), out
+
+
+def test_the_unopened_panel_says_how_to_open_it(box):
+    """The view resolves as soon as the Squad tab is shown, which can happen
+    before any agent is chosen. A blank panel there reads as broken."""
+    out = _drive(box, "commands")
+    assert out.get("views"), "the provider was never resolved"
+    assert "Right-click" in out["views"][0]["html"], out["views"][0]["html"]
 
 
 # ---- operator-editable lists (prompts.txt / slash.txt) --------------------
