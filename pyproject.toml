@@ -9,6 +9,7 @@ description = "Inter-agent messaging hub — connect multiple Claude sessions vi
 requires-python = ">=3.11"
 dependencies = [
     "fastmcp>=2.0.0",
+    "textual>=0.80",
 ]
 
 [project.optional-dependencies]

@@ -36,7 +36,11 @@ const vscode = {
       vscode._handlers[id] = fn;
       return D;
     },
-    executeCommand() {
+    executeCommand(id) {
+      // Recorded: revealing the panel is the difference between "Settings…"
+      // working and appearing to do nothing whenever the Squad tab is not the
+      // visible one — which is the normal case.
+      executed.push(id);
       return Promise.resolve();
     },
   },
@@ -48,7 +52,10 @@ const vscode = {
       const t = {
         name: opts && opts.name,
         shellIntegration: true, // so sendWhenReady fires synchronously
-        show() {},
+        // Recorded: REVEALING a terminal is a visible act. The cockpit yanked
+        // the panel to the board on every roster write, which is invisible to
+        // any test that only checks which terminals exist.
+        show() { shown_terms.push(t.name); },
         sendText(x) {
           sent.push(x);
         },
@@ -60,6 +67,26 @@ const vscode = {
     async showQuickPick(items) {
       const want = nextAnswer();
       const list = await items;
+      // Record what was OFFERED, not just what was chosen. A picker's contents
+      // are otherwise unobservable: `find` returns the first match, so a list
+      // holding an entry twice is indistinguishable from one holding it once,
+      // and a list that lost entries is indistinguishable from a test that
+      // didn't ask for them. The 2026-07-28 flatten turned eleven menu entries
+      // into rows of one list — "they are all still there" is the claim, and
+      // this is the only thing that can check it.
+      offered.push(list.map((i) => String((i && i.label) || i)));
+      // Full items too. A settings row is label + description + SOURCE, and
+      // flattening to labels throws away the two parts the panel exists to
+      // show — "every value names where it came from" is unassertable against
+      // a list of labels.
+      picks.push(
+        list.map((i) =>
+          i && typeof i === "object"
+            ? { label: String(i.label || ""), description: String(i.description || ""),
+                detail: String(i.detail || ""), separator: i.kind === 999 }
+            : { label: String(i), description: "", detail: "", separator: false }
+        )
+      );
       if (want === undefined) return undefined;
       return list.find((i) => String(i.label || i).includes(want));
     },
@@ -83,6 +110,35 @@ const vscode = {
     async showOpenDialog() {
       return undefined;
     },
+    // Recorded because "offers to CREATE the missing file" is only
+    // distinguishable from the old dead-end warning by what it opens.
+    async showTextDocument(doc) {
+      opened.push((doc && doc.fsPath) || String(doc));
+      return {};
+    },
+    // The settings page is a webview PANEL. Both halves are observable on
+    // purpose: the rendered html IS the behaviour, and the message handler is
+    // the only route by which an edit can be triggered, since the page can act
+    // solely through postMessage.
+    createWebviewPanel(id, title) {
+      const panel = {
+        title,
+        webview: {
+          options: {},
+          set html(v) { views.push({ id, title: panel.title, html: v }); },
+          get html() { return views.length ? views[views.length - 1].html : ""; },
+          onDidReceiveMessage(cb) { msgHandlers.push(cb); return D; },
+          postMessage() { return Promise.resolve(true); },
+        },
+        // Recorded so a test can prove ONE tab is retargeted rather than a new
+        // one opened per click — which is invisible from the html alone.
+        reveal() { revealed.push(panel.title); },
+        onDidDispose() { return D; },
+        dispose() {},
+      };
+      panels.push(panel);
+      return panel;
+    },
     onDidChangeTerminalShellIntegration: ev,
     onDidChangeActiveTerminal: ev,
     onDidCloseTerminal: ev,
@@ -92,9 +148,19 @@ const vscode = {
     workspaceFile: process.env.HARNESS_WSFILE
       ? { fsPath: process.env.HARNESS_WSFILE }
       : undefined,
-    workspaceFolders: [],
+    // Env-driven so a test can put the extension in the state where it builds
+    // the cockpit: the operator tabs are gated on a workspace FILE plus at
+    // least one roster agent whose worktree is one of its folders. With this
+    // hardcoded empty, that whole path — board and settings tabs included —
+    // had never run once.
+    workspaceFolders: JSON.parse(process.env.HARNESS_WSFOLDERS || "[]").map(
+      (p) => ({ uri: { fsPath: p }, name: String(p).split("/").pop() })
+    ),
     getConfiguration() {
       return { get: () => undefined };
+    },
+    async openTextDocument(uri) {
+      return { fsPath: (uri && uri.fsPath) || String(uri) };
     },
     createFileSystemWatcher() {
       // Keep the callbacks so a test can fire them. With `ev` for all three the
@@ -127,6 +193,9 @@ const vscode = {
       return true;
     },
   },
+  // Real value is 999 in the VSCode API; the harness only needs the identity
+  // to hold so a separator is distinguishable from a row.
+  QuickPickItemKind: { Separator: 999, Default: 0 },
   ThemeIcon: class {
     constructor(id) {
       this.id = id;
@@ -138,6 +207,7 @@ const vscode = {
     }
   },
   Uri: { file: (p) => ({ fsPath: p, toString: () => p }) },
+  ViewColumn: { Active: -1, One: 1, Beside: -2 },
   RelativePattern: class {
     constructor(base, pattern) {
       this.base = base;
@@ -159,6 +229,16 @@ const vscode = {
 // child_process too and record both. `execSync` stays real: the preview/dry-run
 // paths legitimately shell out and expect output.
 const execs = [];
+const offered = [];
+const picks = [];
+const views = [];
+const panels = [];
+const revealed = [];
+const shown_terms = [];
+let settingsCalls = 0;
+const msgHandlers = [];
+const executed = [];
+const opened = [];
 const folderOps = [];
 const watcherCbs = [];
 const realCp = require("child_process");
@@ -167,7 +247,46 @@ const cpStub = {
   execFile(file, args, opts, cb) {
     execs.push([file, ...(Array.isArray(args) ? args : [])].join(" "));
     const done = typeof opts === "function" ? opts : cb;
-    if (typeof done === "function") done(null, "", "");
+    // `squad attached <a>` is a PROBE whose exit code picks the start path, so
+    // a stub that always succeeds makes only the attached branch reachable —
+    // which is how the typed path silently stopped being covered.
+    const isProbe = Array.isArray(args) && args[0] === "attached";
+    const notAttached = isProbe && process.env.HARNESS_NOT_ATTACHED;
+    // `mcp-hub settings --json` is READ, not fire-and-forget: the settings panel
+    // parses its stdout, so a stub that always answered "" made the only
+    // realistic path unreachable and every settings test exercised the
+    // unparseable-output branch instead.
+    const isSettings = Array.isArray(args) && args[0] === "settings";
+    // Per-call output and latency, so a test can stage the ORDER replies come
+    // back in. Two quick clicks race, and the guard under test only matters
+    // when the FIRST call is the slower one — which cannot happen with a stub
+    // that answers everything instantly and identically.
+    if (isSettings) settingsCalls += 1;
+    const nth = settingsCalls;
+    const settingsOut =
+      nth > 1 && process.env.HARNESS_SETTINGS_OUT2
+        ? process.env.HARNESS_SETTINGS_OUT2
+        : process.env.HARNESS_SETTINGS_OUT || "";
+    const delay =
+      nth === 1 ? Number(process.env.HARNESS_SETTINGS_DELAY_FIRST || 0) : 0;
+    if (isSettings && delay > 0 && typeof done === "function") {
+      setTimeout(() => done(null, settingsOut, ""), delay);
+      return { on() {}, unref() {} };
+    }
+    if (typeof done === "function") {
+      if (isSettings && process.env.HARNESS_SETTINGS_FAIL) {
+        // stdout is emitted too when a test supplies it: a command can print
+        // usable output and STILL exit non-zero, and that is the only case
+        // where the error branch's early return is load-bearing rather than
+        // masked by the unparseable-output guard behind it.
+        done(Object.assign(new Error("exit 1"), { code: 1 }),
+             process.env.HARNESS_SETTINGS_OUT || "",
+             process.env.HARNESS_SETTINGS_FAIL);
+      } else {
+        done(notAttached ? Object.assign(new Error("exit 1"), { code: 1 }) : null,
+             isSettings ? settingsOut : "", "");
+      }
+    }
     return { on() {}, unref() {} };
   },
   spawn(file, args) {
@@ -204,6 +323,7 @@ const extPath = process.env.HARNESS_EXT || path.join(
 const ext = require(extPath);
 ext.activate({ subscriptions: [] });
 
+
 (async () => {
   if (mode === "shortlabel") {
     // The display rule is mirrored in squad's short_label(); this exposes the JS
@@ -212,7 +332,7 @@ ext.activate({ subscriptions: [] });
     return;
   }
   if (mode === "commands") {
-    console.log(JSON.stringify({ registered: registered.sort() }));
+    console.log(JSON.stringify({ registered: registered.sort(), views }));
     return;
   }
   if (mode === "run") {
@@ -231,6 +351,13 @@ ext.activate({ subscriptions: [] });
       : undefined;
     try {
       await fn(clicked);
+      // A second click on the same command. "One tab, retargeted" is a claim
+      // about what the SECOND invocation does, and is invisible to any test
+      // that only ever clicks once.
+      if (process.env.HARNESS_RUN_TWICE) {
+        await fn(clicked);
+        for (let i = 0; i < 30; i++) await new Promise((r) => setTimeout(r, 25));
+      }
       // withAgents() invokes its callback WITHOUT awaiting it, so the command
       // returns before any dialog has run. Drain the microtask/timer queues
       // until nothing new arrives, rather than guessing a sleep.
@@ -239,9 +366,23 @@ ext.activate({ subscriptions: [] });
         await new Promise((r) => setTimeout(r, 25));
       }
     } catch (e) {
-      console.log(JSON.stringify({ error: String((e && e.message) || e), sent, shown, execs, folderOps }));
+      console.log(JSON.stringify({ error: String((e && e.message) || e), sent, shown, execs, offered, opened, picks, views, executed, panelCount: panels.length, revealed, shown_terms, folderOps }));
       process.exitCode = 3;
       return;
+    }
+    // Simulates the operator changing a dropdown in the rendered page. The
+    // page can only act through postMessage, so this is the ONLY route by
+    // which an edit is reachable — without it the whole editable half of the
+    // panel is untestable.
+    if (process.env.HARNESS_WEBVIEW_MSG) {
+      for (const cb of msgHandlers) {
+        try {
+          await cb(JSON.parse(process.env.HARNESS_WEBVIEW_MSG));
+        } catch (e) {
+          shown.push(`message handler threw: ${String((e && e.message) || e)}`);
+        }
+      }
+      for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 25));
     }
     if (process.env.HARNESS_FIRE_ROSTER) {
       for (const cb of watcherCbs) {
@@ -253,7 +394,7 @@ ext.activate({ subscriptions: [] });
       }
       for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 25));
     }
-    console.log(JSON.stringify({ sent, shown, execs, folderOps }));
+    console.log(JSON.stringify({ sent, shown, execs, offered, opened, picks, views, executed, panelCount: panels.length, revealed, shown_terms, folderOps }));
     return;
   }
   console.log(JSON.stringify({ error: `unknown mode: ${mode}` }));

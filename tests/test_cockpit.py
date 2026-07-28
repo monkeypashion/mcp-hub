@@ -45,19 +45,38 @@ def box(tmp_path):
 
 def _drive(home: pathlib.Path, mode: str, target: str = "",
            answers=None, wsfile: str = "", terminal: str = "",
-           exec_out: str = "", exec_fail: str = "", fire_roster: bool = False) -> dict:
+           exec_out: str = "", exec_fail: str = "", fire_roster: bool = False,
+           not_attached: bool = False, settings_out: str = "",
+           settings_fail: str = "", webview_msg=None, twice: bool = False,
+           settings_out2: str = "", delay_first: int = 0, wsfolders=None) -> dict:
     env = dict(
         os.environ,
         HOME=str(home),
         PATH="/nonexistent",          # no tailscale ⇒ no machine-picker step
         HARNESS_ANSWERS=json.dumps(answers or []),
     )
+    if settings_out:
+        env["HARNESS_SETTINGS_OUT"] = settings_out
+    if settings_fail:
+        env["HARNESS_SETTINGS_FAIL"] = settings_fail
+    if webview_msg is not None:
+        env["HARNESS_WEBVIEW_MSG"] = json.dumps(webview_msg)
+    if twice:
+        env["HARNESS_RUN_TWICE"] = "1"
+    if settings_out2:
+        env["HARNESS_SETTINGS_OUT2"] = settings_out2
+    if delay_first:
+        env["HARNESS_SETTINGS_DELAY_FIRST"] = str(delay_first)
+    if wsfolders:
+        env["HARNESS_WSFOLDERS"] = json.dumps([str(p) for p in wsfolders])
     if exec_out:
         env["HARNESS_EXEC_OUT"] = exec_out
     if exec_fail:
         env["HARNESS_EXEC_FAIL"] = exec_fail
     if fire_roster:
         env["HARNESS_FIRE_ROSTER"] = "1"
+    if not_attached:
+        env["HARNESS_NOT_ATTACHED"] = "1"
     if wsfile:
         env["HARNESS_WSFILE"] = wsfile
     if terminal:
@@ -99,6 +118,53 @@ def test_every_declared_command_is_implemented_and_reachable(box):
     assert not orphans, f"implemented but undeclared (palette cannot reach): {orphans}"
     assert not (declared - in_menus), \
         f"declared but in no menu (right-click cannot reach it): {sorted(declared - in_menus)}"
+
+
+def _menu_graph():
+    pkg = json.loads((EXT / "package.json").read_text())
+    c = pkg["contributes"]
+    return c, {s["id"] for s in c.get("submenus", [])}, c["menus"]
+
+
+def test_no_submenu_is_dangling_or_stranded():
+    """The menu is a GRAPH, and both broken edges are invisible until clicked.
+
+    A submenu referenced but not declared renders as nothing; one declared and
+    populated but never referenced strands its entries where no right-click
+    reaches them — and `test_..._reachable` above counts those entries as
+    reachable, because it only asks whether a command appears in SOME menu.
+    Restructuring is precisely when both happen.
+    """
+    _, declared, menus = _menu_graph()
+    referenced = {i["submenu"] for items in menus.values()
+                  for i in items if "submenu" in i}
+    assert not (referenced - declared), \
+        f"menu points at undeclared submenu(s): {sorted(referenced - declared)}"
+    roots = {"squad.agentMenu"}            # reached from terminal/*, not by id
+    assert not (declared - referenced - roots), \
+        f"submenu declared but nothing opens it: {sorted(declared - referenced - roots)}"
+    assert not (declared - set(menus)), \
+        f"submenu declared with no entries — renders empty: {sorted(declared - set(menus))}"
+
+
+def test_the_menu_is_never_three_levels_deep():
+    """The flatten's whole point (2026-07-28). Comms lived at depth three under
+    Restart → Launch settings and could not be found; nesting creeps back one
+    convenient submenu at a time, so pin the depth rather than the layout.
+    """
+    _, _, menus = _menu_graph()
+    depth = {}
+
+    def walk(mid, d, seen):
+        depth[mid] = max(depth.get(mid, 0), d)
+        for i in menus.get(mid, []):
+            sub = i.get("submenu")
+            if sub and sub not in seen:
+                walk(sub, d + 1, seen | {sub})
+
+    walk("squad.agentMenu", 1, {"squad.agentMenu"})
+    too_deep = {m: d for m, d in depth.items() if d > 2}
+    assert not too_deep, f"submenu(s) below the second level: {too_deep}"
 
 
 # ---- teardown, the destructive one ---------------------------------------
@@ -209,32 +275,95 @@ def test_add_folder_cancelled_dialog_changes_nothing(box, tmp_path):
     assert out["sent"] == []
 
 
-# ---- Start & attach: a regression that already happened once -------------
+# ---- Restart: a regression that already happened once ---------------------
+#
+# The fresh variant asks first, so every case below must answer it or the
+# command returns having done nothing. OK is a no-op for the resume variant,
+# which has no dialog to consume it.
+OK = ["Fresh restart"]
+
 
 @pytest.mark.parametrize("command,mode", [
     ("squad.startAttach", "--resume"),
     ("squad.startAttachFresh", "--fresh"),
 ])
-def test_start_and_attach_actually_attaches(box, command, mode):
-    """This broke in production today and the operator caught it, not a test.
-
-    It was rewired to start the agent via a background exec, which left the tab a
-    bare shell — so "Start & attach" only started. Attaching is a property of THIS
-    terminal, so the command must be TYPED INTO THE TAB, and it must contain the
-    attach as well as the restart. Both halves asserted, because the bug was the
-    presence of one without the other.
+def test_start_and_attach_on_a_SHELL_tab_types_the_command(box, command, mode):
+    """The 92a7954 regression: rewiring this to a background exec left the tab a
+    bare shell, so "Start & attach" only started. Attaching is a property of THIS
+    terminal, so when the tab is a shell the command must be TYPED, and it must
+    carry the attach as well as the restart — the bug was one without the other.
     """
-    out = _drive(box, "run", command, terminal="demo · idle")
+    out = _drive(box, "run", command, terminal="demo · idle", not_attached=True,
+                 answers=OK)
     assert len(out["sent"]) == 1, out
     cmd = out["sent"][0]
     assert "squad restart demo" in cmd and mode in cmd, cmd
     assert "squad attach demo" in cmd, f"started without attaching: {cmd}"
 
 
-def test_start_and_attach_on_a_non_agent_tab_warns(box):
-    out = _drive(box, "run", "squad.startAttach")
+@pytest.mark.parametrize("command,mode", [
+    ("squad.startAttach", "--resume"),
+    ("squad.startAttachFresh", "--fresh"),
+])
+def test_start_and_attach_on_an_ATTACHED_tab_does_not_type(box, command, mode):
+    """The other half, and the one the operator hit: the tab is already a running
+    agent, so the pane is Claude, not a shell. Typing there puts the command in
+    the AGENT'S prompt — "it just keeps putting the command into the chat box".
+
+    The restart must go to the BACKGROUND instead, which is sufficient because
+    squad restart respawns the pane in place and attached viewers keep watching.
+
+    Asserting sent == [] is the load-bearing half: this bug is INVISIBLE to a
+    test that only checks the restart happened, because it happened either way.
+    """
+    out = _drive(box, "run", command, terminal="demo · idle", answers=OK)  # attached
+    assert out["sent"] == [], f"typed into a tab that is a live agent: {out['sent']}"
+    assert any(f"restart demo {mode}" in e for e in out["execs"]), out["execs"]
+
+
+@pytest.mark.parametrize("command", ["squad.startAttach", "squad.startAttachFresh"])
+def test_start_and_attach_probes_before_choosing_a_path(box, command):
+    """The choice must be made from the tab's ACTUAL state, not assumed. Without
+    the probe there is only one path and one of the two cases is always wrong.
+    """
+    out = _drive(box, "run", command, terminal="demo · idle", answers=OK)
+    assert any("attached demo" in e for e in out["execs"]), \
+        f"chose a start path without asking whether the tab is attached: {out['execs']}"
+
+
+@pytest.mark.parametrize("not_attached", [False, True])
+def test_a_fresh_restart_asks_before_dropping_the_conversation(box, not_attached):
+    """The 2026-07-28 flatten merged squad.restartFresh into this command, and
+    only ONE of the two asked. Both paths must inherit the guard, because which
+    one runs depends on whether a viewer happens to be attached — a property of
+    the operator's window, not of the intent.
+    """
+    out = _drive(box, "run", "squad.startAttachFresh", terminal="demo · idle",
+                 not_attached=not_attached)          # no answer ⇒ dialog cancels
+    assert out["sent"] == [] and not any("restart demo" in e for e in out["execs"]), \
+        f"restarted fresh with the confirm declined: {out}"
+    assert any("BLANK" in s for s in out["shown"]), f"it never asked: {out['shown']}"
+
+
+def test_a_resume_restart_asks_nothing(box):
+    """The other half: resume keeps the conversation, so a confirm there would
+    be a dialog on the most-used entry in the menu, teaching the operator to
+    click through the one that matters."""
+    out = _drive(box, "run", "squad.startAttach", terminal="demo · idle")
+    assert any("restart demo --resume" in e for e in out["execs"]), out
+    assert not out["shown"], f"resume should ask nothing: {out['shown']}"
+
+
+@pytest.mark.parametrize("command", ["squad.startAttach", "squad.startAttachFresh"])
+def test_start_and_attach_on_a_non_agent_tab_warns(box, command):
+    """No agent ⇒ one warning, from one place. The fresh variant resolves agents
+    itself in order to name them in the confirm, so it can reach this state by a
+    second route and must not ask about a restart it cannot perform."""
+    out = _drive(box, "run", command, answers=OK)
     assert out["sent"] == []
     assert any("no squad agent" in s for s in out["shown"]), out
+    assert not any("BLANK" in s for s in out["shown"]), \
+        f"asked whether to wipe a conversation with no agent selected: {out['shown']}"
 
 
 # ---- the destructive one, and the two everyday ones ----------------------
@@ -262,17 +391,17 @@ def test_clone_from_github_cancelled_enrols_nothing(box):
     assert out["sent"] == []
 
 
-@pytest.mark.parametrize("command,expect", [
-    ("squad.stop", "stop"),
-    ("squad.restartResume", "restart"),
-])
-def test_everyday_lifecycle_commands_target_the_clicked_agent(box, command, expect):
-    """Whatever else changes, these must act on the tab you right-clicked and
-    name that agent explicitly — never the active terminal by accident."""
-    out = _drive(box, "run", command, terminal="demo · idle")
+def test_stop_targets_the_clicked_agent(box):
+    """Whatever else changes, this must act on the tab you right-clicked and name
+    that agent explicitly — never the active terminal by accident.
+
+    (squad.restartResume used to be tested alongside it and was deleted in the
+    2026-07-28 flatten: it was squad.startAttach's background half under a second
+    name. The restart tests above carry that coverage now.)"""
+    out = _drive(box, "run", "squad.stop", terminal="demo · idle")
     ran = out["sent"] + out["execs"]
-    assert ran, f"{command} did nothing at all"
-    assert any(f"{expect} demo" in s for s in ran), out
+    assert ran, "squad.stop did nothing at all"
+    assert any("stop demo" in s for s in ran), out
 
 
 def test_bulk_transport_requires_confirmation(box):
@@ -370,10 +499,332 @@ def test_duplicate_adds_no_folder_when_the_copy_never_landed(box, tmp_path):
     assert added == [], f"adopted a folder for a copy that never landed: {added}"
 
 
+# ---- the operator's own tabs (board + settings) ---------------------------
+
+def _cockpit(box, tmp_path):
+    """Put the extension in the state where it actually builds the cockpit: a
+    workspace FILE, plus a roster agent whose worktree is one of its folders."""
+    work = box / "Projects" / "demo"
+    work.mkdir(parents=True, exist_ok=True)
+    ws = tmp_path / "here.code-workspace"
+    ws.write_text(json.dumps({"folders": [{"path": str(work)}]}), encoding="utf-8")
+    return ws, work
+
+
+def test_the_cockpit_opens_a_board_and_a_settings_tab(box, tmp_path):
+    """Both are the operator's own views rather than agents, and both are made
+    the same way — a terminal in the panel. That is the whole reason the
+    settings panel is shaped like this: it asks nothing of VSCode's UI, so it
+    can sit beside the agents instead of hiding them.
+
+    This path had never executed in a test at all — the harness reported no
+    workspace folders, so the gate above it always returned early.
+    """
+    ws, work = _cockpit(box, tmp_path)
+    out = _drive(box, "run", "squad.stop", terminal="demo · idle",
+                 wsfile=str(ws), wsfolders=[work])
+    launched = " ".join(out["sent"])
+    assert "board -w" in launched, out["sent"]
+    assert "settings --tui" in launched, out["sent"]
+
+
+def test_a_roster_change_does_not_yank_the_panel_to_the_board(box, tmp_path):
+    """Revealing the panel is a STARTUP concern. buildCockpit also runs from the
+    roster watcher, and every launch setting the operator changes writes
+    squad.conf — so this line pulled the panel to the board each time, throwing
+    them out of the settings tab mid-edit.
+    """
+    ws, work = _cockpit(box, tmp_path)
+    out = _drive(box, "run", "squad.stop", terminal="demo · idle",
+                 wsfile=str(ws), wsfolders=[work], fire_roster=True)
+    boards = [n for n in out["shown_terms"] if n == "squad-board"]
+    assert len(boards) <= 1, \
+        f"revealed the board {len(boards)} times — a rebuild stole the view"
+
+
+def test_the_settings_tab_is_scoped_to_the_open_workspace(box, tmp_path):
+    """Same folder-membership rule the tabs themselves use, so the panel lists
+    exactly the agents whose tabs are beside it — rather than every agent on
+    the machine, which is a different and much longer list."""
+    ws, work = _cockpit(box, tmp_path)
+    out = _drive(box, "run", "squad.stop", terminal="demo · idle",
+                 wsfile=str(ws), wsfolders=[work])
+    line = next(s for s in out["sent"] if "settings --tui" in s)
+    assert f"--workspace {json.dumps(str(ws))}" in line, line
+
+
+# ---- the settings panel ---------------------------------------------------
+
+MODEL = json.dumps({
+    "agent": "demo",
+    "sections": [
+        {"title": "SQUADS", "note": "decides who hears its broadcasts",
+         "rows": [{"label": "dreamteam", "value": "hearing it",
+                   "source": "set on this agent — no workspace declares it",
+                   "edit": {"kind": "mute", "choices": ["hear", "mute"],
+                            "bin": "mcp-hub", "applies": "immediately",
+                            "argv": ["mute", "--agent", "demo", "--squad",
+                                     "dreamteam", "--state", "{}"]}}]},
+        {"title": "LAUNCH", "note": "",
+         "rows": [
+             {"label": "Comms (hub wake)", "value": "off",
+              "source": "set on this agent",
+              "edit": {"kind": "comms", "choices": ["on", "off"], "bin": "squad",
+                       "argv": ["comms", "{}", "demo"], "applies": "next restart"}},
+             {"label": "Worktree", "value": "/tmp/demo", "source": "roster"},
+         ]},
+    ],
+})
+
+
+def _page(out):
+    assert out["views"], f"nothing was ever rendered: {out}"
+    return out["views"][-1]["html"]
+
+
+def test_settings_asks_the_cli_rather_than_reading_files_itself(box):
+    """Provenance is the hard part, and duplicating it in the extension is how
+    the future web UI comes to disagree with the cockpit about what an agent is
+    set to. The panel must be a renderer, so the cli call is the behaviour."""
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=MODEL)
+    call = next((e for e in out["execs"] if "settings" in e), None)
+    assert call, out["execs"]
+    assert "--json" in call and f"--cwd {box}/Projects/demo" in call, call
+
+
+def test_the_tab_is_titled_for_the_agent_it_shows(box):
+    """One tab is retargeted rather than one opened per agent, so the title is
+    the only thing saying WHICH agent you are looking at."""
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=MODEL)
+    assert out["panelCount"] == 1, out["panelCount"]
+    assert out["views"][-1]["title"] == "Settings — demo", out["views"]
+
+
+def test_a_second_click_retargets_the_same_tab(box):
+    """Otherwise a session with ten agents ends up with ten near-identical tabs.
+    Invisible to a test that only clicks once — the first click is correct
+    either way."""
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=MODEL, twice=True)
+    assert out["panelCount"] == 1, f"opened {out['panelCount']} tabs"
+    assert out["revealed"], "the existing tab was never brought forward"
+
+
+def test_a_slow_reply_cannot_overwrite_a_newer_one(box):
+    """Two quick clicks race. If the FIRST cli call is the slower one its reply
+    lands last, and without a guard it repaints the tab with the agent you did
+    not ask for — the panel then confidently shows the wrong machine's settings.
+
+    Staged by making call 1 slow and giving the two calls different payloads:
+    with an instant, identical stub the race cannot occur and the guard is
+    unfalsifiable. (Measured — a mutant deleting it passed until this existed.)
+    """
+    other = json.dumps({"agent": "second", "sections": [{"title": "LAUNCH",
+        "note": "", "rows": [{"label": "Comms (hub wake)", "value": "on",
+                              "source": "set on this agent"}]}]})
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=MODEL, settings_out2=other, twice=True,
+                 delay_first=250)
+    assert out["views"], out
+    # Matched on the RENDERED HEADING, not as a loose substring. "second"
+    # appears in the page's own CSS comment ("secondary sidebar"), so a
+    # substring check passes against a page showing the wrong agent entirely —
+    # which is exactly what the mutant produced while the test stayed green.
+    assert "<h1>second</h1>" in out["views"][-1]["html"], \
+        f"the stale reply won and repainted the page: {out['views'][-1]['html'][:300]}"
+
+
+def test_every_row_shows_its_value_and_its_source(box):
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=MODEL)
+    html = _page(out)
+    for fragment in ("dreamteam", "hearing it", "Comms (hub wake)", "Worktree",
+                     "no workspace declares it", "set on this agent", "roster"):
+        assert fragment in html, f"missing from the page: {fragment}"
+
+
+def test_editable_rows_render_a_control_and_read_only_ones_do_not(box):
+    """Editability is shown by the CONTROL, not by a marker beside it: a row you
+    can change looks changeable. Worktree is derived, so a dropdown there would
+    promise an edit that cannot happen."""
+    html = _page(_drive(box, "run", "squad.settings", terminal="demo · idle",
+                        settings_out=MODEL))
+    assert html.count("<select") == 2, html
+    worktree = html[html.index("Worktree"):]
+    assert "<select" not in worktree[:400], "offered a control on a derived value"
+
+
+def test_the_current_value_is_the_selected_option(box):
+    """A dropdown that opens on the wrong entry misreports the setting AND makes
+    the first change a no-op that looks like a change."""
+    html = _page(_drive(box, "run", "squad.settings", terminal="demo · idle",
+                        settings_out=MODEL))
+    assert '<option selected>off</option>' in html, html
+    assert '<option selected>on</option>' not in html, "two options marked selected"
+
+
+def test_when_a_change_takes_effect_is_shown_beside_it(box):
+    """A launch flag does nothing until restart; a mute lands at once. One word
+    for both would be wrong half the time about whether the change is in force.
+    """
+    html = _page(_drive(box, "run", "squad.settings", terminal="demo · idle",
+                        settings_out=MODEL))
+    assert "immediately" in html and "next restart" in html, html
+
+
+def test_values_are_escaped_into_the_page(box):
+    """Nothing in the model is authored by us: agent names come from directory
+    names, launch args from the roster, squads from the hub."""
+    hostile = json.dumps({"agent": "demo", "sections": [{"title": "LAUNCH",
+        "note": "", "rows": [{"label": "Launch args",
+                              "value": "<script>bad()</script>", "source": "roster"}]}]})
+    html = _page(_drive(box, "run", "squad.settings", terminal="demo · idle",
+                        settings_out=hostile))
+    assert "<script>bad()</script>" not in html, "raw markup reached the page"
+    assert "&lt;script&gt;" in html
+
+
+def test_changing_a_dropdown_runs_the_command_the_model_named(box):
+    """The page can only act through postMessage, and the cockpit does not know
+    what a launch flag is — the model says which binary and which argv."""
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=MODEL, webview_msg={"type": "set", "row": "1.0",
+                                                  "value": "on"})
+    assert any(e.endswith("comms on demo") for e in out["execs"]), out["execs"]
+
+
+def test_a_message_naming_a_read_only_row_is_refused(box):
+    """The row index is a CLAIM from the page. Resolved against the model that
+    was actually rendered and refused when it names a row with no edit —
+    trusting it to address a command would let any message run one."""
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=MODEL, webview_msg={"type": "set", "row": "1.1",
+                                                  "value": "/etc"})
+    assert [e for e in out["execs"] if "settings" not in e] == [], out["execs"]
+    # It must REFUSE, not crash on the way to refusing. Dropping the edit check
+    # leaves a throw on row.edit.argv, which runs no command either — so
+    # asserting only "nothing ran" cannot tell a guard from an exception, and a
+    # mutant with the check deleted passed until this line existed.
+    assert not any("threw" in m for m in out["shown"]), out["shown"]
+
+
+def test_a_message_naming_no_row_at_all_is_refused(box):
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=MODEL, webview_msg={"type": "set", "row": "9.9",
+                                                  "value": "on"})
+    assert [e for e in out["execs"] if "settings" not in e] == [], out["execs"]
+    assert not any("threw" in m for m in out["shown"]), out["shown"]
+
+
+def test_choosing_the_value_it_already_has_runs_nothing(box):
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=MODEL, webview_msg={"type": "set", "row": "1.0",
+                                                  "value": "off"})
+    assert [e for e in out["execs"] if "settings" not in e] == [], out["execs"]
+
+
+def test_the_page_is_re_read_after_an_edit(box):
+    """It must show the state AFTER the write, not the value that was sent —
+    those differ whenever a write is rejected, clamped or normalised. On failure
+    it also snaps the control back, because the browser already moved it."""
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=MODEL, webview_msg={"type": "set", "row": "1.0",
+                                                  "value": "on"})
+    assert len([e for e in out["execs"] if "settings" in e]) == 2, out["execs"]
+
+
+def test_a_failed_settings_call_reports_instead_of_rendering(box):
+    """A non-zero exit means the model may be stale or partial; rendering it
+    anyway shows values with no warning they are wrong.
+
+    Supplies parseable stdout ALONGSIDE the failure, or the error branch's early
+    return is masked by the parse guard behind it."""
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=MODEL, settings_fail="not opted in")
+    assert not any("dreamteam" in v["html"] for v in out["views"]), out["views"]
+    assert any("not opted in" in s for s in out["shown"]), out["shown"]
+
+
+def test_unreadable_output_is_reported_not_rendered(box):
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out="this is not json")
+    assert not any("SQUADS" in v["html"] for v in out["views"]), out["views"]
+    assert any("unreadable" in s for s in out["shown"]), out["shown"]
+
+
+def test_settings_on_a_non_agent_tab_warns(box):
+    out = _drive(box, "run", "squad.settings", settings_out=MODEL)
+    assert not any("dreamteam" in v["html"] for v in out["views"])
+    assert any("no squad agent" in s for s in out["shown"]), out
+
+
+def test_no_tab_is_opened_until_settings_is_asked_for(box):
+    """A webview PANEL is created on demand, unlike the docked view it replaces
+    which resolved the moment its container was shown. Activation must not put a
+    tab in the operator's editor."""
+    out = _drive(box, "commands")
+    assert not out.get("views"), f"opened a tab at activation: {out.get('views')}"
+
+
 # ---- operator-editable lists (prompts.txt / slash.txt) --------------------
 
 def _write_list(home: pathlib.Path, name: str, body: str):
     (home / ".config" / "squad" / name).write_text(body, encoding="utf-8")
+
+
+def test_stock_prompts_offers_to_create_the_file_it_needs(box):
+    """This entry used to dead-end in a warning naming a path.
+
+    On a machine that had never made prompts.txt — which is every machine until
+    someone does — the only possible outcome of clicking it was being told it
+    could do nothing, and nothing in the cockpit created the file. A menu entry
+    that can only fail is a menu entry that gets clicked once.
+    """
+    out = _drive(box, "run", "squad.stockPrompt", answers=["Create and open it"],
+                 terminal="demo · idle")
+    assert out["execs"] == [], "nothing should be sent to the agent"
+    target = str(box / ".config" / "squad" / "prompts.txt")
+    assert out["opened"] == [target], out
+    body = pathlib.Path(target).read_text(encoding="utf-8")
+    assert body.strip(), "created an empty file — nothing to learn the format from"
+    # Seeded ENTIRELY commented out: offering to create the file is not consent
+    # to start sending prompts the operator never chose.
+    assert all(ln.startswith("#") for ln in body.splitlines() if ln.strip()), body
+
+
+def test_declining_the_offer_creates_nothing(box):
+    out = _drive(box, "run", "squad.stockPrompt", answers=[], terminal="demo · idle")
+    assert out["opened"] == [] and out["execs"] == []
+    assert not (box / ".config" / "squad" / "prompts.txt").exists()
+
+
+def test_a_populated_list_goes_straight_to_the_picker(box):
+    _write_list(box, "prompts.txt", "# mine\nship it\n")
+    out = _drive(box, "run", "squad.stockPrompt", answers=["ship it"],
+                 terminal="demo · idle")
+    assert any("cmd demo ship it" in e for e in out["execs"]), out
+    assert out["opened"] == [], "an existing list must not open an editor"
+
+
+def test_a_comments_only_file_is_reopened_not_rewritten(box):
+    """The state the seed itself leaves behind, and the ONLY way to reach the
+    create path with the file already present.
+
+    A seeded file parses to zero prompts, so the next click offers to create it
+    again — and "create" must mean "open what is there". Asserting this against a
+    POPULATED file proves nothing: that path returns at the picker and never
+    reaches the write. (Measured — a mutant with the exists-check deleted passed
+    the populated-file version of this test.)
+    """
+    mine = "# my notes, kept\n# status please\n"
+    _write_list(box, "prompts.txt", mine)
+    out = _drive(box, "run", "squad.stockPrompt", answers=["Create and open it"],
+                 terminal="demo · idle")
+    target = box / ".config" / "squad" / "prompts.txt"
+    assert out["opened"] == [str(target)], out
+    assert target.read_text(encoding="utf-8") == mine, "clobbered the operator's file"
 
 
 def test_slash_offers_the_saved_list(box, tmp_path):
@@ -390,16 +841,68 @@ def test_slash_offers_the_saved_list(box, tmp_path):
     assert any("cmd demo /memory-sync" in e for e in out["execs"]), out
 
 
-def test_slash_with_no_file_behaves_exactly_as_before(box):
-    """A feature you haven't opted into must not make the old path longer.
+def test_the_builtins_are_offered_with_no_file_at_all(box):
+    """This REPLACES "no file ⇒ no quick pick, straight to the input box".
 
-    No file ⇒ no quick pick, no toast: straight to the input box, one step, the
-    way it has always worked.
+    That rule was right while /context, /cost and the rest had their own menu
+    entries: the picker was an opt-in extra, so it had to stay out of the way.
+    The 2026-07-28 flatten deleted those entries, which makes this picker the
+    only route to them — so on a machine with no slash.txt it must still offer
+    the eleven, or the flatten silently removed eleven commands instead of
+    moving them.
     """
     out = _drive(box, "run", "squad.slash.custom", answers=["/doctor"],
                  terminal="demo · idle")
     assert any("cmd demo /doctor" in e for e in out["execs"]), out
     assert not out["shown"], f"it should not have announced anything: {out['shown']}"
+    # every entry the flatten deleted, by name — the migration's actual claim
+    assert out["offered"], "no list was offered at all"
+    for cmd in ["/context", "/cost", "/status", "/todos", "/mcp", "/doctor",
+                "/help", "/compact", "/model", "/memory", "/clear"]:
+        assert cmd in out["offered"][0], f"{cmd} lost its menu entry and gained nothing"
+
+
+def test_a_saved_command_replaces_its_builtin_rather_than_doubling_it(box):
+    """Two lists merge into one, so an overlap has to resolve somewhere. Showing
+    /status twice looks like two different commands.
+
+    Asserted on the OFFERED list, not on what ran: the picker returns the first
+    match either way, so a duplicated list still sends one command and a
+    run-only assertion cannot see the defect at all.
+    """
+    _write_list(box, "slash.txt", "/status\n/review\n")
+    out = _drive(box, "run", "squad.slash.custom", answers=["/status"],
+                 terminal="demo · idle")
+    items = out["offered"][0]
+    assert items.count("/status") == 1, items
+    assert "/review" in items, items
+    assert items.index("/review") < items.index("/context"), \
+        f"the operator's own list must come first: {items}"
+
+
+@pytest.mark.parametrize("answers,expect_run", [
+    (["/clear", "Clear"], True),
+    (["/clear"], False),                       # confirm declined
+])
+def test_clear_still_confirms_now_that_it_has_no_menu_entry_of_its_own(box, answers, expect_run):
+    """/clear had a modal confirm because it was its own destructive entry.
+    Folding it into a list of eleven look-alikes is exactly when that guard gets
+    lost — so it now gates on the COMMAND, and must fire whichever route picked
+    it."""
+    out = _drive(box, "run", "squad.slash.custom", answers=answers,
+                 terminal="demo · idle")
+    ran = any("cmd demo /clear" in e for e in out["execs"])
+    assert ran is expect_run, out
+    assert any("wipes the conversation" in s for s in out["shown"]), \
+        f"/clear ran without asking: {out['shown']}"
+
+
+def test_a_typed_clear_confirms_too(box):
+    """The escape hatch must not be the way round the guard."""
+    out = _drive(box, "run", "squad.slash.custom", answers=["Type one", "/clear"],
+                 terminal="demo · idle")
+    assert not any("cmd demo /clear" in e for e in out["execs"]), out
+    assert any("wipes the conversation" in s for s in out["shown"]), out["shown"]
 
 
 def test_slash_list_still_lets_you_type_one(box):
@@ -433,10 +936,12 @@ def test_both_lists_share_one_reader(box):
     Comments and blank lines, proven on both.
     """
     _write_list(box, "prompts.txt", "# c\n\n  status please  \n")
-    _write_list(box, "slash.txt", "# c\n\n  /status  \n")
+    # NOT one of the built-ins, deliberately: /status would be in the list
+    # anyway, so this assertion would hold with slash.txt ignored entirely.
+    _write_list(box, "slash.txt", "# c\n\n  /handover  \n")
     p = _drive(box, "run", "squad.stockPrompt", answers=["status ple"],
                terminal="demo · idle")
-    s = _drive(box, "run", "squad.slash.custom", answers=["stat"],
+    s = _drive(box, "run", "squad.slash.custom", answers=["handov"],
                terminal="demo · idle")
     assert any("cmd demo status please" in e for e in p["execs"]), p
-    assert any("cmd demo /status" in e for e in s["execs"]), s
+    assert any("cmd demo /handover" in e for e in s["execs"]), s

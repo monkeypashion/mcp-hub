@@ -111,6 +111,32 @@ strip_args_tokens() {
     | tr '\n' ' ' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//' || true
 }
 
+# Strip a VALUE-TAKING flag and the token that follows it: "--model opus" is two
+# words, and strip_args_tokens can only match tokens it can describe. The value
+# is arbitrary (an alias, a full model id, a level), so there is no pattern for
+# it — position is the only thing that identifies it.
+#
+# Leaving the value behind is not a cosmetic bug: an orphaned "opus" becomes an
+# unknown positional and the next launch fails. Exactly the failure comms
+# avoided by naming both its tokens.
+strip_args_pair() {
+  printf '%s\n' "$1" | awk -v f="$2" '{
+    out = ""
+    for (i = 1; i <= NF; i++) {
+      if ($i == f) { i++; continue }   # skip the flag AND its value
+      out = (out == "" ? $i : out " " $i)
+    }
+    print out
+  }'
+}
+
+# Read a value-taking flag back out of an args string. Empty when absent.
+args_pair_value() {
+  printf '%s\n' "$1" | awk -v f="$2" '{
+    for (i = 1; i < NF; i++) if ($i == f) { print $(i + 1); exit }
+  }'
+}
+
 # Single writer for roster field 4 so args/comms/resume/arm_comms can't drift.
 roster_set_args() {
   local tmp; tmp="$(mktemp)"
@@ -1898,6 +1924,28 @@ case "${1:-help}" in
             # an on-demand agent comes to life (the cockpit's Start action).
             a="$(need_agent "${2:-}")" || exit 1
             up_one "$a" ;;
+  attached) # Is a viewer currently attached to this agent's session? exit 0 yes,
+            # 1 no. Built for the cockpit, which has to choose between two
+            # start paths that are NOT interchangeable:
+            #
+            #   tab is a SHELL (nothing attached) -> the command must be TYPED
+            #     into it, because attaching is a property of THIS terminal and
+            #     a background exec leaves the tab a bare shell (the 2026-07-26
+            #     "Start & attach only started" regression).
+            #   tab is ATTACHED to a live agent -> the pane is Claude, not a
+            #     shell, so typing puts the command in the AGENT'S PROMPT.
+            #     Operator hit exactly this trying to restart a running seat:
+            #     "it just keeps putting the command into the chat box".
+            #     Here restart must run in the BACKGROUND — it respawns the
+            #     pane in place and attached viewers keep watching, so nothing
+            #     needs typing at all.
+            #
+            # The discriminator is "is this session attached", NOT "is the agent
+            # running" — a running agent with no viewer is a shell tab, and it
+            # needs the typed path.
+            a="$(need_agent "${2:-}")" || exit 1
+            tm has-session -t "=$a" 2>/dev/null || exit 1
+            [ -n "$(tm list-clients -t "=$a" -F '#{client_tty}' 2>/dev/null)" ] ;;
   stop)     # explicit single-agent stop — the inverse of start. Kills the tmux
             # session (attached cockpit terminals drop back to their shell) and
             # retires the daemon so nothing keeps beating for a stopped agent.
@@ -2324,6 +2372,56 @@ case "${1:-help}" in
             esac
             roster_set_args "$a" "$new"
             echo "$a: resume $mode — takes effect on next launch (args: ${new:-<none>})"
+            exit 0 ;;
+  launch)   # Persist a value-taking launch flag: model and effort.
+            #   squad launch model  [agent] <alias|full-id|default>
+            #   squad launch effort [agent] <low|medium|high|xhigh|max|default>
+            #   squad launch model  [agent]            -> report
+            # "default" removes the flag, restoring claude's own default.
+            #
+            # Deliberately SEPARATE from `squad model`, which types /model into
+            # the running session and lasts until that session ends. These two
+            # verbs answer different questions — "what is it using now" versus
+            # "what should it start as" — and the settings panel showed the
+            # second as a setting while only the first existed, which made the
+            # panel lie. One writes field 4; the other writes a pane.
+            what="${2:-}"
+            case "$what" in
+              model)  flag="--model" ;;
+              effort) flag="--effort" ;;
+              *) echo "!! usage: $CMD launch model|effort [agent] <value|default>" >&2
+                 exit 1 ;;
+            esac
+            shift 2
+            if [ -n "${1:-}" ] && agents | grep -qxF -- "${1:-}"; then a="$1"; shift
+            else a="$(need_agent "")" || exit 1; fi
+            val="${1:-}"
+            cur="$(field "$a" 4)"
+            have="$(args_pair_value "$cur" "$flag")"
+            if [ -z "$val" ]; then
+              echo "$a: $what ${have:-default (flag not set)}"
+              exit 0
+            fi
+            # Refuse a value that looks like a flag: `squad launch model --fresh`
+            # would otherwise write "--model --fresh" and break every launch,
+            # with the roster looking plausible.
+            case "$val" in -*) echo "!! '$val' is not a $what value" >&2; exit 1 ;; esac
+            if [ "$what" = effort ]; then
+              case "$val" in
+                low|medium|high|xhigh|max|default) ;;
+                *) echo "!! effort must be low|medium|high|xhigh|max|default" >&2; exit 1 ;;
+              esac
+            fi
+            stripped="$(strip_args_pair "$cur" "$flag")"
+            if [ "$val" = default ]; then
+              new="$stripped"
+            else
+              new="$(printf '%s %s %s' "$stripped" "$flag" "$val" | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//')"
+            fi
+            roster_set_args "$a" "$new"
+            echo "$a: $what $val — takes effect on next launch (args: ${new:-<none>})"
+            tm has-session -t "=$a" 2>/dev/null && \
+              echo "   it's running now, so relaunch to apply: $CMD restart $a --resume"
             exit 0 ;;
   dash)     # The whole-squad monitor: ONE window, one live pane per agent, tiled.
             # Recreates the old "seven VSCode windows on one monitor" view in a

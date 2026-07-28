@@ -19,6 +19,15 @@ const os = require("os");
 const path = require("path");
 
 const SQUAD = path.join(os.homedir(), ".local", "bin", "squad");
+// Same directory as squad, installed as a link by the same step. Named
+// explicitly rather than trusting PATH because a VSCode extension host does not
+// inherit an interactive shell's PATH.
+const MCP_HUB = path.join(os.homedir(), ".local", "bin", "mcp-hub");
+// Guarded: QuickPickItemKind arrived in VSCode 1.64. Falling back to undefined
+// degrades a separator into an ordinary unselectable-looking row rather than
+// throwing while building the list, which would take the whole panel with it.
+const SEPARATOR =
+  (vscode.QuickPickItemKind && vscode.QuickPickItemKind.Separator) || undefined;
 
 // repo-key -> [codicon, terminal color id]; fallback below for unknown repos
 const THEME = {
@@ -58,6 +67,8 @@ const FALLBACK = ["terminal", "terminal.ansiBrightBlack"];
 // Terminal -> agent name, for context-menu target resolution
 const agentOf = new Map();
 let buildCockpitRef = null;   // set at activation so commands can refresh tabs
+// The panel is revealed once, at startup. See buildCockpit's tail.
+let revealedOnce = false;
 
 function rosterRows() {
   const conf = path.join(os.homedir(), ".config", "squad", "squad.conf");
@@ -153,10 +164,13 @@ function themeFor(agent) {
 // ONE function for both lists (~/.config/squad/prompts.txt and slash.txt) so
 // "same rules as prompts.txt" is structurally true rather than a claim in a
 // comment that can quietly stop being true.
+const operatorListPath = (name) =>
+  path.join(os.homedir(), ".config", "squad", name);
+
 function readOperatorList(name) {
   try {
     return fs
-      .readFileSync(path.join(os.homedir(), ".config", "squad", name), "utf8")
+      .readFileSync(operatorListPath(name), "utf8")
       .split("\n")
       .map((s) => s.trim())
       .filter((s) => s && !s.startsWith("#"));
@@ -164,6 +178,38 @@ function readOperatorList(name) {
     return [];
   }
 }
+
+// Create the list file with a worked example and open it for editing.
+//
+// "Stock prompt…" used to dead-end in a warning naming a path — a menu entry
+// whose only possible outcome was to tell you it could do nothing, on any
+// machine that had never made the file. Nothing created it, so nothing ever
+// would. The seed is entirely commented out, so the first click still shows an
+// empty list rather than silently installing prompts nobody chose.
+//
+// NEVER overwrites: this is the operator's file, and the only reason to be here
+// is that it was missing.
+async function openOperatorList(name, seed) {
+  const p = operatorListPath(name);
+  try {
+    if (!fs.existsSync(p)) {
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, seed, { flag: "wx" });
+    }
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(p));
+    await vscode.window.showTextDocument(doc);
+  } catch (e) {
+    vscode.window.showErrorMessage(`Squad: could not open ${p}: ${e.message}`);
+  }
+}
+
+const PROMPTS_SEED = `# Stock prompts — one per line, sent to the agent(s) you right-clicked.
+# Lines starting with # are ignored, so delete a # to enable one.
+#
+# status please
+# commit what you have, then tell me what is left
+# write up where you got to in memory before you run out of context
+`;
 
 // short label: strip the derived "-<hostname>" (sanitized like cli.py) — from
 // the MIDDLE as well as the end.
@@ -213,7 +259,34 @@ function startWithMode(args, mode) {
     any = true;
     inflight.set(t, Date.now());          // suppress the focus toast for this tab
     t.show(false);
-    t.sendText(`clear; squad restart ${a} ${mode} >/dev/null 2>&1 && squad attach ${a}; clear`);
+    // TWO PATHS, and they are not interchangeable — picked by whether a viewer
+    // is ATTACHED, not by whether the agent is running.
+    //
+    // Typing is right for a SHELL tab: attaching is a property of THIS
+    // terminal, and a background exec would leave the tab a bare shell (the
+    // 2026-07-26 "Start & attach only started" regression, which is why the
+    // typed form exists at all).
+    //
+    // Typing is WRONG for an attached tab: the pane is Claude, so the command
+    // lands in the agent's own prompt. The operator hit this restarting a live
+    // seat — "it just keeps putting the command into the chat box". For that
+    // case `squad restart` must run in the BACKGROUND: it respawns the pane in
+    // place and attached viewers keep watching, so nothing needs typing.
+    //
+    // Fails toward TYPING: if the probe errors we take the shell path, because
+    // a stray command line in a tab is visible and recoverable, whereas a
+    // background restart on a shell tab leaves the operator staring at a
+    // prompt wondering why the button did nothing.
+    cp.execFile(SQUAD, ["attached", a], { timeout: 10000 }, (err) => {
+      const isAttached = !err;
+      if (isAttached) {
+        squadExec(["restart", a, mode], a);
+      } else {
+        t.sendText(
+          `clear; squad restart ${a} ${mode} >/dev/null 2>&1 && squad attach ${a}; clear`
+        );
+      }
+    });
   }
   if (!any) vscode.window.showWarningMessage("Squad: no squad agent in the selection.");
 }
@@ -269,7 +342,260 @@ function withAgents(args, fn) {
 
 const labels = (agents) => agents.map(shortLabel).join(", ");
 
+// The model from `mcp-hub settings --json`, as quick-pick rows.
+//
+// A quick pick rather than a webview because a webview is an EDITOR TAB — it
+// sits in the file row and is closed, not dismissed, which is not what a
+// settings view should feel like (operator, 2026-07-28: "it opened it as a file
+// rather than a popup"). This appears over the centre, Escape closes it, and
+// typing filters.
+//
+// label = the setting, description = its value, detail = its SOURCE. The source
+// is a whole line of its own rather than a parenthetical because it is the point
+// of the panel: these settings differ in scope, so a value alone cannot say
+// whether changing it affects this agent or every agent on the machine.
+// matchOnDetail makes those sources searchable too — "no workspace declares it"
+// finds every hand-set value in one keystroke.
+// ---- the settings view: a real panel, docked beside the terminals ----
+//
+// A webview in the EDITOR area is a file tab ("it opened it as a file rather
+// than a popup"); a quick pick is a filter list that cannot lay anything out
+// ("ok but very basic"); and the PANEL area shows one tab at a time, so a view
+// there competes with the Terminal instead of sitting beside it. VSCode has no
+// modal webview and no way to stack a contributed view with the terminal, so
+// this lives in its own view container — visible at the same time as the panel,
+// and draggable to the secondary sidebar, which VSCode then remembers.
+//
+// Nothing here names a location. `<viewId>.focus` reveals the view wherever it
+// has been parked, which is what makes the position the operator's to choose
+// rather than a thing to re-ship. The view ID is therefore load-bearing and
+// pinned by a test.
+//
+// Values are rendered as SELECTS for editable rows and as plain text for the
+// rest, which makes editability visible in the control itself rather than in a
+// marker beside it. Sources get their own column: they are the point of the
+// panel, and a value alone cannot say whether changing it affects this agent or
+// every agent on the machine.
+
+const esc = (s) =>
+  String(s == null ? "" : s).replace(
+    /[&<>"']/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
+  );
+
+function settingsHtml(model, nonce) {
+  const sections = (model.sections || [])
+    .map((sec, si) => {
+      const rows = (sec.rows || [])
+        .map((r, ri) => {
+          const control = r.edit
+            ? `<select data-row="${si}.${ri}">` +
+              (r.edit.choices.includes(r.value)
+                ? ""
+                : `<option selected>${esc(r.value)}</option>`) +
+              r.edit.choices
+                .map(
+                  (c) =>
+                    `<option${c === r.value ? " selected" : ""}>${esc(c)}</option>`
+                )
+                .join("") +
+              `</select>`
+            : `<div class="ro">${esc(r.value)}</div>`;
+          const when = r.edit
+            ? `<span class="when">applies ${esc(r.edit.applies)}</span>`
+            : "";
+          return `<div class="row${r.edit ? " editable" : ""}">
+              <div class="k">${esc(r.label)}</div>
+              <div class="v">${control}</div>
+              <div class="src">${esc(r.source)}${when}</div>
+            </div>`;
+        })
+        .join("");
+      const note = sec.note ? `<div class="note">${esc(sec.note)}</div>` : "";
+      return `<section><h2>${esc(sec.title)}</h2>${note}${rows}</section>`;
+    })
+    .join("");
+  return `<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none';
+ style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
+<style>
+ /* Every rule here is width-tolerant on purpose. This view is dockable —
+    activity bar, secondary sidebar, panel, editor — and the operator moves it
+    freely, so a layout that only works at one width is a layout that is broken
+    most of the time. It was a three-column TABLE first, which needed width it
+    never has in a sidebar: "formatting and ergonomics is terrible", correctly.
+    Stacked is the base case; columns are the enhancement, not the assumption. */
+ *{box-sizing:border-box}
+ body{font-family:var(--vscode-font-family);color:var(--vscode-foreground);
+      font-size:var(--vscode-font-size);padding:.6rem .8rem 2rem;margin:0;
+      line-height:1.45}
+ h1{font-size:1.05em;font-weight:600;margin:0 0 .1rem;
+    overflow-wrap:anywhere}
+ .sub{opacity:.55;font-size:.85em;margin:0 0 .4rem}
+ section{margin-top:1.15rem}
+ h2{font-size:.7em;letter-spacing:.11em;font-weight:700;opacity:.65;margin:0;
+    padding-bottom:.25rem;border-bottom:1px solid
+    var(--vscode-widget-border,rgba(128,128,128,.25))}
+ .note{opacity:.55;font-size:.83em;margin:.3rem 0 .1rem}
+ .row{padding:.5rem 0;border-bottom:1px solid
+      var(--vscode-widget-border,rgba(128,128,128,.10))}
+ .row:last-child{border-bottom:0}
+ .k{font-weight:500;overflow-wrap:anywhere}
+ .v{margin:.22rem 0 .1rem}
+ .ro{font-family:var(--vscode-editor-font-family);font-size:.92em;opacity:.85;
+     overflow-wrap:anywhere}
+ .src{opacity:.55;font-size:.82em;overflow-wrap:anywhere}
+ .when{opacity:.9;margin-left:.4rem;font-style:italic}
+ select{width:100%;background:var(--vscode-dropdown-background);
+        color:var(--vscode-dropdown-foreground);
+        border:1px solid var(--vscode-dropdown-border,
+        var(--vscode-contrastBorder,rgba(128,128,128,.35)));
+        border-radius:3px;padding:.28rem .4rem;font-family:inherit;
+        font-size:inherit;cursor:pointer}
+ select:hover{background:var(--vscode-dropdown-listBackground,
+              var(--vscode-dropdown-background))}
+ select:focus{outline:1px solid var(--vscode-focusBorder);outline-offset:-1px}
+ .empty{opacity:.6;padding:1.2rem .2rem;line-height:1.6}
+ /* Wide enough for two columns — editor tab, or a sidebar dragged out. The key
+    and the value/source share a row instead of stacking, which is what makes
+    the same view readable full-width without a second template. */
+ @media (min-width:460px){
+   body{padding:.8rem 1.2rem 2rem}
+   .row{display:grid;grid-template-columns:minmax(7rem,14rem) 1fr;
+        column-gap:1.2rem;align-items:baseline;padding:.42rem 0}
+   .k{grid-row:1;grid-column:1}
+   .v{grid-row:1;grid-column:2;margin:0}
+   .src{grid-row:2;grid-column:2;margin-top:.15rem}
+   select{width:auto;min-width:11rem;max-width:100%}
+ }
+</style></head><body>
+<h1>${esc(model.agent)}</h1>
+<div class="sub">read-only values show where they came from</div>
+${sections}
+<script nonce="${nonce}">
+ const vs = acquireVsCodeApi();
+ for (const el of document.querySelectorAll("select")) {
+   el.addEventListener("change", () =>
+     vs.postMessage({ type: "set", row: el.dataset.row, value: el.value }));
+ }
+</script>
+</body></html>`;
+}
+
+
+// ONE editor tab, retargeted — not a tab per click.
+//
+// An editor tab is the only surface in VSCode that can render this well: full
+// width, aligned columns, real dropdowns, proper typography. It is not a popup,
+// and there is no modal webview to make it one — a native modal gives plain
+// text in a proportional font with about three buttons, which cannot show a
+// settings sheet and cannot edit one. Docked views were tried and are worse
+// again: the panel area shows one tab at a time so it hides the terminals, and
+// a sidebar is too narrow for anything but a stacked list.
+//
+// Retargeting rather than spawning is what stops "Settings…" turning into a row
+// of near-identical tabs across a session with ten agents.
+class SettingsPanel {
+  constructor() {
+    this.panel = undefined;
+    this.agent = undefined;
+    this.worktree = undefined;
+    this.model = undefined;
+    this.seq = 0;
+  }
+
+  show(agent, worktree) {
+    this.agent = agent;
+    this.worktree = worktree;
+    if (this.panel) {
+      // reveal() without taking focus away from wherever the operator is
+      // typing would be wrong here: they asked for this panel, so it should
+      // come forward.
+      this.panel.reveal(undefined, false);
+    } else {
+      this.panel = vscode.window.createWebviewPanel(
+        "squadSettings",
+        "Squad settings",
+        vscode.ViewColumn.Active,
+        { enableScripts: true, retainContextWhenHidden: true }
+      );
+      this.panel.onDidDispose(() => {
+        this.panel = undefined;
+        this.model = undefined;
+      });
+      this.panel.webview.onDidReceiveMessage((msg) => this.onMessage(msg));
+    }
+    this.panel.title = `Settings — ${shortLabel(agent)}`;
+    this.render();
+  }
+
+  render() {
+    if (!this.panel) return;
+    // Guards against an out-of-order reply retargeting the tab: two quick
+    // clicks on different agents race, and the SLOWER cli call would otherwise
+    // win and render the agent you didn't ask for last.
+    const mine = ++this.seq;
+    cp.execFile(
+      MCP_HUB,
+      ["settings", "--cwd", this.worktree, "--json"],
+      { timeout: 15000 },
+      (err, out, stderr) => {
+        if (mine !== this.seq || !this.panel) return;
+        if (err) {
+          vscode.window.showErrorMessage(
+            `Squad settings: ${(stderr || err.message || "").trim()}`
+          );
+          return;
+        }
+        try {
+          this.model = JSON.parse(out);
+        } catch {
+          vscode.window.showErrorMessage("Squad settings: unreadable output.");
+          return;
+        }
+        // A fresh nonce per render: reused across renders it is a nonce in
+        // name only.
+        this.panel.webview.html = settingsHtml(this.model, `n${mine}s${this.seq}`);
+      }
+    );
+  }
+
+  onMessage(msg) {
+    if (!msg || msg.type !== "set" || !this.model) return;
+    const [si, ri] = String(msg.row).split(".").map(Number);
+    const section = (this.model.sections || [])[si];
+    const row = section && (section.rows || [])[ri];
+    // The row index is a CLAIM from the page, so it is resolved against the
+    // model actually rendered and refused when it names a row that is not
+    // editable — rather than trusted to address a command.
+    if (!row || !row.edit) return;
+    if (msg.value === row.value) return;
+    const argv = row.edit.argv.map((a) => (a === "{}" ? msg.value : a));
+    const bin = row.edit.bin === "mcp-hub" ? MCP_HUB : SQUAD;
+    cp.execFile(bin, argv, { timeout: 20000 }, (err, _o, stderr) => {
+      if (err) {
+        vscode.window.showErrorMessage(
+          `Squad: ${row.label} unchanged — ${(stderr || err.message || "").trim()}`
+        );
+      } else {
+        vscode.window.showInformationMessage(
+          `Squad: ${shortLabel(this.agent)} ${row.label} → ${msg.value} (applies ${row.edit.applies}).`
+        );
+      }
+      // Re-read either way. On success the page must show the state after the
+      // write rather than the value sent; on failure it must snap the control
+      // BACK, because the browser already moved it and the page would otherwise
+      // display a setting that was never applied.
+      this.render();
+    });
+  }
+}
+
+const settingsView = new SettingsPanel();
+
 function activate(context) {
+
   // ---- context-menu commands (registered in every window; they no-op
   // politely on non-agent terminals) ----
   // one-click answers to the approval dialog — `squad answer` parses the
@@ -303,7 +629,11 @@ function activate(context) {
       withAgents(args, async (agents) => {
         const prompts = readOperatorList("prompts.txt");
         if (!prompts.length) {
-          vscode.window.showWarningMessage("No stock prompts — add lines to ~/.config/squad/prompts.txt");
+          const go = await vscode.window.showWarningMessage(
+            "No stock prompts yet. They live in ~/.config/squad/prompts.txt — one prompt per line.",
+            "Create and open it"
+          );
+          if (go) await openOperatorList("prompts.txt", PROMPTS_SEED);
           return;
         }
         const pick = await vscode.window.showQuickPick(prompts, {
@@ -353,8 +683,32 @@ function activate(context) {
         );
       })();
     }),
-    vscode.commands.registerCommand("squad.compact", (...args) =>
-      withAgents(args, (agents) => agents.forEach((a) => squadExec(["cmd", a, "/compact"], a)))
+    // ---- settings: READ-ONLY, and deliberately so ----
+    // Nothing in this panel DOES anything: no restart, no transport, no retire.
+    // A settings panel that can destroy an agent is one you open carefully, and
+    // it should be one you can open freely — its whole job is answering "what is
+    // this agent actually set to", which nothing else does.
+    //
+    // The model comes from `mcp-hub settings --json`, not from reading files
+    // here. Provenance is the hard part (a squad usually comes from a workspace,
+    // comms is per agent, the hub URL is per machine) and duplicating that logic
+    // in the extension is how the future web UI would come to disagree with the
+    // cockpit about what an agent is set to.
+    vscode.commands.registerCommand("squad.settings", (...args) =>
+      withAgents(args, (agents) => {
+        const agent = agents[0];
+        const row = rosterRows().find((r) => r.agent === agent);
+        if (!row) {
+          vscode.window.showWarningMessage(`Squad: ${agent} has no roster row.`);
+          return;
+        }
+        if (agents.length > 1) {
+          vscode.window.showInformationMessage(
+            `Squad: settings are per agent — showing ${shortLabel(agent)}.`
+          );
+        }
+        settingsView.show(agent, row.worktree);
+      })
     ),
     vscode.commands.registerCommand("squad.interrupt", (...args) =>
       withAgents(args, (agents) => agents.forEach((a) => squadExec(["key", a, "Escape"], a)))
@@ -389,27 +743,39 @@ function activate(context) {
     // the one-off mode override, then this terminal attaches; `clear` wipes the
     // typed line and the launch chatter so the tab shows the agent, not a
     // transcript of how it got there.
+    // These two ARE the restart pair. There used to be four commands here:
+    // squad.restartResume/Fresh ran `squad restart` in the background, and
+    // startAttach did the same thing plus an attach — the same action under two
+    // names in two different submenus, which is most of why the menu needed
+    // finding rather than reading (2026-07-28 flatten). startWithMode is the
+    // superset: on an attached tab it takes the identical background path, and
+    // on a bare shell it also attaches, which the background-only pair never
+    // did. So the pair went and this one kept BOTH names' behaviour.
+    //
+    // The confirm came from the deleted squad.restartFresh and had to be
+    // carried across deliberately: of the two commands that were merged only
+    // one asked, and collapsing to the more permissive of a safe/unsafe pair is
+    // how a guard disappears in a refactor that looks like pure tidying.
     vscode.commands.registerCommand("squad.startAttach", (...args) =>
       startWithMode(args, "--resume")
     ),
-    vscode.commands.registerCommand("squad.startAttachFresh", (...args) =>
-      startWithMode(args, "--fresh")
-    ),
-    vscode.commands.registerCommand("squad.stop", (...args) =>
-      withAgents(args, (agents) => agents.forEach((a) => squadExec(["stop", a], a)))
-    ),
-    vscode.commands.registerCommand("squad.restartResume", (...args) =>
-      withAgents(args, (agents) => agents.forEach((a) => squadExec(["restart", a, "--resume"], a)))
-    ),
-    vscode.commands.registerCommand("squad.restartFresh", (...args) =>
-      withAgents(args, async (agents) => {
+    vscode.commands.registerCommand("squad.startAttachFresh", async (...args) => {
+      cancelPendingToasts();
+      const agents = resolveAgents(args);
+      if (agents.length) {
         const ok = await vscode.window.showWarningMessage(
-          `Restart ${labels(agents)} with BLANK conversation(s)?`,
+          `Restart ${labels(agents)} with a BLANK conversation? The current conversation is kept on disk but not resumed.`,
           { modal: true },
           "Fresh restart"
         );
-        if (ok) agents.forEach((a) => squadExec(["restart", a, "--fresh"], a));
-      })
+        if (!ok) return;
+      }
+      // Falls through with no agents so the "no squad agent" warning still
+      // comes from one place.
+      startWithMode(args, "--fresh");
+    }),
+    vscode.commands.registerCommand("squad.stop", (...args) =>
+      withAgents(args, (agents) => agents.forEach((a) => squadExec(["stop", a], a)))
     )
   );
 
@@ -1113,37 +1479,23 @@ function activate(context) {
   );
 
   // ---- standard claude slash commands (typed into the agent's pane) ----
-  // /clear is destructive (wipes the conversation) -> modal confirm.
-  for (const slash of ["context", "cost", "status", "doctor", "mcp", "model", "memory", "todos", "help"]) {
-    context.subscriptions.push(
-      vscode.commands.registerCommand(`squad.slash.${slash}`, (...args) =>
-        withAgents(args, (agents) => agents.forEach((a) => squadExec(["cmd", a, `/${slash}`], a)))
-      )
-    );
-  }
+  // Each of these had its OWN menu entry until the 2026-07-28 flatten: eleven
+  // rows you navigated by remembering their order. One searchable list is
+  // shorter to read and faster to use — you type "cost" quicker than you find
+  // it — and it collapses the last real difference between a built-in and an
+  // operator-saved command, which were two rules for one menu.
+  //
+  // The list is therefore shown ALWAYS, including with no slash.txt. That
+  // reverses the older rule ("no file ⇒ no quick pick, straight to the input
+  // box") and had to: with the individual entries gone, this picker is the only
+  // way left to reach /context, so skipping it would remove the commands rather
+  // than move them.
+  const BUILTIN_SLASH = [
+    "/context", "/cost", "/status", "/todos", "/mcp", "/doctor", "/help",
+    "/compact", "/model", "/memory", "/clear",
+  ];
+  const DESTRUCTIVE = new Set(["/clear"]);
   context.subscriptions.push(
-    vscode.commands.registerCommand("squad.slash.clear", (...args) =>
-      withAgents(args, async (agents) => {
-        const ok = await vscode.window.showWarningMessage(
-          `/clear wipes the conversation(s) of: ${labels(agents)}. Sure?`,
-          { modal: true },
-          "Clear"
-        );
-        if (ok) agents.forEach((a) => squadExec(["cmd", a, "/clear"], a));
-      })
-    ),
-    // The nine built-ins above are menu contributions, so adding one costs two
-    // source edits, a version bump and an ext-align — which is why the list
-    // never grew. Stock PROMPTS were a file you edit, appearing instantly; this
-    // was a build step. Same menu, two rules for the operator.
-    //
-    // ~/.config/squad/slash.txt closes that. The saved list is offered first
-    // with "type one" at the top — the same shape the workspace picker uses for
-    // "➕ New workspace…", rather than a second near-identical menu entry.
-    //
-    // With NO file the quick pick is skipped entirely and this behaves exactly
-    // as it always did: one input box, no extra click, no nagging toast. A
-    // feature you haven't opted into must not make the old path longer.
     vscode.commands.registerCommand("squad.slash.custom", (...args) =>
       withAgents(args, async (agents) => {
         const TYPE = "✎ Type one…";
@@ -1153,14 +1505,16 @@ function activate(context) {
         const saved = readOperatorList("slash.txt").map((s) =>
           s.startsWith("/") ? s : "/" + s
         );
-        let cmd;
-        if (saved.length) {
-          const pick = await vscode.window.showQuickPick([TYPE, ...saved], {
-            placeHolder: `Slash command for ${labels(agents)}`,
-          });
-          if (!pick) return;
-          if (pick !== TYPE) cmd = pick;
-        }
+        // Saved first: they are the ones this operator curated, and putting the
+        // eleven built-ins above them would bury a short personal list under a
+        // fixed one. Deduped, so a saved "/status" replaces the built-in in
+        // place rather than appearing twice.
+        const items = [TYPE, ...new Set([...saved, ...BUILTIN_SLASH])];
+        const pick = await vscode.window.showQuickPick(items, {
+          placeHolder: `Slash command for ${labels(agents)}`,
+        });
+        if (!pick) return;
+        let cmd = pick === TYPE ? undefined : pick;
         if (!cmd) {
           cmd = await vscode.window.showInputBox({
             prompt: `Slash command for ${labels(agents)}`,
@@ -1168,7 +1522,19 @@ function activate(context) {
             validateInput: (v) => (v.startsWith("/") ? undefined : "must start with /"),
           });
         }
-        if (cmd) agents.forEach((a) => squadExec(["cmd", a, cmd], a));
+        if (!cmd) return;
+        // /clear had a modal confirm when it was its own menu entry. Gating on
+        // the COMMAND rather than on the entry it arrived through keeps that
+        // guard whichever route reaches it — picked from the list, or typed.
+        if (DESTRUCTIVE.has(cmd.trim())) {
+          const ok = await vscode.window.showWarningMessage(
+            `${cmd.trim()} wipes the conversation(s) of: ${labels(agents)}. Sure?`,
+            { modal: true },
+            "Clear"
+          );
+          if (!ok) return;
+        }
+        agents.forEach((a) => squadExec(["cmd", a, cmd], a));
       })
     )
   );
@@ -1237,6 +1603,35 @@ function activate(context) {
     sendWhenReady(b, `${SQUAD} board -w`);
   }
 
+  // Settings panel — the operator's own view, same door as the board.
+  //
+  // A TERMINAL, after four attempts at VSCode-native surfaces that each failed
+  // for a structural reason: a webview in the editor is a file tab, a quick
+  // pick cannot lay anything out, a panel view HIDES the terminals it sits
+  // beside, and a sidebar is too narrow. This asks nothing of VSCode's UI —
+  // it is a tab in the panel like every agent, so it can stay open, be clicked
+  // back to, and look however we render it.
+  //
+  // Scoped to THIS workspace by the same folder-membership rule the tabs use,
+  // so the panel lists exactly the agents whose tabs are beside it.
+  const SETTINGS = "squad-settings";
+  if (![...vscode.window.terminals].some((t) => t.name === SETTINGS)) {
+    const st = vscode.window.createTerminal({
+      name: SETTINGS,
+      iconPath: new vscode.ThemeIcon("settings-gear"),
+      color: new vscode.ThemeColor("terminal.ansiCyan"),
+      cwd: fs.existsSync(path.join(os.homedir(), "Projects"))
+        ? path.join(os.homedir(), "Projects")
+        : undefined,
+    });
+    const ws = vscode.workspace.workspaceFile;
+    sendWhenReady(
+      st,
+      `${MCP_HUB} settings --tui` +
+        (ws ? ` --workspace ${JSON.stringify(ws.fsPath)}` : "")
+    );
+  }
+
   // The who engine runs headless as squad-who.service and its signal lives in
   // the tab titles; `squad dash` (tiled wall) remains one command away.
 
@@ -1287,8 +1682,21 @@ function activate(context) {
   // restored-open empty panel (the recurring "bash <first-folder>" ghost
   // tab) — which means revealing the panel is OUR job now: once the cockpit
   // is built, show it with the board on top, without stealing focus.
-  const boardTerm = [...vscode.window.terminals].find((t) => t.name === BOARD);
-  if (boardTerm) boardTerm.show(true);
+  //
+  // ONCE. buildCockpit() also runs from the roster watcher, and every launch
+  // setting written by `squad comms/resume/launch` changes squad.conf — so
+  // this line yanked the panel to the board every time the operator changed a
+  // value in the settings tab ("I change any of the launch settings and it
+  // takes me out of the settings and the squad-board loads instead",
+  // 2026-07-28). Revealing the panel is a STARTUP concern; a rebuild triggered
+  // by someone editing a setting must leave the view where they put it.
+  if (!revealedOnce) {
+    const boardTerm = [...vscode.window.terminals].find((t) => t.name === BOARD);
+    if (boardTerm) {
+      boardTerm.show(true);
+      revealedOnce = true;
+    }
+  }
   };
 
   buildCockpitRef = buildCockpit;

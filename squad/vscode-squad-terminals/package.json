@@ -2,7 +2,7 @@
   "name": "squad-terminals",
   "displayName": "Squad Terminals",
   "description": "Auto-opens one plain terminal per squad agent (squad attach) with icon+color, and adds per-agent squad actions to the terminal tab context menu.",
-  "version": "0.22.0",
+  "version": "0.30.0",
   "publisher": "monkeypashion",
   "engines": {
     "vscode": "^1.90.0"
@@ -30,27 +30,22 @@
       },
       {
         "command": "squad.sendPrompt",
-        "title": "Send prompt\u2026",
+        "title": "Send prompt…",
         "category": "Squad"
       },
       {
         "command": "squad.stockPrompt",
-        "title": "Stock prompt\u2026",
+        "title": "Stock prompt…",
         "category": "Squad"
       },
       {
         "command": "squad.broadcast",
-        "title": "Broadcast to team via agent\u2026",
+        "title": "Broadcast to squad via this agent…",
         "category": "Squad"
       },
       {
         "command": "squad.dmVia",
-        "title": "Message agent(s) via this one\u2026",
-        "category": "Squad"
-      },
-      {
-        "command": "squad.compact",
-        "title": "/compact",
+        "title": "Message agent(s) via this one…",
         "category": "Squad"
       },
       {
@@ -60,57 +55,12 @@
       },
       {
         "command": "squad.startAttach",
-        "title": "Start & attach  (resume conversation)",
+        "title": "Restart (resume conversation)",
         "category": "Squad"
       },
       {
         "command": "squad.stop",
         "title": "Stop (session ends, conversation kept)",
-        "category": "Squad"
-      },
-      {
-        "command": "squad.restartResume",
-        "title": "Restart (resume conversation)",
-        "category": "Squad"
-      },
-      {
-        "command": "squad.restartFresh",
-        "title": "Restart (fresh conversation)",
-        "category": "Squad"
-      },
-      {
-        "command": "squad.slash.clear",
-        "title": "/clear  (wipe conversation)",
-        "category": "Squad"
-      },
-      {
-        "command": "squad.slash.context",
-        "title": "/context",
-        "category": "Squad"
-      },
-      {
-        "command": "squad.slash.cost",
-        "title": "/cost",
-        "category": "Squad"
-      },
-      {
-        "command": "squad.slash.status",
-        "title": "/status",
-        "category": "Squad"
-      },
-      {
-        "command": "squad.slash.doctor",
-        "title": "/doctor",
-        "category": "Squad"
-      },
-      {
-        "command": "squad.slash.mcp",
-        "title": "/mcp",
-        "category": "Squad"
-      },
-      {
-        "command": "squad.slash.model",
-        "title": "/model  (open picker)",
         "category": "Squad"
       },
       {
@@ -189,23 +139,8 @@
         "category": "Squad"
       },
       {
-        "command": "squad.slash.memory",
-        "title": "/memory",
-        "category": "Squad"
-      },
-      {
-        "command": "squad.slash.todos",
-        "title": "/todos",
-        "category": "Squad"
-      },
-      {
-        "command": "squad.slash.help",
-        "title": "/help",
-        "category": "Squad"
-      },
-      {
         "command": "squad.slash.custom",
-        "title": "Other /command\u2026",
+        "title": "Slash command…",
         "category": "Squad"
       },
       {
@@ -230,7 +165,7 @@
       },
       {
         "command": "squad.transport",
-        "title": "Transport to workspace\u2026",
+        "title": "Transport to workspace…",
         "category": "Squad"
       },
       {
@@ -240,22 +175,22 @@
       },
       {
         "command": "squad.transportAll",
-        "title": "Transport ALL agents to workspace\u2026",
+        "title": "Transport ALL agents to workspace…",
         "category": "Squad"
       },
       {
         "command": "squad.addFolder",
-        "title": "Add existing folder as agent\u2026",
+        "title": "Add existing folder as agent…",
         "category": "Squad"
       },
       {
         "command": "squad.startAttachFresh",
-        "title": "Start & attach  (fresh conversation)",
+        "title": "Restart (fresh conversation)",
         "category": "Squad"
       },
       {
         "command": "squad.transportWorkspace",
-        "title": "Transport THIS workspace to\u2026",
+        "title": "Workspace: transport it to…",
         "category": "Squad"
       },
       {
@@ -270,12 +205,17 @@
       },
       {
         "command": "squad.addFromGitHub",
-        "title": "Clone from GitHub as agent\u2026",
+        "title": "Clone from GitHub as agent…",
         "category": "Squad"
       },
       {
         "command": "squad.teardownWorkspace",
-        "title": "Tear THIS workspace down\u2026",
+        "title": "Workspace: tear it down…",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.settings",
+        "title": "Settings…",
         "category": "Squad"
       }
     ],
@@ -283,10 +223,6 @@
       {
         "id": "squad.agentMenu",
         "label": "Squad"
-      },
-      {
-        "id": "squad.slashMenu",
-        "label": "Slash commands"
       },
       {
         "id": "squad.modelMenu",
@@ -306,15 +242,15 @@
       },
       {
         "id": "squad.messagingMenu",
-        "label": "Messaging"
+        "label": "Send to others"
       },
       {
-        "id": "squad.lifecycleMenu",
-        "label": "Restart & launch settings"
+        "id": "squad.moveMenu",
+        "label": "Move & copy"
       },
       {
-        "id": "squad.workspaceMenu",
-        "label": "Workspace & enrolment"
+        "id": "squad.enrolMenu",
+        "label": "Add & remove"
       }
     ],
     "menus": {
@@ -352,8 +288,18 @@
           "when": "squad.isAgent"
         },
         {
-          "command": "squad.interrupt",
+          "command": "squad.stockPrompt",
           "group": "1_talk@2",
+          "when": "squad.isAgent"
+        },
+        {
+          "command": "squad.slash.custom",
+          "group": "1_talk@3",
+          "when": "squad.isAgent"
+        },
+        {
+          "command": "squad.interrupt",
+          "group": "1_talk@4",
           "when": "squad.isAgent"
         },
         {
@@ -373,78 +319,37 @@
         },
         {
           "submenu": "squad.messagingMenu",
-          "group": "1_talk@3"
+          "group": "3_groups@1"
         },
         {
-          "submenu": "squad.lifecycleMenu",
-          "group": "2_lifecycle@4",
-          "when": "squad.isAgent"
+          "submenu": "squad.moveMenu",
+          "group": "3_groups@2"
         },
         {
-          "submenu": "squad.workspaceMenu",
-          "group": "3_workspace@1"
-        }
-      ],
-      "squad.slashMenu": [
-        {
-          "command": "squad.slash.context",
-          "group": "1_info@1"
-        },
-        {
-          "command": "squad.slash.cost",
-          "group": "1_info@2"
-        },
-        {
-          "command": "squad.slash.status",
-          "group": "1_info@3"
-        },
-        {
-          "command": "squad.slash.todos",
-          "group": "1_info@4"
-        },
-        {
-          "command": "squad.slash.mcp",
-          "group": "1_info@5"
-        },
-        {
-          "command": "squad.slash.doctor",
-          "group": "1_info@6"
-        },
-        {
-          "command": "squad.slash.help",
-          "group": "1_info@7"
-        },
-        {
-          "command": "squad.compact",
-          "group": "2_change@1"
+          "submenu": "squad.enrolMenu",
+          "group": "3_groups@3"
         },
         {
           "submenu": "squad.modelMenu",
-          "group": "2_change@2"
+          "group": "4_session@1"
         },
         {
           "submenu": "squad.effortMenu",
-          "group": "2_change@3"
+          "group": "4_session@2"
         },
         {
           "submenu": "squad.voiceMenu",
-          "group": "2_change@4"
+          "group": "4_session@3"
         },
         {
-          "command": "squad.slash.model",
-          "group": "2_change@5"
+          "submenu": "squad.launchMenu",
+          "group": "4_session@4",
+          "when": "squad.isAgent"
         },
         {
-          "command": "squad.slash.memory",
-          "group": "2_change@6"
-        },
-        {
-          "command": "squad.slash.clear",
-          "group": "3_danger@1"
-        },
-        {
-          "command": "squad.slash.custom",
-          "group": "4_custom@1"
+          "command": "squad.settings",
+          "group": "5_settings@1",
+          "when": "squad.isAgent"
         }
       ],
       "squad.modelMenu": [
@@ -537,81 +442,58 @@
       ],
       "squad.messagingMenu": [
         {
-          "command": "squad.stockPrompt",
+          "command": "squad.broadcast",
           "group": "1_msg@1",
           "when": "squad.isAgent"
         },
         {
-          "command": "squad.broadcast",
+          "command": "squad.dmVia",
           "group": "1_msg@2",
           "when": "squad.isAgent"
-        },
-        {
-          "command": "squad.dmVia",
-          "group": "1_msg@3",
-          "when": "squad.isAgent"
-        },
-        {
-          "submenu": "squad.slashMenu",
-          "group": "2_slash@1"
         }
       ],
-      "squad.lifecycleMenu": [
-        {
-          "command": "squad.restartResume",
-          "group": "1_restart@1",
-          "when": "squad.isAgent"
-        },
-        {
-          "command": "squad.restartFresh",
-          "group": "1_restart@2",
-          "when": "squad.isAgent"
-        },
-        {
-          "submenu": "squad.launchMenu",
-          "group": "2_settings@1"
-        }
-      ],
-      "squad.workspaceMenu": [
+      "squad.moveMenu": [
         {
           "command": "squad.transport",
-          "group": "1_ws@1",
+          "group": "1_move@1",
           "when": "squad.isAgent"
         },
         {
           "command": "squad.duplicate",
-          "group": "1_ws@2",
+          "group": "1_move@2",
           "when": "squad.isAgent"
         },
         {
-          "command": "squad.transportWorkspace",
-          "group": "1_ws@3"
-        },
-        {
-          "command": "squad.teardownWorkspace",
-          "group": "3_ws_close@1"
-        },
-        {
           "command": "squad.transportAll",
-          "group": "1_ws@4"
+          "group": "2_bulk@1"
         },
+        {
+          "command": "squad.transportWorkspace",
+          "group": "2_bulk@2"
+        }
+      ],
+      "squad.enrolMenu": [
         {
           "command": "squad.addFolder",
-          "group": "1_ws@5"
+          "group": "1_add@1"
         },
         {
           "command": "squad.addFromGitHub",
-          "group": "1_ws@6"
+          "group": "1_add@2"
         },
         {
           "command": "squad.wsRemove",
-          "group": "1_ws@7",
+          "group": "2_remove@1",
           "when": "squad.isAgent"
         },
         {
           "command": "squad.retire",
-          "group": "1_ws@8",
+          "group": "3_danger@1",
           "when": "squad.isAgent"
+        },
+        {
+          "command": "squad.teardownWorkspace",
+          "group": "3_danger@2"
         }
       ]
     },
@@ -628,8 +510,8 @@
           "default": "confirm",
           "enumDescriptions": [
             "Focusing a down agent's terminal shows a one-click 'Start & attach' prompt (default).",
-            "Focusing a down agent's terminal starts claude immediately \u2014 zero-click; window-restore/panel-reveal focus events can start an agent from a glance.",
-            "Never auto-start; use the tab context menu (Squad \u2192 Start & attach)."
+            "Focusing a down agent's terminal starts claude immediately — zero-click; window-restore/panel-reveal focus events can start an agent from a glance.",
+            "Never auto-start; use the tab context menu (Squad → Start & attach)."
           ],
           "description": "What happens when you focus the terminal of an agent that is down."
         }
