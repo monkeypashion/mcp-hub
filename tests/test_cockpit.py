@@ -48,7 +48,7 @@ def _drive(home: pathlib.Path, mode: str, target: str = "",
            exec_out: str = "", exec_fail: str = "", fire_roster: bool = False,
            not_attached: bool = False, settings_out: str = "",
            settings_fail: str = "", webview_msg=None, twice: bool = False,
-           settings_out2: str = "", delay_first: int = 0) -> dict:
+           settings_out2: str = "", delay_first: int = 0, wsfolders=None) -> dict:
     env = dict(
         os.environ,
         HOME=str(home),
@@ -67,6 +67,8 @@ def _drive(home: pathlib.Path, mode: str, target: str = "",
         env["HARNESS_SETTINGS_OUT2"] = settings_out2
     if delay_first:
         env["HARNESS_SETTINGS_DELAY_FIRST"] = str(delay_first)
+    if wsfolders:
+        env["HARNESS_WSFOLDERS"] = json.dumps([str(p) for p in wsfolders])
     if exec_out:
         env["HARNESS_EXEC_OUT"] = exec_out
     if exec_fail:
@@ -495,6 +497,46 @@ def test_duplicate_adds_no_folder_when_the_copy_never_landed(box, tmp_path):
                  terminal="demo \u00b7 idle", exec_out=DRY, fire_roster=True)
     added = [p for op in out["folderOps"] for p in op["add"]]
     assert added == [], f"adopted a folder for a copy that never landed: {added}"
+
+
+# ---- the operator's own tabs (board + settings) ---------------------------
+
+def _cockpit(box, tmp_path):
+    """Put the extension in the state where it actually builds the cockpit: a
+    workspace FILE, plus a roster agent whose worktree is one of its folders."""
+    work = box / "Projects" / "demo"
+    work.mkdir(parents=True, exist_ok=True)
+    ws = tmp_path / "here.code-workspace"
+    ws.write_text(json.dumps({"folders": [{"path": str(work)}]}), encoding="utf-8")
+    return ws, work
+
+
+def test_the_cockpit_opens_a_board_and_a_settings_tab(box, tmp_path):
+    """Both are the operator's own views rather than agents, and both are made
+    the same way — a terminal in the panel. That is the whole reason the
+    settings panel is shaped like this: it asks nothing of VSCode's UI, so it
+    can sit beside the agents instead of hiding them.
+
+    This path had never executed in a test at all — the harness reported no
+    workspace folders, so the gate above it always returned early.
+    """
+    ws, work = _cockpit(box, tmp_path)
+    out = _drive(box, "run", "squad.stop", terminal="demo · idle",
+                 wsfile=str(ws), wsfolders=[work])
+    launched = " ".join(out["sent"])
+    assert "board -w" in launched, out["sent"]
+    assert "settings --tui" in launched, out["sent"]
+
+
+def test_the_settings_tab_is_scoped_to_the_open_workspace(box, tmp_path):
+    """Same folder-membership rule the tabs themselves use, so the panel lists
+    exactly the agents whose tabs are beside it — rather than every agent on
+    the machine, which is a different and much longer list."""
+    ws, work = _cockpit(box, tmp_path)
+    out = _drive(box, "run", "squad.stop", terminal="demo · idle",
+                 wsfile=str(ws), wsfolders=[work])
+    line = next(s for s in out["sent"] if "settings --tui" in s)
+    assert f"--workspace {json.dumps(str(ws))}" in line, line
 
 
 # ---- the settings panel ---------------------------------------------------

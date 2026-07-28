@@ -145,7 +145,14 @@ const vscode = {
     workspaceFile: process.env.HARNESS_WSFILE
       ? { fsPath: process.env.HARNESS_WSFILE }
       : undefined,
-    workspaceFolders: [],
+    // Env-driven so a test can put the extension in the state where it builds
+    // the cockpit: the operator tabs are gated on a workspace FILE plus at
+    // least one roster agent whose worktree is one of its folders. With this
+    // hardcoded empty, that whole path — board and settings tabs included —
+    // had never run once.
+    workspaceFolders: JSON.parse(process.env.HARNESS_WSFOLDERS || "[]").map(
+      (p) => ({ uri: { fsPath: p }, name: String(p).split("/").pop() })
+    ),
     getConfiguration() {
       return { get: () => undefined };
     },

@@ -1655,6 +1655,57 @@ def identity_command(args: argparse.Namespace) -> int:
 SQUAD_CONF = pathlib.Path.home() / ".config" / "squad" / "squad.conf"
 
 
+def _roster_all() -> list[dict[str, str]]:
+    """Every roster row, in file order: [{agent, worktree, args, klass}].
+
+    File order is deliberate — it is the order `squad` lists agents in and the
+    order the cockpit's tabs appear, so a settings view that re-sorted would
+    disagree with both for no reason.
+    """
+    try:
+        text = SQUAD_CONF.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    rows = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        f = line.split("|")
+        if not f[0].strip() or len(f) < 2 or not f[1].strip():
+            continue
+        worktree = f[1].strip()
+        if worktree.startswith("~"):
+            worktree = str(pathlib.Path.home()) + worktree[1:]
+        rows.append({
+            "agent": f[0].strip(),
+            "worktree": worktree,
+            "args": f[3].strip() if len(f) > 3 else "",
+            "klass": (f[4].strip() if len(f) > 4 else "") or "squad",
+        })
+    return rows
+
+
+def _agents_in_workspace(ws_path: str | None) -> list[dict[str, str]]:
+    """Roster rows whose worktree is a folder of this workspace.
+
+    The SAME rule squad's ws_agents() uses, and the same rule the cockpit uses
+    to decide which tabs to open — folder membership, not the workspace's name.
+    A third spelling of "which agents are in this workspace" is how teardown and
+    the tab list would come to disagree about what they are acting on.
+
+    No workspace (a bare shell) ⇒ the whole roster. The caller says so in the
+    header rather than letting an unscoped list look like a scoped one.
+    """
+    rows = _roster_all()
+    if not ws_path:
+        return rows
+    folders = {_norm_path(f) for f in _workspace_folders(ws_path)}
+    if not folders:
+        return rows
+    return [r for r in rows if _norm_path(r["worktree"]) in folders]
+
+
 def _roster_row(agent: str) -> dict[str, str]:
     """One agent's roster row: {worktree, args, klass}. {} if absent.
 
@@ -1973,8 +2024,323 @@ def _invalidate_status_cache(agent: str) -> None:
         pass
 
 
+class SettingsTui:
+    """The settings TUI's whole state machine — deliberately free of curses.
+
+    Rendering and key reading live in the curses layer; everything that decides
+    WHAT is shown, what is selected and what a keypress means lives here, so it
+    can be tested without a terminal. A TUI whose logic is entangled with its
+    drawing is a TUI that gets tested by looking at it.
+    """
+
+    def __init__(self, agents: list[dict[str, str]], scoped_to: str | None = None):
+        self.agents = agents
+        self.scoped_to = scoped_to        # workspace file, or None for the box
+        self.agent_ix = 0
+        self.row_ix = 0
+        self.model: dict[str, Any] | None = None
+        self.status = ""
+        self.load()
+
+    # ---- data ----
+
+    def load(self) -> None:
+        """(Re)read the selected agent's model. Never raises: this runs inside a
+        redraw loop, and an exception there takes the whole panel down over one
+        agent that happens to be un-derivable."""
+        self.model = None
+        self.row_ix = 0
+        if not self.agents:
+            return
+        try:
+            self.model = _settings_model(self.agents[self.agent_ix]["worktree"])
+        except Exception as exc:  # noqa: BLE001
+            self.status = f"could not read settings: {exc}"
+        # Row 0 is ALWAYS a section heading, so leaving the cursor there opens
+        # every agent with nothing selected and the first keypress behaving
+        # oddly. Start on the first row that can actually be acted on.
+        picks = self.selectable()
+        self.row_ix = picks[0] if picks else 0
+
+    def rows(self) -> list[dict[str, Any]]:
+        """Flat row list for the detail pane, section headers included.
+
+        Headers are rows so the renderer needs no second structure, and are
+        marked so navigation can skip them — a cursor that can land on a
+        heading is a cursor that appears stuck.
+        """
+        out: list[dict[str, Any]] = []
+        for section in (self.model or {}).get("sections", []):
+            out.append({"header": section["title"], "note": section.get("note", "")})
+            out.extend(section.get("rows", []))
+        return out
+
+    def selectable(self) -> list[int]:
+        return [i for i, r in enumerate(self.rows()) if "header" not in r]
+
+    def current(self) -> dict[str, Any] | None:
+        rows = self.rows()
+        return rows[self.row_ix] if 0 <= self.row_ix < len(rows) else None
+
+    # ---- navigation ----
+
+    def move_agent(self, delta: int) -> None:
+        if not self.agents:
+            return
+        self.agent_ix = max(0, min(len(self.agents) - 1, self.agent_ix + delta))
+        self.load()
+
+    def select_agent(self, index: int) -> None:
+        if 0 <= index < len(self.agents) and index != self.agent_ix:
+            self.agent_ix = index
+            self.load()
+
+    def move_row(self, delta: int) -> None:
+        """Step to the next SELECTABLE row, skipping headers.
+
+        Clamps rather than wraps: wrapping in a two-pane list moves the eye to
+        the far end of the screen for what felt like one step down.
+        """
+        picks = self.selectable()
+        if not picks:
+            return
+        if self.row_ix not in picks:
+            # Snap into the list in the DIRECTION OF TRAVEL, not to a fixed
+            # end. Sitting on a heading (which row 0 always is) and pressing up
+            # sent the cursor to the very bottom — one keypress, whole screen.
+            after = [p for p in picks if p > self.row_ix]
+            before = [p for p in picks if p < self.row_ix]
+            if delta >= 0:
+                self.row_ix = after[0] if after else picks[-1]
+            else:
+                self.row_ix = before[-1] if before else picks[0]
+            return
+        here = picks.index(self.row_ix)
+        self.row_ix = picks[max(0, min(len(picks) - 1, here + delta))]
+
+    def select_row(self, index: int) -> None:
+        if index in self.selectable():
+            self.row_ix = index
+
+    # ---- editing ----
+
+    def choices(self) -> list[str]:
+        """Values offered for the current row; empty when it cannot be edited."""
+        row = self.current()
+        return list((row or {}).get("edit", {}).get("choices", []))
+
+    def command_for(self, choice: str) -> tuple[str, list[str]] | None:
+        """(binary, argv) to apply `choice` here, or None if it cannot apply.
+
+        Refuses a row with no edit, and refuses the value already set — the
+        verbs are idempotent, so this is not about safety; it is about not
+        reporting a change that did not happen.
+        """
+        row = self.current()
+        edit = (row or {}).get("edit")
+        if not edit or choice not in edit.get("choices", []):
+            return None
+        if choice == row.get("value"):
+            return None
+        argv = [choice if a == "{}" else a for a in edit["argv"]]
+        return edit.get("bin", "squad"), argv
+
+    def header(self) -> str:
+        where = (
+            pathlib.Path(self.scoped_to).name if self.scoped_to
+            else "this machine — no workspace open"
+        )
+        return f"{len(self.agents)} agent(s) · {where}"
+
+
+def _tui_run(stdscr, tui: "SettingsTui") -> None:  # pragma: no cover - draws
+    """Draw + key loop. Decides nothing: every branch delegates to SettingsTui.
+
+    Uncovered by design — this is the part a test cannot see, which is exactly
+    why everything worth asserting lives in the state machine instead.
+    """
+    import curses
+
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    try:
+        curses.mousemask(curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED)
+    except curses.error:
+        pass
+    curses.use_default_colors()
+    for i, fg in enumerate((curses.COLOR_CYAN, curses.COLOR_YELLOW,
+                            curses.COLOR_GREEN, curses.COLOR_RED), start=1):
+        try:
+            curses.init_pair(i, fg, -1)
+        except curses.error:
+            pass
+    CY, YE, GR, RD = (curses.color_pair(i) for i in (1, 2, 3, 4))
+    DIM = curses.A_DIM
+
+    def put(y, x, text, attr=0):
+        h, w = stdscr.getmaxyx()
+        if 0 <= y < h and x < w:
+            stdscr.addnstr(y, x, text, max(0, w - x - 1), attr)
+
+    picker: list[str] | None = None
+    picker_ix = 0
+
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        put(0, 0, " SQUAD SETTINGS ", curses.A_REVERSE | curses.A_BOLD)
+        put(0, 17, tui.header(), DIM)
+
+        # ---- agent list ----
+        top = 2
+        agent_rows = {}
+        for i, a in enumerate(tui.agents):
+            y = top + i
+            if y >= h - 2:
+                break
+            agent_rows[y] = i
+            sel = i == tui.agent_ix
+            put(y, 1, "▸" if sel else " ", CY | curses.A_BOLD)
+            # Ellipsis when cut: a truncated agent name that looks complete is
+            # worse than an obviously shortened one, because these names differ
+            # only by suffix (…-wsl vs …-wsl-windows).
+            name = a["agent"]
+            name = name if len(name) <= 34 else name[:33] + "…"
+            put(y, 3, name.ljust(35), (curses.A_BOLD | CY) if sel else 0)
+            put(y, 38, a.get("klass", ""), DIM)
+
+        sep = top + min(len(tui.agents), max(1, h - top - 4))
+        put(sep, 0, "─" * max(0, w - 1), DIM)
+
+        # ---- settings rows for the selected agent ----
+        detail_top = sep + 1
+        row_rows = {}
+        for i, r in enumerate(tui.rows()):
+            y = detail_top + i
+            if y >= h - 1:
+                break
+            if "header" in r:
+                label = r["header"]
+                put(y, 1, label, YE | curses.A_BOLD)
+                if r.get("note"):
+                    put(y, 2 + len(label), r["note"], DIM)
+                continue
+            row_rows[y] = i
+            sel = i == tui.row_ix
+            editable = bool(r.get("edit"))
+            put(y, 1, "▸" if sel else " ", CY | curses.A_BOLD)
+            put(y, 3, str(r["label"])[:24].ljust(25), curses.A_BOLD if sel else 0)
+            value = f"‹ {r['value']} ›" if editable else str(r["value"])
+            put(y, 28, value[:26].ljust(27),
+                (GR if editable else 0) | (curses.A_REVERSE if sel and editable else 0))
+            put(y, 56, str(r.get("source", "")), DIM)
+
+        hint = ("↑↓ row · ←→ agent · ⏎ change · r reload · q quit"
+                if not picker else "↑↓ choose · ⏎ apply · esc cancel")
+        put(h - 1, 1, hint, DIM)
+        if tui.status:
+            put(h - 1, max(0, w - len(tui.status) - 2), tui.status, RD)
+
+        # ---- the inline value picker ----
+        if picker:
+            row = tui.current() or {}
+            py = min(detail_top + tui.row_ix + 1, h - len(picker) - 2)
+            for j, choice in enumerate(picker):
+                mark = "●" if choice == row.get("value") else " "
+                put(py + j, 26, f" {mark} {choice} ".ljust(22),
+                    curses.A_REVERSE if j == picker_ix else curses.A_NORMAL)
+
+        stdscr.refresh()
+        try:
+            key = stdscr.getch()
+        except KeyboardInterrupt:
+            return
+
+        if picker:
+            if key in (curses.KEY_UP, ord("k")):
+                picker_ix = max(0, picker_ix - 1)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                picker_ix = min(len(picker) - 1, picker_ix + 1)
+            elif key in (27, ord("q")):
+                picker = None
+            elif key in (curses.KEY_ENTER, 10, 13):
+                choice = picker[picker_ix]
+                picker = None
+                cmd = tui.command_for(choice)
+                if cmd is None:
+                    tui.status = f"{choice}: already set"
+                else:
+                    binary, argv = cmd
+                    exe = MCP_HUB_BIN if binary == "mcp-hub" else SQUAD_BIN
+                    try:
+                        subprocess.run([exe, *argv], check=True,
+                                       capture_output=True, text=True, timeout=30)
+                        tui.status = f"{tui.current()['label']} → {choice}"
+                    except subprocess.CalledProcessError as exc:
+                        tui.status = (exc.stderr or exc.stdout or "failed").strip()[:60]
+                    except Exception as exc:  # noqa: BLE001
+                        tui.status = str(exc)[:60]
+                    # Re-read rather than patch: the panel must show the state
+                    # after the write, not the value that was sent.
+                    tui.load()
+            continue
+
+        if key in (ord("q"), 27):
+            return
+        if key in (curses.KEY_UP, ord("k")):
+            tui.move_row(-1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            tui.move_row(1)
+        elif key in (curses.KEY_LEFT, curses.KEY_BTAB):
+            tui.move_agent(-1)
+        elif key in (curses.KEY_RIGHT, 9):
+            tui.move_agent(1)
+        elif key == ord("r"):
+            tui.load()
+            tui.status = "reloaded"
+        elif key in (curses.KEY_ENTER, 10, 13):
+            choices = tui.choices()
+            if choices:
+                picker = choices
+                picker_ix = max(0, choices.index(tui.current()["value"])
+                                if tui.current()["value"] in choices else 0)
+            else:
+                tui.status = "read-only — this value is derived"
+        elif key == curses.KEY_MOUSE:
+            try:
+                _, mx, my, _, _ = curses.getmouse()
+            except curses.error:
+                continue
+            if my in agent_rows:
+                tui.select_agent(agent_rows[my])
+            elif my in row_rows:
+                tui.select_row(row_rows[my])
+        elif key == curses.KEY_RESIZE:
+            continue
+
+
+# Resolved once: the TUI shells out to both, and PATH inside a VSCode terminal
+# is not guaranteed to carry ~/.local/bin.
+SQUAD_BIN = str(pathlib.Path.home() / ".local" / "bin" / "squad")
+MCP_HUB_BIN = str(pathlib.Path.home() / ".local" / "bin" / "mcp-hub")
+
+
 def settings_command(args: argparse.Namespace) -> int:
-    """Read-only: every setting that governs one agent, and where it came from."""
+    """One agent's settings, or an interactive panel over a workspace's agents."""
+    if getattr(args, "tui", False):
+        import curses
+
+        agents = _agents_in_workspace(getattr(args, "workspace", None))
+        if not agents:
+            where = getattr(args, "workspace", None) or "this machine"
+            print(f"no roster agents in {where}", file=sys.stderr)
+            return 1
+        tui = SettingsTui(agents, scoped_to=getattr(args, "workspace", None))
+        try:
+            curses.wrapper(_tui_run, tui)
+        except KeyboardInterrupt:
+            pass
+        return 0
     cwd = args.cwd or os.getcwd()
     model = _settings_model(cwd)
     if model is None:
@@ -3311,6 +3677,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     settings.add_argument("--cwd", default=None, help="Worktree (default: current directory)")
     settings.add_argument("--json", action="store_true", help="Emit the panel model as JSON")
+    settings.add_argument(
+        "--tui", action="store_true",
+        help="Interactive panel over every agent in the workspace (arrows, enter, mouse)",
+    )
+    settings.add_argument(
+        "--workspace", default=None,
+        help=(
+            "A .code-workspace file; --tui scopes to the agents whose worktree "
+            "is one of its folders — the same rule `squad`'s ws_agents and the "
+            "cockpit's tab list use. Omitted: every agent on this machine."
+        ),
+    )
 
     mute = sub.add_parser(
         "mute",

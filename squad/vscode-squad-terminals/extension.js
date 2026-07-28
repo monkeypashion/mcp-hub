@@ -1601,6 +1601,35 @@ function activate(context) {
     sendWhenReady(b, `${SQUAD} board -w`);
   }
 
+  // Settings panel — the operator's own view, same door as the board.
+  //
+  // A TERMINAL, after four attempts at VSCode-native surfaces that each failed
+  // for a structural reason: a webview in the editor is a file tab, a quick
+  // pick cannot lay anything out, a panel view HIDES the terminals it sits
+  // beside, and a sidebar is too narrow. This asks nothing of VSCode's UI —
+  // it is a tab in the panel like every agent, so it can stay open, be clicked
+  // back to, and look however we render it.
+  //
+  // Scoped to THIS workspace by the same folder-membership rule the tabs use,
+  // so the panel lists exactly the agents whose tabs are beside it.
+  const SETTINGS = "squad-settings";
+  if (![...vscode.window.terminals].some((t) => t.name === SETTINGS)) {
+    const st = vscode.window.createTerminal({
+      name: SETTINGS,
+      iconPath: new vscode.ThemeIcon("settings-gear"),
+      color: new vscode.ThemeColor("terminal.ansiCyan"),
+      cwd: fs.existsSync(path.join(os.homedir(), "Projects"))
+        ? path.join(os.homedir(), "Projects")
+        : undefined,
+    });
+    const ws = vscode.workspace.workspaceFile;
+    sendWhenReady(
+      st,
+      `${MCP_HUB} settings --tui` +
+        (ws ? ` --workspace ${JSON.stringify(ws.fsPath)}` : "")
+    );
+  }
+
   // The who engine runs headless as squad-who.service and its signal lives in
   // the tab titles; `squad dash` (tiled wall) remains one command away.
 
