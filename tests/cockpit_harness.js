@@ -97,6 +97,19 @@ const vscode = {
       opened.push((doc && doc.fsPath) || String(doc));
       return {};
     },
+    // The settings panel's only output is a rendered page, so the HTML IS the
+    // behaviour under test — assert on it, not on the fact a panel appeared.
+    createWebviewPanel(id, title) {
+      const panel = { title, html: "", dispose() {} };
+      Object.defineProperty(panel, "webview", {
+        get: () => ({
+          set html(v) { panel.html = v; panels[panels.length - 1].html = v; },
+          get html() { return panel.html; },
+        }),
+      });
+      panels.push({ id, title, html: "" });
+      return panel;
+    },
     onDidChangeTerminalShellIntegration: ev,
     onDidChangeActiveTerminal: ev,
     onDidCloseTerminal: ev,
@@ -155,6 +168,7 @@ const vscode = {
     }
   },
   Uri: { file: (p) => ({ fsPath: p, toString: () => p }) },
+  ViewColumn: { Active: -1, One: 1, Beside: -2 },
   RelativePattern: class {
     constructor(base, pattern) {
       this.base = base;
@@ -177,6 +191,7 @@ const vscode = {
 // paths legitimately shell out and expect output.
 const execs = [];
 const offered = [];
+const panels = [];
 const opened = [];
 const folderOps = [];
 const watcherCbs = [];
@@ -191,8 +206,24 @@ const cpStub = {
     // which is how the typed path silently stopped being covered.
     const isProbe = Array.isArray(args) && args[0] === "attached";
     const notAttached = isProbe && process.env.HARNESS_NOT_ATTACHED;
+    // `mcp-hub settings --json` is READ, not fire-and-forget: the settings panel
+    // parses its stdout, so a stub that always answered "" made the only
+    // realistic path unreachable and every settings test exercised the
+    // unparseable-output branch instead.
+    const isSettings = Array.isArray(args) && args[0] === "settings";
     if (typeof done === "function") {
-      done(notAttached ? Object.assign(new Error("exit 1"), { code: 1 }) : null, "", "");
+      if (isSettings && process.env.HARNESS_SETTINGS_FAIL) {
+        // stdout is emitted too when a test supplies it: a command can print
+        // usable output and STILL exit non-zero, and that is the only case
+        // where the error branch's early return is load-bearing rather than
+        // masked by the unparseable-output guard behind it.
+        done(Object.assign(new Error("exit 1"), { code: 1 }),
+             process.env.HARNESS_SETTINGS_OUT || "",
+             process.env.HARNESS_SETTINGS_FAIL);
+      } else {
+        done(notAttached ? Object.assign(new Error("exit 1"), { code: 1 }) : null,
+             isSettings ? process.env.HARNESS_SETTINGS_OUT || "" : "", "");
+      }
     }
     return { on() {}, unref() {} };
   },
@@ -265,7 +296,7 @@ ext.activate({ subscriptions: [] });
         await new Promise((r) => setTimeout(r, 25));
       }
     } catch (e) {
-      console.log(JSON.stringify({ error: String((e && e.message) || e), sent, shown, execs, offered, opened, folderOps }));
+      console.log(JSON.stringify({ error: String((e && e.message) || e), sent, shown, execs, offered, opened, panels, folderOps }));
       process.exitCode = 3;
       return;
     }
@@ -279,7 +310,7 @@ ext.activate({ subscriptions: [] });
       }
       for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 25));
     }
-    console.log(JSON.stringify({ sent, shown, execs, offered, opened, folderOps }));
+    console.log(JSON.stringify({ sent, shown, execs, offered, opened, panels, folderOps }));
     return;
   }
   console.log(JSON.stringify({ error: `unknown mode: ${mode}` }));

@@ -40,7 +40,14 @@ from typing import Any
 # deliberately cut 2026-05-29 (a domain 404 is correct, not an outage), but
 # this default still pointed at it, so a fresh machine without MCP_HUB_URL
 # would aim at a dead endpoint. Every fleet machine is on the tailnet.
-DEFAULT_HUB_URL = os.environ.get("MCP_HUB_URL", "http://100.109.6.114:8090/mcp")
+#
+# Kept as a separate literal because DEFAULT_HUB_URL folds the env var in at
+# IMPORT time, which makes it useless for saying where a URL came from: unset
+# MCP_HUB_URL after import and DEFAULT_HUB_URL still holds the env value. The
+# settings panel reports provenance, so it needs the un-overridden default to
+# compare against.
+BUILTIN_HUB_URL = "http://100.109.6.114:8090/mcp"
+DEFAULT_HUB_URL = os.environ.get("MCP_HUB_URL", BUILTIN_HUB_URL)
 
 # Windows: a console-subsystem child (git, tasklist, python) launched from a
 # window-less parent ALLOCATES A NEW VISIBLE CONSOLE. Our hooks run at every
@@ -1645,6 +1652,228 @@ def identity_command(args: argparse.Namespace) -> int:
     return 0
 
 
+SQUAD_CONF = pathlib.Path.home() / ".config" / "squad" / "squad.conf"
+
+
+def _roster_row(agent: str) -> dict[str, str]:
+    """One agent's roster row: {worktree, args, klass}. {} if absent.
+
+    Third reader of squad.conf, after `squad` itself and the cockpit extension.
+    The alternative — shelling out to `squad` — costs a subprocess for four
+    fields of a pipe-delimited file, and the extension already set the
+    precedent. Field order is squad's: agent|worktree|?|args|class.
+    """
+    try:
+        text = SQUAD_CONF.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        f = line.split("|")
+        if f[0].strip() != agent:
+            continue
+        worktree = f[1].strip() if len(f) > 1 else ""
+        if worktree.startswith("~"):
+            worktree = str(pathlib.Path.home()) + worktree[1:]
+        return {
+            "worktree": worktree,
+            "args": f[3].strip() if len(f) > 3 else "",
+            # squad: anything that is not exactly "faculty" is squad-class, so a
+            # typo'd class must never silently stop an agent being started.
+            "klass": (f[4].strip() if len(f) > 4 else "") or "squad",
+        }
+    return {}
+
+
+def _known_workspace_files() -> list[pathlib.Path]:
+    """Every .code-workspace this machine might list an agent in.
+
+    Same two directories the cockpit's transport picker enumerates, plus any
+    file already named in squad_workspaces — a squad workspace kept somewhere
+    unusual is still the one that decides membership, so it must not be the one
+    we fail to look at.
+    """
+    home = pathlib.Path.home()
+    found: dict[str, pathlib.Path] = {}
+    for d in (home / "Projects", home):
+        try:
+            for p in sorted(d.glob("*.code-workspace")):
+                found[_norm_path(str(p))] = p
+        except OSError:
+            continue
+    table = _load_hub_config().get("squad_workspaces")
+    if isinstance(table, dict):
+        for ws in table:
+            if isinstance(ws, str):
+                found.setdefault(_norm_path(ws), pathlib.Path(ws))
+    return list(found.values())
+
+
+def _workspaces_listing(cwd: str) -> list[pathlib.Path]:
+    target = _norm_path(cwd)
+    return [
+        ws for ws in _known_workspace_files()
+        if any(_norm_path(f) == target for f in _workspace_folders(str(ws)))
+    ]
+
+
+def _launch_flags(launch_args: str) -> dict[str, bool]:
+    """comms/resume from the roster's launch args.
+
+    Mirrors the cockpit's launchStateOf(). Comms is TWO conditions, not one: the
+    channels flag must be present AND name the hub server, because the flag can
+    carry other servers and an agent pointed at one of those is not reachable
+    for wake.
+    """
+    has_channels = bool(
+        re.search(r"(^|\s)--(dangerously-load-development-)?channels(\s|$)", launch_args)
+    )
+    return {
+        "comms": has_channels and "hub" in launch_args,
+        "resume": bool(re.search(r"(^|\s)--continue(\s|$)", launch_args)),
+    }
+
+
+def _settings_model(cwd: str) -> dict[str, Any] | None:
+    """Everything the settings panel shows, with each value's SOURCE.
+
+    Provenance is not decoration. These settings have genuinely different
+    scopes — a squad usually comes from a workspace, comms is per agent, the hub
+    URL is per machine — and a panel that showed only values would be unable to
+    answer the one question worth asking before you change something: does this
+    affect this agent, or everyone on the box?
+
+    Read-only, and deliberately assembled HERE rather than in the extension, so
+    a web UI can render the same model without reimplementing any of it.
+    """
+    name, project = _derive_agent_identity(cwd)
+    if name is None:
+        return None
+
+    row = _roster_row(name)
+    worktree = row.get("worktree") or cwd
+    flags = _launch_flags(row.get("args", ""))
+    workspaces = _workspaces_listing(worktree)
+    derived = _resolve_squads(worktree)
+
+    # What the HUB believes, which is what actually governs delivery. The local
+    # config only says what it WOULD derive at the next register.
+    live: dict[str, Any] = {}
+    try:
+        snap = json.loads(_status_cache_path(name).read_text(encoding="utf-8"))
+        if isinstance(snap, dict):
+            live = snap
+    except (OSError, ValueError):
+        live = {}
+    live_squads = live.get("squads") if isinstance(live.get("squads"), list) else None
+    muted = set(live.get("muted") or [])
+
+    if live_squads is None:
+        squad_value, squad_source = "unknown", "no status snapshot yet — is the agent running?"
+    elif not live_squads:
+        squad_value, squad_source = "— none —", "no squad workspace lists this worktree"
+    else:
+        squad_value = ", ".join(
+            s + " (muted)" if s in muted else s for s in live_squads
+        )
+        if derived:
+            names = ", ".join(w.name for w in workspaces if _resolve_squads(worktree))
+            squad_source = f"from {names}" if names else "derived from workspace type"
+        else:
+            # The gap worth surfacing: a membership nothing regenerates. It
+            # survives because register() treats empty squads as "preserve".
+            squad_source = "set on this agent — no workspace declares it"
+
+    ws_value = ", ".join(w.name for w in workspaces) or "— none —"
+    # Decided by comparing the VALUE to the un-overridden default, not by
+    # reading the env var: MCP_HUB_URL is consumed at import, so "is it set
+    # right now" answers a different question from "where did this URL come
+    # from" — and only the second is what the row claims to say.
+    hub_url = os.environ.get("MCP_HUB_URL") or DEFAULT_HUB_URL
+    hub_src = "built-in default" if hub_url == BUILTIN_HUB_URL else "MCP_HUB_URL"
+    onoff = {True: "on", False: "off"}
+
+    return {
+        "agent": name,
+        "cwd": cwd,
+        "sections": [
+            {
+                "title": "IDENTITY",
+                "note": "",
+                "rows": [
+                    {"label": "Name", "value": name,
+                     "source": "derived from repo + hostname"},
+                    {"label": "Project", "value": project or "—",
+                     "source": "derived from git remote"},
+                    {"label": "Worktree", "value": worktree,
+                     "source": "roster" if row else "not enrolled with squad"},
+                    {"label": "Workspaces", "value": ws_value,
+                     "source": f"appears in {len(workspaces)}"},
+                ],
+            },
+            {
+                "title": "SQUADS",
+                "note": "decides who hears its broadcasts, and whose it hears",
+                "rows": [
+                    {"label": "Squads", "value": squad_value, "source": squad_source},
+                    {"label": "Would derive as",
+                     "value": ", ".join(derived) or "— none —",
+                     "source": "from squad_workspaces, at next register"},
+                ],
+            },
+            {
+                "title": "LAUNCH",
+                "note": "applies at next restart, not to the running session",
+                "rows": [
+                    {"label": "Comms (hub wake)", "value": onoff[flags["comms"]],
+                     "source": "set on this agent"},
+                    {"label": "Resume on restart", "value": onoff[flags["resume"]],
+                     "source": "set on this agent"},
+                    {"label": "Launch args", "value": row.get("args") or "—",
+                     "source": "roster"},
+                    {"label": "Model / Effort", "value": "not persisted",
+                     "source": "session only — the menu sets them until next restart"},
+                ],
+            },
+            {
+                "title": "THIS MACHINE",
+                "note": "applies to every agent here",
+                "rows": [
+                    {"label": "Hub URL", "value": hub_url, "source": hub_src},
+                    {"label": "Enrolment", "value": row.get("klass") or "—",
+                     "source": "roster — faculty is never auto-started by `squad up`"},
+                    {"label": "Opted-in projects",
+                     "value": ", ".join(_load_hub_config().get("projects") or []) or "— none —",
+                     "source": str(_HUB_CONFIG_PATH)},
+                ],
+            },
+        ],
+    }
+
+
+def settings_command(args: argparse.Namespace) -> int:
+    """Read-only: every setting that governs one agent, and where it came from."""
+    cwd = args.cwd or os.getcwd()
+    model = _settings_model(cwd)
+    if model is None:
+        print(f"no derived hub identity for {cwd} (not opted in?)", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(model, indent=2))
+        return 0
+    print(f"Settings — {model['agent']}")
+    for section in model["sections"]:
+        note = f"   ({section['note']})" if section["note"] else ""
+        print(f"\n{section['title']}{note}")
+        width = max(len(r["label"]) for r in section["rows"])
+        for r in section["rows"]:
+            print(f"  {r['label']:<{width}}  {r['value']}")
+            print(f"  {'':<{width}}  \033[2m{r['source']}\033[0m")
+    return 0
+
+
 def transport_history_command(args: argparse.Namespace) -> int:
     """Copy + re-key every transcript from one project path to another.
 
@@ -2948,6 +3177,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Derive even when the project isn't opted in yet (transport needs this)",
     )
 
+    settings = sub.add_parser(
+        "settings",
+        help="Show every setting governing one agent, and where each came from",
+        description=(
+            "Read-only view of one agent's settings with the SOURCE of every "
+            "value. The sources differ in scope — a squad usually comes from a "
+            "workspace, comms is per agent, the hub URL is per machine — so a "
+            "value on its own cannot answer whether changing it affects this "
+            "agent or every agent on the box. Assembled here rather than in "
+            "the cockpit extension so a web UI can render the same model."
+        ),
+    )
+    settings.add_argument("--cwd", default=None, help="Worktree (default: current directory)")
+    settings.add_argument("--json", action="store_true", help="Emit the panel model as JSON")
+
     xport_hist = sub.add_parser(
         "transport-history",
         help="Copy + re-key an agent's conversation history to a new path",
@@ -3031,6 +3275,8 @@ def main(argv: list[str] | None = None) -> int:
         return memory_verify_command(args)
     if args.subcommand == "identity":
         return identity_command(args)
+    if args.subcommand == "settings":
+        return settings_command(args)
     if args.subcommand == "transport-history":
         return transport_history_command(args)
     if args.subcommand == "rebind-url":

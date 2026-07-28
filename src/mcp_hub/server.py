@@ -3436,6 +3436,7 @@ _CLI_SUBCOMMANDS = {
     "memory-verify",
     "transport-history",
     "identity",
+    "settings",
     "rebind-url",
 }
 

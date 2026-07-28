@@ -19,6 +19,10 @@ const os = require("os");
 const path = require("path");
 
 const SQUAD = path.join(os.homedir(), ".local", "bin", "squad");
+// Same directory as squad, installed as a link by the same step. Named
+// explicitly rather than trusting PATH because a VSCode extension host does not
+// inherit an interactive shell's PATH.
+const MCP_HUB = path.join(os.homedir(), ".local", "bin", "mcp-hub");
 
 // repo-key -> [codicon, terminal color id]; fallback below for unknown repos
 const THEME = {
@@ -331,6 +335,59 @@ function withAgents(args, fn) {
 
 const labels = (agents) => agents.map(shortLabel).join(", ");
 
+// Every value in the model is a plain string from squad.conf, a workspace file
+// or the hub — none of it authored here, all of it interpolated into a page. An
+// agent named from a directory, or a launch-args field, is quite enough to
+// break out of the markup by accident, so nothing reaches the DOM unescaped.
+const esc = (s) =>
+  String(s == null ? "" : s).replace(
+    /[&<>"']/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
+  );
+
+// Renders the model from `mcp-hub settings --json`. Every row is value + SOURCE,
+// because these settings differ in scope and a value alone cannot tell you
+// whether changing it affects this agent or every agent on the machine.
+function settingsHtml(model) {
+  const sections = (model.sections || [])
+    .map((s) => {
+      const rows = (s.rows || [])
+        .map(
+          (r) => `<tr><th>${esc(r.label)}</th><td><div class="v">${esc(r.value)}</div>
+            <div class="src">${esc(r.source)}</div></td></tr>`
+        )
+        .join("");
+      const note = s.note ? `<span class="note">${esc(s.note)}</span>` : "";
+      return `<h2>${esc(s.title)}${note}</h2><table>${rows}</table>`;
+    })
+    .join("");
+  return `<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
+<style>
+  body { font-family: var(--vscode-font-family); color: var(--vscode-foreground);
+         padding: 1rem 1.4rem; font-size: var(--vscode-font-size); }
+  h1 { font-size: 1.25em; margin: 0 0 .2rem; }
+  .sub { opacity: .65; margin: 0 0 1.4rem; font-size: .9em; }
+  h2 { font-size: .8em; letter-spacing: .09em; margin: 1.5rem 0 .4rem;
+       opacity: .8; font-weight: 600; }
+  .note { text-transform: none; letter-spacing: 0; font-weight: 400;
+          opacity: .65; margin-left: .7rem; }
+  table { border-collapse: collapse; width: 100%; }
+  th { text-align: left; font-weight: 400; opacity: .75; vertical-align: top;
+       padding: .35rem 1rem .35rem 0; white-space: nowrap; width: 1%; }
+  td { padding: .35rem 0; }
+  .v { font-family: var(--vscode-editor-font-family); word-break: break-all; }
+  .src { opacity: .55; font-size: .87em; margin-top: .1rem; }
+  tr + tr th, tr + tr td { border-top: 1px solid var(--vscode-widget-border,
+                           rgba(128,128,128,.18)); }
+</style></head><body>
+<h1>${esc(model.agent)}</h1>
+<p class="sub">Read-only. Nothing on this page changes anything &mdash; every value
+shows where it came from, so you can see what editing it would affect.</p>
+${sections}
+</body></html>`;
+}
+
 function activate(context) {
   // ---- context-menu commands (registered in every window; they no-op
   // politely on non-agent terminals) ----
@@ -419,6 +476,59 @@ function activate(context) {
         );
       })();
     }),
+    // ---- settings: READ-ONLY, and deliberately so ----
+    // Nothing in this panel DOES anything: no restart, no transport, no retire.
+    // A settings panel that can destroy an agent is one you open carefully, and
+    // it should be one you can open freely — its whole job is answering "what is
+    // this agent actually set to", which nothing else does.
+    //
+    // The model comes from `mcp-hub settings --json`, not from reading files
+    // here. Provenance is the hard part (a squad usually comes from a workspace,
+    // comms is per agent, the hub URL is per machine) and duplicating that logic
+    // in the extension is how the future web UI would come to disagree with the
+    // cockpit about what an agent is set to.
+    vscode.commands.registerCommand("squad.settings", (...args) =>
+      withAgents(args, (agents) => {
+        const agent = agents[0];
+        const row = rosterRows().find((r) => r.agent === agent);
+        if (!row) {
+          vscode.window.showWarningMessage(`Squad: ${agent} has no roster row.`);
+          return;
+        }
+        if (agents.length > 1) {
+          vscode.window.showInformationMessage(
+            `Squad: settings are per agent — showing ${shortLabel(agent)}.`
+          );
+        }
+        cp.execFile(
+          MCP_HUB,
+          ["settings", "--cwd", row.worktree, "--json"],
+          { timeout: 15000 },
+          (err, out, stderr) => {
+            if (err) {
+              vscode.window.showErrorMessage(
+                `Squad settings: ${(stderr || err.message || "").trim()}`
+              );
+              return;
+            }
+            let model;
+            try {
+              model = JSON.parse(out);
+            } catch {
+              vscode.window.showErrorMessage("Squad settings: unreadable output.");
+              return;
+            }
+            const panel = vscode.window.createWebviewPanel(
+              "squadSettings",
+              `Settings — ${shortLabel(agent)}`,
+              vscode.ViewColumn.Active,
+              {}                       // no scripts: nothing here is interactive
+            );
+            panel.webview.html = settingsHtml(model);
+          }
+        );
+      })
+    ),
     vscode.commands.registerCommand("squad.interrupt", (...args) =>
       withAgents(args, (agents) => agents.forEach((a) => squadExec(["key", a, "Escape"], a)))
     ),

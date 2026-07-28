@@ -46,13 +46,18 @@ def box(tmp_path):
 def _drive(home: pathlib.Path, mode: str, target: str = "",
            answers=None, wsfile: str = "", terminal: str = "",
            exec_out: str = "", exec_fail: str = "", fire_roster: bool = False,
-           not_attached: bool = False) -> dict:
+           not_attached: bool = False, settings_out: str = "",
+           settings_fail: str = "") -> dict:
     env = dict(
         os.environ,
         HOME=str(home),
         PATH="/nonexistent",          # no tailscale ⇒ no machine-picker step
         HARNESS_ANSWERS=json.dumps(answers or []),
     )
+    if settings_out:
+        env["HARNESS_SETTINGS_OUT"] = settings_out
+    if settings_fail:
+        env["HARNESS_SETTINGS_FAIL"] = settings_fail
     if exec_out:
         env["HARNESS_EXEC_OUT"] = exec_out
     if exec_fail:
@@ -481,6 +486,97 @@ def test_duplicate_adds_no_folder_when_the_copy_never_landed(box, tmp_path):
                  terminal="demo \u00b7 idle", exec_out=DRY, fire_roster=True)
     added = [p for op in out["folderOps"] for p in op["add"]]
     assert added == [], f"adopted a folder for a copy that never landed: {added}"
+
+
+# ---- the settings panel (read-only) --------------------------------------
+
+MODEL = json.dumps({
+    "agent": "demo",
+    "sections": [
+        {"title": "SQUADS", "note": "decides who hears its broadcasts",
+         "rows": [{"label": "Squads", "value": "dreamteam",
+                   "source": "set on this agent — no workspace declares it"}]},
+        {"title": "LAUNCH", "note": "",
+         "rows": [{"label": "Comms (hub wake)", "value": "on",
+                   "source": "set on this agent"}]},
+    ],
+})
+
+
+def test_settings_asks_the_cli_rather_than_reading_files_itself(box):
+    """Provenance is the hard part, and duplicating it in the extension is how
+    the future web UI comes to disagree with the cockpit about what an agent is
+    set to. The panel must be a renderer, so the cli call is the behaviour."""
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=MODEL)
+    call = next((e for e in out["execs"] if "settings" in e), None)
+    assert call, out["execs"]
+    assert "--json" in call and f"--cwd {box}/Projects/demo" in call, call
+
+
+def test_the_panel_shows_every_value_with_its_source(box):
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=MODEL)
+    assert len(out["panels"]) == 1, out
+    html = out["panels"][0]["html"]
+    assert "dreamteam" in html
+    # THE point of the panel: a value with no source cannot tell the operator
+    # whether changing it affects this agent or every agent on the machine.
+    assert "no workspace declares it" in html, html
+    assert "set on this agent" in html
+    assert out["panels"][0]["title"] == "Settings — demo"
+
+
+def test_the_panel_does_nothing_to_the_agent(box):
+    """Read-only is the property that makes it safe to open freely. A settings
+    panel that can restart or retire is one you open carefully."""
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=MODEL)
+    assert out["sent"] == [], "typed into the agent's tab"
+    assert [e for e in out["execs"] if "settings" not in e] == [], out["execs"]
+
+
+def test_values_are_escaped_into_the_page(box):
+    """Nothing in the model is authored by us: agent names come from directory
+    names, launch args from the roster, squads from the hub. A value that closes
+    a tag is an accident away, and this page is rendered as HTML."""
+    hostile = json.dumps({"agent": "demo", "sections": [{"title": "LAUNCH", "note": "",
+        "rows": [{"label": "Launch args", "value": "<script>bad()</script>",
+                  "source": "roster"}]}]})
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=hostile)
+    html = out["panels"][0]["html"]
+    assert "<script>bad()</script>" not in html, "raw markup reached the page"
+    assert "&lt;script&gt;" in html, html
+
+
+def test_a_failed_settings_call_reports_instead_of_opening_a_panel(box):
+    """A non-zero exit means the model may be stale, partial, or about something
+    else — rendering it anyway shows the operator numbers with no warning that
+    they are wrong.
+
+    Deliberately supplies parseable stdout ALONGSIDE the failure. Without it the
+    error branch's early return is unfalsifiable: stdout is empty, so the
+    unparseable-output guard behind it catches the fall-through and the panel
+    stays closed either way. (Measured — a mutant deleting this return passed.)
+    """
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=MODEL, settings_fail="not opted in")
+    assert out["panels"] == [], "rendered a model from a call that failed"
+    assert any("not opted in" in s for s in out["shown"]), out["shown"]
+
+
+def test_unreadable_output_is_reported_not_rendered(box):
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out="this is not json")
+    assert out["panels"] == []
+    assert any("unreadable" in s for s in out["shown"]), out["shown"]
+
+
+def test_settings_on_a_non_agent_tab_warns(box):
+    out = _drive(box, "run", "squad.settings", settings_out=MODEL)
+    assert out["panels"] == [] and out["execs"] == []
+    assert any("no squad agent" in s for s in out["shown"]), out
 
 
 # ---- operator-editable lists (prompts.txt / slash.txt) --------------------
