@@ -213,7 +213,34 @@ function startWithMode(args, mode) {
     any = true;
     inflight.set(t, Date.now());          // suppress the focus toast for this tab
     t.show(false);
-    t.sendText(`clear; squad restart ${a} ${mode} >/dev/null 2>&1 && squad attach ${a}; clear`);
+    // TWO PATHS, and they are not interchangeable — picked by whether a viewer
+    // is ATTACHED, not by whether the agent is running.
+    //
+    // Typing is right for a SHELL tab: attaching is a property of THIS
+    // terminal, and a background exec would leave the tab a bare shell (the
+    // 2026-07-26 "Start & attach only started" regression, which is why the
+    // typed form exists at all).
+    //
+    // Typing is WRONG for an attached tab: the pane is Claude, so the command
+    // lands in the agent's own prompt. The operator hit this restarting a live
+    // seat — "it just keeps putting the command into the chat box". For that
+    // case `squad restart` must run in the BACKGROUND: it respawns the pane in
+    // place and attached viewers keep watching, so nothing needs typing.
+    //
+    // Fails toward TYPING: if the probe errors we take the shell path, because
+    // a stray command line in a tab is visible and recoverable, whereas a
+    // background restart on a shell tab leaves the operator staring at a
+    // prompt wondering why the button did nothing.
+    cp.execFile(SQUAD, ["attached", a], { timeout: 10000 }, (err) => {
+      const isAttached = !err;
+      if (isAttached) {
+        squadExec(["restart", a, mode], a);
+      } else {
+        t.sendText(
+          `clear; squad restart ${a} ${mode} >/dev/null 2>&1 && squad attach ${a}; clear`
+        );
+      }
+    });
   }
   if (!any) vscode.window.showWarningMessage("Squad: no squad agent in the selection.");
 }

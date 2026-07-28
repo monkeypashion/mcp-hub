@@ -1898,6 +1898,28 @@ case "${1:-help}" in
             # an on-demand agent comes to life (the cockpit's Start action).
             a="$(need_agent "${2:-}")" || exit 1
             up_one "$a" ;;
+  attached) # Is a viewer currently attached to this agent's session? exit 0 yes,
+            # 1 no. Built for the cockpit, which has to choose between two
+            # start paths that are NOT interchangeable:
+            #
+            #   tab is a SHELL (nothing attached) -> the command must be TYPED
+            #     into it, because attaching is a property of THIS terminal and
+            #     a background exec leaves the tab a bare shell (the 2026-07-26
+            #     "Start & attach only started" regression).
+            #   tab is ATTACHED to a live agent -> the pane is Claude, not a
+            #     shell, so typing puts the command in the AGENT'S PROMPT.
+            #     Operator hit exactly this trying to restart a running seat:
+            #     "it just keeps putting the command into the chat box".
+            #     Here restart must run in the BACKGROUND — it respawns the
+            #     pane in place and attached viewers keep watching, so nothing
+            #     needs typing at all.
+            #
+            # The discriminator is "is this session attached", NOT "is the agent
+            # running" — a running agent with no viewer is a shell tab, and it
+            # needs the typed path.
+            a="$(need_agent "${2:-}")" || exit 1
+            tm has-session -t "=$a" 2>/dev/null || exit 1
+            [ -n "$(tm list-clients -t "=$a" -F '#{client_tty}' 2>/dev/null)" ] ;;
   stop)     # explicit single-agent stop — the inverse of start. Kills the tmux
             # session (attached cockpit terminals drop back to their shell) and
             # retires the daemon so nothing keeps beating for a stopped agent.
