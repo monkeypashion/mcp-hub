@@ -302,3 +302,82 @@ def test_the_edit_command_names_the_agent_it_will_change(box):
     launch = _rows(cli._settings_model(str(box["work"])), "LAUNCH")
     assert "widget-box" in launch["Comms (hub wake)"]["edit"]["argv"]
     assert "widget-box" in launch["Model"]["edit"]["argv"]
+
+
+# ---- `mcp-hub mute`: the cli half of it ------------------------------------
+#
+# The hub tool itself is covered in test_broadcast_scope (6 tests). What was
+# untested is the part written for the cockpit: turning the operator's word into
+# the tool's boolean, and what happens to the cached copy afterwards.
+
+def _mute_args(**kw):
+    import argparse
+    base = dict(agent="widget-box", squad="dreamteam", state="mute",
+                hub_url="http://hub.invalid/mcp")
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+@pytest.mark.parametrize("state,expected", [("mute", True), ("hear", False)])
+def test_the_operators_word_maps_to_the_tools_boolean(box, monkeypatch, state, expected):
+    """`--state hear|mute` reads correctly at the command line; `muted=` reads
+    correctly at the tool. The mapping between them is one negation away from
+    silencing a squad when asked to unsilence it, and the two spellings mean the
+    round trip cannot be checked by eye."""
+    seen = {}
+
+    async def fake(hub_url, name, squad, muted):
+        seen.update(hub_url=hub_url, name=name, squad=squad, muted=muted)
+        return "ok"
+
+    monkeypatch.setattr(cli, "_mute_squad", fake)
+    assert cli.mute_command(_mute_args(state=state)) == 0
+    assert seen["muted"] is expected, seen
+    assert seen["name"] == "widget-box" and seen["squad"] == "dreamteam"
+
+
+def test_a_successful_mute_drops_the_cached_snapshot(box, monkeypatch):
+    """The hub is the record; the status file is a copy that the statusline AND
+    the settings panel both read. Left stale, the panel keeps showing the old
+    state — which reads as "the click did nothing"."""
+    snap = box["home"] / ".mcp-hub" / "status-widget-box.json"
+    snap.write_text(json.dumps({"squads": ["dreamteam"], "muted": []}), encoding="utf-8")
+
+    async def fake(*a, **k):
+        return "ok"
+
+    monkeypatch.setattr(cli, "_mute_squad", fake)
+    assert cli.mute_command(_mute_args()) == 0
+    assert not snap.exists(), "the panel would keep reporting the old state"
+
+
+def test_a_failed_mute_reports_and_keeps_the_snapshot(box, monkeypatch):
+    """Nothing changed on the hub, so the cached copy is still ACCURATE.
+    Dropping it there would replace a correct value with 'unknown' — turning a
+    failed write into a second, invented, symptom."""
+    snap = box["home"] / ".mcp-hub" / "status-widget-box.json"
+    snap.write_text(json.dumps({"squads": ["dreamteam"], "muted": []}), encoding="utf-8")
+
+    async def boom(*a, **k):
+        raise RuntimeError("hub unreachable")
+
+    monkeypatch.setattr(cli, "_mute_squad", boom)
+    assert cli.mute_command(_mute_args()) == 1
+    assert snap.exists(), "discarded a snapshot that was still correct"
+
+
+def test_the_settings_edit_and_the_mute_command_agree_on_spelling(box):
+    """The panel builds `--state {}` from the row's choices, so the choices ARE
+    the accepted values. A rename on either side leaves a dropdown whose entries
+    the command rejects — and the panel would report the refusal as if the hub
+    had said no."""
+    (box["home"] / ".mcp-hub" / "status-widget-box.json").write_text(
+        json.dumps({"squads": ["dreamteam"], "muted": []}), encoding="utf-8")
+    squads = _rows(cli._settings_model(str(box["work"])), "SQUADS")
+    choices = squads["dreamteam"]["edit"]["choices"]
+    parser = cli.build_parser()
+    accepted = set(
+        parser._subparsers._group_actions[0]
+        .choices["mute"]._option_string_actions["--state"].choices
+    )
+    assert set(choices) == accepted, f"panel offers {choices}, cli accepts {accepted}"
