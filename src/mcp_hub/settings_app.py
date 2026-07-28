@@ -19,7 +19,48 @@ from typing import Any
 from textual import on
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.theme import Theme
 from textual.widgets import Footer, Header, Label, ListItem, ListView, Select, Static
+
+# Claude's own palette, read out of the Claude Code binary's CSS custom
+# properties rather than recalled — `--clay: #d97757`, `--clay-emphasized`,
+# `--plum`, `--mineral`, `--peach`, and a 40-step WARM grey ramp (#fcfcfb …
+# #0b0b0b) that is what makes it read as Claude rather than as a generic dark
+# theme: the greys are not neutral, they lean yellow.
+#
+#   grep -aoE "#[0-9a-f]{6}" ~/.local/share/claude/versions/<v>
+#
+# Both variants are registered, so Ctrl+P still switches to any of Textual's
+# 22 built-ins — this only changes the DEFAULT.
+CLAY = "#d97757"
+CLAUDE_DARK = Theme(
+    name="claude",
+    primary=CLAY,             # clay
+    secondary="#827dbd",      # plum
+    accent="#ebc9b7",         # peach
+    warning="#eb6834",        # orange-350
+    error="#e34948",          # red-400
+    success="#629987",        # mineral
+    foreground="#e4e3dd",     # gray-90
+    background="#1a1a19",     # gray-830
+    surface="#20201f",        # gray-800
+    panel="#2c2c2a",          # gray-750
+    dark=True,
+)
+CLAUDE_LIGHT = Theme(
+    name="claude-light",
+    primary="#c6613f",        # clay-emphasized, for contrast on cream
+    secondary="#827dbd",
+    accent=CLAY,
+    warning="#ae461c",        # orange-500
+    error="#b93535",          # red-500
+    success="#629987",
+    foreground="#20201f",     # gray-800
+    background="#f9f9f7",     # gray-20
+    surface="#ffffff",
+    panel="#f0efec",          # gray-50
+    dark=False,
+)
 
 CSS = """
 Screen { layout: vertical; }
@@ -30,18 +71,18 @@ Screen { layout: vertical; }
    exactly one row of the panel and blank space below it. */
 #agents {
     width: 36;
-    border-right: solid $panel-lighten-2;
+    border-right: solid $primary 40%;
     background: $surface;
     height: 1fr;
 }
 #agents > ListItem { height: 2; padding: 0 1; }
-#agents > ListItem.-highlight { background: $accent 40%; }
+#agents > ListItem.-highlight { background: $primary 30%; }
 .agent-name { text-style: bold; height: 1; }
 .agent-class { color: $text-muted; height: 1; }
 
 #detail { padding: 0 2; height: 1fr; }
 .section {
-    color: $accent;
+    color: $primary;
     text-style: bold;
     height: 1;
     margin: 1 0 0 0;
@@ -108,6 +149,9 @@ class SettingsApp(App):
         yield Footer()
 
     async def on_mount(self) -> None:
+        self.register_theme(CLAUDE_DARK)
+        self.register_theme(CLAUDE_LIGHT)
+        self.theme = "claude"
         self.title = "Squad settings"
         where = self.scoped_to.rsplit("/", 1)[-1] if self.scoped_to else "this machine"
         self.sub_title = f"{len(self.agents)} agent(s) · {where}"
