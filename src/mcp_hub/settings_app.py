@@ -34,7 +34,7 @@ from textual.widgets import Footer, Header, Label, ListItem, ListView, Select, S
 # 22 built-ins — this only changes the DEFAULT.
 CLAY = "#d97757"
 CLAUDE_DARK = Theme(
-    name="claude",
+    name="claude-dark",
     primary=CLAY,             # clay
     secondary="#827dbd",      # plum
     accent="#ebc9b7",         # peach
@@ -48,7 +48,7 @@ CLAUDE_DARK = Theme(
     dark=True,
 )
 CLAUDE_LIGHT = Theme(
-    name="claude-light",
+    name="claude-light",   # the DEFAULT — see on_mount
     primary="#c6613f",        # clay-emphasized, for contrast on cream
     secondary="#827dbd",
     accent=CLAY,
@@ -151,7 +151,11 @@ class SettingsApp(App):
     async def on_mount(self) -> None:
         self.register_theme(CLAUDE_DARK)
         self.register_theme(CLAUDE_LIGHT)
-        self.theme = "claude"
+        # Light by default: Claude's sessions are the warm cream ground, not
+        # the dark one. #f9f9f7 (gray-20) with #ffffff panels, and the
+        # emphasized clay #c6613f for text weight — plain clay is too light on
+        # cream to read as a heading.
+        self.theme = "claude-light"
         self.title = "Squad settings"
         where = self.scoped_to.rsplit("/", 1)[-1] if self.scoped_to else "this machine"
         self.sub_title = f"{len(self.agents)} agent(s) · {where}"
