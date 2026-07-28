@@ -2238,6 +2238,42 @@ class SettingsTui:
         return f"{len(self.agents)} agent(s) · {where}"
 
 
+ESC = 27
+
+
+def read_key(stdscr):  # pragma: no cover - needs a terminal
+    """One keystroke, with untranslated escape sequences swallowed whole.
+
+    Returns a curses key code, or None when the bytes were an escape sequence
+    ncurses did not fold into a KEY_* code. Acting on the leading 27 of such a
+    sequence is exactly the defect this exists to prevent: it makes every arrow
+    key look like ESC.
+
+    A real ESC press is distinguished by what follows it — nothing. With
+    escdelay set low, a bare ESC returns -1 on the immediate next read while a
+    sequence has its remaining bytes already waiting.
+    """
+    key = stdscr.getch()
+    if key != ESC:
+        return key
+    stdscr.nodelay(True)
+    try:
+        nxt = stdscr.getch()
+        if nxt == -1:
+            return ESC                    # a genuine, bare Escape
+        # Drain the rest of the sequence: CSI parameters are digits and ';',
+        # terminated by a letter or '~'. Bounded, so a malformed sequence
+        # cannot spin here.
+        if nxt == ord("["):
+            for _ in range(8):
+                c = stdscr.getch()
+                if c == -1 or chr(c & 0xFF).isalpha() or c == ord("~"):
+                    break
+        return None
+    finally:
+        stdscr.nodelay(False)
+
+
 def _tui_run(stdscr, tui: "SettingsTui") -> None:  # pragma: no cover - draws
     """Draw + key loop. Decides nothing: every branch delegates to SettingsTui.
 
@@ -2247,7 +2283,16 @@ def _tui_run(stdscr, tui: "SettingsTui") -> None:  # pragma: no cover - draws
     import curses
 
     curses.curs_set(0)
+    # keypad(True) asks ncurses to translate escape SEQUENCES into single
+    # KEY_* codes. It does not always get the chance: VSCode's terminal sends
+    # arrows in NORMAL cursor mode (ESC [ B) and the first byte reaches us as
+    # 27. Everything below is written so that no untranslated sequence can be
+    # mistaken for a keystroke the operator meant.
     stdscr.keypad(True)
+    try:
+        curses.set_escdelay(25)   # ESC responds now, not after a second
+    except (AttributeError, curses.error):
+        pass
     try:
         curses.mousemask(curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED)
     except curses.error:
@@ -2347,16 +2392,18 @@ def _tui_run(stdscr, tui: "SettingsTui") -> None:  # pragma: no cover - draws
 
         stdscr.refresh()
         try:
-            key = stdscr.getch()
+            key = read_key(stdscr)
         except KeyboardInterrupt:
             return
 
+        if key is None:          # an escape sequence we could not interpret
+            continue
         if picker:
             if key in (curses.KEY_UP, ord("k")):
                 picker_ix = max(0, picker_ix - 1)
             elif key in (curses.KEY_DOWN, ord("j")):
                 picker_ix = min(len(picker) - 1, picker_ix + 1)
-            elif key in (27, ord("q")):
+            elif key in (ESC, ord("q")):
                 picker = None
             elif key in (curses.KEY_ENTER, 10, 13):
                 choice = picker[picker_ix]
@@ -2395,7 +2442,12 @@ def _tui_run(stdscr, tui: "SettingsTui") -> None:  # pragma: no cover - draws
                     tui.load()
             continue
 
-        if key in (ord("q"), 27):
+        # `q` ONLY. Binding bare ESC to quit is what broke every arrow key:
+        # curses hands over 27 as the first byte of an untranslated sequence,
+        # so pressing DOWN quit the program and the next keystroke went to the
+        # shell underneath — "you hit enter to apply and the whole settings
+        # menu exits" (operator, 2026-07-28). ESC now only closes a picker.
+        if key in (ord("q"), ord("Q")):
             return
         if key in (curses.KEY_UP, ord("k")):
             tui.move_row(-1)
