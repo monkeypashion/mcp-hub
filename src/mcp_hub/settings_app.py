@@ -52,7 +52,7 @@ Screen { layout: vertical; }
 .value-ro { color: $text; height: 1; width: 1fr; }
 .source { color: $text-muted; height: 1; padding: 0 0 0 24; }
 Select { width: 30; height: 1; }
-#note { color: $warning; padding: 1 0; height: auto; }
+.note { color: $warning; padding: 1 0; height: auto; }
 #status { dock: bottom; height: 1; padding: 0 2; background: $panel; }
 """
 
@@ -77,6 +77,14 @@ class SettingsApp(App):
         self.hub_bin = hub_bin
         self.agent_ix = 0
         self.model: dict[str, Any] | None = None
+        # Bumped every redraw and baked into each widget id. remove_children()
+        # is ASYNCHRONOUS, so a widget from the previous render can still be in
+        # the tree when the next one mounts — a fixed id then raises
+        # DuplicateIds and takes the whole app down. Clicking from one
+        # no-settings agent to another did exactly that ("it crashed the whole
+        # thing", 2026-07-28). Awaiting the removal fixes the timing; this makes
+        # a collision impossible even if the timing changes again.
+        self._gen = 0
 
     # ---- layout ----
 
@@ -99,7 +107,7 @@ class SettingsApp(App):
         yield Static("", id="status")
         yield Footer()
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         self.title = "Squad settings"
         where = self.scoped_to.rsplit("/", 1)[-1] if self.scoped_to else "this machine"
         self.sub_title = f"{len(self.agents)} agent(s) · {where}"
@@ -110,7 +118,7 @@ class SettingsApp(App):
         lv = self.query_one("#agents", ListView)
         lv.index = self.agent_ix
         lv.focus()
-        self.refresh_detail()
+        await self.refresh_detail()
 
     def _first_with_settings(self) -> int:
         for i, a in enumerate(self.agents):
@@ -123,34 +131,37 @@ class SettingsApp(App):
 
     # ---- rendering the selected agent ----
 
-    def refresh_detail(self) -> None:
+    async def refresh_detail(self) -> None:
         detail = self.query_one("#detail", VerticalScroll)
-        detail.remove_children()
+        await detail.remove_children()      # AWAITED: mounts below raced it
+        self._gen += 1
         if not self.agents:
-            detail.mount(Static("no agents in this workspace", id="note"))
+            await detail.mount(Static("no agents in this workspace", classes="note"))
             return
         agent = self.agents[self.agent_ix]
         try:
             self.model = self._model_for(agent["worktree"])
         except Exception as exc:  # noqa: BLE001
             self.model = None
-            detail.mount(Static(f"could not read settings: {exc}", id="note"))
+            await detail.mount(Static(f"could not read settings: {exc}", classes="note"))
             return
         if not self.model:
             # Not a failure — a folder with no hub identity. Saying so beats an
             # empty pane, which reads as broken.
-            detail.mount(Static(
+            await detail.mount(Static(
                 "No hub identity for this folder. Settings are derived from a git "
                 "remote plus ~/.mcp-hub/config.json, so a plain folder added with "
-                "`squad add-folder` has none.", id="note"))
+                "`squad add-folder` has none.", classes="note"))
             return
+        widgets: list[Any] = []
         for si, section in enumerate(self.model.get("sections", [])):
             head = section["title"]
             if section.get("note"):
                 head += f"   {section['note']}"
-            detail.mount(Static(head, classes="section"))
+            widgets.append(Static(head, classes="section"))
             for ri, row in enumerate(section.get("rows", [])):
-                detail.mount(self._row_widget(si, ri, row))
+                widgets.append(self._row_widget(si, ri, row))
+        await detail.mount_all(widgets)     # one mount: never seen half-built
 
     def _row_widget(self, si: int, ri: int, row: dict[str, Any]) -> Vertical:
         edit = row.get("edit")
@@ -164,7 +175,7 @@ class SettingsApp(App):
                 choices = [row["value"], *choices]
             control: Any = Select(
                 [(c, c) for c in choices], value=row["value"],
-                allow_blank=False, id=f"sel-{si}-{ri}", compact=True,
+                allow_blank=False, id=f"sel-{self._gen}-{si}-{ri}", compact=True,
             )
         else:
             control = Static(str(row["value"]), classes="value-ro")
@@ -181,11 +192,11 @@ class SettingsApp(App):
     # ---- events ----
 
     @on(ListView.Highlighted, "#agents")
-    def _agent_changed(self, event: ListView.Highlighted) -> None:
+    async def _agent_changed(self, event: ListView.Highlighted) -> None:
         if event.list_view.index is None or event.list_view.index == self.agent_ix:
             return
         self.agent_ix = event.list_view.index
-        self.refresh_detail()
+        await self.refresh_detail()
 
     @on(Select.Changed)
     def _value_changed(self, event: Select.Changed) -> None:
@@ -193,7 +204,7 @@ class SettingsApp(App):
             return
         sel_id = event.select.id or ""
         try:
-            _, si, ri = sel_id.split("-")
+            _, _gen, si, ri = sel_id.split("-")
             row = self.model["sections"][int(si)]["rows"][int(ri)]
         except (ValueError, IndexError, KeyError):
             return
@@ -231,11 +242,11 @@ class SettingsApp(App):
 
     def _after_apply(self, msg: str) -> None:
         self._set_status(msg)
-        self.refresh_detail()
+        self.call_later(self.refresh_detail)
 
     def _set_status(self, text: str) -> None:
         self.query_one("#status", Static).update(text)
 
-    def action_reload(self) -> None:
-        self.refresh_detail()
+    async def action_reload(self) -> None:
+        await self.refresh_detail()
         self._set_status("reloaded")
