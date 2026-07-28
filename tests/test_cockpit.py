@@ -514,40 +514,44 @@ def test_settings_asks_the_cli_rather_than_reading_files_itself(box):
     assert "--json" in call and f"--cwd {box}/Projects/demo" in call, call
 
 
-def test_the_panel_shows_every_value_with_its_source(box):
+def test_every_row_shows_its_value_AND_its_source(box):
+    """THE property. A value with no source cannot tell the operator whether
+    changing it affects this agent or every agent on the machine — which is the
+    only question worth asking before touching one.
+
+    Asserted per row rather than by searching a blob: a whole-output substring
+    check passes while some rows carry a source and others don't.
+    """
     out = _drive(box, "run", "squad.settings", terminal="demo · idle",
                  settings_out=MODEL)
-    assert len(out["panels"]) == 1, out
-    html = out["panels"][0]["html"]
-    assert "dreamteam" in html
-    # THE point of the panel: a value with no source cannot tell the operator
-    # whether changing it affects this agent or every agent on the machine.
-    assert "no workspace declares it" in html, html
-    assert "set on this agent" in html
-    assert out["panels"][0]["title"] == "Settings — demo"
+    assert len(out["picks"]) == 1, out
+    rows = [i for i in out["picks"][0] if not i["separator"]]
+    assert len(rows) == 2, rows
+    for row in rows:
+        assert row["description"], f"{row['label']} has no value"
+        assert row["detail"], f"{row['label']} has no source"
+    by_label = {r["label"]: r for r in rows}
+    assert by_label["Squads"]["description"] == "dreamteam"
+    assert by_label["Squads"]["detail"] == \
+        "set on this agent — no workspace declares it"
+
+
+def test_sections_are_separators_not_selectable_rows(box):
+    """A heading you can click is a heading that looks like a setting."""
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=MODEL)
+    heads = [i for i in out["picks"][0] if i["separator"]]
+    assert [h["label"] for h in heads] == [
+        "SQUADS — decides who hears its broadcasts", "LAUNCH"], heads
 
 
 def test_the_panel_does_nothing_to_the_agent(box):
-    """Read-only is the property that makes it safe to open freely. A settings
-    panel that can restart or retire is one you open carefully."""
+    """Read-only is what makes it safe to open freely. A settings panel that can
+    restart or retire is one you open carefully."""
     out = _drive(box, "run", "squad.settings", terminal="demo · idle",
-                 settings_out=MODEL)
+                 settings_out=MODEL, answers=["Comms"])   # a row IS selected
     assert out["sent"] == [], "typed into the agent's tab"
     assert [e for e in out["execs"] if "settings" not in e] == [], out["execs"]
-
-
-def test_values_are_escaped_into_the_page(box):
-    """Nothing in the model is authored by us: agent names come from directory
-    names, launch args from the roster, squads from the hub. A value that closes
-    a tag is an accident away, and this page is rendered as HTML."""
-    hostile = json.dumps({"agent": "demo", "sections": [{"title": "LAUNCH", "note": "",
-        "rows": [{"label": "Launch args", "value": "<script>bad()</script>",
-                  "source": "roster"}]}]})
-    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
-                 settings_out=hostile)
-    html = out["panels"][0]["html"]
-    assert "<script>bad()</script>" not in html, "raw markup reached the page"
-    assert "&lt;script&gt;" in html, html
 
 
 def test_a_failed_settings_call_reports_instead_of_opening_a_panel(box):
@@ -562,20 +566,20 @@ def test_a_failed_settings_call_reports_instead_of_opening_a_panel(box):
     """
     out = _drive(box, "run", "squad.settings", terminal="demo · idle",
                  settings_out=MODEL, settings_fail="not opted in")
-    assert out["panels"] == [], "rendered a model from a call that failed"
+    assert out["picks"] == [], "rendered a model from a call that failed"
     assert any("not opted in" in s for s in out["shown"]), out["shown"]
 
 
 def test_unreadable_output_is_reported_not_rendered(box):
     out = _drive(box, "run", "squad.settings", terminal="demo · idle",
                  settings_out="this is not json")
-    assert out["panels"] == []
+    assert out["picks"] == []
     assert any("unreadable" in s for s in out["shown"]), out["shown"]
 
 
 def test_settings_on_a_non_agent_tab_warns(box):
     out = _drive(box, "run", "squad.settings", settings_out=MODEL)
-    assert out["panels"] == [] and out["execs"] == []
+    assert out["picks"] == [] and out["execs"] == []
     assert any("no squad agent" in s for s in out["shown"]), out
 
 

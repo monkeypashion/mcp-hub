@@ -68,6 +68,18 @@ const vscode = {
       // into rows of one list — "they are all still there" is the claim, and
       // this is the only thing that can check it.
       offered.push(list.map((i) => String((i && i.label) || i)));
+      // Full items too. A settings row is label + description + SOURCE, and
+      // flattening to labels throws away the two parts the panel exists to
+      // show — "every value names where it came from" is unassertable against
+      // a list of labels.
+      picks.push(
+        list.map((i) =>
+          i && typeof i === "object"
+            ? { label: String(i.label || ""), description: String(i.description || ""),
+                detail: String(i.detail || ""), separator: i.kind === 999 }
+            : { label: String(i), description: "", detail: "", separator: false }
+        )
+      );
       if (want === undefined) return undefined;
       return list.find((i) => String(i.label || i).includes(want));
     },
@@ -96,19 +108,6 @@ const vscode = {
     async showTextDocument(doc) {
       opened.push((doc && doc.fsPath) || String(doc));
       return {};
-    },
-    // The settings panel's only output is a rendered page, so the HTML IS the
-    // behaviour under test — assert on it, not on the fact a panel appeared.
-    createWebviewPanel(id, title) {
-      const panel = { title, html: "", dispose() {} };
-      Object.defineProperty(panel, "webview", {
-        get: () => ({
-          set html(v) { panel.html = v; panels[panels.length - 1].html = v; },
-          get html() { return panel.html; },
-        }),
-      });
-      panels.push({ id, title, html: "" });
-      return panel;
     },
     onDidChangeTerminalShellIntegration: ev,
     onDidChangeActiveTerminal: ev,
@@ -157,6 +156,9 @@ const vscode = {
       return true;
     },
   },
+  // Real value is 999 in the VSCode API; the harness only needs the identity
+  // to hold so a separator is distinguishable from a row.
+  QuickPickItemKind: { Separator: 999, Default: 0 },
   ThemeIcon: class {
     constructor(id) {
       this.id = id;
@@ -168,7 +170,6 @@ const vscode = {
     }
   },
   Uri: { file: (p) => ({ fsPath: p, toString: () => p }) },
-  ViewColumn: { Active: -1, One: 1, Beside: -2 },
   RelativePattern: class {
     constructor(base, pattern) {
       this.base = base;
@@ -191,7 +192,7 @@ const vscode = {
 // paths legitimately shell out and expect output.
 const execs = [];
 const offered = [];
-const panels = [];
+const picks = [];
 const opened = [];
 const folderOps = [];
 const watcherCbs = [];
@@ -296,7 +297,7 @@ ext.activate({ subscriptions: [] });
         await new Promise((r) => setTimeout(r, 25));
       }
     } catch (e) {
-      console.log(JSON.stringify({ error: String((e && e.message) || e), sent, shown, execs, offered, opened, panels, folderOps }));
+      console.log(JSON.stringify({ error: String((e && e.message) || e), sent, shown, execs, offered, opened, picks, folderOps }));
       process.exitCode = 3;
       return;
     }
@@ -310,7 +311,7 @@ ext.activate({ subscriptions: [] });
       }
       for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 25));
     }
-    console.log(JSON.stringify({ sent, shown, execs, offered, opened, panels, folderOps }));
+    console.log(JSON.stringify({ sent, shown, execs, offered, opened, picks, folderOps }));
     return;
   }
   console.log(JSON.stringify({ error: `unknown mode: ${mode}` }));

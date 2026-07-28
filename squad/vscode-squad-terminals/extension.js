@@ -23,6 +23,11 @@ const SQUAD = path.join(os.homedir(), ".local", "bin", "squad");
 // explicitly rather than trusting PATH because a VSCode extension host does not
 // inherit an interactive shell's PATH.
 const MCP_HUB = path.join(os.homedir(), ".local", "bin", "mcp-hub");
+// Guarded: QuickPickItemKind arrived in VSCode 1.64. Falling back to undefined
+// degrades a separator into an ordinary unselectable-looking row rather than
+// throwing while building the list, which would take the whole panel with it.
+const SEPARATOR =
+  (vscode.QuickPickItemKind && vscode.QuickPickItemKind.Separator) || undefined;
 
 // repo-key -> [codicon, terminal color id]; fallback below for unknown repos
 const THEME = {
@@ -335,57 +340,36 @@ function withAgents(args, fn) {
 
 const labels = (agents) => agents.map(shortLabel).join(", ");
 
-// Every value in the model is a plain string from squad.conf, a workspace file
-// or the hub — none of it authored here, all of it interpolated into a page. An
-// agent named from a directory, or a launch-args field, is quite enough to
-// break out of the markup by accident, so nothing reaches the DOM unescaped.
-const esc = (s) =>
-  String(s == null ? "" : s).replace(
-    /[&<>"']/g,
-    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
-  );
-
-// Renders the model from `mcp-hub settings --json`. Every row is value + SOURCE,
-// because these settings differ in scope and a value alone cannot tell you
+// The model from `mcp-hub settings --json`, as quick-pick rows.
+//
+// A quick pick rather than a webview because a webview is an EDITOR TAB — it
+// sits in the file row and is closed, not dismissed, which is not what a
+// settings view should feel like (operator, 2026-07-28: "it opened it as a file
+// rather than a popup"). This appears over the centre, Escape closes it, and
+// typing filters.
+//
+// label = the setting, description = its value, detail = its SOURCE. The source
+// is a whole line of its own rather than a parenthetical because it is the point
+// of the panel: these settings differ in scope, so a value alone cannot say
 // whether changing it affects this agent or every agent on the machine.
-function settingsHtml(model) {
-  const sections = (model.sections || [])
-    .map((s) => {
-      const rows = (s.rows || [])
-        .map(
-          (r) => `<tr><th>${esc(r.label)}</th><td><div class="v">${esc(r.value)}</div>
-            <div class="src">${esc(r.source)}</div></td></tr>`
-        )
-        .join("");
-      const note = s.note ? `<span class="note">${esc(s.note)}</span>` : "";
-      return `<h2>${esc(s.title)}${note}</h2><table>${rows}</table>`;
-    })
-    .join("");
-  return `<!DOCTYPE html><html><head><meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
-<style>
-  body { font-family: var(--vscode-font-family); color: var(--vscode-foreground);
-         padding: 1rem 1.4rem; font-size: var(--vscode-font-size); }
-  h1 { font-size: 1.25em; margin: 0 0 .2rem; }
-  .sub { opacity: .65; margin: 0 0 1.4rem; font-size: .9em; }
-  h2 { font-size: .8em; letter-spacing: .09em; margin: 1.5rem 0 .4rem;
-       opacity: .8; font-weight: 600; }
-  .note { text-transform: none; letter-spacing: 0; font-weight: 400;
-          opacity: .65; margin-left: .7rem; }
-  table { border-collapse: collapse; width: 100%; }
-  th { text-align: left; font-weight: 400; opacity: .75; vertical-align: top;
-       padding: .35rem 1rem .35rem 0; white-space: nowrap; width: 1%; }
-  td { padding: .35rem 0; }
-  .v { font-family: var(--vscode-editor-font-family); word-break: break-all; }
-  .src { opacity: .55; font-size: .87em; margin-top: .1rem; }
-  tr + tr th, tr + tr td { border-top: 1px solid var(--vscode-widget-border,
-                           rgba(128,128,128,.18)); }
-</style></head><body>
-<h1>${esc(model.agent)}</h1>
-<p class="sub">Read-only. Nothing on this page changes anything &mdash; every value
-shows where it came from, so you can see what editing it would affect.</p>
-${sections}
-</body></html>`;
+// matchOnDetail makes those sources searchable too — "no workspace declares it"
+// finds every hand-set value in one keystroke.
+function settingsItems(model) {
+  const items = [];
+  for (const section of model.sections || []) {
+    items.push({
+      label: section.note ? `${section.title} — ${section.note}` : section.title,
+      kind: SEPARATOR,
+    });
+    for (const row of section.rows || []) {
+      items.push({
+        label: row.label,
+        description: row.value,
+        detail: row.source,
+      });
+    }
+  }
+  return items;
 }
 
 function activate(context) {
@@ -518,13 +502,15 @@ function activate(context) {
               vscode.window.showErrorMessage("Squad settings: unreadable output.");
               return;
             }
-            const panel = vscode.window.createWebviewPanel(
-              "squadSettings",
-              `Settings — ${shortLabel(agent)}`,
-              vscode.ViewColumn.Active,
-              {}                       // no scripts: nothing here is interactive
-            );
-            panel.webview.html = settingsHtml(model);
+            // The result is deliberately discarded. Every row is read-only, so
+            // there is nothing for a selection to mean — picking one just
+            // closes the list, the same as Escape.
+            vscode.window.showQuickPick(settingsItems(model), {
+              title: `Settings — ${shortLabel(agent)}`,
+              placeHolder: "read-only — type to filter, Escape to close",
+              matchOnDescription: true,
+              matchOnDetail: true,
+            });
           }
         );
       })
