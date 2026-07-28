@@ -356,11 +356,18 @@ const labels = (agents) => agents.map(shortLabel).join(", ");
 // finds every hand-set value in one keystroke.
 // ---- the settings view: a real panel, docked beside the terminals ----
 //
-// Third presentation, and the first that fits. A webview in the EDITOR area is
-// a file tab ("it opened it as a file rather than a popup"); a quick pick is a
-// filter list that cannot lay anything out ("ok but very basic"). VSCode has no
-// modal webview, so the remaining question was only where it docks — and the
-// panel is where the cockpit already lives, beside the agent tabs.
+// A webview in the EDITOR area is a file tab ("it opened it as a file rather
+// than a popup"); a quick pick is a filter list that cannot lay anything out
+// ("ok but very basic"); and the PANEL area shows one tab at a time, so a view
+// there competes with the Terminal instead of sitting beside it. VSCode has no
+// modal webview and no way to stack a contributed view with the terminal, so
+// this lives in its own view container — visible at the same time as the panel,
+// and draggable to the secondary sidebar, which VSCode then remembers.
+//
+// Nothing here names a location. `<viewId>.focus` reveals the view wherever it
+// has been parked, which is what makes the position the operator's to choose
+// rather than a thing to re-ship. The view ID is therefore load-bearing and
+// pinned by a test.
 //
 // Values are rendered as SELECTS for editable rows and as plain text for the
 // rest, which makes editability visible in the control itself rather than in a

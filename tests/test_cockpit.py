@@ -663,6 +663,31 @@ def test_settings_on_a_non_agent_tab_warns(box):
     assert any("no squad agent" in s for s in out["shown"]), out
 
 
+def test_the_view_id_the_reveal_command_uses_is_the_one_contributed():
+    """`<viewId>.focus` is a command VSCode synthesises from the MANIFEST, so
+    the id in package.json and the id the extension reveals are a two-registry
+    coupling with nothing joining them. Renaming the view leaves a focus command
+    that silently resolves to nothing — the panel renders, and never appears.
+
+    This is also what makes the view's LOCATION the operator's to choose: focus
+    reveals it wherever it has been dragged, so moving it between the panel, the
+    sidebar and the secondary sidebar needs no code change at all.
+    """
+    pkg = json.loads((EXT / "package.json").read_text())
+    contributed = {v["id"] for views in pkg["contributes"]["views"].values()
+                   for v in views}
+    source = (EXT / "extension.js").read_text(encoding="utf-8")
+    for vid in contributed:
+        assert f'"{vid}"' in source, f"contributed view {vid} is never registered"
+        assert f'"{vid}.focus"' in source, \
+            f"{vid} is registered but nothing reveals it"
+    containers = pkg["contributes"]["viewsContainers"]
+    owned = set(pkg["contributes"]["views"])
+    declared = {c["id"] for cs in containers.values() for c in cs}
+    assert owned == declared, \
+        f"views belong to containers that do not exist: {owned ^ declared}"
+
+
 def test_the_unopened_panel_says_how_to_open_it(box):
     """The view resolves as soon as the Squad tab is shown, which can happen
     before any agent is chosen. A blank panel there reads as broken."""
