@@ -96,7 +96,7 @@ def test_a_squad_nothing_derives_is_named_as_such(box):
         json.dumps({"squads": ["dreamteam"], "muted": [], "online": True}),
         encoding="utf-8")
     squads = _rows(cli._settings_model(str(box["work"])), "SQUADS")
-    assert squads["dreamteam"]["value"] == "hearing it"
+    assert squads["dreamteam"]["value"] == "hearing"
     assert squads["dreamteam"]["source"] == "set on this agent — no workspace declares it"
     assert squads["Would derive as"]["value"] == "— none —"
 
@@ -274,7 +274,7 @@ def test_squad_membership_offers_mute_but_never_join_or_leave(box):
         json.dumps({"squads": ["dreamteam"], "muted": []}), encoding="utf-8")
     squads = _rows(cli._settings_model(str(box["work"])), "SQUADS")
     edit = squads["dreamteam"]["edit"]
-    assert edit["choices"] == ["hear", "mute"], edit
+    assert edit["choices"] == ["hearing", "muted"], edit
     assert "mute" in edit["argv"] and edit["bin"] == "mcp-hub"
     assert not any(w in " ".join(edit["argv"]) for w in ("join", "leave", "set_squads"))
     assert "edit" not in squads["Would derive as"], \
@@ -312,13 +312,13 @@ def test_the_edit_command_names_the_agent_it_will_change(box):
 
 def _mute_args(**kw):
     import argparse
-    base = dict(agent="widget-box", squad="dreamteam", state="mute",
+    base = dict(agent="widget-box", squad="dreamteam", state="muted",
                 hub_url="http://hub.invalid/mcp")
     base.update(kw)
     return argparse.Namespace(**base)
 
 
-@pytest.mark.parametrize("state,expected", [("mute", True), ("hear", False)])
+@pytest.mark.parametrize("state,expected", [("muted", True), ("hearing", False)])
 def test_the_operators_word_maps_to_the_tools_boolean(box, monkeypatch, state, expected):
     """`--state hear|mute` reads correctly at the command line; `muted=` reads
     correctly at the tool. The mapping between them is one negation away from
@@ -353,7 +353,7 @@ def test_a_successful_mute_is_RECORDED_in_the_snapshot_not_erased(box, monkeypat
         return "ok"
 
     monkeypatch.setattr(cli, "_mute_squad", fake)
-    assert cli.mute_command(_mute_args(state="mute")) == 0
+    assert cli.mute_command(_mute_args(state="muted")) == 0
     after = json.loads(snap.read_text())
     assert after["muted"] == ["dreamteam"], after
     assert after["squads"] == ["dreamteam"], "membership was disturbed by a mute"
@@ -368,7 +368,7 @@ def test_unmuting_removes_it_again(box, monkeypatch):
         return "ok"
 
     monkeypatch.setattr(cli, "_mute_squad", fake)
-    assert cli.mute_command(_mute_args(state="hear")) == 0
+    assert cli.mute_command(_mute_args(state="hearing")) == 0
     assert json.loads(snap.read_text())["muted"] == []
 
 
@@ -381,7 +381,7 @@ def test_muting_twice_does_not_duplicate_the_entry(box, monkeypatch):
         return "ok"
 
     monkeypatch.setattr(cli, "_mute_squad", fake)
-    cli.mute_command(_mute_args(state="mute"))
+    cli.mute_command(_mute_args(state="muted"))
     assert json.loads(snap.read_text())["muted"] == ["dreamteam"]
 
 

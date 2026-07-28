@@ -1895,14 +1895,18 @@ def _settings_model(cwd: str) -> dict[str, Any] | None:
         for s in live_squads:
             squad_rows.append({
                 "label": s,
-                "value": "muted" if s in muted else "hearing it",
+                "value": "muted" if s in muted else "hearing",
                 "source": member_source,
                 # Mute only. JOINING and LEAVING are deliberately absent:
                 # membership derives from declaring a workspace as a squad, and
                 # a per-agent override here would be a second source of truth
                 # that silently disagrees with the workspace. Attention is per
                 # agent; membership is not.
-                "edit": _edit("mute", ["hear", "mute"],
+                # Same words as the VALUE. A control whose options are
+                # spelled differently from the state it displays cannot show
+                # the current setting as selected — one vocabulary per
+                # decision.
+                "edit": _edit("mute", ["hearing", "muted"],
                               ["mute", "--agent", name, "--squad", s, "--state", "{}"],
                               binary="mcp-hub", applies="immediately"),
             })
@@ -2003,7 +2007,7 @@ def mute_command(args: argparse.Namespace) -> int:
     a workspace as a squad, and a second way to set it would disagree with the
     workspace sooner or later. Attention is per agent; membership is not.
     """
-    muted = args.state == "mute"
+    muted = args.state == "muted"
     try:
         reply = asyncio.run(_mute_squad(args.hub_url, args.agent, args.squad, muted))
     except Exception as exc:  # noqa: BLE001
@@ -2050,441 +2054,15 @@ def _record_mute_in_cache(agent: str, squad: str, muted: bool) -> None:
         pass
 
 
-class SettingsTui:
-    """The settings TUI's whole state machine — deliberately free of curses.
-
-    Rendering and key reading live in the curses layer; everything that decides
-    WHAT is shown, what is selected and what a keypress means lives here, so it
-    can be tested without a terminal. A TUI whose logic is entangled with its
-    drawing is a TUI that gets tested by looking at it.
-    """
-
-    def __init__(self, agents: list[dict[str, str]], scoped_to: str | None = None):
-        self.agents = agents
-        self.scoped_to = scoped_to        # workspace file, or None for the box
-        self.agent_ix = 0
-        self.row_ix = 0
-        self.model: dict[str, Any] | None = None
-        self.status = ""
-        self.reason = ""          # why this agent has no settings, if it hasn't
-        # Open on an agent that HAS settings. A plain folder added with
-        # `squad add-folder` has no derived identity by design, so it has no
-        # settings at all — and four of six agents in the operator's own
-        # workspace are exactly that. Opening on the first ROSTER row showed a
-        # blank panel and looked like a broken feature.
-        self.agent_ix = self._first_with_settings()
-        self.load()
-
-    def _first_with_settings(self) -> int:
-        for i in range(len(self.agents)):
-            try:
-                if _settings_model(self.agents[i]["worktree"]):
-                    return i
-            except Exception:  # noqa: BLE001
-                continue
-        return 0
-
-    # ---- data ----
-
-    def load(self) -> None:
-        """(Re)read the selected agent's model. Never raises: this runs inside a
-        redraw loop, and an exception there takes the whole panel down over one
-        agent that happens to be un-derivable."""
-        self.model = None
-        self.row_ix = 0
-        if not self.agents:
-            return
-        self.reason = ""
-        try:
-            self.model = _settings_model(self.agents[self.agent_ix]["worktree"])
-        except Exception as exc:  # noqa: BLE001
-            self.status = f"could not read settings: {exc}"
-        if self.model is None and not self.status:
-            # Not a failure — `squad add-folder` enrols plain directories on
-            # purpose, and identity is derived from a git remote plus the hub
-            # opt-in list. Saying so beats an empty pane, which reads as broken.
-            self.reason = (
-                "no hub identity for this folder — settings are derived from a "
-                "git remote and ~/.mcp-hub/config.json, so a plain folder "
-                "(squad add-folder) has none"
-            )
-        # Land on the first EDITABLE row, not merely the first selectable one.
-        # IDENTITY comes first and every row in it is derived, so "first
-        # selectable" opened the panel on a wall of read-only fields — press
-        # enter, get "read-only", conclude the panel cannot edit anything.
-        # That is exactly what happened (operator, 2026-07-28: "I am not able
-        # to update the settings... how do I do an edit?").
-        self.row_ix = self.first_editable()
-
-    def rows(self) -> list[dict[str, Any]]:
-        """Flat row list for the detail pane, section headers included.
-
-        Headers are rows so the renderer needs no second structure, and are
-        marked so navigation can skip them — a cursor that can land on a
-        heading is a cursor that appears stuck.
-        """
-        out: list[dict[str, Any]] = []
-        for section in (self.model or {}).get("sections", []):
-            out.append({"header": section["title"], "note": section.get("note", "")})
-            out.extend(section.get("rows", []))
-        return out
-
-    def selectable(self) -> list[int]:
-        return [i for i, r in enumerate(self.rows()) if "header" not in r]
-
-    def editable(self) -> list[int]:
-        return [i for i, r in enumerate(self.rows()) if r.get("edit")]
-
-    def first_editable(self) -> int:
-        """Where the cursor should start: the first row that can be CHANGED.
-
-        Falls back to the first selectable row, then to 0, so an agent with
-        nothing editable still opens somewhere sensible rather than nowhere.
-        """
-        for candidates in (self.editable(), self.selectable()):
-            if candidates:
-                return candidates[0]
-        return 0
-
-    def visible(self, height: int) -> tuple[int, int]:
-        """(first, last+1) row indices to draw, keeping the cursor on screen.
-
-        Scrolling belongs here rather than in the drawing code because "can the
-        operator reach this row" is behaviour, not decoration: without it the
-        rows below the fold are not merely unseen, they are unreachable — the
-        cursor moves onto them and disappears. In a terminal panel that is most
-        of the panel.
-        """
-        total = len(self.rows())
-        if height <= 0 or total == 0:
-            return 0, 0
-        if total <= height:
-            return 0, total
-        start = max(0, min(self.row_ix - height // 2, total - height))
-        return start, start + height
-
-    def current(self) -> dict[str, Any] | None:
-        rows = self.rows()
-        return rows[self.row_ix] if 0 <= self.row_ix < len(rows) else None
-
-    # ---- navigation ----
-
-    def move_agent(self, delta: int) -> None:
-        if not self.agents:
-            return
-        self.agent_ix = max(0, min(len(self.agents) - 1, self.agent_ix + delta))
-        self.load()
-
-    def select_agent(self, index: int) -> None:
-        if 0 <= index < len(self.agents) and index != self.agent_ix:
-            self.agent_ix = index
-            self.load()
-
-    def move_row(self, delta: int) -> None:
-        """Step to the next SELECTABLE row, skipping headers.
-
-        Clamps rather than wraps: wrapping in a two-pane list moves the eye to
-        the far end of the screen for what felt like one step down.
-        """
-        picks = self.selectable()
-        if not picks:
-            return
-        if self.row_ix not in picks:
-            # Snap into the list in the DIRECTION OF TRAVEL, not to a fixed
-            # end. Sitting on a heading (which row 0 always is) and pressing up
-            # sent the cursor to the very bottom — one keypress, whole screen.
-            after = [p for p in picks if p > self.row_ix]
-            before = [p for p in picks if p < self.row_ix]
-            if delta >= 0:
-                self.row_ix = after[0] if after else picks[-1]
-            else:
-                self.row_ix = before[-1] if before else picks[0]
-            return
-        here = picks.index(self.row_ix)
-        self.row_ix = picks[max(0, min(len(picks) - 1, here + delta))]
-
-    def select_row(self, index: int) -> None:
-        if index in self.selectable():
-            self.row_ix = index
-
-    # ---- editing ----
-
-    def choices(self) -> list[str]:
-        """Values offered for the current row; empty when it cannot be edited."""
-        row = self.current()
-        return list((row or {}).get("edit", {}).get("choices", []))
-
-    def command_for(self, choice: str) -> tuple[str, list[str]] | None:
-        """(binary, argv) to apply `choice` here, or None if it cannot apply.
-
-        Refuses a row with no edit, and refuses the value already set — the
-        verbs are idempotent, so this is not about safety; it is about not
-        reporting a change that did not happen.
-        """
-        row = self.current()
-        edit = (row or {}).get("edit")
-        if not edit or choice not in edit.get("choices", []):
-            return None
-        if choice == row.get("value"):
-            return None
-        argv = [choice if a == "{}" else a for a in edit["argv"]]
-        return edit.get("bin", "squad"), argv
-
-    def header(self) -> str:
-        where = (
-            pathlib.Path(self.scoped_to).name if self.scoped_to
-            else "this machine — no workspace open"
-        )
-        return f"{len(self.agents)} agent(s) · {where}"
-
-
-ESC = 27
-
-
-def read_key(stdscr):  # pragma: no cover - needs a terminal
-    """One keystroke, with untranslated escape sequences swallowed whole.
-
-    Returns a curses key code, or None when the bytes were an escape sequence
-    ncurses did not fold into a KEY_* code. Acting on the leading 27 of such a
-    sequence is exactly the defect this exists to prevent: it makes every arrow
-    key look like ESC.
-
-    A real ESC press is distinguished by what follows it — nothing. With
-    escdelay set low, a bare ESC returns -1 on the immediate next read while a
-    sequence has its remaining bytes already waiting.
-    """
-    key = stdscr.getch()
-    if key != ESC:
-        return key
-    stdscr.nodelay(True)
-    try:
-        nxt = stdscr.getch()
-        if nxt == -1:
-            return ESC                    # a genuine, bare Escape
-        # Drain the rest of the sequence: CSI parameters are digits and ';',
-        # terminated by a letter or '~'. Bounded, so a malformed sequence
-        # cannot spin here.
-        if nxt == ord("["):
-            for _ in range(8):
-                c = stdscr.getch()
-                if c == -1 or chr(c & 0xFF).isalpha() or c == ord("~"):
-                    break
-        return None
-    finally:
-        stdscr.nodelay(False)
-
-
-def _tui_run(stdscr, tui: "SettingsTui") -> None:  # pragma: no cover - draws
-    """Draw + key loop. Decides nothing: every branch delegates to SettingsTui.
-
-    Uncovered by design — this is the part a test cannot see, which is exactly
-    why everything worth asserting lives in the state machine instead.
-    """
-    import curses
-
-    curses.curs_set(0)
-    # keypad(True) asks ncurses to translate escape SEQUENCES into single
-    # KEY_* codes. It does not always get the chance: VSCode's terminal sends
-    # arrows in NORMAL cursor mode (ESC [ B) and the first byte reaches us as
-    # 27. Everything below is written so that no untranslated sequence can be
-    # mistaken for a keystroke the operator meant.
-    stdscr.keypad(True)
-    try:
-        curses.set_escdelay(25)   # ESC responds now, not after a second
-    except (AttributeError, curses.error):
-        pass
-    try:
-        curses.mousemask(curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED)
-    except curses.error:
-        pass
-    curses.use_default_colors()
-    for i, fg in enumerate((curses.COLOR_CYAN, curses.COLOR_YELLOW,
-                            curses.COLOR_GREEN, curses.COLOR_RED), start=1):
-        try:
-            curses.init_pair(i, fg, -1)
-        except curses.error:
-            pass
-    CY, YE, GR, RD = (curses.color_pair(i) for i in (1, 2, 3, 4))
-    DIM = curses.A_DIM
-
-    def put(y, x, text, attr=0):
-        h, w = stdscr.getmaxyx()
-        if 0 <= y < h and x < w:
-            stdscr.addnstr(y, x, text, max(0, w - x - 1), attr)
-
-    picker: list[str] | None = None
-    picker_ix = 0
-
-    while True:
-        stdscr.erase()
-        h, w = stdscr.getmaxyx()
-        put(0, 0, " SQUAD SETTINGS ", curses.A_REVERSE | curses.A_BOLD)
-        put(0, 17, tui.header(), DIM)
-
-        # ---- agent list ----
-        top = 2
-        agent_rows = {}
-        # Cap the agent pane so the detail pane always has room. Without this a
-        # long roster pushed the settings — the point of the panel — off the
-        # bottom entirely.
-        alist = max(1, min(len(tui.agents), max(3, (h - 6) // 2)))
-        astart = max(0, min(tui.agent_ix - alist // 2, len(tui.agents) - alist))
-        for j in range(alist):
-            i = astart + j
-            if i >= len(tui.agents):
-                break
-            a = tui.agents[i]
-            y = top + j
-            agent_rows[y] = i
-            sel = i == tui.agent_ix
-            put(y, 1, "▸" if sel else " ", CY | curses.A_BOLD)
-            # Ellipsis when cut: a truncated agent name that looks complete is
-            # worse than an obviously shortened one, because these names differ
-            # only by suffix (…-wsl vs …-wsl-windows).
-            name = a["agent"]
-            name = name if len(name) <= 34 else name[:33] + "…"
-            put(y, 3, name.ljust(35), (curses.A_BOLD | CY) if sel else 0)
-            put(y, 38, a.get("klass", ""), DIM)
-
-        sep = top + alist
-        put(sep, 0, "─" * max(0, w - 1), DIM)
-
-        # ---- settings rows for the selected agent ----
-        detail_top = sep + 1
-        row_rows = {}
-        if tui.reason:
-            put(detail_top, 3, tui.reason[: max(0, w - 5)], YE)
-        first, last = tui.visible(max(0, h - detail_top - 1))
-        for i, r in list(enumerate(tui.rows()))[first:last]:
-            y = detail_top + (i - first)
-            if y >= h - 1:
-                break
-            if "header" in r:
-                label = r["header"]
-                put(y, 1, label, YE | curses.A_BOLD)
-                if r.get("note"):
-                    put(y, 2 + len(label), r["note"], DIM)
-                continue
-            row_rows[y] = i
-            sel = i == tui.row_ix
-            editable = bool(r.get("edit"))
-            put(y, 1, "▸" if sel else " ", CY | curses.A_BOLD)
-            put(y, 3, str(r["label"])[:24].ljust(25), curses.A_BOLD if sel else 0)
-            value = f"‹ {r['value']} ›" if editable else str(r["value"])
-            put(y, 28, value[:26].ljust(27),
-                (GR if editable else 0) | (curses.A_REVERSE if sel and editable else 0))
-            put(y, 56, str(r.get("source", "")), DIM)
-
-        hint = ("↑↓ row · ←→ agent · ⏎ change · r reload · q quit"
-                if not picker else "↑↓ choose · ⏎ apply · esc cancel")
-        put(h - 1, 1, hint, DIM)
-        if tui.status:
-            put(h - 1, max(0, w - len(tui.status) - 2), tui.status, RD)
-
-        # ---- the inline value picker ----
-        if picker:
-            row = tui.current() or {}
-            py = min(detail_top + (tui.row_ix - first) + 1, h - len(picker) - 2)
-            for j, choice in enumerate(picker):
-                mark = "●" if choice == row.get("value") else " "
-                put(py + j, 26, f" {mark} {choice} ".ljust(22),
-                    curses.A_REVERSE if j == picker_ix else curses.A_NORMAL)
-
-        stdscr.refresh()
-        try:
-            key = read_key(stdscr)
-        except KeyboardInterrupt:
-            return
-
-        if key is None:          # an escape sequence we could not interpret
-            continue
-        if picker:
-            if key in (curses.KEY_UP, ord("k")):
-                picker_ix = max(0, picker_ix - 1)
-            elif key in (curses.KEY_DOWN, ord("j")):
-                picker_ix = min(len(picker) - 1, picker_ix + 1)
-            elif key in (ESC, ord("q")):
-                picker = None
-            elif key in (curses.KEY_ENTER, 10, 13):
-                choice = picker[picker_ix]
-                picker = None
-                cmd = tui.command_for(choice)
-                if cmd is None:
-                    tui.status = f"{choice}: already set"
-                else:
-                    binary, argv = cmd
-                    exe = MCP_HUB_BIN if binary == "mcp-hub" else SQUAD_BIN
-                    label = (tui.current() or {}).get("label", "setting")
-                    # PAINT FIRST. The command runs synchronously in this redraw
-                    # loop, and a mute is a network round trip to the hub — so
-                    # the panel simply freezes, with the old value still on
-                    # screen and no cursor. That is indistinguishable from a
-                    # hang ("it got stuck", 2026-07-28). Say what is happening
-                    # before blocking on it.
-                    tui.status = f"applying {label} → {choice}…"
-                    put(h - 1, max(0, w - len(tui.status) - 2), tui.status, YE)
-                    stdscr.refresh()
-                    try:
-                        # Short: this blocks the UI, so a slow hub must surface
-                        # as an error the operator can act on rather than a
-                        # frozen panel they have to guess about.
-                        subprocess.run([exe, *argv], check=True,
-                                       capture_output=True, text=True, timeout=12)
-                        tui.status = f"{label} → {choice}"
-                    except subprocess.TimeoutExpired:
-                        tui.status = f"{label}: timed out — is the hub reachable?"
-                    except subprocess.CalledProcessError as exc:
-                        tui.status = (exc.stderr or exc.stdout or "failed").strip()[:60]
-                    except Exception as exc:  # noqa: BLE001
-                        tui.status = str(exc)[:60]
-                    # Re-read rather than patch: the panel must show the state
-                    # after the write, not the value that was sent.
-                    tui.load()
-            continue
-
-        # `q` ONLY. Binding bare ESC to quit is what broke every arrow key:
-        # curses hands over 27 as the first byte of an untranslated sequence,
-        # so pressing DOWN quit the program and the next keystroke went to the
-        # shell underneath — "you hit enter to apply and the whole settings
-        # menu exits" (operator, 2026-07-28). ESC now only closes a picker.
-        if key in (ord("q"), ord("Q")):
-            return
-        if key in (curses.KEY_UP, ord("k")):
-            tui.move_row(-1)
-        elif key in (curses.KEY_DOWN, ord("j")):
-            tui.move_row(1)
-        elif key in (curses.KEY_LEFT, curses.KEY_BTAB):
-            tui.move_agent(-1)
-        elif key in (curses.KEY_RIGHT, 9):
-            tui.move_agent(1)
-        elif key == ord("r"):
-            tui.load()
-            tui.status = "reloaded"
-        elif key in (curses.KEY_ENTER, 10, 13):
-            choices = tui.choices()
-            if choices:
-                picker = choices
-                picker_ix = max(0, choices.index(tui.current()["value"])
-                                if tui.current()["value"] in choices else 0)
-            elif tui.current() is None:
-                tui.status = "nothing to change for this agent"
-            else:
-                tui.status = "read-only — this value is derived"
-        elif key == curses.KEY_MOUSE:
-            try:
-                _, mx, my, _, _ = curses.getmouse()
-            except curses.error:
-                continue
-            if my in agent_rows:
-                tui.select_agent(agent_rows[my])
-            elif my in row_rows:
-                tui.select_row(row_rows[my])
-        elif key == curses.KEY_RESIZE:
-            continue
-
-
-# Resolved once: the TUI shells out to both, and PATH inside a VSCode terminal
-# is not guaranteed to carry ~/.local/bin.
+# Where the panel shells out to. Resolved absolutely because a VSCode
+# extension host does not inherit an interactive shell's PATH.
+#
+# The panel itself lives in settings_app.py, on Textual. It replaced a
+# hand-rolled curses version whose key handling I wrote myself — and one
+# line of it, binding ESC to quit, made every arrow key exit the program,
+# because VSCode sends arrows as `ESC [ B` and the leading byte arrives as
+# 27. Keyboard, focus and mouse are a solved problem; they were not mine to
+# solve, and solving them badly cost the operator an evening.
 SQUAD_BIN = str(pathlib.Path.home() / ".local" / "bin" / "squad")
 MCP_HUB_BIN = str(pathlib.Path.home() / ".local" / "bin" / "mcp-hub")
 
@@ -2492,18 +2070,24 @@ MCP_HUB_BIN = str(pathlib.Path.home() / ".local" / "bin" / "mcp-hub")
 def settings_command(args: argparse.Namespace) -> int:
     """One agent's settings, or an interactive panel over a workspace's agents."""
     if getattr(args, "tui", False):
-        import curses
-
         agents = _agents_in_workspace(getattr(args, "workspace", None))
         if not agents:
             where = getattr(args, "workspace", None) or "this machine"
             print(f"no roster agents in {where}", file=sys.stderr)
             return 1
-        tui = SettingsTui(agents, scoped_to=getattr(args, "workspace", None))
         try:
-            curses.wrapper(_tui_run, tui)
-        except KeyboardInterrupt:
-            pass
+            from .settings_app import SettingsApp
+        except ImportError:
+            print("the settings panel needs textual:  pip install textual",
+                  file=sys.stderr)
+            return 1
+        SettingsApp(
+            agents,
+            scoped_to=getattr(args, "workspace", None),
+            model_for=_settings_model,
+            squad_bin=SQUAD_BIN,
+            hub_bin=MCP_HUB_BIN,
+        ).run()
         return 0
     cwd = args.cwd or os.getcwd()
     model = _settings_model(cwd)
@@ -3868,7 +3452,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mute.add_argument("--agent", required=True, help="Agent whose attention this is")
     mute.add_argument("--squad", required=True, help="Squad to silence or unsilence")
-    mute.add_argument("--state", required=True, choices=["hear", "mute"])
+    mute.add_argument("--state", required=True, choices=["hearing", "muted"])
     mute.add_argument("--hub-url", default=DEFAULT_HUB_URL)
 
     xport_hist = sub.add_parser(
