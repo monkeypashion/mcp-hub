@@ -354,6 +354,96 @@ const labels = (agents) => agents.map(shortLabel).join(", ");
 // whether changing it affects this agent or every agent on the machine.
 // matchOnDetail makes those sources searchable too — "no workspace declares it"
 // finds every hand-set value in one keystroke.
+// Open the panel for one agent, reading the model fresh from the cli.
+//
+// A function rather than the command body because an edit REOPENS it: the panel
+// must show the state after the write, not the value that was sent. Those
+// differ whenever a write is rejected, clamped or normalised on the way in, and
+// a panel that showed the request would be confidently wrong exactly when it
+// mattered.
+function openSettings(agent, worktree) {
+  cp.execFile(
+    MCP_HUB,
+    ["settings", "--cwd", worktree, "--json"],
+    { timeout: 15000 },
+    (err, out, stderr) => {
+      if (err) {
+        vscode.window.showErrorMessage(
+          `Squad settings: ${(stderr || err.message || "").trim()}`
+        );
+        return;
+      }
+      let model;
+      try {
+        model = JSON.parse(out);
+      } catch {
+        vscode.window.showErrorMessage("Squad settings: unreadable output.");
+        return;
+      }
+      vscode.window
+        .showQuickPick(settingsItems(model), {
+          title: `Settings — ${shortLabel(agent)}`,
+          placeHolder: "type to filter · \u270f rows can be changed · Escape to close",
+          matchOnDescription: true,
+          matchOnDetail: true,
+        })
+        .then((pick) => {
+          // Picking a read-only row closes the list, the same as Escape. There
+          // is nothing a selection there could mean.
+          if (!pick || !pick.edit) return;
+          applyEdit(agent, worktree, pick);
+        });
+    }
+  );
+}
+
+// Second step of the drill-down: choose a value, run the command the model
+// named, reopen the panel showing the result.
+//
+// The command comes from the MODEL — which binary, which argv, which choices —
+// so the cockpit never needs to know what a launch flag or a squad is. That is
+// what keeps a future web UI able to offer the same edits without
+// reimplementing them, and it means an edit the underlying verb cannot perform
+// simply never appears.
+function applyEdit(agent, worktree, pick) {
+  const edit = pick.edit;
+  vscode.window
+    .showQuickPick(edit.choices, {
+      title: `${pick.setting} — currently ${pick.description}`,
+      // Not decoration: a launch flag changes nothing until the agent
+      // restarts, while a mute lands on the hub at once. Saying which BEFORE
+      // the choice is the difference between an informed click and a surprise.
+      placeHolder: `applies ${edit.applies}`,
+    })
+    .then((choice) => {
+      if (!choice) return;
+      if (choice === pick.description) {
+        vscode.window.showInformationMessage(
+          `Squad: ${pick.setting} is already ${choice}.`
+        );
+        return;
+      }
+      const argv = edit.argv.map((a) => (a === "{}" ? choice : a));
+      const bin = edit.bin === "mcp-hub" ? MCP_HUB : SQUAD;
+      cp.execFile(bin, argv, { timeout: 20000 }, (err, _out, stderr) => {
+        if (err) {
+          vscode.window.showErrorMessage(
+            `Squad: ${pick.setting} unchanged — ${(stderr || err.message || "").trim()}`
+          );
+          return;
+        }
+        vscode.window.showInformationMessage(
+          `Squad: ${shortLabel(agent)} ${pick.setting} → ${choice} (applies ${edit.applies}).`
+        );
+        // Reopen, re-reading from the cli rather than patching the row we have.
+        // A panel that showed the value it just sent would be reporting the
+        // REQUEST, not the state — and the two differ whenever the write is
+        // rejected, clamped, or normalised on the way in.
+        openSettings(agent, worktree);
+      });
+    });
+}
+
 function settingsItems(model) {
   const items = [];
   for (const section of model.sections || []) {
@@ -363,9 +453,16 @@ function settingsItems(model) {
     });
     for (const row of section.rows || []) {
       items.push({
-        label: row.label,
+        // A pencil on the rows that can actually be changed. Most cannot —
+        // identity is derived, and squad membership comes from declaring a
+        // workspace — so without a marker every row invites a click and most
+        // of them do nothing, which reads as a broken panel rather than a
+        // deliberate read-only value.
+        label: row.edit ? `$(pencil) ${row.label}` : row.label,
         description: row.value,
         detail: row.source,
+        edit: row.edit,
+        setting: row.label,
       });
     }
   }
@@ -484,35 +581,7 @@ function activate(context) {
             `Squad: settings are per agent — showing ${shortLabel(agent)}.`
           );
         }
-        cp.execFile(
-          MCP_HUB,
-          ["settings", "--cwd", row.worktree, "--json"],
-          { timeout: 15000 },
-          (err, out, stderr) => {
-            if (err) {
-              vscode.window.showErrorMessage(
-                `Squad settings: ${(stderr || err.message || "").trim()}`
-              );
-              return;
-            }
-            let model;
-            try {
-              model = JSON.parse(out);
-            } catch {
-              vscode.window.showErrorMessage("Squad settings: unreadable output.");
-              return;
-            }
-            // The result is deliberately discarded. Every row is read-only, so
-            // there is nothing for a selection to mean — picking one just
-            // closes the list, the same as Escape.
-            vscode.window.showQuickPick(settingsItems(model), {
-              title: `Settings — ${shortLabel(agent)}`,
-              placeHolder: "read-only — type to filter, Escape to close",
-              matchOnDescription: true,
-              matchOnDetail: true,
-            });
-          }
-        );
+        openSettings(agent, row.worktree);
       })
     ),
     vscode.commands.registerCommand("squad.interrupt", (...args) =>

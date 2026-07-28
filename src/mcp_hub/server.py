@@ -3437,6 +3437,7 @@ _CLI_SUBCOMMANDS = {
     "transport-history",
     "identity",
     "settings",
+    "mute",
     "rebind-url",
 }
 

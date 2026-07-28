@@ -1736,6 +1736,50 @@ def _launch_flags(launch_args: str) -> dict[str, bool]:
     }
 
 
+def _launch_pair(launch_args: str, flag: str) -> str:
+    """Value of a value-taking launch flag, or "" when absent.
+
+    Read POSITIONALLY, the same way `squad launch` writes it: the value of
+    --model is arbitrary (an alias, a full id) so no pattern describes it, and
+    the token after the flag is the only thing that identifies it.
+    """
+    tokens = launch_args.split()
+    for i, tok in enumerate(tokens[:-1]):
+        if tok == flag:
+            return tokens[i + 1]
+    return ""
+
+
+# How each editable row is changed, declared HERE rather than in the cockpit.
+#
+# A row carries `edit`: the choices, and the argv template that applies one. The
+# extension renders and runs it without knowing what a squad or a launch flag
+# is, which is what lets a web UI reuse the same model — and, more immediately,
+# stops the panel offering an edit the underlying verb cannot perform.
+#
+# A row with no `edit` key is READ-ONLY, and that is the common case: identity is
+# derived, "would derive as" is the output of a calculation, and squad
+# membership comes from declaring a workspace — editing it per agent would
+# create the second source of truth this design exists to avoid.
+_EDIT_ONOFF = ["on", "off"]
+_EDIT_MODELS = ["default", "opus", "opus[1m]", "claude-opus-4-8", "fable", "sonnet", "haiku"]
+_EDIT_EFFORTS = ["default", "low", "medium", "high", "xhigh", "max"]
+
+
+def _edit(kind: str, choices: list[str], argv: list[str],
+          binary: str = "squad", applies: str = "next restart") -> dict[str, Any]:
+    """`argv` is a command with {} standing in for the chosen value.
+
+    `applies` is shown to the operator after the change lands, and the two
+    values are not interchangeable: a launch flag does nothing until the agent
+    restarts, while a mute takes effect on the hub at once. A panel that said
+    "applied" for both would be wrong half the time about whether the thing you
+    just changed is actually in force.
+    """
+    return {"kind": kind, "choices": choices, "argv": argv,
+            "bin": binary, "applies": applies}
+
+
 def _settings_model(cwd: str) -> dict[str, Any] | None:
     """Everything the settings panel shows, with each value's SOURCE.
 
@@ -1755,6 +1799,8 @@ def _settings_model(cwd: str) -> dict[str, Any] | None:
     row = _roster_row(name)
     worktree = row.get("worktree") or cwd
     flags = _launch_flags(row.get("args", ""))
+    launch_model = _launch_pair(row.get("args", ""), "--model")
+    launch_effort = _launch_pair(row.get("args", ""), "--effort")
     workspaces = _workspaces_listing(worktree)
     derived = _resolve_squads(worktree)
 
@@ -1770,21 +1816,39 @@ def _settings_model(cwd: str) -> dict[str, Any] | None:
     live_squads = live.get("squads") if isinstance(live.get("squads"), list) else None
     muted = set(live.get("muted") or [])
 
-    if live_squads is None:
-        squad_value, squad_source = "unknown", "no status snapshot yet — is the agent running?"
-    elif not live_squads:
-        squad_value, squad_source = "— none —", "no squad workspace lists this worktree"
+    if derived:
+        ws_names = ", ".join(w.name for w in workspaces)
+        member_source = f"from {ws_names}" if ws_names else "derived from workspace type"
     else:
-        squad_value = ", ".join(
-            s + " (muted)" if s in muted else s for s in live_squads
-        )
-        if derived:
-            names = ", ".join(w.name for w in workspaces if _resolve_squads(worktree))
-            squad_source = f"from {names}" if names else "derived from workspace type"
-        else:
-            # The gap worth surfacing: a membership nothing regenerates. It
-            # survives because register() treats empty squads as "preserve".
-            squad_source = "set on this agent — no workspace declares it"
+        # The gap worth surfacing: a membership nothing regenerates. It
+        # survives because register() treats empty squads as "preserve".
+        member_source = "set on this agent — no workspace declares it"
+
+    # One row PER SQUAD, not one row listing them, because mute is per (agent,
+    # squad): a single row could show the memberships but could never offer the
+    # edit, and an agent in two squads routinely wants one of them quiet.
+    squad_rows: list[dict[str, Any]] = []
+    if live_squads is None:
+        squad_rows.append({"label": "Squads", "value": "unknown",
+                           "source": "no status snapshot yet — is the agent running?"})
+    elif not live_squads:
+        squad_rows.append({"label": "Squads", "value": "— none —",
+                           "source": "no squad workspace lists this worktree"})
+    else:
+        for s in live_squads:
+            squad_rows.append({
+                "label": s,
+                "value": "muted" if s in muted else "hearing it",
+                "source": member_source,
+                # Mute only. JOINING and LEAVING are deliberately absent:
+                # membership derives from declaring a workspace as a squad, and
+                # a per-agent override here would be a second source of truth
+                # that silently disagrees with the workspace. Attention is per
+                # agent; membership is not.
+                "edit": _edit("mute", ["hear", "mute"],
+                              ["mute", "--agent", name, "--squad", s, "--state", "{}"],
+                              binary="mcp-hub", applies="immediately"),
+            })
 
     ws_value = ", ".join(w.name for w in workspaces) or "— none —"
     # Decided by comparing the VALUE to the un-overridden default, not by
@@ -1816,8 +1880,7 @@ def _settings_model(cwd: str) -> dict[str, Any] | None:
             {
                 "title": "SQUADS",
                 "note": "decides who hears its broadcasts, and whose it hears",
-                "rows": [
-                    {"label": "Squads", "value": squad_value, "source": squad_source},
+                "rows": squad_rows + [
                     {"label": "Would derive as",
                      "value": ", ".join(derived) or "— none —",
                      "source": "from squad_workspaces, at next register"},
@@ -1828,13 +1891,23 @@ def _settings_model(cwd: str) -> dict[str, Any] | None:
                 "note": "applies at next restart, not to the running session",
                 "rows": [
                     {"label": "Comms (hub wake)", "value": onoff[flags["comms"]],
-                     "source": "set on this agent"},
+                     "source": "set on this agent",
+                     "edit": _edit("comms", _EDIT_ONOFF, ["comms", "{}", name])},
                     {"label": "Resume on restart", "value": onoff[flags["resume"]],
-                     "source": "set on this agent"},
+                     "source": "set on this agent",
+                     "edit": _edit("resume", _EDIT_ONOFF, ["resume", "{}", name])},
+                    {"label": "Model", "value": launch_model or "default",
+                     "source": "set on this agent" if launch_model else
+                     "claude's own default — no --model in the launch args",
+                     "edit": _edit("model", _EDIT_MODELS,
+                                   ["launch", "model", name, "{}"])},
+                    {"label": "Effort", "value": launch_effort or "default",
+                     "source": "set on this agent" if launch_effort else
+                     "claude's own default — no --effort in the launch args",
+                     "edit": _edit("effort", _EDIT_EFFORTS,
+                                   ["launch", "effort", name, "{}"])},
                     {"label": "Launch args", "value": row.get("args") or "—",
                      "source": "roster"},
-                    {"label": "Model / Effort", "value": "not persisted",
-                     "source": "session only — the menu sets them until next restart"},
                 ],
             },
             {
@@ -1851,6 +1924,53 @@ def _settings_model(cwd: str) -> dict[str, Any] | None:
             },
         ],
     }
+
+
+async def _mute_squad(hub_url: str, name: str, squad: str, muted: bool) -> str:
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    async with streamablehttp_client(_ephemeral_hub_url(hub_url), timeout=15) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            return _extract_text(await session.call_tool(
+                "mute_squad", {"name": name, "squad": squad, "muted": muted}
+            )) or ""
+
+
+def mute_command(args: argparse.Namespace) -> int:
+    """Silence one squad's broadcasts for one agent, without leaving it.
+
+    Exists as a CLI verb because the cockpit cannot call MCP tools — it shells
+    out. Deliberately does NOT join or leave: membership derives from declaring
+    a workspace as a squad, and a second way to set it would disagree with the
+    workspace sooner or later. Attention is per agent; membership is not.
+    """
+    muted = args.state == "mute"
+    try:
+        reply = asyncio.run(_mute_squad(args.hub_url, args.agent, args.squad, muted))
+    except Exception as exc:  # noqa: BLE001
+        print(f"!! mute failed: {exc}", file=sys.stderr)
+        return 1
+    print(reply or f"{args.agent}: {args.squad} {'muted' if muted else 'unmuted'}")
+    # The hub is the record; the status cache is a stale copy the statusline
+    # and this panel both read. Left alone it keeps showing the old state until
+    # the daemon's next beat, which reads as "the click did nothing".
+    _invalidate_status_cache(args.agent)
+    return 0
+
+
+def _invalidate_status_cache(agent: str) -> None:
+    """Drop the cached snapshot so the next read comes from the hub.
+
+    Deleting rather than editing: this file is written by the daemon from a
+    live query, and hand-patching one field here would make it a second author
+    of a cache whose whole value is being a faithful copy.
+    """
+    try:
+        _status_cache_path(agent).unlink()
+    except OSError:
+        pass
 
 
 def settings_command(args: argparse.Namespace) -> int:
@@ -3192,6 +3312,23 @@ def build_parser() -> argparse.ArgumentParser:
     settings.add_argument("--cwd", default=None, help="Worktree (default: current directory)")
     settings.add_argument("--json", action="store_true", help="Emit the panel model as JSON")
 
+    mute = sub.add_parser(
+        "mute",
+        help="Silence (or unsilence) one squad's broadcasts for one agent",
+        description=(
+            "Mutes one squad for one agent without leaving it: membership and "
+            "attention are different things, and leaving a squad to get quiet "
+            "also removes the ability to address it. Joining and leaving are "
+            "deliberately NOT here — membership derives from declaring a "
+            "workspace as a squad, and a second way to set it would disagree "
+            "with the workspace eventually."
+        ),
+    )
+    mute.add_argument("--agent", required=True, help="Agent whose attention this is")
+    mute.add_argument("--squad", required=True, help="Squad to silence or unsilence")
+    mute.add_argument("--state", required=True, choices=["hear", "mute"])
+    mute.add_argument("--hub-url", default=DEFAULT_HUB_URL)
+
     xport_hist = sub.add_parser(
         "transport-history",
         help="Copy + re-key an agent's conversation history to a new path",
@@ -3277,6 +3414,8 @@ def main(argv: list[str] | None = None) -> int:
         return identity_command(args)
     if args.subcommand == "settings":
         return settings_command(args)
+    if args.subcommand == "mute":
+        return mute_command(args)
     if args.subcommand == "transport-history":
         return transport_history_command(args)
     if args.subcommand == "rebind-url":

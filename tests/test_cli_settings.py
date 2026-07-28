@@ -96,8 +96,8 @@ def test_a_squad_nothing_derives_is_named_as_such(box):
         json.dumps({"squads": ["dreamteam"], "muted": [], "online": True}),
         encoding="utf-8")
     squads = _rows(cli._settings_model(str(box["work"])), "SQUADS")
-    assert squads["Squads"]["value"] == "dreamteam"
-    assert squads["Squads"]["source"] == "set on this agent — no workspace declares it"
+    assert squads["dreamteam"]["value"] == "hearing it"
+    assert squads["dreamteam"]["source"] == "set on this agent — no workspace declares it"
     assert squads["Would derive as"]["value"] == "— none —"
 
 
@@ -110,7 +110,7 @@ def test_a_derived_squad_names_the_workspace_it_came_from(box):
     (box["home"] / ".mcp-hub" / "status-widget-box.json").write_text(
         json.dumps({"squads": ["dreamteam"], "muted": []}), encoding="utf-8")
     squads = _rows(cli._settings_model(str(box["work"])), "SQUADS")
-    assert squads["Squads"]["source"] == "from team.code-workspace", squads
+    assert squads["dreamteam"]["source"] == "from team.code-workspace", squads
     assert squads["Would derive as"]["value"] == "dreamteam"
 
 
@@ -133,7 +133,7 @@ def test_a_muted_squad_is_marked(box):
     (box["home"] / ".mcp-hub" / "status-widget-box.json").write_text(
         json.dumps({"squads": ["dreamteam"], "muted": ["dreamteam"]}), encoding="utf-8")
     squads = _rows(cli._settings_model(str(box["work"])), "SQUADS")
-    assert squads["Squads"]["value"] == "dreamteam (muted)"
+    assert squads["dreamteam"]["value"] == "muted"
 
 
 def test_identity_names_the_workspaces_this_worktree_appears_in(box):
@@ -216,3 +216,89 @@ def test_json_output_round_trips(box, capsys):
     assert model["agent"] == "widget-box"
     assert [s["title"] for s in model["sections"]] == [
         "IDENTITY", "SQUADS", "LAUNCH", "THIS MACHINE"]
+
+
+# ---- editability: which rows can be changed, and by what -------------------
+
+def test_model_and_effort_are_read_from_the_launch_args(box):
+    """They were session-only, which made the panel lie by calling them
+    settings. Now they persist as --model/--effort and the panel reads back
+    what will actually be used at next start."""
+    conf = box["home"] / ".config" / "squad" / "squad.conf"
+    conf.write_text(conf.read_text().rstrip("\n").replace(
+        "|squad", "|squad").replace("server:hub", "server:hub --model opus --effort high"),
+        encoding="utf-8")
+    launch = _rows(cli._settings_model(str(box["work"])), "LAUNCH")
+    assert launch["Model"]["value"] == "opus"
+    assert launch["Effort"]["value"] == "high"
+    assert launch["Model"]["source"] == "set on this agent"
+
+
+def test_an_unset_model_names_whose_default_it_is(box):
+    launch = _rows(cli._settings_model(str(box["work"])), "LAUNCH")
+    assert launch["Model"]["value"] == "default"
+    assert "claude's own default" in launch["Model"]["source"]
+
+
+def test_every_editable_row_carries_a_runnable_command(box):
+    """The extension shells out; it does not know what a squad or a launch flag
+    is. So an edit descriptor has to be complete on its own — choices to offer,
+    argv to run, and which binary runs it."""
+    (box["home"] / ".mcp-hub" / "status-widget-box.json").write_text(
+        json.dumps({"squads": ["dreamteam"], "muted": []}), encoding="utf-8")
+    model = cli._settings_model(str(box["work"]))
+    edits = [(r["label"], r["edit"]) for s in model["sections"] for r in s["rows"]
+             if "edit" in r]
+    assert edits, "nothing is editable at all"
+    for label, edit in edits:
+        assert edit["choices"], label
+        assert edit["bin"] in ("squad", "mcp-hub"), label
+        assert "{}" in edit["argv"], f"{label}: no placeholder for the chosen value"
+        assert edit["applies"] in ("next restart", "immediately"), label
+
+
+def test_derived_values_are_not_offered_for_editing(box):
+    """Name, project and worktree are COMPUTED. Offering an edit implies a
+    stored value that could be changed, and there isn't one."""
+    ident = _rows(cli._settings_model(str(box["work"])), "IDENTITY")
+    for label in ("Name", "Project", "Worktree", "Workspaces"):
+        assert "edit" not in ident[label], f"{label} was offered as editable"
+
+
+def test_squad_membership_offers_mute_but_never_join_or_leave(box):
+    """Membership derives from declaring a workspace as a squad. A second way to
+    set it here would disagree with the workspace eventually — which is the
+    exact failure the derived model exists to prevent. Attention is per agent;
+    membership is not."""
+    (box["home"] / ".mcp-hub" / "status-widget-box.json").write_text(
+        json.dumps({"squads": ["dreamteam"], "muted": []}), encoding="utf-8")
+    squads = _rows(cli._settings_model(str(box["work"])), "SQUADS")
+    edit = squads["dreamteam"]["edit"]
+    assert edit["choices"] == ["hear", "mute"], edit
+    assert "mute" in edit["argv"] and edit["bin"] == "mcp-hub"
+    assert not any(w in " ".join(edit["argv"]) for w in ("join", "leave", "set_squads"))
+    assert "edit" not in squads["Would derive as"], \
+        "offered to edit the OUTPUT of a derivation"
+
+
+def test_a_mute_applies_immediately_and_a_launch_flag_does_not(box):
+    """Not interchangeable: a launch flag does nothing until the agent restarts,
+    a mute lands on the hub at once. One word for both would be wrong half the
+    time about whether the change is in force."""
+    (box["home"] / ".mcp-hub" / "status-widget-box.json").write_text(
+        json.dumps({"squads": ["dreamteam"], "muted": []}), encoding="utf-8")
+    model = cli._settings_model(str(box["work"]))
+    squads = _rows(model, "SQUADS")
+    launch = _rows(model, "LAUNCH")
+    assert squads["dreamteam"]["edit"]["applies"] == "immediately"
+    assert launch["Comms (hub wake)"]["edit"]["applies"] == "next restart"
+    assert launch["Model"]["edit"]["applies"] == "next restart"
+
+
+def test_the_edit_command_names_the_agent_it_will_change(box):
+    """The panel is opened per agent and the command runs detached from it. An
+    argv that relied on cwd would edit whichever agent the extension host
+    happened to be sitting in."""
+    launch = _rows(cli._settings_model(str(box["work"])), "LAUNCH")
+    assert "widget-box" in launch["Comms (hub wake)"]["edit"]["argv"]
+    assert "widget-box" in launch["Model"]["edit"]["argv"]

@@ -2,7 +2,7 @@
   "name": "squad-terminals",
   "displayName": "Squad Terminals",
   "description": "Auto-opens one plain terminal per squad agent (squad attach) with icon+color, and adds per-agent squad actions to the terminal tab context menu.",
-  "version": "0.24.1",
+  "version": "0.25.0",
   "publisher": "monkeypashion",
   "engines": {
     "vscode": "^1.90.0"

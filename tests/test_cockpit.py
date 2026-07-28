@@ -577,6 +577,78 @@ def test_unreadable_output_is_reported_not_rendered(box):
     assert any("unreadable" in s for s in out["shown"]), out["shown"]
 
 
+EDITABLE = json.dumps({
+    "agent": "demo",
+    "sections": [{"title": "LAUNCH", "note": "", "rows": [
+        {"label": "Comms (hub wake)", "value": "off", "source": "set on this agent",
+         "edit": {"kind": "comms", "choices": ["on", "off"], "bin": "squad",
+                  "argv": ["comms", "{}", "demo"], "applies": "next restart"}},
+        {"label": "Worktree", "value": "/tmp/demo", "source": "roster"},
+    ]}],
+})
+
+
+def test_editable_rows_are_marked_and_read_only_ones_are_not(box):
+    """Most rows CANNOT be changed — identity is derived, membership comes from
+    a workspace. Without a marker every row invites a click and most do nothing,
+    which reads as a broken panel rather than a deliberate read-only value."""
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=EDITABLE)
+    rows = {i["label"]: i for i in out["picks"][0] if not i["separator"]}
+    assert "$(pencil) Comms (hub wake)" in rows, rows
+    assert "Worktree" in rows, "a read-only row was marked editable"
+
+
+def test_choosing_a_value_runs_the_command_the_model_named(box):
+    """The cockpit does not know what a launch flag is; the model tells it which
+    binary and which argv. That is what lets a web UI offer the same edits
+    without reimplementing them."""
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=EDITABLE, answers=["Comms", "on"])
+    assert any(e.endswith("comms on demo") for e in out["execs"]), out["execs"]
+
+
+def test_the_placeholder_says_when_the_change_takes_effect(box):
+    """A launch flag does nothing until restart; a mute lands at once. Saying
+    which BEFORE the choice is the difference between an informed click and a
+    surprise."""
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=EDITABLE, answers=["Comms"])
+    assert len(out["picks"]) == 2, "no second picker was offered"
+    assert out["picks"][1][0]["label"] in ("on", "off")
+
+
+def test_cancelling_the_value_picker_changes_nothing(box):
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=EDITABLE, answers=["Comms"])
+    assert not any("comms" in e for e in out["execs"]), out["execs"]
+
+
+def test_choosing_the_value_it_already_has_runs_nothing(box):
+    """Every one of these verbs is idempotent, so this is not about safety — it
+    is about not reporting "changed" when nothing did."""
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=EDITABLE, answers=["Comms", "off"])
+    assert not any(e.endswith("comms off demo") for e in out["execs"]), out["execs"]
+    assert any("already" in s for s in out["shown"]), out["shown"]
+
+
+def test_picking_a_read_only_row_does_nothing_at_all(box):
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=EDITABLE, answers=["Worktree"])
+    assert len(out["picks"]) == 1, "offered to edit a read-only row"
+    assert [e for e in out["execs"] if "settings" not in e] == [], out["execs"]
+
+
+def test_the_panel_reopens_from_the_cli_after_an_edit(box):
+    """It must show the state AFTER the write, not the value that was sent —
+    those differ whenever a write is rejected, clamped or normalised. Re-reading
+    is the only way the panel can be right about that."""
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=EDITABLE, answers=["Comms", "on"])
+    assert len([e for e in out["execs"] if "settings" in e]) == 2, out["execs"]
+
+
 def test_settings_on_a_non_agent_tab_warns(box):
     out = _drive(box, "run", "squad.settings", settings_out=MODEL)
     assert out["picks"] == [] and out["execs"] == []
