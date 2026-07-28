@@ -388,56 +388,88 @@ function settingsHtml(model, nonce) {
         .map((r, ri) => {
           const control = r.edit
             ? `<select data-row="${si}.${ri}">` +
+              (r.edit.choices.includes(r.value)
+                ? ""
+                : `<option selected>${esc(r.value)}</option>`) +
               r.edit.choices
                 .map(
                   (c) =>
                     `<option${c === r.value ? " selected" : ""}>${esc(c)}</option>`
                 )
                 .join("") +
-              (r.edit.choices.includes(r.value)
-                ? ""
-                : `<option selected>${esc(r.value)}</option>`) +
               `</select>`
-            : `<span class="ro">${esc(r.value)}</span>`;
-          const when = r.edit ? `<em>${esc(r.edit.applies)}</em>` : "";
-          return `<tr><th>${esc(r.label)}</th><td>${control}</td>
-                  <td class="src">${esc(r.source)} ${when}</td></tr>`;
+            : `<div class="ro">${esc(r.value)}</div>`;
+          const when = r.edit
+            ? `<span class="when">applies ${esc(r.edit.applies)}</span>`
+            : "";
+          return `<div class="row${r.edit ? " editable" : ""}">
+              <div class="k">${esc(r.label)}</div>
+              <div class="v">${control}</div>
+              <div class="src">${esc(r.source)}${when}</div>
+            </div>`;
         })
         .join("");
-      const note = sec.note ? `<span class="note">${esc(sec.note)}</span>` : "";
-      return `<h2>${esc(sec.title)}${note}</h2><table>${rows}</table>`;
+      const note = sec.note ? `<div class="note">${esc(sec.note)}</div>` : "";
+      return `<section><h2>${esc(sec.title)}</h2>${note}${rows}</section>`;
     })
     .join("");
   return `<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none';
  style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
 <style>
+ /* Every rule here is width-tolerant on purpose. This view is dockable —
+    activity bar, secondary sidebar, panel, editor — and the operator moves it
+    freely, so a layout that only works at one width is a layout that is broken
+    most of the time. It was a three-column TABLE first, which needed width it
+    never has in a sidebar: "formatting and ergonomics is terrible", correctly.
+    Stacked is the base case; columns are the enhancement, not the assumption. */
+ *{box-sizing:border-box}
  body{font-family:var(--vscode-font-family);color:var(--vscode-foreground);
-      font-size:var(--vscode-font-size);padding:.7rem 1rem 1.4rem}
- h1{font-size:1.15em;margin:0 0 1rem;font-weight:600}
- h2{font-size:.74em;letter-spacing:.10em;margin:1.3rem 0 .3rem;opacity:.75;
-    font-weight:600;border-bottom:1px solid var(--vscode-widget-border,
-    rgba(128,128,128,.22));padding-bottom:.25rem}
- .note{text-transform:none;letter-spacing:0;font-weight:400;opacity:.7;
-       margin-left:.7rem}
- table{border-collapse:collapse;width:100%}
- th{text-align:left;font-weight:400;opacity:.85;padding:.3rem 1.2rem .3rem 0;
-    white-space:nowrap;width:1%;vertical-align:middle}
- td{padding:.3rem 0;vertical-align:middle}
- td:nth-child(2){width:1%;padding-right:1.4rem;white-space:nowrap}
- .ro{font-family:var(--vscode-editor-font-family);opacity:.9;
-     word-break:break-all}
- .src{opacity:.6;font-size:.88em;line-height:1.35}
- .src em{font-style:normal;opacity:.85;margin-left:.4rem}
- select{background:var(--vscode-dropdown-background);
+      font-size:var(--vscode-font-size);padding:.6rem .8rem 2rem;margin:0;
+      line-height:1.45}
+ h1{font-size:1.05em;font-weight:600;margin:0 0 .1rem;
+    overflow-wrap:anywhere}
+ .sub{opacity:.55;font-size:.85em;margin:0 0 .4rem}
+ section{margin-top:1.15rem}
+ h2{font-size:.7em;letter-spacing:.11em;font-weight:700;opacity:.65;margin:0;
+    padding-bottom:.25rem;border-bottom:1px solid
+    var(--vscode-widget-border,rgba(128,128,128,.25))}
+ .note{opacity:.55;font-size:.83em;margin:.3rem 0 .1rem}
+ .row{padding:.5rem 0;border-bottom:1px solid
+      var(--vscode-widget-border,rgba(128,128,128,.10))}
+ .row:last-child{border-bottom:0}
+ .k{font-weight:500;overflow-wrap:anywhere}
+ .v{margin:.22rem 0 .1rem}
+ .ro{font-family:var(--vscode-editor-font-family);font-size:.92em;opacity:.85;
+     overflow-wrap:anywhere}
+ .src{opacity:.55;font-size:.82em;overflow-wrap:anywhere}
+ .when{opacity:.9;margin-left:.4rem;font-style:italic}
+ select{width:100%;background:var(--vscode-dropdown-background);
         color:var(--vscode-dropdown-foreground);
-        border:1px solid var(--vscode-dropdown-border,transparent);
-        border-radius:2px;padding:.15rem 1.4rem .15rem .4rem;
-        font-family:inherit;font-size:inherit;min-width:9rem}
- select:focus{outline:1px solid var(--vscode-focusBorder)}
- .empty{opacity:.6;padding:1.4rem .2rem;line-height:1.5}
+        border:1px solid var(--vscode-dropdown-border,
+        var(--vscode-contrastBorder,rgba(128,128,128,.35)));
+        border-radius:3px;padding:.28rem .4rem;font-family:inherit;
+        font-size:inherit;cursor:pointer}
+ select:hover{background:var(--vscode-dropdown-listBackground,
+              var(--vscode-dropdown-background))}
+ select:focus{outline:1px solid var(--vscode-focusBorder);outline-offset:-1px}
+ .empty{opacity:.6;padding:1.2rem .2rem;line-height:1.6}
+ /* Wide enough for two columns — editor tab, or a sidebar dragged out. The key
+    and the value/source share a row instead of stacking, which is what makes
+    the same view readable full-width without a second template. */
+ @media (min-width:460px){
+   body{padding:.8rem 1.2rem 2rem}
+   .row{display:grid;grid-template-columns:minmax(7rem,14rem) 1fr;
+        column-gap:1.2rem;align-items:baseline;padding:.42rem 0}
+   .k{grid-row:1;grid-column:1}
+   .v{grid-row:1;grid-column:2;margin:0}
+   .src{grid-row:2;grid-column:2;margin-top:.15rem}
+   select{width:auto;min-width:11rem;max-width:100%}
+ }
 </style></head><body>
 <h1>${esc(model.agent)}</h1>
+<div class="sub">read-only values show where they came from</div>
 ${sections}
 <script nonce="${nonce}">
  const vs = acquireVsCodeApi();
@@ -449,55 +481,65 @@ ${sections}
 </body></html>`;
 }
 
-// Renders whichever agent was last asked for. One view, retargeted — a second
-// panel per agent would put the cockpit's own tab strip inside the panel that
-// already has one.
-class SettingsView {
+
+// ONE editor tab, retargeted — not a tab per click.
+//
+// An editor tab is the only surface in VSCode that can render this well: full
+// width, aligned columns, real dropdowns, proper typography. It is not a popup,
+// and there is no modal webview to make it one — a native modal gives plain
+// text in a proportional font with about three buttons, which cannot show a
+// settings sheet and cannot edit one. Docked views were tried and are worse
+// again: the panel area shows one tab at a time so it hides the terminals, and
+// a sidebar is too narrow for anything but a stacked list.
+//
+// Retargeting rather than spawning is what stops "Settings…" turning into a row
+// of near-identical tabs across a session with ten agents.
+class SettingsPanel {
   constructor() {
-    this.view = undefined;
+    this.panel = undefined;
     this.agent = undefined;
     this.worktree = undefined;
     this.model = undefined;
     this.seq = 0;
   }
 
-  resolveWebviewView(view) {
-    this.view = view;
-    view.webview.options = { enableScripts: true };
-    view.webview.onDidReceiveMessage((msg) => this.onMessage(msg));
-    this.render();
-  }
-
   show(agent, worktree) {
     this.agent = agent;
     this.worktree = worktree;
+    if (this.panel) {
+      // reveal() without taking focus away from wherever the operator is
+      // typing would be wrong here: they asked for this panel, so it should
+      // come forward.
+      this.panel.reveal(undefined, false);
+    } else {
+      this.panel = vscode.window.createWebviewPanel(
+        "squadSettings",
+        "Squad settings",
+        vscode.ViewColumn.Active,
+        { enableScripts: true, retainContextWhenHidden: true }
+      );
+      this.panel.onDidDispose(() => {
+        this.panel = undefined;
+        this.model = undefined;
+      });
+      this.panel.webview.onDidReceiveMessage((msg) => this.onMessage(msg));
+    }
+    this.panel.title = `Settings — ${shortLabel(agent)}`;
     this.render();
   }
 
-  html(body) {
-    // A fresh nonce per render: a CSP nonce reused across renders is a nonce in
-    // name only.
-    return body;
-  }
-
   render() {
-    if (!this.view) return;
-    if (!this.agent) {
-      this.view.webview.html =
-        `<body><p class="empty">Right-click an agent tab &rarr; Squad &rarr; Settings&hellip;</p></body>`;
-      return;
-    }
-    // Guards against an out-of-order reply retargeting the view: two quick
+    if (!this.panel) return;
+    // Guards against an out-of-order reply retargeting the tab: two quick
     // clicks on different agents race, and the SLOWER cli call would otherwise
     // win and render the agent you didn't ask for last.
     const mine = ++this.seq;
-    const agent = this.agent;
     cp.execFile(
       MCP_HUB,
       ["settings", "--cwd", this.worktree, "--json"],
       { timeout: 15000 },
       (err, out, stderr) => {
-        if (mine !== this.seq) return;
+        if (mine !== this.seq || !this.panel) return;
         if (err) {
           vscode.window.showErrorMessage(
             `Squad settings: ${(stderr || err.message || "").trim()}`
@@ -510,8 +552,9 @@ class SettingsView {
           vscode.window.showErrorMessage("Squad settings: unreadable output.");
           return;
         }
-        const nonce = `n${mine}${String(agent).length}x`;
-        this.view.webview.html = this.html(settingsHtml(this.model, nonce));
+        // A fresh nonce per render: reused across renders it is a nonce in
+        // name only.
+        this.panel.webview.html = settingsHtml(this.model, `n${mine}s${this.seq}`);
       }
     );
   }
@@ -521,8 +564,8 @@ class SettingsView {
     const [si, ri] = String(msg.row).split(".").map(Number);
     const section = (this.model.sections || [])[si];
     const row = section && (section.rows || [])[ri];
-    // The row index is a claim from the page, so it is resolved against the
-    // model we actually rendered and refused if it names a row that is not
+    // The row index is a CLAIM from the page, so it is resolved against the
+    // model actually rendered and refused when it names a row that is not
     // editable — rather than trusted to address a command.
     if (!row || !row.edit) return;
     if (msg.value === row.value) return;
@@ -538,7 +581,7 @@ class SettingsView {
           `Squad: ${shortLabel(this.agent)} ${row.label} → ${msg.value} (applies ${row.edit.applies}).`
         );
       }
-      // Re-read either way. On success the panel must show the state after the
+      // Re-read either way. On success the page must show the state after the
       // write rather than the value sent; on failure it must snap the control
       // BACK, because the browser already moved it and the page would otherwise
       // display a setting that was never applied.
@@ -547,17 +590,9 @@ class SettingsView {
   }
 }
 
-const settingsView = new SettingsView();
+const settingsView = new SettingsPanel();
 
 function activate(context) {
-  context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider("squad.settingsView", settingsView, {
-      // The panel keeps its rendered state when you switch to a terminal tab
-      // and back. Without this the view is torn down on every hide and the
-      // settings you were reading are replaced by the placeholder.
-      webviewOptions: { retainContextWhenHidden: true },
-    })
-  );
 
   // ---- context-menu commands (registered in every window; they no-op
   // politely on non-agent terminals) ----
@@ -671,10 +706,6 @@ function activate(context) {
           );
         }
         settingsView.show(agent, row.worktree);
-        // Reveal the panel. Without this the command looks like it did nothing
-        // whenever the Squad tab is not already the visible one — which is the
-        // normal case, since the operator is usually looking at an agent.
-        vscode.commands.executeCommand("squad.settingsView.focus");
       })
     ),
     vscode.commands.registerCommand("squad.interrupt", (...args) =>

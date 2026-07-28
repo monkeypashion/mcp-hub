@@ -113,24 +113,28 @@ const vscode = {
       opened.push((doc && doc.fsPath) || String(doc));
       return {};
     },
-    // The settings view is a WebviewView, so the extension hands VSCode a
-    // PROVIDER and never sees a view until one is resolved. The harness plays
-    // VSCode's part: resolve it once with a stub whose html and message
-    // handler are both observable, because the rendered page IS the behaviour
-    // and the message handler is the only way an edit can be triggered.
-    registerWebviewViewProvider(id, provider) {
-      const view = {
+    // The settings page is a webview PANEL. Both halves are observable on
+    // purpose: the rendered html IS the behaviour, and the message handler is
+    // the only route by which an edit can be triggered, since the page can act
+    // solely through postMessage.
+    createWebviewPanel(id, title) {
+      const panel = {
+        title,
         webview: {
           options: {},
-          set html(v) { views.push({ id, html: v }); },
+          set html(v) { views.push({ id, title: panel.title, html: v }); },
           get html() { return views.length ? views[views.length - 1].html : ""; },
           onDidReceiveMessage(cb) { msgHandlers.push(cb); return D; },
           postMessage() { return Promise.resolve(true); },
         },
-        show() {},
+        // Recorded so a test can prove ONE tab is retargeted rather than a new
+        // one opened per click — which is invisible from the html alone.
+        reveal() { revealed.push(panel.title); },
+        onDidDispose() { return D; },
+        dispose() {},
       };
-      providers.push({ id, provider, view });
-      return D;
+      panels.push(panel);
+      return panel;
     },
     onDidChangeTerminalShellIntegration: ev,
     onDidChangeActiveTerminal: ev,
@@ -193,6 +197,7 @@ const vscode = {
     }
   },
   Uri: { file: (p) => ({ fsPath: p, toString: () => p }) },
+  ViewColumn: { Active: -1, One: 1, Beside: -2 },
   RelativePattern: class {
     constructor(base, pattern) {
       this.base = base;
@@ -217,7 +222,9 @@ const execs = [];
 const offered = [];
 const picks = [];
 const views = [];
-const providers = [];
+const panels = [];
+const revealed = [];
+let settingsCalls = 0;
 const msgHandlers = [];
 const executed = [];
 const opened = [];
@@ -239,6 +246,22 @@ const cpStub = {
     // realistic path unreachable and every settings test exercised the
     // unparseable-output branch instead.
     const isSettings = Array.isArray(args) && args[0] === "settings";
+    // Per-call output and latency, so a test can stage the ORDER replies come
+    // back in. Two quick clicks race, and the guard under test only matters
+    // when the FIRST call is the slower one — which cannot happen with a stub
+    // that answers everything instantly and identically.
+    if (isSettings) settingsCalls += 1;
+    const nth = settingsCalls;
+    const settingsOut =
+      nth > 1 && process.env.HARNESS_SETTINGS_OUT2
+        ? process.env.HARNESS_SETTINGS_OUT2
+        : process.env.HARNESS_SETTINGS_OUT || "";
+    const delay =
+      nth === 1 ? Number(process.env.HARNESS_SETTINGS_DELAY_FIRST || 0) : 0;
+    if (isSettings && delay > 0 && typeof done === "function") {
+      setTimeout(() => done(null, settingsOut, ""), delay);
+      return { on() {}, unref() {} };
+    }
     if (typeof done === "function") {
       if (isSettings && process.env.HARNESS_SETTINGS_FAIL) {
         // stdout is emitted too when a test supplies it: a command can print
@@ -250,7 +273,7 @@ const cpStub = {
              process.env.HARNESS_SETTINGS_FAIL);
       } else {
         done(notAttached ? Object.assign(new Error("exit 1"), { code: 1 }) : null,
-             isSettings ? process.env.HARNESS_SETTINGS_OUT || "" : "", "");
+             isSettings ? settingsOut : "", "");
       }
     }
     return { on() {}, unref() {} };
@@ -288,14 +311,7 @@ const extPath = process.env.HARNESS_EXT || path.join(
 );
 const ext = require(extPath);
 ext.activate({ subscriptions: [] });
-// VSCode resolves a webview view when its container is first shown. Do it
-// straight after activation so the provider is live for the whole run —
-// otherwise every settings test would exercise the never-resolved path.
-for (const p of providers) {
-  if (typeof p.provider.resolveWebviewView === "function") {
-    p.provider.resolveWebviewView(p.view);
-  }
-}
+
 
 (async () => {
   if (mode === "shortlabel") {
@@ -324,6 +340,13 @@ for (const p of providers) {
       : undefined;
     try {
       await fn(clicked);
+      // A second click on the same command. "One tab, retargeted" is a claim
+      // about what the SECOND invocation does, and is invisible to any test
+      // that only ever clicks once.
+      if (process.env.HARNESS_RUN_TWICE) {
+        await fn(clicked);
+        for (let i = 0; i < 30; i++) await new Promise((r) => setTimeout(r, 25));
+      }
       // withAgents() invokes its callback WITHOUT awaiting it, so the command
       // returns before any dialog has run. Drain the microtask/timer queues
       // until nothing new arrives, rather than guessing a sleep.
@@ -332,7 +355,7 @@ for (const p of providers) {
         await new Promise((r) => setTimeout(r, 25));
       }
     } catch (e) {
-      console.log(JSON.stringify({ error: String((e && e.message) || e), sent, shown, execs, offered, opened, picks, views, executed, folderOps }));
+      console.log(JSON.stringify({ error: String((e && e.message) || e), sent, shown, execs, offered, opened, picks, views, executed, panelCount: panels.length, revealed, folderOps }));
       process.exitCode = 3;
       return;
     }
@@ -360,7 +383,7 @@ for (const p of providers) {
       }
       for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 25));
     }
-    console.log(JSON.stringify({ sent, shown, execs, offered, opened, picks, views, executed, folderOps }));
+    console.log(JSON.stringify({ sent, shown, execs, offered, opened, picks, views, executed, panelCount: panels.length, revealed, folderOps }));
     return;
   }
   console.log(JSON.stringify({ error: `unknown mode: ${mode}` }));

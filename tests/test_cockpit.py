@@ -47,7 +47,8 @@ def _drive(home: pathlib.Path, mode: str, target: str = "",
            answers=None, wsfile: str = "", terminal: str = "",
            exec_out: str = "", exec_fail: str = "", fire_roster: bool = False,
            not_attached: bool = False, settings_out: str = "",
-           settings_fail: str = "", webview_msg=None) -> dict:
+           settings_fail: str = "", webview_msg=None, twice: bool = False,
+           settings_out2: str = "", delay_first: int = 0) -> dict:
     env = dict(
         os.environ,
         HOME=str(home),
@@ -60,6 +61,12 @@ def _drive(home: pathlib.Path, mode: str, target: str = "",
         env["HARNESS_SETTINGS_FAIL"] = settings_fail
     if webview_msg is not None:
         env["HARNESS_WEBVIEW_MSG"] = json.dumps(webview_msg)
+    if twice:
+        env["HARNESS_RUN_TWICE"] = "1"
+    if settings_out2:
+        env["HARNESS_SETTINGS_OUT2"] = settings_out2
+    if delay_first:
+        env["HARNESS_SETTINGS_DELAY_FIRST"] = str(delay_first)
     if exec_out:
         env["HARNESS_EXEC_OUT"] = exec_out
     if exec_fail:
@@ -530,13 +537,47 @@ def test_settings_asks_the_cli_rather_than_reading_files_itself(box):
     assert "--json" in call and f"--cwd {box}/Projects/demo" in call, call
 
 
-def test_the_panel_is_revealed_not_merely_updated(box):
-    """The Squad tab is usually NOT the visible one — the operator is looking at
-    an agent. Rendering without revealing looks exactly like a dead menu entry.
-    """
+def test_the_tab_is_titled_for_the_agent_it_shows(box):
+    """One tab is retargeted rather than one opened per agent, so the title is
+    the only thing saying WHICH agent you are looking at."""
     out = _drive(box, "run", "squad.settings", terminal="demo · idle",
                  settings_out=MODEL)
-    assert any("settingsView" in c for c in out["executed"]), out["executed"]
+    assert out["panelCount"] == 1, out["panelCount"]
+    assert out["views"][-1]["title"] == "Settings — demo", out["views"]
+
+
+def test_a_second_click_retargets_the_same_tab(box):
+    """Otherwise a session with ten agents ends up with ten near-identical tabs.
+    Invisible to a test that only clicks once — the first click is correct
+    either way."""
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=MODEL, twice=True)
+    assert out["panelCount"] == 1, f"opened {out['panelCount']} tabs"
+    assert out["revealed"], "the existing tab was never brought forward"
+
+
+def test_a_slow_reply_cannot_overwrite_a_newer_one(box):
+    """Two quick clicks race. If the FIRST cli call is the slower one its reply
+    lands last, and without a guard it repaints the tab with the agent you did
+    not ask for — the panel then confidently shows the wrong machine's settings.
+
+    Staged by making call 1 slow and giving the two calls different payloads:
+    with an instant, identical stub the race cannot occur and the guard is
+    unfalsifiable. (Measured — a mutant deleting it passed until this existed.)
+    """
+    other = json.dumps({"agent": "second", "sections": [{"title": "LAUNCH",
+        "note": "", "rows": [{"label": "Comms (hub wake)", "value": "on",
+                              "source": "set on this agent"}]}]})
+    out = _drive(box, "run", "squad.settings", terminal="demo · idle",
+                 settings_out=MODEL, settings_out2=other, twice=True,
+                 delay_first=250)
+    assert out["views"], out
+    # Matched on the RENDERED HEADING, not as a loose substring. "second"
+    # appears in the page's own CSS comment ("secondary sidebar"), so a
+    # substring check passes against a page showing the wrong agent entirely —
+    # which is exactly what the mutant produced while the test stayed green.
+    assert "<h1>second</h1>" in out["views"][-1]["html"], \
+        f"the stale reply won and repainted the page: {out['views'][-1]['html'][:300]}"
 
 
 def test_every_row_shows_its_value_and_its_source(box):
@@ -663,37 +704,12 @@ def test_settings_on_a_non_agent_tab_warns(box):
     assert any("no squad agent" in s for s in out["shown"]), out
 
 
-def test_the_view_id_the_reveal_command_uses_is_the_one_contributed():
-    """`<viewId>.focus` is a command VSCode synthesises from the MANIFEST, so
-    the id in package.json and the id the extension reveals are a two-registry
-    coupling with nothing joining them. Renaming the view leaves a focus command
-    that silently resolves to nothing — the panel renders, and never appears.
-
-    This is also what makes the view's LOCATION the operator's to choose: focus
-    reveals it wherever it has been dragged, so moving it between the panel, the
-    sidebar and the secondary sidebar needs no code change at all.
-    """
-    pkg = json.loads((EXT / "package.json").read_text())
-    contributed = {v["id"] for views in pkg["contributes"]["views"].values()
-                   for v in views}
-    source = (EXT / "extension.js").read_text(encoding="utf-8")
-    for vid in contributed:
-        assert f'"{vid}"' in source, f"contributed view {vid} is never registered"
-        assert f'"{vid}.focus"' in source, \
-            f"{vid} is registered but nothing reveals it"
-    containers = pkg["contributes"]["viewsContainers"]
-    owned = set(pkg["contributes"]["views"])
-    declared = {c["id"] for cs in containers.values() for c in cs}
-    assert owned == declared, \
-        f"views belong to containers that do not exist: {owned ^ declared}"
-
-
-def test_the_unopened_panel_says_how_to_open_it(box):
-    """The view resolves as soon as the Squad tab is shown, which can happen
-    before any agent is chosen. A blank panel there reads as broken."""
+def test_no_tab_is_opened_until_settings_is_asked_for(box):
+    """A webview PANEL is created on demand, unlike the docked view it replaces
+    which resolved the moment its container was shown. Activation must not put a
+    tab in the operator's editor."""
     out = _drive(box, "commands")
-    assert out.get("views"), "the provider was never resolved"
-    assert "Right-click" in out["views"][0]["html"], out["views"][0]["html"]
+    assert not out.get("views"), f"opened a tab at activation: {out.get('views')}"
 
 
 # ---- operator-editable lists (prompts.txt / slash.txt) --------------------
