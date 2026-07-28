@@ -167,7 +167,14 @@ const cpStub = {
   execFile(file, args, opts, cb) {
     execs.push([file, ...(Array.isArray(args) ? args : [])].join(" "));
     const done = typeof opts === "function" ? opts : cb;
-    if (typeof done === "function") done(null, "", "");
+    // `squad attached <a>` is a PROBE whose exit code picks the start path, so
+    // a stub that always succeeds makes only the attached branch reachable —
+    // which is how the typed path silently stopped being covered.
+    const isProbe = Array.isArray(args) && args[0] === "attached";
+    const notAttached = isProbe && process.env.HARNESS_NOT_ATTACHED;
+    if (typeof done === "function") {
+      done(notAttached ? Object.assign(new Error("exit 1"), { code: 1 }) : null, "", "");
+    }
     return { on() {}, unref() {} };
   },
   spawn(file, args) {

@@ -45,7 +45,8 @@ def box(tmp_path):
 
 def _drive(home: pathlib.Path, mode: str, target: str = "",
            answers=None, wsfile: str = "", terminal: str = "",
-           exec_out: str = "", exec_fail: str = "", fire_roster: bool = False) -> dict:
+           exec_out: str = "", exec_fail: str = "", fire_roster: bool = False,
+           not_attached: bool = False) -> dict:
     env = dict(
         os.environ,
         HOME=str(home),
@@ -58,6 +59,8 @@ def _drive(home: pathlib.Path, mode: str, target: str = "",
         env["HARNESS_EXEC_FAIL"] = exec_fail
     if fire_roster:
         env["HARNESS_FIRE_ROSTER"] = "1"
+    if not_attached:
+        env["HARNESS_NOT_ATTACHED"] = "1"
     if wsfile:
         env["HARNESS_WSFILE"] = wsfile
     if terminal:
@@ -215,20 +218,47 @@ def test_add_folder_cancelled_dialog_changes_nothing(box, tmp_path):
     ("squad.startAttach", "--resume"),
     ("squad.startAttachFresh", "--fresh"),
 ])
-def test_start_and_attach_actually_attaches(box, command, mode):
-    """This broke in production today and the operator caught it, not a test.
-
-    It was rewired to start the agent via a background exec, which left the tab a
-    bare shell — so "Start & attach" only started. Attaching is a property of THIS
-    terminal, so the command must be TYPED INTO THE TAB, and it must contain the
-    attach as well as the restart. Both halves asserted, because the bug was the
-    presence of one without the other.
+def test_start_and_attach_on_a_SHELL_tab_types_the_command(box, command, mode):
+    """The 92a7954 regression: rewiring this to a background exec left the tab a
+    bare shell, so "Start & attach" only started. Attaching is a property of THIS
+    terminal, so when the tab is a shell the command must be TYPED, and it must
+    carry the attach as well as the restart — the bug was one without the other.
     """
-    out = _drive(box, "run", command, terminal="demo · idle")
+    out = _drive(box, "run", command, terminal="demo · idle", not_attached=True)
     assert len(out["sent"]) == 1, out
     cmd = out["sent"][0]
     assert "squad restart demo" in cmd and mode in cmd, cmd
     assert "squad attach demo" in cmd, f"started without attaching: {cmd}"
+
+
+@pytest.mark.parametrize("command,mode", [
+    ("squad.startAttach", "--resume"),
+    ("squad.startAttachFresh", "--fresh"),
+])
+def test_start_and_attach_on_an_ATTACHED_tab_does_not_type(box, command, mode):
+    """The other half, and the one the operator hit: the tab is already a running
+    agent, so the pane is Claude, not a shell. Typing there puts the command in
+    the AGENT'S prompt — "it just keeps putting the command into the chat box".
+
+    The restart must go to the BACKGROUND instead, which is sufficient because
+    squad restart respawns the pane in place and attached viewers keep watching.
+
+    Asserting sent == [] is the load-bearing half: this bug is INVISIBLE to a
+    test that only checks the restart happened, because it happened either way.
+    """
+    out = _drive(box, "run", command, terminal="demo · idle")   # attached
+    assert out["sent"] == [], f"typed into a tab that is a live agent: {out['sent']}"
+    assert any(f"restart demo {mode}" in e for e in out["execs"]), out["execs"]
+
+
+@pytest.mark.parametrize("command", ["squad.startAttach", "squad.startAttachFresh"])
+def test_start_and_attach_probes_before_choosing_a_path(box, command):
+    """The choice must be made from the tab's ACTUAL state, not assumed. Without
+    the probe there is only one path and one of the two cases is always wrong.
+    """
+    out = _drive(box, "run", command, terminal="demo · idle")
+    assert any("attached demo" in e for e in out["execs"]), \
+        f"chose a start path without asking whether the tab is attached: {out['execs']}"
 
 
 def test_start_and_attach_on_a_non_agent_tab_warns(box):
