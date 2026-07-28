@@ -33,6 +33,31 @@ from textual.widgets import Footer, Header, Label, ListItem, ListView, Select, S
 # Both variants are registered, so Ctrl+P still switches to any of Textual's
 # 22 built-ins — this only changes the DEFAULT.
 CLAY = "#d97757"
+# WHITE, and a selection that is not a colour wash.
+#
+# Six goes at this. The failure was reaching for someone else's palette each
+# time — the built-in light themes are all off-white (#E0E0E0, #EFF1F5,
+# #FAFAFA, #fdf6e3) and every one tints its selection with the primary hue, so
+# the highlighted row renders as dark text over a blue-ish wash: "kind of blue
+# and black at the same time. It's fucking annoying." Correct description of
+# what a 25% primary tint under near-black text actually looks like.
+#
+# So: pure white, near-black text, and NEUTRAL greys for selection and rules.
+# The accent is used for emphasis only, never as a background behind text.
+SQUAD_LIGHT = Theme(
+    name="squad-light",
+    primary="#1f1f1f",        # headings: weight, not hue
+    secondary="#4a4a4a",
+    accent="#c6613f",         # clay, for the one thing that needs attention
+    warning="#b45309",
+    error="#b3261e",
+    success="#2e7d5b",
+    foreground="#1a1a1a",
+    background="#ffffff",
+    surface="#ffffff",
+    panel="#f4f4f4",
+    dark=False,
+)
 CLAUDE_DARK = Theme(
     name="claude-dark",
     primary=CLAY,             # clay
@@ -71,12 +96,13 @@ Screen { layout: vertical; }
    exactly one row of the panel and blank space below it. */
 #agents {
     width: 36;
-    border-right: solid $foreground;
+    background: $background;
+    border-right: solid #d8d8d8;
     background: $surface;
     height: 1fr;
 }
 #agents > ListItem { height: 2; padding: 0 1; }
-#agents > ListItem.-highlight { text-style: reverse; }
+#agents > ListItem.-highlight { background: #e8e8e8; color: $foreground; }
 .agent-name { text-style: bold; height: 1; }
 .agent-class { color: $text-muted; height: 1; }
 
@@ -151,15 +177,8 @@ class SettingsApp(App):
     async def on_mount(self) -> None:
         self.register_theme(CLAUDE_DARK)
         self.register_theme(CLAUDE_LIGHT)
-        # INHERIT the terminal. Every palette I picked was a palette the
-        # operator had not asked for — first Textual's dark, then Claude's web
-        # CSS (which is not what the terminal renderer uses at all), then
-        # Claude's cream. What was wanted was "the same as the tmux session",
-        # and the only way to be the same as the terminal is to not have an
-        # opinion: ansi-light maps every colour onto ansi_default and the ANSI
-        # 16, so the terminal's own scheme shows through unchanged.
-        self.ansi_color = True
-        self.theme = "ansi-light"
+        self.register_theme(SQUAD_LIGHT)
+        self.theme = "squad-light"
         self.title = "Squad settings"
         where = self.scoped_to.rsplit("/", 1)[-1] if self.scoped_to else "this machine"
         self.sub_title = f"{len(self.agents)} agent(s) · {where}"
