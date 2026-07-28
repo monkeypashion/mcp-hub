@@ -832,8 +832,12 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             "- broadcast(from, message, priority) — to the whole fleet\n\n"
             "Priority is one of low|normal|urgent. Default is normal. "
             "Use 'low' for FYIs / status updates / EOD recaps that the recipient "
-            "doesn't need to act on now — the hub queues these without firing a "
-            "channel-push wake. Use 'normal' when you're waiting on the recipient. "
+            "doesn't need to act on now. What 'low' does then DIFFERS BY "
+            "PRIMITIVE, deliberately: broadcast and post queue without ever "
+            "firing a wake, while a low send() still wakes a recipient who is "
+            "IDLE (and queues silently for one mid-turn) — a soft ask should "
+            "still reach an idle agent. Do not generalise either rule to the "
+            "other. Use 'normal' when you're waiting on the recipient. "
             "Use 'urgent' sparingly — it should mean 'blocking on you' or "
             "'production incident'.\n\n"
             "After register() the hub binds your MCP session for channel-push wake. "
@@ -1524,6 +1528,38 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             )
         now = time.time()
         conn = _get_db(db_path)
+
+        # ORPHAN GATE (ra's #136, 2026-07-27). register() is otherwise ungated
+        # ON PURPOSE — see the binding note below and parked #17 — and this does
+        # NOT change that for any name the hub has already seen. It closes one
+        # narrow hole: a session already bound to X registering a name that has
+        # NEVER existed conjures an agent nobody will ever drain, which then
+        # presents as ⚡ live in every roster until the reaper notices. ra's
+        # probe did exactly that, deliberately, and the junk name sat online.
+        #
+        # The two conditions together are what keep this safe. Re-register of an
+        # EXISTING name is never touched, so the fleet's constant reconnect path
+        # (and legitimate multi-name aliasing, which the cross-identity guard
+        # polices on the SPEAKING side instead) is unaffected — which is why
+        # #17's "a false predicate could unbind the whole fleet" objection does
+        # not reach here. A brand-new agent's own first register is also
+        # untouched: its session owns nothing yet, so `owners` is empty.
+        if ctx is not None:
+            owners = registry.names_for_session(ctx.session)
+            if owners and name not in owners:
+                known = conn.execute(
+                    "SELECT 1 FROM agents WHERE name = ?", (name,)
+                ).fetchone()
+                if known is None:
+                    held = ", ".join(sorted(owners))
+                    return (
+                        f"REFUSED: this session is already registered as {held}, "
+                        f"and '{name}' has never been seen before. Registering a "
+                        f"brand-new name from another agent's session leaves an "
+                        f"agent that looks online but that nobody is listening "
+                        f"for. If '{name}' is real, register it from its own "
+                        f"session; if you are probing, use an unbound client."
+                    )
 
         # NOTE: no one-agent-per-project dedup here, deliberately. Multiple
         # clones of the same repo register distinct derived names
