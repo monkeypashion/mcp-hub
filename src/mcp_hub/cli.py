@@ -2010,22 +2010,42 @@ def mute_command(args: argparse.Namespace) -> int:
         print(f"!! mute failed: {exc}", file=sys.stderr)
         return 1
     print(reply or f"{args.agent}: {args.squad} {'muted' if muted else 'unmuted'}")
-    # The hub is the record; the status cache is a stale copy the statusline
-    # and this panel both read. Left alone it keeps showing the old state until
-    # the daemon's next beat, which reads as "the click did nothing".
-    _invalidate_status_cache(args.agent)
+    _record_mute_in_cache(args.agent, args.squad, muted)
     return 0
 
 
-def _invalidate_status_cache(agent: str) -> None:
-    """Drop the cached snapshot so the next read comes from the hub.
+def _record_mute_in_cache(agent: str, squad: str, muted: bool) -> None:
+    """Write the mute we just made into the cached snapshot.
 
-    Deleting rather than editing: this file is written by the daemon from a
-    live query, and hand-patching one field here would make it a second author
-    of a cache whose whole value is being a faithful copy.
+    This used to DELETE the file, on the reasoning that the daemon is the only
+    honest author of a cache. That was wrong in the way that matters: the
+    daemon rewrites it about once a minute, so between the write and the next
+    beat every reader — statusline and settings panel alike — reported the
+    squad as `unknown`. The operator changed a value and watched it become
+    unknown (2026-07-28).
+
+    "We do not know" is a strictly worse answer than the state we just
+    successfully applied. Only this one field is touched, and only after the
+    hub confirmed the write, so the copy stays faithful; the daemon overwrites
+    it wholesale on its next beat regardless.
     """
+    path = _status_cache_path(agent)
     try:
-        _status_cache_path(agent).unlink()
+        snap = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(snap, dict):
+            return
+    except (OSError, ValueError):
+        return          # nothing cached yet: leave it to the daemon
+    current = [s for s in (snap.get("muted") or []) if isinstance(s, str)]
+    if muted and squad not in current:
+        current.append(squad)
+    elif not muted and squad in current:
+        current = [s for s in current if s != squad]
+    snap["muted"] = sorted(current)
+    try:
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(snap), encoding="utf-8")
+        tmp.replace(path)
     except OSError:
         pass
 
@@ -2347,10 +2367,25 @@ def _tui_run(stdscr, tui: "SettingsTui") -> None:  # pragma: no cover - draws
                 else:
                     binary, argv = cmd
                     exe = MCP_HUB_BIN if binary == "mcp-hub" else SQUAD_BIN
+                    label = (tui.current() or {}).get("label", "setting")
+                    # PAINT FIRST. The command runs synchronously in this redraw
+                    # loop, and a mute is a network round trip to the hub — so
+                    # the panel simply freezes, with the old value still on
+                    # screen and no cursor. That is indistinguishable from a
+                    # hang ("it got stuck", 2026-07-28). Say what is happening
+                    # before blocking on it.
+                    tui.status = f"applying {label} → {choice}…"
+                    put(h - 1, max(0, w - len(tui.status) - 2), tui.status, YE)
+                    stdscr.refresh()
                     try:
+                        # Short: this blocks the UI, so a slow hub must surface
+                        # as an error the operator can act on rather than a
+                        # frozen panel they have to guess about.
                         subprocess.run([exe, *argv], check=True,
-                                       capture_output=True, text=True, timeout=30)
-                        tui.status = f"{tui.current()['label']} → {choice}"
+                                       capture_output=True, text=True, timeout=12)
+                        tui.status = f"{label} → {choice}"
+                    except subprocess.TimeoutExpired:
+                        tui.status = f"{label}: timed out — is the hub reachable?"
                     except subprocess.CalledProcessError as exc:
                         tui.status = (exc.stderr or exc.stdout or "failed").strip()[:60]
                     except Exception as exc:  # noqa: BLE001

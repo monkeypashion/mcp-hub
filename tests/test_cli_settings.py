@@ -336,10 +336,16 @@ def test_the_operators_word_maps_to_the_tools_boolean(box, monkeypatch, state, e
     assert seen["name"] == "widget-box" and seen["squad"] == "dreamteam"
 
 
-def test_a_successful_mute_drops_the_cached_snapshot(box, monkeypatch):
-    """The hub is the record; the status file is a copy that the statusline AND
-    the settings panel both read. Left stale, the panel keeps showing the old
-    state — which reads as "the click did nothing"."""
+def test_a_successful_mute_is_RECORDED_in_the_snapshot_not_erased(box, monkeypatch):
+    """This REPLACES "a successful mute drops the cached snapshot".
+
+    Deleting looked principled — the daemon is the honest author of that file,
+    so don't hand-edit it. But the daemon rewrites it about once a minute, so
+    between the write and the next beat every reader reported the squad as
+    `unknown`. The operator changed a value and watched it become unknown
+    (2026-07-28). "We do not know" is strictly worse than the state we just
+    successfully applied.
+    """
     snap = box["home"] / ".mcp-hub" / "status-widget-box.json"
     snap.write_text(json.dumps({"squads": ["dreamteam"], "muted": []}), encoding="utf-8")
 
@@ -347,8 +353,49 @@ def test_a_successful_mute_drops_the_cached_snapshot(box, monkeypatch):
         return "ok"
 
     monkeypatch.setattr(cli, "_mute_squad", fake)
+    assert cli.mute_command(_mute_args(state="mute")) == 0
+    after = json.loads(snap.read_text())
+    assert after["muted"] == ["dreamteam"], after
+    assert after["squads"] == ["dreamteam"], "membership was disturbed by a mute"
+
+
+def test_unmuting_removes_it_again(box, monkeypatch):
+    snap = box["home"] / ".mcp-hub" / "status-widget-box.json"
+    snap.write_text(json.dumps({"squads": ["dreamteam"], "muted": ["dreamteam"]}),
+                    encoding="utf-8")
+
+    async def fake(*a, **k):
+        return "ok"
+
+    monkeypatch.setattr(cli, "_mute_squad", fake)
+    assert cli.mute_command(_mute_args(state="hear")) == 0
+    assert json.loads(snap.read_text())["muted"] == []
+
+
+def test_muting_twice_does_not_duplicate_the_entry(box, monkeypatch):
+    snap = box["home"] / ".mcp-hub" / "status-widget-box.json"
+    snap.write_text(json.dumps({"squads": ["dreamteam"], "muted": ["dreamteam"]}),
+                    encoding="utf-8")
+
+    async def fake(*a, **k):
+        return "ok"
+
+    monkeypatch.setattr(cli, "_mute_squad", fake)
+    cli.mute_command(_mute_args(state="mute"))
+    assert json.loads(snap.read_text())["muted"] == ["dreamteam"]
+
+
+def test_no_snapshot_yet_is_left_for_the_daemon(box, monkeypatch):
+    """Inventing a cache file here would publish a snapshot with no online or
+    wakeable fields, which the statusline reads as an agent that is down."""
+    snap = box["home"] / ".mcp-hub" / "status-widget-box.json"
+
+    async def fake(*a, **k):
+        return "ok"
+
+    monkeypatch.setattr(cli, "_mute_squad", fake)
     assert cli.mute_command(_mute_args()) == 0
-    assert not snap.exists(), "the panel would keep reporting the old state"
+    assert not snap.exists()
 
 
 def test_a_failed_mute_reports_and_keeps_the_snapshot(box, monkeypatch):
@@ -363,7 +410,8 @@ def test_a_failed_mute_reports_and_keeps_the_snapshot(box, monkeypatch):
 
     monkeypatch.setattr(cli, "_mute_squad", boom)
     assert cli.mute_command(_mute_args()) == 1
-    assert snap.exists(), "discarded a snapshot that was still correct"
+    assert json.loads(snap.read_text())["muted"] == [], \
+        "recorded a mute that never reached the hub"
 
 
 def test_the_settings_edit_and_the_mute_command_agree_on_spelling(box):
