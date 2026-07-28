@@ -489,6 +489,59 @@ def _write_list(home: pathlib.Path, name: str, body: str):
     (home / ".config" / "squad" / name).write_text(body, encoding="utf-8")
 
 
+def test_stock_prompts_offers_to_create_the_file_it_needs(box):
+    """This entry used to dead-end in a warning naming a path.
+
+    On a machine that had never made prompts.txt — which is every machine until
+    someone does — the only possible outcome of clicking it was being told it
+    could do nothing, and nothing in the cockpit created the file. A menu entry
+    that can only fail is a menu entry that gets clicked once.
+    """
+    out = _drive(box, "run", "squad.stockPrompt", answers=["Create and open it"],
+                 terminal="demo · idle")
+    assert out["execs"] == [], "nothing should be sent to the agent"
+    target = str(box / ".config" / "squad" / "prompts.txt")
+    assert out["opened"] == [target], out
+    body = pathlib.Path(target).read_text(encoding="utf-8")
+    assert body.strip(), "created an empty file — nothing to learn the format from"
+    # Seeded ENTIRELY commented out: offering to create the file is not consent
+    # to start sending prompts the operator never chose.
+    assert all(ln.startswith("#") for ln in body.splitlines() if ln.strip()), body
+
+
+def test_declining_the_offer_creates_nothing(box):
+    out = _drive(box, "run", "squad.stockPrompt", answers=[], terminal="demo · idle")
+    assert out["opened"] == [] and out["execs"] == []
+    assert not (box / ".config" / "squad" / "prompts.txt").exists()
+
+
+def test_a_populated_list_goes_straight_to_the_picker(box):
+    _write_list(box, "prompts.txt", "# mine\nship it\n")
+    out = _drive(box, "run", "squad.stockPrompt", answers=["ship it"],
+                 terminal="demo · idle")
+    assert any("cmd demo ship it" in e for e in out["execs"]), out
+    assert out["opened"] == [], "an existing list must not open an editor"
+
+
+def test_a_comments_only_file_is_reopened_not_rewritten(box):
+    """The state the seed itself leaves behind, and the ONLY way to reach the
+    create path with the file already present.
+
+    A seeded file parses to zero prompts, so the next click offers to create it
+    again — and "create" must mean "open what is there". Asserting this against a
+    POPULATED file proves nothing: that path returns at the picker and never
+    reaches the write. (Measured — a mutant with the exists-check deleted passed
+    the populated-file version of this test.)
+    """
+    mine = "# my notes, kept\n# status please\n"
+    _write_list(box, "prompts.txt", mine)
+    out = _drive(box, "run", "squad.stockPrompt", answers=["Create and open it"],
+                 terminal="demo · idle")
+    target = box / ".config" / "squad" / "prompts.txt"
+    assert out["opened"] == [str(target)], out
+    assert target.read_text(encoding="utf-8") == mine, "clobbered the operator's file"
+
+
 def test_slash_offers_the_saved_list(box, tmp_path):
     """Adding a slash command must cost one line in a file, not two source edits
     plus a version bump and an ext-align — which is why the built-in list never

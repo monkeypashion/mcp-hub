@@ -153,10 +153,13 @@ function themeFor(agent) {
 // ONE function for both lists (~/.config/squad/prompts.txt and slash.txt) so
 // "same rules as prompts.txt" is structurally true rather than a claim in a
 // comment that can quietly stop being true.
+const operatorListPath = (name) =>
+  path.join(os.homedir(), ".config", "squad", name);
+
 function readOperatorList(name) {
   try {
     return fs
-      .readFileSync(path.join(os.homedir(), ".config", "squad", name), "utf8")
+      .readFileSync(operatorListPath(name), "utf8")
       .split("\n")
       .map((s) => s.trim())
       .filter((s) => s && !s.startsWith("#"));
@@ -164,6 +167,38 @@ function readOperatorList(name) {
     return [];
   }
 }
+
+// Create the list file with a worked example and open it for editing.
+//
+// "Stock prompt…" used to dead-end in a warning naming a path — a menu entry
+// whose only possible outcome was to tell you it could do nothing, on any
+// machine that had never made the file. Nothing created it, so nothing ever
+// would. The seed is entirely commented out, so the first click still shows an
+// empty list rather than silently installing prompts nobody chose.
+//
+// NEVER overwrites: this is the operator's file, and the only reason to be here
+// is that it was missing.
+async function openOperatorList(name, seed) {
+  const p = operatorListPath(name);
+  try {
+    if (!fs.existsSync(p)) {
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, seed, { flag: "wx" });
+    }
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(p));
+    await vscode.window.showTextDocument(doc);
+  } catch (e) {
+    vscode.window.showErrorMessage(`Squad: could not open ${p}: ${e.message}`);
+  }
+}
+
+const PROMPTS_SEED = `# Stock prompts — one per line, sent to the agent(s) you right-clicked.
+# Lines starting with # are ignored, so delete a # to enable one.
+#
+# status please
+# commit what you have, then tell me what is left
+# write up where you got to in memory before you run out of context
+`;
 
 // short label: strip the derived "-<hostname>" (sanitized like cli.py) — from
 // the MIDDLE as well as the end.
@@ -330,7 +365,11 @@ function activate(context) {
       withAgents(args, async (agents) => {
         const prompts = readOperatorList("prompts.txt");
         if (!prompts.length) {
-          vscode.window.showWarningMessage("No stock prompts — add lines to ~/.config/squad/prompts.txt");
+          const go = await vscode.window.showWarningMessage(
+            "No stock prompts yet. They live in ~/.config/squad/prompts.txt — one prompt per line.",
+            "Create and open it"
+          );
+          if (go) await openOperatorList("prompts.txt", PROMPTS_SEED);
           return;
         }
         const pick = await vscode.window.showQuickPick(prompts, {

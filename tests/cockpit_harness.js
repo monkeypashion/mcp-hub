@@ -91,6 +91,12 @@ const vscode = {
     async showOpenDialog() {
       return undefined;
     },
+    // Recorded because "offers to CREATE the missing file" is only
+    // distinguishable from the old dead-end warning by what it opens.
+    async showTextDocument(doc) {
+      opened.push((doc && doc.fsPath) || String(doc));
+      return {};
+    },
     onDidChangeTerminalShellIntegration: ev,
     onDidChangeActiveTerminal: ev,
     onDidCloseTerminal: ev,
@@ -103,6 +109,9 @@ const vscode = {
     workspaceFolders: [],
     getConfiguration() {
       return { get: () => undefined };
+    },
+    async openTextDocument(uri) {
+      return { fsPath: (uri && uri.fsPath) || String(uri) };
     },
     createFileSystemWatcher() {
       // Keep the callbacks so a test can fire them. With `ev` for all three the
@@ -168,6 +177,7 @@ const vscode = {
 // paths legitimately shell out and expect output.
 const execs = [];
 const offered = [];
+const opened = [];
 const folderOps = [];
 const watcherCbs = [];
 const realCp = require("child_process");
@@ -255,7 +265,7 @@ ext.activate({ subscriptions: [] });
         await new Promise((r) => setTimeout(r, 25));
       }
     } catch (e) {
-      console.log(JSON.stringify({ error: String((e && e.message) || e), sent, shown, execs, offered, folderOps }));
+      console.log(JSON.stringify({ error: String((e && e.message) || e), sent, shown, execs, offered, opened, folderOps }));
       process.exitCode = 3;
       return;
     }
@@ -269,7 +279,7 @@ ext.activate({ subscriptions: [] });
       }
       for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 25));
     }
-    console.log(JSON.stringify({ sent, shown, execs, offered, folderOps }));
+    console.log(JSON.stringify({ sent, shown, execs, offered, opened, folderOps }));
     return;
   }
   console.log(JSON.stringify({ error: `unknown mode: ${mode}` }));
