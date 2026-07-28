@@ -1694,9 +1694,17 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         conn.commit()
         touch_session(name, ctx)
         if not wanted:
+            # States the capability precisely, because the earlier wording
+            # ("cannot broadcast until it joins one") was FALSE and is what
+            # taught the fleet the wrong rule — three agents reasoned from it
+            # to "squadless seats are structurally unreportable" before anyone
+            # measured. broadcast()'s own refusal had it right the whole time;
+            # writing the same fact two ways is how they came to disagree.
             return (
                 f"'{name}' now belongs to no squad — it can still send and "
-                f"receive direct messages, but cannot broadcast until it joins one."
+                f"receive direct messages, post to named channels, and "
+                f"broadcast with scope=\"{_FLEET_SCOPE}\". Only a squad-scoped "
+                f"broadcast is unavailable, having no squad to address."
             )
         return f"'{name}' now belongs to: {', '.join(wanted)}."
 
@@ -1762,7 +1770,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             if not rows:
                 return (
                     f"'{agent}' belongs to no squad — it can send and receive "
-                    f"direct messages, but cannot broadcast until it joins one."
+                    f"direct messages, post to named channels, and broadcast "
+                    f"with scope=\"{_FLEET_SCOPE}\". Only a squad-scoped "
+                    f"broadcast is unavailable, having no squad to address."
                 )
             return f"{agent} is in:\n" + "\n".join(
                 f"  {r['squad']}" + ("  (muted)" if r["muted"] else "") for r in rows

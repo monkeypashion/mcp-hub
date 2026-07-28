@@ -587,3 +587,33 @@ def test_legacy_team_migration_runs_once_not_on_every_restart(tmp_path):
         "SELECT squad FROM squad_members WHERE agent='ghost'").fetchall()
     conn.close()
     assert rows == [], f"a restart resurrected a squad the agent had left: {rows}"
+
+
+async def test_the_squadless_messages_do_not_contradict_the_capability(server):
+    """The strings and the behaviour are asserted TOGETHER, in one test, on
+    purpose.
+
+    set_squads and list_squads used to tell a squadless agent it "cannot
+    broadcast until it joins one". That is false — scope="fleet" has no
+    membership check — and broadcast()'s own refusal text said so correctly at
+    the same time. Two statements of one fact, disagreeing, and the fleet
+    believed the wrong one: three agents reasoned from it to "squadless seats
+    are structurally unreportable" before anyone ran the call.
+
+    Testing the string alone would let it drift from the code again; testing
+    the capability alone is what we already had. Binding them is the fix.
+    """
+    await _enrol(server, "loner", "someone/else")           # no squad
+
+    said = [
+        await _call(server, "set_squads", {"name": "loner", "squads": ""}),
+        await _call(server, "list_squads", {"agent": "loner"}),
+    ]
+    for msg in said:
+        assert "cannot broadcast" not in msg, f"claims a capability it has: {msg}"
+        assert "fleet" in msg, f"omits the route it actually has: {msg}"
+
+    # ...and the capability those strings now describe genuinely works.
+    out = await _call(server, "broadcast", {
+        "from_agent": "loner", "message": "reachable", "scope": "fleet"})
+    assert "osted" in out or "woke" in out, f"the strings promise what the code refuses: {out}"
