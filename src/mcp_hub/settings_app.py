@@ -44,14 +44,20 @@ CLAY = "#d97757"
 #
 # So: pure white, near-black text, and NEUTRAL greys for selection and rules.
 # The accent is used for emphasis only, never as a background behind text.
+# The hues are `squad board`'s, which is a VOCABULARY rather than decoration —
+# cyan for names and informational sections, green for healthy, yellow for
+# down, red for needs-you, magenta for unshipped, dim for everything
+# secondary. Darkened from the ANSI originals because the board renders on
+# whatever the terminal gives it and this panel is on white, where ansi cyan
+# and green are too pale to read.
 SQUAD_LIGHT = Theme(
     name="squad-light",
-    primary="#1f1f1f",        # headings: weight, not hue
-    secondary="#4a4a4a",
-    accent="#c6613f",         # clay, for the one thing that needs attention
-    warning="#b45309",
-    error="#b3261e",
-    success="#2e7d5b",
+    primary="#0a6c78",        # board cyan — headings and agent names
+    secondary="#8839ef",      # board magenta
+    accent="#c6613f",         # clay, emphasis only
+    warning="#b45309",        # board yellow — down / attention
+    error="#b3261e",          # board red — needs you
+    success="#2e7d32",        # board green — healthy
     foreground="#1a1a1a",
     background="#ffffff",
     surface="#ffffff",
@@ -103,7 +109,7 @@ Screen { layout: vertical; }
 }
 #agents > ListItem { height: 2; padding: 0 1; }
 #agents > ListItem.-highlight { background: #e8e8e8; color: $foreground; }
-.agent-name { text-style: bold; height: 1; }
+.agent-name { text-style: bold; height: 1; color: $primary; }
 .agent-class { color: $text-muted; height: 1; }
 
 #detail { padding: 0 2; height: 1fr; }
@@ -113,6 +119,9 @@ Screen { layout: vertical; }
     height: 1;
     margin: 1 0 0 0;
 }
+.value-on { color: $success; }
+.value-off { color: $text-muted; }
+.value-warn { color: $warning; }
 .row { height: 2; }
 .row-line { height: 1; }
 .label { width: 24; height: 1; }
@@ -123,6 +132,25 @@ Select { width: 30; height: 1; }
 #status { dock: bottom; height: 1; padding: 0 2; background: $panel; }
 """
 
+
+
+# Same idiom the board uses for 🟢 / dim / yellow: healthy reads green, an
+# absent or default value reads dim, and anything the operator may need to act
+# on reads amber. Applied to the VALUE only — never behind text as a
+# background, which is what made the earlier selection unreadable.
+_ON = {"on", "hearing", "squad"}
+_OFF = {"off", "muted", "default", "— none —", "—"}
+
+
+def _value_class(value: str) -> str:
+    v = str(value).strip().lower()
+    if v in _ON:
+        return "value-on"
+    if v == "unknown":
+        return "value-warn"
+    if v in _OFF:
+        return "value-off"
+    return "value-ro"
 
 
 class SettingsApp(App):
@@ -229,7 +257,7 @@ class SettingsApp(App):
             head = section["title"]
             if section.get("note"):
                 head += f"   {section['note']}"
-            widgets.append(Static(head, classes="section"))
+            widgets.append(Static(f"\u258c{head}", classes="section"))
             for ri, row in enumerate(section.get("rows", [])):
                 widgets.append(self._row_widget(si, ri, row))
         await detail.mount_all(widgets)     # one mount: never seen half-built
@@ -249,7 +277,7 @@ class SettingsApp(App):
                 allow_blank=False, id=f"sel-{self._gen}-{si}-{ri}", compact=True,
             )
         else:
-            control = Static(str(row["value"]), classes="value-ro")
+            control = Static(str(row["value"]), classes=_value_class(row["value"]))
         source = row.get("source", "")
         if edit:
             source = f"{source} · applies {edit['applies']}"
