@@ -538,3 +538,52 @@ async def test_re_registering_without_squads_does_not_drop_you_from_them(server)
 
     out = await _call(server, "get_broadcasts_for_agent", {"agent_name": "fo", "bind": False})
     assert "still here?" in out, f"a bare re-register dropped fo from its team:\n{out}"
+
+
+# ---- the legacy migration must not resurrect what was removed --------------
+
+def test_legacy_team_migration_runs_once_not_on_every_restart(tmp_path):
+    """FOUND IN PRODUCTION, 2026-07-28: a squad I had deliberately retired came
+    BACK after a redeploy.
+
+    init_db re-runs on every hub start, and the migration that carries the old
+    single-`team` column into squad_members re-imported from a column that
+    still held the old value. So leaving a squad did not survive a restart —
+    an agent removed from a squad would silently rejoin on the next deploy,
+    while everyone believed the removal had stuck.
+
+    The fix is to CLEAR the legacy column once its value has been carried over,
+    which makes the import genuinely one-shot rather than merely idempotent
+    against its own output.
+    """
+    import sqlite3
+
+    from mcp_hub.server import init_db
+
+    db = tmp_path / "legacy.db"
+    init_db(db)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO agents (name, project, status, registered, last_seen, team) "
+        "VALUES ('ghost', 'p', 'online', 0, 0, 'oldsquad')"
+    )
+    conn.commit()
+    conn.close()
+
+    init_db(db)                      # first restart: carries it over
+    conn = sqlite3.connect(db)
+    rows = conn.execute(
+        "SELECT squad FROM squad_members WHERE agent='ghost'").fetchall()
+    assert rows == [("oldsquad",)], f"migration did not carry the value: {rows}"
+
+    # The agent LEAVES — exactly what set_squads(name, "") does.
+    conn.execute("DELETE FROM squad_members WHERE agent='ghost'")
+    conn.commit()
+    conn.close()
+
+    init_db(db)                      # second restart: must NOT resurrect it
+    conn = sqlite3.connect(db)
+    rows = conn.execute(
+        "SELECT squad FROM squad_members WHERE agent='ghost'").fetchall()
+    conn.close()
+    assert rows == [], f"a restart resurrected a squad the agent had left: {rows}"

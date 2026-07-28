@@ -521,11 +521,24 @@ def init_db(db_path: Path = DB_PATH) -> None:
         conn.commit()
     except sqlite3.OperationalError:
         pass  # Column already exists
-    conn.execute(
+    # The column is CLEARED once carried over, which is what makes this
+    # one-shot rather than merely idempotent against its own output.
+    #
+    # Without the clear it re-imported on EVERY hub start, because init_db runs
+    # at every start and the source column still held the old value. Found in
+    # production 2026-07-28: a squad retired by hand came back after the next
+    # redeploy. The real cost is not the litter — it is that LEAVING A SQUAD
+    # DID NOT SURVIVE A RESTART, so an agent removed from a squad would
+    # silently rejoin on the next deploy while everyone believed the removal
+    # had stuck. INSERT OR IGNORE hides it perfectly: no error, no duplicate,
+    # just a membership quietly back from the dead.
+    migrated = conn.execute(
         """INSERT OR IGNORE INTO squad_members (agent, squad, muted, joined)
            SELECT name, team, 0, ? FROM agents WHERE team != ''""",
         (time.time(),),
-    )
+    ).rowcount
+    if migrated:
+        conn.execute("UPDATE agents SET team = '' WHERE team != ''")
     conn.commit()
 
     # Migrate: AUDIENCE — who a broadcast was for, recorded ON THE ROW at send
