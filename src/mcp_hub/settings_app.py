@@ -71,12 +71,12 @@ Screen { layout: vertical; }
    exactly one row of the panel and blank space below it. */
 #agents {
     width: 36;
-    border-right: solid $primary 40%;
+    border-right: solid $foreground;
     background: $surface;
     height: 1fr;
 }
 #agents > ListItem { height: 2; padding: 0 1; }
-#agents > ListItem.-highlight { background: $primary 30%; }
+#agents > ListItem.-highlight { text-style: reverse; }
 .agent-name { text-style: bold; height: 1; }
 .agent-class { color: $text-muted; height: 1; }
 
@@ -151,11 +151,15 @@ class SettingsApp(App):
     async def on_mount(self) -> None:
         self.register_theme(CLAUDE_DARK)
         self.register_theme(CLAUDE_LIGHT)
-        # Light by default: Claude's sessions are the warm cream ground, not
-        # the dark one. #f9f9f7 (gray-20) with #ffffff panels, and the
-        # emphasized clay #c6613f for text weight — plain clay is too light on
-        # cream to read as a heading.
-        self.theme = "claude-light"
+        # INHERIT the terminal. Every palette I picked was a palette the
+        # operator had not asked for — first Textual's dark, then Claude's web
+        # CSS (which is not what the terminal renderer uses at all), then
+        # Claude's cream. What was wanted was "the same as the tmux session",
+        # and the only way to be the same as the terminal is to not have an
+        # opinion: ansi-light maps every colour onto ansi_default and the ANSI
+        # 16, so the terminal's own scheme shows through unchanged.
+        self.ansi_color = True
+        self.theme = "ansi-light"
         self.title = "Squad settings"
         where = self.scoped_to.rsplit("/", 1)[-1] if self.scoped_to else "this machine"
         self.sub_title = f"{len(self.agents)} agent(s) · {where}"
