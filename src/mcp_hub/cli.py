@@ -2081,12 +2081,18 @@ def settings_command(args: argparse.Namespace) -> int:
             print("the settings panel needs textual:  pip install textual",
                   file=sys.stderr)
             return 1
+        from .board_data import collect, terminal_prefers_dark
+        # Ask the terminal BEFORE the app owns the tty — OSC 11 needs a quiet
+        # line, and Textual's raw-mode setup would eat the reply.
+        dark = terminal_prefers_dark()
         SettingsApp(
             agents,
             scoped_to=getattr(args, "workspace", None),
             model_for=_settings_model,
             squad_bin=SQUAD_BIN,
             hub_bin=MCP_HUB_BIN,
+            board_for=lambda: collect(SQUAD_BIN),
+            dark=dark,
         ).run()
         return 0
     cwd = args.cwd or os.getcwd()
