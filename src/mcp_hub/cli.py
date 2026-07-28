@@ -1652,7 +1652,13 @@ def identity_command(args: argparse.Namespace) -> int:
     return 0
 
 
-SQUAD_CONF = pathlib.Path.home() / ".config" / "squad" / "squad.conf"
+# Honours $SQUAD_CONF exactly as `squad` does. Two readers of one file must
+# agree on WHICH file, or a sandboxed run reads the real roster — and the only
+# way to exercise the settings TUI's write path without touching the live fleet
+# is to point both at a throwaway copy.
+SQUAD_CONF = pathlib.Path(
+    os.environ.get("SQUAD_CONF") or (pathlib.Path.home() / ".config" / "squad" / "squad.conf")
+)
 
 
 def _roster_all() -> list[dict[str, str]]:
@@ -2040,7 +2046,23 @@ class SettingsTui:
         self.row_ix = 0
         self.model: dict[str, Any] | None = None
         self.status = ""
+        self.reason = ""          # why this agent has no settings, if it hasn't
+        # Open on an agent that HAS settings. A plain folder added with
+        # `squad add-folder` has no derived identity by design, so it has no
+        # settings at all — and four of six agents in the operator's own
+        # workspace are exactly that. Opening on the first ROSTER row showed a
+        # blank panel and looked like a broken feature.
+        self.agent_ix = self._first_with_settings()
         self.load()
+
+    def _first_with_settings(self) -> int:
+        for i in range(len(self.agents)):
+            try:
+                if _settings_model(self.agents[i]["worktree"]):
+                    return i
+            except Exception:  # noqa: BLE001
+                continue
+        return 0
 
     # ---- data ----
 
@@ -2052,15 +2074,27 @@ class SettingsTui:
         self.row_ix = 0
         if not self.agents:
             return
+        self.reason = ""
         try:
             self.model = _settings_model(self.agents[self.agent_ix]["worktree"])
         except Exception as exc:  # noqa: BLE001
             self.status = f"could not read settings: {exc}"
-        # Row 0 is ALWAYS a section heading, so leaving the cursor there opens
-        # every agent with nothing selected and the first keypress behaving
-        # oddly. Start on the first row that can actually be acted on.
-        picks = self.selectable()
-        self.row_ix = picks[0] if picks else 0
+        if self.model is None and not self.status:
+            # Not a failure — `squad add-folder` enrols plain directories on
+            # purpose, and identity is derived from a git remote plus the hub
+            # opt-in list. Saying so beats an empty pane, which reads as broken.
+            self.reason = (
+                "no hub identity for this folder — settings are derived from a "
+                "git remote and ~/.mcp-hub/config.json, so a plain folder "
+                "(squad add-folder) has none"
+            )
+        # Land on the first EDITABLE row, not merely the first selectable one.
+        # IDENTITY comes first and every row in it is derived, so "first
+        # selectable" opened the panel on a wall of read-only fields — press
+        # enter, get "read-only", conclude the panel cannot edit anything.
+        # That is exactly what happened (operator, 2026-07-28: "I am not able
+        # to update the settings... how do I do an edit?").
+        self.row_ix = self.first_editable()
 
     def rows(self) -> list[dict[str, Any]]:
         """Flat row list for the detail pane, section headers included.
@@ -2077,6 +2111,37 @@ class SettingsTui:
 
     def selectable(self) -> list[int]:
         return [i for i, r in enumerate(self.rows()) if "header" not in r]
+
+    def editable(self) -> list[int]:
+        return [i for i, r in enumerate(self.rows()) if r.get("edit")]
+
+    def first_editable(self) -> int:
+        """Where the cursor should start: the first row that can be CHANGED.
+
+        Falls back to the first selectable row, then to 0, so an agent with
+        nothing editable still opens somewhere sensible rather than nowhere.
+        """
+        for candidates in (self.editable(), self.selectable()):
+            if candidates:
+                return candidates[0]
+        return 0
+
+    def visible(self, height: int) -> tuple[int, int]:
+        """(first, last+1) row indices to draw, keeping the cursor on screen.
+
+        Scrolling belongs here rather than in the drawing code because "can the
+        operator reach this row" is behaviour, not decoration: without it the
+        rows below the fold are not merely unseen, they are unreachable — the
+        cursor moves onto them and disappears. In a terminal panel that is most
+        of the panel.
+        """
+        total = len(self.rows())
+        if height <= 0 or total == 0:
+            return 0, 0
+        if total <= height:
+            return 0, total
+        start = max(0, min(self.row_ix - height // 2, total - height))
+        return start, start + height
 
     def current(self) -> dict[str, Any] | None:
         rows = self.rows()
@@ -2194,10 +2259,17 @@ def _tui_run(stdscr, tui: "SettingsTui") -> None:  # pragma: no cover - draws
         # ---- agent list ----
         top = 2
         agent_rows = {}
-        for i, a in enumerate(tui.agents):
-            y = top + i
-            if y >= h - 2:
+        # Cap the agent pane so the detail pane always has room. Without this a
+        # long roster pushed the settings — the point of the panel — off the
+        # bottom entirely.
+        alist = max(1, min(len(tui.agents), max(3, (h - 6) // 2)))
+        astart = max(0, min(tui.agent_ix - alist // 2, len(tui.agents) - alist))
+        for j in range(alist):
+            i = astart + j
+            if i >= len(tui.agents):
                 break
+            a = tui.agents[i]
+            y = top + j
             agent_rows[y] = i
             sel = i == tui.agent_ix
             put(y, 1, "▸" if sel else " ", CY | curses.A_BOLD)
@@ -2209,14 +2281,17 @@ def _tui_run(stdscr, tui: "SettingsTui") -> None:  # pragma: no cover - draws
             put(y, 3, name.ljust(35), (curses.A_BOLD | CY) if sel else 0)
             put(y, 38, a.get("klass", ""), DIM)
 
-        sep = top + min(len(tui.agents), max(1, h - top - 4))
+        sep = top + alist
         put(sep, 0, "─" * max(0, w - 1), DIM)
 
         # ---- settings rows for the selected agent ----
         detail_top = sep + 1
         row_rows = {}
-        for i, r in enumerate(tui.rows()):
-            y = detail_top + i
+        if tui.reason:
+            put(detail_top, 3, tui.reason[: max(0, w - 5)], YE)
+        first, last = tui.visible(max(0, h - detail_top - 1))
+        for i, r in list(enumerate(tui.rows()))[first:last]:
+            y = detail_top + (i - first)
             if y >= h - 1:
                 break
             if "header" in r:
@@ -2244,7 +2319,7 @@ def _tui_run(stdscr, tui: "SettingsTui") -> None:  # pragma: no cover - draws
         # ---- the inline value picker ----
         if picker:
             row = tui.current() or {}
-            py = min(detail_top + tui.row_ix + 1, h - len(picker) - 2)
+            py = min(detail_top + (tui.row_ix - first) + 1, h - len(picker) - 2)
             for j, choice in enumerate(picker):
                 mark = "●" if choice == row.get("value") else " "
                 put(py + j, 26, f" {mark} {choice} ".ljust(22),
@@ -2304,6 +2379,8 @@ def _tui_run(stdscr, tui: "SettingsTui") -> None:  # pragma: no cover - draws
                 picker = choices
                 picker_ix = max(0, choices.index(tui.current()["value"])
                                 if tui.current()["value"] in choices else 0)
+            elif tui.current() is None:
+                tui.status = "nothing to change for this agent"
             else:
                 tui.status = "read-only — this value is derived"
         elif key == curses.KEY_MOUSE:

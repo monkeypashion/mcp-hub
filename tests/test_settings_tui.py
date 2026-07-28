@@ -16,6 +16,13 @@ import pytest
 from mcp_hub import cli
 
 SECTIONS = [
+    # IDENTITY FIRST and entirely read-only, exactly as production emits it.
+    # Without it "first selectable" and "first editable" coincide and no test
+    # here can tell them apart — which is how the cursor came to open on a wall
+    # of derived fields and the panel looked unable to edit anything.
+    {"title": "IDENTITY", "note": "", "rows": [
+        {"label": "Name", "value": "a1", "source": "derived from repo + hostname"},
+        {"label": "Project", "value": "acme/a1", "source": "derived from git remote"}]},
     {"title": "SQUADS", "note": "who hears its broadcasts", "rows": [
         {"label": "dreamteam", "value": "hearing it", "source": "set on this agent",
          "edit": {"kind": "mute", "choices": ["hear", "mute"], "bin": "mcp-hub",
@@ -79,8 +86,9 @@ def test_changing_agent_reloads_and_resets_the_row(tui):
     tui.move_agent(1)
     assert tui.agent_ix == 1
     assert tui.model["agent"] == "a2"
-    # back to the FIRST SELECTABLE row, which is never row 0 (a heading)
-    assert tui.row_ix == tui.selectable()[0]
+    # back to the first EDITABLE row — not row 0 (a heading), and not the
+    # first selectable one either, which in production is a derived field
+    assert tui.row_ix == tui.first_editable()
     assert tui.row_ix != moved
 
 
@@ -233,3 +241,97 @@ def test_the_roster_order_is_preserved(tmp_path, monkeypatch):
     conf.write_text(f"zeta|{tmp_path}/z|||\nalpha|{tmp_path}/a|||\n", encoding="utf-8")
     monkeypatch.setattr(cli, "SQUAD_CONF", conf)
     assert [r["agent"] for r in cli._roster_all()] == ["zeta", "alpha"]
+
+
+# ---- reachability: the two defects the operator hit ------------------------
+
+def test_the_cursor_opens_on_an_EDITABLE_row(tui):
+    """IDENTITY comes first and every row in it is derived, so "first
+    selectable" opened the panel on a wall of read-only fields: press enter,
+    get "read-only", conclude the panel cannot edit anything. Which is exactly
+    what happened — "I am not able to update the settings... how do I do an
+    edit?" (2026-07-28)."""
+    assert tui.current().get("edit"), tui.current()
+    assert tui.choices(), "opened on a row with nothing to choose"
+
+
+def test_an_agent_with_nothing_editable_still_opens_somewhere_sensible(monkeypatch):
+    monkeypatch.setattr(cli, "_settings_model", lambda cwd: {"agent": "x", "sections": [
+        {"title": "IDENTITY", "note": "", "rows": [
+            {"label": "Name", "value": "x", "source": "derived"}]}]})
+    t = cli.SettingsTui([{"agent": "x", "worktree": "/tmp/x"}], scoped_to=None)
+    assert t.current()["label"] == "Name"       # first selectable, not row 0
+    assert t.choices() == []
+
+
+def test_rows_below_the_fold_scroll_into_view(tui):
+    """Without a viewport the rows past the screen are not merely unseen, they
+    are UNREACHABLE: the cursor moves onto them and disappears. In a terminal
+    panel that is most of the panel."""
+    height = 3
+    for _ in range(20):
+        tui.move_row(1)
+    first, last = tui.visible(height)
+    assert first <= tui.row_ix < last, \
+        f"cursor {tui.row_ix} outside the drawn window {first}:{last}"
+
+
+def test_the_viewport_never_runs_past_either_end(tui):
+    total = len(tui.rows())
+    for _ in range(30):
+        tui.move_row(-1)
+    first, last = tui.visible(3)
+    assert first == 0 and last <= total
+    for _ in range(30):
+        tui.move_row(1)
+    first, last = tui.visible(3)
+    assert last == total and first >= 0
+
+
+def test_a_pane_taller_than_the_list_shows_all_of_it(tui):
+    assert tui.visible(500) == (0, len(tui.rows()))
+
+
+def test_a_zero_height_pane_asks_for_nothing(tui):
+    assert tui.visible(0) == (0, 0)
+
+
+def test_it_opens_on_an_agent_that_HAS_settings(monkeypatch):
+    """`squad add-folder` enrols plain directories on purpose, and those have no
+    derived identity — so no settings at all. Four of the six agents in the
+    operator's own workspace are exactly that, and opening on the first ROSTER
+    row showed a blank panel that looked like a broken feature.
+    """
+    def model(cwd):
+        return None if "scratch" in cwd else {"agent": "real", "sections": SECTIONS}
+
+    monkeypatch.setattr(cli, "_settings_model", model)
+    t = cli.SettingsTui([{"agent": "s1", "worktree": "/tmp/scratch/a"},
+                         {"agent": "s2", "worktree": "/tmp/scratch/b"},
+                         {"agent": "real", "worktree": "/tmp/real"}], scoped_to=None)
+    assert t.agent_ix == 2, "opened on an agent with nothing to show"
+    assert t.model is not None
+
+
+def test_an_agent_with_no_identity_says_why_rather_than_showing_nothing(monkeypatch):
+    """An empty pane reads as broken. This is not a failure — it is a folder
+    that deliberately has no hub identity — so it has to say so."""
+    monkeypatch.setattr(cli, "_settings_model", lambda cwd: None)
+    t = cli.SettingsTui([{"agent": "s1", "worktree": "/tmp/scratch/a"}], scoped_to=None)
+    assert t.rows() == []
+    assert "no hub identity" in t.reason
+    assert "add-folder" in t.reason, "does not name the thing that created it"
+
+
+def test_the_reason_clears_when_moving_to_an_agent_that_has_settings(monkeypatch):
+    """Stale explanatory text under a populated panel is worse than none."""
+    def model(cwd):
+        return None if "scratch" in cwd else {"agent": "real", "sections": SECTIONS}
+
+    monkeypatch.setattr(cli, "_settings_model", model)
+    t = cli.SettingsTui([{"agent": "real", "worktree": "/tmp/real"},
+                         {"agent": "s1", "worktree": "/tmp/scratch/a"}], scoped_to=None)
+    t.move_agent(1)
+    assert t.reason
+    t.move_agent(-1)
+    assert not t.reason, "kept the no-identity note over an agent that has one"
