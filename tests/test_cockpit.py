@@ -104,6 +104,53 @@ def test_every_declared_command_is_implemented_and_reachable(box):
         f"declared but in no menu (right-click cannot reach it): {sorted(declared - in_menus)}"
 
 
+def _menu_graph():
+    pkg = json.loads((EXT / "package.json").read_text())
+    c = pkg["contributes"]
+    return c, {s["id"] for s in c.get("submenus", [])}, c["menus"]
+
+
+def test_no_submenu_is_dangling_or_stranded():
+    """The menu is a GRAPH, and both broken edges are invisible until clicked.
+
+    A submenu referenced but not declared renders as nothing; one declared and
+    populated but never referenced strands its entries where no right-click
+    reaches them — and `test_..._reachable` above counts those entries as
+    reachable, because it only asks whether a command appears in SOME menu.
+    Restructuring is precisely when both happen.
+    """
+    _, declared, menus = _menu_graph()
+    referenced = {i["submenu"] for items in menus.values()
+                  for i in items if "submenu" in i}
+    assert not (referenced - declared), \
+        f"menu points at undeclared submenu(s): {sorted(referenced - declared)}"
+    roots = {"squad.agentMenu"}            # reached from terminal/*, not by id
+    assert not (declared - referenced - roots), \
+        f"submenu declared but nothing opens it: {sorted(declared - referenced - roots)}"
+    assert not (declared - set(menus)), \
+        f"submenu declared with no entries — renders empty: {sorted(declared - set(menus))}"
+
+
+def test_the_menu_is_never_three_levels_deep():
+    """The flatten's whole point (2026-07-28). Comms lived at depth three under
+    Restart → Launch settings and could not be found; nesting creeps back one
+    convenient submenu at a time, so pin the depth rather than the layout.
+    """
+    _, _, menus = _menu_graph()
+    depth = {}
+
+    def walk(mid, d, seen):
+        depth[mid] = max(depth.get(mid, 0), d)
+        for i in menus.get(mid, []):
+            sub = i.get("submenu")
+            if sub and sub not in seen:
+                walk(sub, d + 1, seen | {sub})
+
+    walk("squad.agentMenu", 1, {"squad.agentMenu"})
+    too_deep = {m: d for m, d in depth.items() if d > 2}
+    assert not too_deep, f"submenu(s) below the second level: {too_deep}"
+
+
 # ---- teardown, the destructive one ---------------------------------------
 
 def test_teardown_keeps_code_unless_deletion_is_chosen(box, tmp_path):
@@ -212,7 +259,13 @@ def test_add_folder_cancelled_dialog_changes_nothing(box, tmp_path):
     assert out["sent"] == []
 
 
-# ---- Start & attach: a regression that already happened once -------------
+# ---- Restart: a regression that already happened once ---------------------
+#
+# The fresh variant asks first, so every case below must answer it or the
+# command returns having done nothing. OK is a no-op for the resume variant,
+# which has no dialog to consume it.
+OK = ["Fresh restart"]
+
 
 @pytest.mark.parametrize("command,mode", [
     ("squad.startAttach", "--resume"),
@@ -224,7 +277,8 @@ def test_start_and_attach_on_a_SHELL_tab_types_the_command(box, command, mode):
     terminal, so when the tab is a shell the command must be TYPED, and it must
     carry the attach as well as the restart — the bug was one without the other.
     """
-    out = _drive(box, "run", command, terminal="demo · idle", not_attached=True)
+    out = _drive(box, "run", command, terminal="demo · idle", not_attached=True,
+                 answers=OK)
     assert len(out["sent"]) == 1, out
     cmd = out["sent"][0]
     assert "squad restart demo" in cmd and mode in cmd, cmd
@@ -246,7 +300,7 @@ def test_start_and_attach_on_an_ATTACHED_tab_does_not_type(box, command, mode):
     Asserting sent == [] is the load-bearing half: this bug is INVISIBLE to a
     test that only checks the restart happened, because it happened either way.
     """
-    out = _drive(box, "run", command, terminal="demo · idle")   # attached
+    out = _drive(box, "run", command, terminal="demo · idle", answers=OK)  # attached
     assert out["sent"] == [], f"typed into a tab that is a live agent: {out['sent']}"
     assert any(f"restart demo {mode}" in e for e in out["execs"]), out["execs"]
 
@@ -256,15 +310,44 @@ def test_start_and_attach_probes_before_choosing_a_path(box, command):
     """The choice must be made from the tab's ACTUAL state, not assumed. Without
     the probe there is only one path and one of the two cases is always wrong.
     """
-    out = _drive(box, "run", command, terminal="demo · idle")
+    out = _drive(box, "run", command, terminal="demo · idle", answers=OK)
     assert any("attached demo" in e for e in out["execs"]), \
         f"chose a start path without asking whether the tab is attached: {out['execs']}"
 
 
-def test_start_and_attach_on_a_non_agent_tab_warns(box):
-    out = _drive(box, "run", "squad.startAttach")
+@pytest.mark.parametrize("not_attached", [False, True])
+def test_a_fresh_restart_asks_before_dropping_the_conversation(box, not_attached):
+    """The 2026-07-28 flatten merged squad.restartFresh into this command, and
+    only ONE of the two asked. Both paths must inherit the guard, because which
+    one runs depends on whether a viewer happens to be attached — a property of
+    the operator's window, not of the intent.
+    """
+    out = _drive(box, "run", "squad.startAttachFresh", terminal="demo · idle",
+                 not_attached=not_attached)          # no answer ⇒ dialog cancels
+    assert out["sent"] == [] and not any("restart demo" in e for e in out["execs"]), \
+        f"restarted fresh with the confirm declined: {out}"
+    assert any("BLANK" in s for s in out["shown"]), f"it never asked: {out['shown']}"
+
+
+def test_a_resume_restart_asks_nothing(box):
+    """The other half: resume keeps the conversation, so a confirm there would
+    be a dialog on the most-used entry in the menu, teaching the operator to
+    click through the one that matters."""
+    out = _drive(box, "run", "squad.startAttach", terminal="demo · idle")
+    assert any("restart demo --resume" in e for e in out["execs"]), out
+    assert not out["shown"], f"resume should ask nothing: {out['shown']}"
+
+
+@pytest.mark.parametrize("command", ["squad.startAttach", "squad.startAttachFresh"])
+def test_start_and_attach_on_a_non_agent_tab_warns(box, command):
+    """No agent ⇒ one warning, from one place. The fresh variant resolves agents
+    itself in order to name them in the confirm, so it can reach this state by a
+    second route and must not ask about a restart it cannot perform."""
+    out = _drive(box, "run", command, answers=OK)
     assert out["sent"] == []
     assert any("no squad agent" in s for s in out["shown"]), out
+    assert not any("BLANK" in s for s in out["shown"]), \
+        f"asked whether to wipe a conversation with no agent selected: {out['shown']}"
 
 
 # ---- the destructive one, and the two everyday ones ----------------------
@@ -292,17 +375,17 @@ def test_clone_from_github_cancelled_enrols_nothing(box):
     assert out["sent"] == []
 
 
-@pytest.mark.parametrize("command,expect", [
-    ("squad.stop", "stop"),
-    ("squad.restartResume", "restart"),
-])
-def test_everyday_lifecycle_commands_target_the_clicked_agent(box, command, expect):
-    """Whatever else changes, these must act on the tab you right-clicked and
-    name that agent explicitly — never the active terminal by accident."""
-    out = _drive(box, "run", command, terminal="demo · idle")
+def test_stop_targets_the_clicked_agent(box):
+    """Whatever else changes, this must act on the tab you right-clicked and name
+    that agent explicitly — never the active terminal by accident.
+
+    (squad.restartResume used to be tested alongside it and was deleted in the
+    2026-07-28 flatten: it was squad.startAttach's background half under a second
+    name. The restart tests above carry that coverage now.)"""
+    out = _drive(box, "run", "squad.stop", terminal="demo · idle")
     ran = out["sent"] + out["execs"]
-    assert ran, f"{command} did nothing at all"
-    assert any(f"{expect} demo" in s for s in ran), out
+    assert ran, "squad.stop did nothing at all"
+    assert any("stop demo" in s for s in ran), out
 
 
 def test_bulk_transport_requires_confirmation(box):
@@ -420,16 +503,68 @@ def test_slash_offers_the_saved_list(box, tmp_path):
     assert any("cmd demo /memory-sync" in e for e in out["execs"]), out
 
 
-def test_slash_with_no_file_behaves_exactly_as_before(box):
-    """A feature you haven't opted into must not make the old path longer.
+def test_the_builtins_are_offered_with_no_file_at_all(box):
+    """This REPLACES "no file ⇒ no quick pick, straight to the input box".
 
-    No file ⇒ no quick pick, no toast: straight to the input box, one step, the
-    way it has always worked.
+    That rule was right while /context, /cost and the rest had their own menu
+    entries: the picker was an opt-in extra, so it had to stay out of the way.
+    The 2026-07-28 flatten deleted those entries, which makes this picker the
+    only route to them — so on a machine with no slash.txt it must still offer
+    the eleven, or the flatten silently removed eleven commands instead of
+    moving them.
     """
     out = _drive(box, "run", "squad.slash.custom", answers=["/doctor"],
                  terminal="demo · idle")
     assert any("cmd demo /doctor" in e for e in out["execs"]), out
     assert not out["shown"], f"it should not have announced anything: {out['shown']}"
+    # every entry the flatten deleted, by name — the migration's actual claim
+    assert out["offered"], "no list was offered at all"
+    for cmd in ["/context", "/cost", "/status", "/todos", "/mcp", "/doctor",
+                "/help", "/compact", "/model", "/memory", "/clear"]:
+        assert cmd in out["offered"][0], f"{cmd} lost its menu entry and gained nothing"
+
+
+def test_a_saved_command_replaces_its_builtin_rather_than_doubling_it(box):
+    """Two lists merge into one, so an overlap has to resolve somewhere. Showing
+    /status twice looks like two different commands.
+
+    Asserted on the OFFERED list, not on what ran: the picker returns the first
+    match either way, so a duplicated list still sends one command and a
+    run-only assertion cannot see the defect at all.
+    """
+    _write_list(box, "slash.txt", "/status\n/review\n")
+    out = _drive(box, "run", "squad.slash.custom", answers=["/status"],
+                 terminal="demo · idle")
+    items = out["offered"][0]
+    assert items.count("/status") == 1, items
+    assert "/review" in items, items
+    assert items.index("/review") < items.index("/context"), \
+        f"the operator's own list must come first: {items}"
+
+
+@pytest.mark.parametrize("answers,expect_run", [
+    (["/clear", "Clear"], True),
+    (["/clear"], False),                       # confirm declined
+])
+def test_clear_still_confirms_now_that_it_has_no_menu_entry_of_its_own(box, answers, expect_run):
+    """/clear had a modal confirm because it was its own destructive entry.
+    Folding it into a list of eleven look-alikes is exactly when that guard gets
+    lost — so it now gates on the COMMAND, and must fire whichever route picked
+    it."""
+    out = _drive(box, "run", "squad.slash.custom", answers=answers,
+                 terminal="demo · idle")
+    ran = any("cmd demo /clear" in e for e in out["execs"])
+    assert ran is expect_run, out
+    assert any("wipes the conversation" in s for s in out["shown"]), \
+        f"/clear ran without asking: {out['shown']}"
+
+
+def test_a_typed_clear_confirms_too(box):
+    """The escape hatch must not be the way round the guard."""
+    out = _drive(box, "run", "squad.slash.custom", answers=["Type one", "/clear"],
+                 terminal="demo · idle")
+    assert not any("cmd demo /clear" in e for e in out["execs"]), out
+    assert any("wipes the conversation" in s for s in out["shown"]), out["shown"]
 
 
 def test_slash_list_still_lets_you_type_one(box):
@@ -463,10 +598,12 @@ def test_both_lists_share_one_reader(box):
     Comments and blank lines, proven on both.
     """
     _write_list(box, "prompts.txt", "# c\n\n  status please  \n")
-    _write_list(box, "slash.txt", "# c\n\n  /status  \n")
+    # NOT one of the built-ins, deliberately: /status would be in the list
+    # anyway, so this assertion would hold with slash.txt ignored entirely.
+    _write_list(box, "slash.txt", "# c\n\n  /handover  \n")
     p = _drive(box, "run", "squad.stockPrompt", answers=["status ple"],
                terminal="demo · idle")
-    s = _drive(box, "run", "squad.slash.custom", answers=["stat"],
+    s = _drive(box, "run", "squad.slash.custom", answers=["handov"],
                terminal="demo · idle")
     assert any("cmd demo status please" in e for e in p["execs"]), p
-    assert any("cmd demo /status" in e for e in s["execs"]), s
+    assert any("cmd demo /handover" in e for e in s["execs"]), s

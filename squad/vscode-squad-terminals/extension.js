@@ -380,9 +380,6 @@ function activate(context) {
         );
       })();
     }),
-    vscode.commands.registerCommand("squad.compact", (...args) =>
-      withAgents(args, (agents) => agents.forEach((a) => squadExec(["cmd", a, "/compact"], a)))
-    ),
     vscode.commands.registerCommand("squad.interrupt", (...args) =>
       withAgents(args, (agents) => agents.forEach((a) => squadExec(["key", a, "Escape"], a)))
     ),
@@ -416,27 +413,39 @@ function activate(context) {
     // the one-off mode override, then this terminal attaches; `clear` wipes the
     // typed line and the launch chatter so the tab shows the agent, not a
     // transcript of how it got there.
+    // These two ARE the restart pair. There used to be four commands here:
+    // squad.restartResume/Fresh ran `squad restart` in the background, and
+    // startAttach did the same thing plus an attach — the same action under two
+    // names in two different submenus, which is most of why the menu needed
+    // finding rather than reading (2026-07-28 flatten). startWithMode is the
+    // superset: on an attached tab it takes the identical background path, and
+    // on a bare shell it also attaches, which the background-only pair never
+    // did. So the pair went and this one kept BOTH names' behaviour.
+    //
+    // The confirm came from the deleted squad.restartFresh and had to be
+    // carried across deliberately: of the two commands that were merged only
+    // one asked, and collapsing to the more permissive of a safe/unsafe pair is
+    // how a guard disappears in a refactor that looks like pure tidying.
     vscode.commands.registerCommand("squad.startAttach", (...args) =>
       startWithMode(args, "--resume")
     ),
-    vscode.commands.registerCommand("squad.startAttachFresh", (...args) =>
-      startWithMode(args, "--fresh")
-    ),
-    vscode.commands.registerCommand("squad.stop", (...args) =>
-      withAgents(args, (agents) => agents.forEach((a) => squadExec(["stop", a], a)))
-    ),
-    vscode.commands.registerCommand("squad.restartResume", (...args) =>
-      withAgents(args, (agents) => agents.forEach((a) => squadExec(["restart", a, "--resume"], a)))
-    ),
-    vscode.commands.registerCommand("squad.restartFresh", (...args) =>
-      withAgents(args, async (agents) => {
+    vscode.commands.registerCommand("squad.startAttachFresh", async (...args) => {
+      cancelPendingToasts();
+      const agents = resolveAgents(args);
+      if (agents.length) {
         const ok = await vscode.window.showWarningMessage(
-          `Restart ${labels(agents)} with BLANK conversation(s)?`,
+          `Restart ${labels(agents)} with a BLANK conversation? The current conversation is kept on disk but not resumed.`,
           { modal: true },
           "Fresh restart"
         );
-        if (ok) agents.forEach((a) => squadExec(["restart", a, "--fresh"], a));
-      })
+        if (!ok) return;
+      }
+      // Falls through with no agents so the "no squad agent" warning still
+      // comes from one place.
+      startWithMode(args, "--fresh");
+    }),
+    vscode.commands.registerCommand("squad.stop", (...args) =>
+      withAgents(args, (agents) => agents.forEach((a) => squadExec(["stop", a], a)))
     )
   );
 
@@ -1140,37 +1149,23 @@ function activate(context) {
   );
 
   // ---- standard claude slash commands (typed into the agent's pane) ----
-  // /clear is destructive (wipes the conversation) -> modal confirm.
-  for (const slash of ["context", "cost", "status", "doctor", "mcp", "model", "memory", "todos", "help"]) {
-    context.subscriptions.push(
-      vscode.commands.registerCommand(`squad.slash.${slash}`, (...args) =>
-        withAgents(args, (agents) => agents.forEach((a) => squadExec(["cmd", a, `/${slash}`], a)))
-      )
-    );
-  }
+  // Each of these had its OWN menu entry until the 2026-07-28 flatten: eleven
+  // rows you navigated by remembering their order. One searchable list is
+  // shorter to read and faster to use — you type "cost" quicker than you find
+  // it — and it collapses the last real difference between a built-in and an
+  // operator-saved command, which were two rules for one menu.
+  //
+  // The list is therefore shown ALWAYS, including with no slash.txt. That
+  // reverses the older rule ("no file ⇒ no quick pick, straight to the input
+  // box") and had to: with the individual entries gone, this picker is the only
+  // way left to reach /context, so skipping it would remove the commands rather
+  // than move them.
+  const BUILTIN_SLASH = [
+    "/context", "/cost", "/status", "/todos", "/mcp", "/doctor", "/help",
+    "/compact", "/model", "/memory", "/clear",
+  ];
+  const DESTRUCTIVE = new Set(["/clear"]);
   context.subscriptions.push(
-    vscode.commands.registerCommand("squad.slash.clear", (...args) =>
-      withAgents(args, async (agents) => {
-        const ok = await vscode.window.showWarningMessage(
-          `/clear wipes the conversation(s) of: ${labels(agents)}. Sure?`,
-          { modal: true },
-          "Clear"
-        );
-        if (ok) agents.forEach((a) => squadExec(["cmd", a, "/clear"], a));
-      })
-    ),
-    // The nine built-ins above are menu contributions, so adding one costs two
-    // source edits, a version bump and an ext-align — which is why the list
-    // never grew. Stock PROMPTS were a file you edit, appearing instantly; this
-    // was a build step. Same menu, two rules for the operator.
-    //
-    // ~/.config/squad/slash.txt closes that. The saved list is offered first
-    // with "type one" at the top — the same shape the workspace picker uses for
-    // "➕ New workspace…", rather than a second near-identical menu entry.
-    //
-    // With NO file the quick pick is skipped entirely and this behaves exactly
-    // as it always did: one input box, no extra click, no nagging toast. A
-    // feature you haven't opted into must not make the old path longer.
     vscode.commands.registerCommand("squad.slash.custom", (...args) =>
       withAgents(args, async (agents) => {
         const TYPE = "✎ Type one…";
@@ -1180,14 +1175,16 @@ function activate(context) {
         const saved = readOperatorList("slash.txt").map((s) =>
           s.startsWith("/") ? s : "/" + s
         );
-        let cmd;
-        if (saved.length) {
-          const pick = await vscode.window.showQuickPick([TYPE, ...saved], {
-            placeHolder: `Slash command for ${labels(agents)}`,
-          });
-          if (!pick) return;
-          if (pick !== TYPE) cmd = pick;
-        }
+        // Saved first: they are the ones this operator curated, and putting the
+        // eleven built-ins above them would bury a short personal list under a
+        // fixed one. Deduped, so a saved "/status" replaces the built-in in
+        // place rather than appearing twice.
+        const items = [TYPE, ...new Set([...saved, ...BUILTIN_SLASH])];
+        const pick = await vscode.window.showQuickPick(items, {
+          placeHolder: `Slash command for ${labels(agents)}`,
+        });
+        if (!pick) return;
+        let cmd = pick === TYPE ? undefined : pick;
         if (!cmd) {
           cmd = await vscode.window.showInputBox({
             prompt: `Slash command for ${labels(agents)}`,
@@ -1195,7 +1192,19 @@ function activate(context) {
             validateInput: (v) => (v.startsWith("/") ? undefined : "must start with /"),
           });
         }
-        if (cmd) agents.forEach((a) => squadExec(["cmd", a, cmd], a));
+        if (!cmd) return;
+        // /clear had a modal confirm when it was its own menu entry. Gating on
+        // the COMMAND rather than on the entry it arrived through keeps that
+        // guard whichever route reaches it — picked from the list, or typed.
+        if (DESTRUCTIVE.has(cmd.trim())) {
+          const ok = await vscode.window.showWarningMessage(
+            `${cmd.trim()} wipes the conversation(s) of: ${labels(agents)}. Sure?`,
+            { modal: true },
+            "Clear"
+          );
+          if (!ok) return;
+        }
+        agents.forEach((a) => squadExec(["cmd", a, cmd], a));
       })
     )
   );

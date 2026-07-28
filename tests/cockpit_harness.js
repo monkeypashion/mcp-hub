@@ -60,6 +60,14 @@ const vscode = {
     async showQuickPick(items) {
       const want = nextAnswer();
       const list = await items;
+      // Record what was OFFERED, not just what was chosen. A picker's contents
+      // are otherwise unobservable: `find` returns the first match, so a list
+      // holding an entry twice is indistinguishable from one holding it once,
+      // and a list that lost entries is indistinguishable from a test that
+      // didn't ask for them. The 2026-07-28 flatten turned eleven menu entries
+      // into rows of one list — "they are all still there" is the claim, and
+      // this is the only thing that can check it.
+      offered.push(list.map((i) => String((i && i.label) || i)));
       if (want === undefined) return undefined;
       return list.find((i) => String(i.label || i).includes(want));
     },
@@ -159,6 +167,7 @@ const vscode = {
 // child_process too and record both. `execSync` stays real: the preview/dry-run
 // paths legitimately shell out and expect output.
 const execs = [];
+const offered = [];
 const folderOps = [];
 const watcherCbs = [];
 const realCp = require("child_process");
@@ -246,7 +255,7 @@ ext.activate({ subscriptions: [] });
         await new Promise((r) => setTimeout(r, 25));
       }
     } catch (e) {
-      console.log(JSON.stringify({ error: String((e && e.message) || e), sent, shown, execs, folderOps }));
+      console.log(JSON.stringify({ error: String((e && e.message) || e), sent, shown, execs, offered, folderOps }));
       process.exitCode = 3;
       return;
     }
@@ -260,7 +269,7 @@ ext.activate({ subscriptions: [] });
       }
       for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 25));
     }
-    console.log(JSON.stringify({ sent, shown, execs, folderOps }));
+    console.log(JSON.stringify({ sent, shown, execs, offered, folderOps }));
     return;
   }
   console.log(JSON.stringify({ error: `unknown mode: ${mode}` }));
