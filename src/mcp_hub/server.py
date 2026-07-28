@@ -532,13 +532,22 @@ def init_db(db_path: Path = DB_PATH) -> None:
     # silently rejoin on the next deploy while everyone believed the removal
     # had stuck. INSERT OR IGNORE hides it perfectly: no error, no duplicate,
     # just a membership quietly back from the dead.
-    migrated = conn.execute(
+    conn.execute(
         """INSERT OR IGNORE INTO squad_members (agent, squad, muted, joined)
            SELECT name, team, 0, ? FROM agents WHERE team != ''""",
         (time.time(),),
-    ).rowcount
-    if migrated:
-        conn.execute("UPDATE agents SET team = '' WHERE team != ''")
+    )
+    # UNCONDITIONAL, and it must stay that way. Guarding this on the INSERT's
+    # rowcount looks like a sensible optimisation and is wrong: OR IGNORE
+    # inserts nothing when the membership ALREADY exists from an earlier boot,
+    # so rowcount is 0, so the guard skips the clear, so the column survives to
+    # re-import after the next manual removal. That is the exact state
+    # production was in — the first version of this fix left one more silent
+    # revert pending and would have looked like it worked.
+    #
+    # The condition that matters is "the column still holds a value", not "we
+    # just used it".
+    conn.execute("UPDATE agents SET team = '' WHERE team != ''")
     conn.commit()
 
     # Migrate: AUDIENCE — who a broadcast was for, recorded ON THE ROW at send

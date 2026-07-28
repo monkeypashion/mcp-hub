@@ -617,3 +617,53 @@ async def test_the_squadless_messages_do_not_contradict_the_capability(server):
     out = await _call(server, "broadcast", {
         "from_agent": "loner", "message": "reachable", "scope": "fleet"})
     assert "osted" in out or "woke" in out, f"the strings promise what the code refuses: {out}"
+
+
+def test_legacy_clear_happens_even_when_the_import_inserts_nothing(tmp_path):
+    """The state PRODUCTION was actually in, which the first fix missed.
+
+    By the time the fix deployed, the memberships had already been imported by
+    an earlier boot. So the INSERT OR IGNORE inserted nothing, its rowcount was
+    0, and a clear guarded on that rowcount never ran — leaving the legacy
+    column set and one more silent revert pending.
+
+    The condition that matters is "the column still holds a value", not "we
+    just used it". This is the difference between a fix that works and one that
+    looks like it works: the idealised fixture (empty table, import inserts,
+    clear fires) passes either way.
+    """
+    import sqlite3
+
+    from mcp_hub.server import init_db
+
+    db = tmp_path / "already.db"
+    init_db(db)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO agents (name, project, status, registered, last_seen, team) "
+        "VALUES ('ghost', 'p', 'online', 0, 0, 'oldsquad')"
+    )
+    conn.execute(
+        "INSERT INTO squad_members (agent, squad, muted, joined) "
+        "VALUES ('ghost', 'oldsquad', 0, 0)"          # already imported
+    )
+    conn.commit()
+    conn.close()
+
+    init_db(db)                                        # the import is a no-op
+    conn = sqlite3.connect(db)
+    team = conn.execute("SELECT team FROM agents WHERE name='ghost'").fetchone()[0]
+    conn.execute("DELETE FROM squad_members WHERE agent='ghost'")
+    conn.commit()
+    conn.close()
+    assert team == "", (
+        "legacy column survived a boot because the import inserted nothing — "
+        "one more silent resurrection is still pending"
+    )
+
+    init_db(db)
+    conn = sqlite3.connect(db)
+    rows = conn.execute(
+        "SELECT squad FROM squad_members WHERE agent='ghost'").fetchall()
+    conn.close()
+    assert rows == [], f"resurrected after removal: {rows}"
