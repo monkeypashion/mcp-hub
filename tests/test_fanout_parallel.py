@@ -125,6 +125,13 @@ async def test_post_fans_out_in_parallel(server):
         server,
         ["recipient_1", "recipient_2", "recipient_3", "recipient_4", "recipient_5"],
     )
+    # Channel wakes are subscriber-scoped (2026-07-29): opt the five in so
+    # the parallelism property is measured over a full fan-out.
+    for i in range(1, 6):
+        await _call_tool(
+            server, "subscribe_channel",
+            {"name": f"recipient_{i}", "channel": "deploys"},
+        )
 
     registry = server._hub_registry  # type: ignore[attr-defined]
     with patch.object(registry, "push", side_effect=_delayed_push):
@@ -146,7 +153,7 @@ async def test_post_fans_out_in_parallel(server):
         f"expected parallel fan-out (≈ {_PER_PUSH_DELAY_S}s), got serial-shaped "
         f"timing (>= {expected_serial_floor / 2:.3f}s)"
     )
-    assert "woke 5/5" in out
+    assert "woke 5/5 connected subscriber" in out
 
 
 def _server_db(server):
