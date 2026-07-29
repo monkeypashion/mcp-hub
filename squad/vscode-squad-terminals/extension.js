@@ -69,6 +69,7 @@ const agentOf = new Map();
 let buildCockpitRef = null;   // set at activation so commands can refresh tabs
 // The panel is revealed once, at startup. See buildCockpit's tail.
 let revealedOnce = false;
+let purgedOldViews = false;
 
 function rosterRows() {
   const conf = path.join(os.homedir(), ".config", "squad", "squad.conf");
@@ -1582,10 +1583,36 @@ function activate(context) {
   // tasks in this folder" permission and silently doesn't start, which is
   // exactly how it failed to appear on first try. The extension already
   // creates the agent terminals reliably; use the same door.
-  // Named for the command that fills it (`squad board`), not just "board":
-  // every other tab in the list is a bare agent name, so an unqualified
-  // "board" reads like one more agent rather than the operator's own view.
+  // ONE operator view, not two. The text board (`squad board -w`) and the
+  // settings panel were separate tabs until 2026-07-29, when the settings
+  // panel absorbed the board (operator: "consolidate the two items into
+  // one") — the Textual app now shows the live fleet AND the settings sheet,
+  // so a second tab would be the same data rendered worse. The tab keeps the
+  // board's NAME and icon because the board is what it is; the settings
+  // sheet is one section of it. `squad board` itself remains a CLI command —
+  // and this panel's data source.
+  //
+  // A TERMINAL, after four attempts at VSCode-native surfaces that each failed
+  // for a structural reason: a webview in the editor is a file tab, a quick
+  // pick cannot lay anything out, a panel view HIDES the terminals it sits
+  // beside, and a sidebar is too narrow. This asks nothing of VSCode's UI —
+  // it is a tab in the panel like every agent, so it can stay open, be clicked
+  // back to, and look however we render it.
+  //
+  // Scoped to THIS workspace by the same folder-membership rule the tabs use,
+  // so the panel lists exactly the agents whose tabs are beside it.
   const BOARD = "squad-board";
+  // Retired tab names from the two-tab era. A restored "squad-settings"
+  // terminal would sit beside the new board as a duplicate view; a restored
+  // "squad-board" is the OLD text-board watch loop wearing the new tab's
+  // name, which would satisfy the dedup below and keep the old view forever.
+  // Purged ONCE per activation — within a session the dedup owns the name.
+  if (!purgedOldViews) {
+    purgedOldViews = true;
+    for (const t of [...vscode.window.terminals]) {
+      if (t.name === "squad-settings" || t.name === BOARD) t.dispose();
+    }
+  }
   if (![...vscode.window.terminals].some((t) => t.name === BOARD)) {
     const b = vscode.window.createTerminal({
       name: BOARD,
@@ -1600,34 +1627,10 @@ function activate(context) {
         ? path.join(os.homedir(), "Projects")
         : undefined,
     });
-    sendWhenReady(b, `${SQUAD} board -w`);
-  }
-
-  // Settings panel — the operator's own view, same door as the board.
-  //
-  // A TERMINAL, after four attempts at VSCode-native surfaces that each failed
-  // for a structural reason: a webview in the editor is a file tab, a quick
-  // pick cannot lay anything out, a panel view HIDES the terminals it sits
-  // beside, and a sidebar is too narrow. This asks nothing of VSCode's UI —
-  // it is a tab in the panel like every agent, so it can stay open, be clicked
-  // back to, and look however we render it.
-  //
-  // Scoped to THIS workspace by the same folder-membership rule the tabs use,
-  // so the panel lists exactly the agents whose tabs are beside it.
-  const SETTINGS = "squad-settings";
-  if (![...vscode.window.terminals].some((t) => t.name === SETTINGS)) {
-    const st = vscode.window.createTerminal({
-      name: SETTINGS,
-      iconPath: new vscode.ThemeIcon("settings-gear"),
-      color: new vscode.ThemeColor("terminal.ansiCyan"),
-      cwd: fs.existsSync(path.join(os.homedir(), "Projects"))
-        ? path.join(os.homedir(), "Projects")
-        : undefined,
-    });
     const ws = vscode.workspace.workspaceFile;
     sendWhenReady(
-      st,
-      `${MCP_HUB} settings --tui` +
+      b,
+      `${MCP_HUB} board` +
         (ws ? ` --workspace ${JSON.stringify(ws.fsPath)}` : "")
     );
   }

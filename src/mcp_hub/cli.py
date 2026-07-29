@@ -3444,6 +3444,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    board = sub.add_parser(
+        "board",
+        help="SQUAD BOARD — the live fleet and each agent's settings, one screen",
+        description=(
+            "The operator's view: who needs you, who is working, who is idle, "
+            "each agent's blocking question with answer buttons, git and token "
+            "usage — with the settings sheet underneath. This is `settings "
+            "--tui` under the name the screen actually wears; both spellings "
+            "stay because the cockpit predates the rename."
+        ),
+    )
+    board.add_argument(
+        "--workspace", default=None,
+        help="A .code-workspace file to scope the roster to (see `settings --workspace`)",
+    )
+
     mute = sub.add_parser(
         "mute",
         help="Silence (or unsilence) one squad's broadcasts for one agent",
@@ -3545,6 +3561,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.subcommand == "identity":
         return identity_command(args)
     if args.subcommand == "settings":
+        return settings_command(args)
+    if args.subcommand == "board":
+        # `board` IS the panel: settings --tui wearing the screen's real name.
+        args.tui = True
+        args.cwd = None
+        args.json = False
         return settings_command(args)
     if args.subcommand == "mute":
         return mute_command(args)
