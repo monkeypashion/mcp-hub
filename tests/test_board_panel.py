@@ -296,8 +296,15 @@ async def test_polling_a_waiting_agent_does_not_crash_or_churn_its_buttons():
     def snapshot():
         tick["n"] += 1
         snap = _snapshot()
-        # seconds advance every scan; the rendered "2m" does not
-        snap["agents"]["beta"]["waiting_seconds"] = 134 + tick["n"]
+        # Seconds advance every scan; the rendered "2m" must not. MODULO is
+        # load-bearing: `134 + tick["n"]` crossed 180s → "3m" once ~46 ticks
+        # accumulated, which the 0.05s timer reaches on a loaded box but not
+        # a fast one — the section then rebuilt LEGITIMATELY and the test
+        # called it churn (7/12 failures on dev-vm-1, 0/12 here, same
+        # commit; measured 2026-07-30). Staying inside one displayed minute
+        # makes the assertion stronger too: ANY number of ticks now proves
+        # no rebuild, instead of only the few that fit in the window.
+        snap["agents"]["beta"]["waiting_seconds"] = 134 + (tick["n"] % 45)
         return snap
 
     app = _app(board=snapshot)
