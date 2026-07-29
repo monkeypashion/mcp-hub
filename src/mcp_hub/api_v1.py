@@ -1,0 +1,1081 @@
+"""/api/v1 — the hub's management surface (docs/hub-api-v1.md).
+
+REST alongside MCP, one store: the MCP tools remain the conversation surface
+for agents; this module is CRUD for operators, CLIs, the future UI and edge
+daemons. It shares the hub's SQLite DB (notably `squad_members`, which stays
+the single membership truth the MCP tools read) and adds its own tables for
+the resources MCP never modelled: machines, seats, workspaces, capsules,
+placements.
+
+The edge boundary is a CONTRACT, not code: placements are desired-state
+records served to per-machine edge daemons. Nothing here executes anything on
+a machine; `status: pending-edge` is the honest name for that.
+
+Auth: bearer tokens. The operator token comes from $MCP_HUB_API_TOKEN — unset
+means the whole surface answers 503 (off, loudly — never open by accident).
+Machine tokens are issued once at enrolment and stored hashed; a machine
+principal may only pull its own placements and report observed state.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import os
+import secrets
+import sqlite3
+import tarfile
+import time
+from pathlib import Path
+from typing import Any, Callable
+
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+
+SUBSTRATES = ("worktree", "docker")
+
+# Default settings block for rendered .code-workspace files — mirrors what
+# `squad ws-new` writes, so an API workspace opens identically to a manual one.
+WS_SETTINGS = {
+    "terminal.integrated.tabs.title": "${sequence}",
+    "terminal.integrated.tabs.description": "${progress}",
+    "terminal.integrated.enablePersistentSessions": False,
+    "terminal.integrated.hideOnStartup": "whenEmpty",
+}
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _sha(text: bytes) -> str:
+    return hashlib.sha256(text).hexdigest()
+
+
+def _err(status: int, detail: str) -> JSONResponse:
+    return JSONResponse({"detail": detail}, status_code=status)
+
+
+def init_api_tables(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS api_machines (
+            name         TEXT PRIMARY KEY,
+            os           TEXT NOT NULL DEFAULT '',
+            capabilities TEXT NOT NULL DEFAULT '{}',
+            token_hash   TEXT NOT NULL,
+            last_seen    REAL,
+            archived     INTEGER NOT NULL DEFAULT 0,
+            created      REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS api_seats (
+            identity    TEXT PRIMARY KEY,
+            repo        TEXT NOT NULL,
+            machine     TEXT NOT NULL,
+            folder      TEXT NOT NULL,
+            launch_args TEXT NOT NULL DEFAULT '',
+            class       TEXT NOT NULL DEFAULT 'squad',
+            cloned_from TEXT NOT NULL DEFAULT '',
+            archived    INTEGER NOT NULL DEFAULT 0,
+            created     REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS api_squads (
+            name             TEXT PRIMARY KEY,
+            description      TEXT NOT NULL DEFAULT '',
+            board_visibility TEXT NOT NULL DEFAULT 'shown',
+            archived         INTEGER NOT NULL DEFAULT 0,
+            created          REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS api_workspaces (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            name     TEXT NOT NULL,
+            machine  TEXT NOT NULL DEFAULT '',
+            squad    TEXT NOT NULL DEFAULT '',
+            listings TEXT NOT NULL DEFAULT '[]',
+            created  REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS api_capsules (
+            id       TEXT PRIMARY KEY,
+            squad    TEXT NOT NULL,
+            manifest TEXT NOT NULL,
+            tarball  BLOB NOT NULL,
+            created  REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS api_placements (
+            id             TEXT PRIMARY KEY,
+            seat           TEXT NOT NULL,
+            machine        TEXT NOT NULL,
+            substrate      TEXT NOT NULL,
+            desired        TEXT NOT NULL DEFAULT 'running',
+            observed_state TEXT,
+            observed_at    REAL,
+            observed_enum  TEXT NOT NULL DEFAULT '{}',
+            reclaim        TEXT NOT NULL DEFAULT '',
+            created        REAL NOT NULL
+        );
+        """
+    )
+    # Membership provenance: API-set rows say so, workspace-seeded rows will
+    # say which file — the fix-by-design for the board's union-attribution
+    # defect. ALTER is idempotent-by-exception, matching server.py migrations.
+    try:
+        conn.execute(
+            "ALTER TABLE squad_members ADD COLUMN source TEXT NOT NULL DEFAULT ''"
+        )
+    except sqlite3.OperationalError:
+        pass
+    conn.commit()
+
+
+def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
+    """Register every /api/v1 route on the hub's streamable-http app."""
+    from mcp_hub.server import _get_db  # shared thread-local connection pool
+
+    def db() -> sqlite3.Connection:
+        return _get_db(db_path)
+
+    # -- auth ---------------------------------------------------------------
+
+    def auth(request: Request) -> tuple[str, str] | JSONResponse:
+        """Return (principal, machine_name) or an error response.
+
+        principal is "operator" (machine_name "") or "machine" (its name).
+        """
+        op_token = os.environ.get("MCP_HUB_API_TOKEN", "")
+        if not op_token:
+            return _err(503, "management API disabled: MCP_HUB_API_TOKEN not set")
+        header = request.headers.get("authorization", "")
+        if not header.startswith("Bearer "):
+            return _err(401, "missing bearer token")
+        token = header[len("Bearer "):]
+        if secrets.compare_digest(token, op_token):
+            return ("operator", "")
+        row = db().execute(
+            "SELECT name FROM api_machines WHERE token_hash = ? AND archived = 0",
+            (_sha(token.encode()),),
+        ).fetchone()
+        if row:
+            return ("machine", row["name"])
+        return _err(401, "unrecognised token")
+
+    def operator_only(request: Request) -> tuple[str, str] | JSONResponse:
+        got = auth(request)
+        if isinstance(got, JSONResponse):
+            return got
+        principal, name = got
+        if principal != "operator":
+            return _err(403, "operator token required")
+        return got
+
+    async def body_of(request: Request) -> dict:
+        try:
+            return await request.json()
+        except Exception:  # noqa: BLE001 — absent/invalid body is just {}
+            return {}
+
+    def route(path: str, methods: list[str]) -> Callable:
+        return mcp.custom_route(path, methods=methods)
+
+    # -- serializers --------------------------------------------------------
+
+    def machine_json(row: sqlite3.Row, token: str | None = None) -> dict:
+        out = {
+            "name": row["name"],
+            "os": row["os"],
+            "capabilities": json.loads(row["capabilities"]),
+            "last_seen": row["last_seen"],
+        }
+        if token is not None:
+            out["token"] = token
+        return out
+
+    def seat_json(row: sqlite3.Row, presence: bool = False) -> dict:
+        out = {
+            "identity": row["identity"],
+            "repo": row["repo"],
+            "machine": row["machine"],
+            "folder": row["folder"],
+            "launch_args": row["launch_args"],
+            "class": row["class"],
+            "cloned_from": row["cloned_from"],
+        }
+        if presence:
+            agent = db().execute(
+                "SELECT status FROM agents WHERE name = ?", (row["identity"],)
+            ).fetchone()
+            out["presence"] = {
+                "online": bool(agent and agent["status"] == "online"),
+                "bound": row["identity"] in set(registry.names()),
+            }
+        return out
+
+    def squad_json(row: sqlite3.Row) -> dict:
+        count = db().execute(
+            "SELECT COUNT(*) AS n FROM squad_members WHERE squad = ?",
+            (row["name"],),
+        ).fetchone()["n"]
+        return {
+            "name": row["name"],
+            "description": row["description"],
+            "board_visibility": row["board_visibility"],
+            "archived": bool(row["archived"]),
+            "member_count": count,
+        }
+
+    def workspace_json(row: sqlite3.Row) -> dict:
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "machine": row["machine"],
+            "squad": row["squad"],
+            "listings": json.loads(row["listings"]),
+        }
+
+    def placement_status(row: sqlite3.Row) -> str:
+        if row["observed_state"] is None:
+            return "pending-edge"
+        if row["observed_state"] == row["desired"]:
+            return "converged"
+        return "diverged"
+
+    def placement_json(row: sqlite3.Row) -> dict:
+        out = {
+            "id": row["id"],
+            "seat": row["seat"],
+            "machine": row["machine"],
+            "substrate": row["substrate"],
+            "desired": row["desired"],
+            "observed": {
+                "state": row["observed_state"],
+                "at": row["observed_at"],
+                "enumeration": json.loads(row["observed_enum"]),
+            },
+            "status": placement_status(row),
+        }
+        if row["reclaim"]:
+            out["reclaim"] = json.loads(row["reclaim"])
+        return out
+
+    def active_placements(where: str, args: tuple) -> int:
+        return db().execute(
+            f"SELECT COUNT(*) AS n FROM api_placements WHERE {where} "
+            "AND desired != 'reclaimed'",
+            args,
+        ).fetchone()["n"]
+
+    # -- machines -----------------------------------------------------------
+
+    @route("/api/v1/machines", methods=["GET", "POST"])
+    async def machines(request: Request) -> Response:
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        if request.method == "GET":
+            rows = db().execute(
+                "SELECT * FROM api_machines WHERE archived = 0"
+            ).fetchall()
+            return JSONResponse({"machines": [machine_json(r) for r in rows]})
+        body = await body_of(request)
+        name = body.get("name", "")
+        if not name:
+            return _err(422, "name required")
+        if db().execute(
+            "SELECT 1 FROM api_machines WHERE name = ?", (name,)
+        ).fetchone():
+            return _err(409, f"machine '{name}' already enrolled")
+        token = secrets.token_hex(24)
+        db().execute(
+            "INSERT INTO api_machines (name, os, capabilities, token_hash, created)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (
+                name,
+                body.get("os", ""),
+                json.dumps(body.get("capabilities", {})),
+                _sha(token.encode()),
+                _now(),
+            ),
+        )
+        db().commit()
+        row = db().execute(
+            "SELECT * FROM api_machines WHERE name = ?", (name,)
+        ).fetchone()
+        return JSONResponse(machine_json(row, token=token), status_code=201)
+
+    @route("/api/v1/machines/{name}", methods=["GET", "PATCH", "DELETE"])
+    async def machine_one(request: Request) -> Response:
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        name = request.path_params["name"]
+        row = db().execute(
+            "SELECT * FROM api_machines WHERE name = ? AND archived = 0", (name,)
+        ).fetchone()
+        if not row:
+            return _err(404, f"no machine '{name}'")
+        if request.method == "GET":
+            return JSONResponse(machine_json(row))
+        if request.method == "PATCH":
+            body = await body_of(request)
+            caps = json.loads(row["capabilities"])
+            caps.update(body.get("capabilities", {}))
+            db().execute(
+                "UPDATE api_machines SET capabilities = ?, os = ? WHERE name = ?",
+                (json.dumps(caps), body.get("os", row["os"]), name),
+            )
+            db().commit()
+            row = db().execute(
+                "SELECT * FROM api_machines WHERE name = ?", (name,)
+            ).fetchone()
+            return JSONResponse(machine_json(row))
+        # DELETE — refcount rule: a machine with live placements cannot retire.
+        if active_placements("machine = ?", (name,)):
+            return _err(409, "machine has active placements; reclaim them first")
+        db().execute("UPDATE api_machines SET archived = 1 WHERE name = ?", (name,))
+        db().commit()
+        return JSONResponse({"name": name, "archived": True})
+
+    @route("/api/v1/machines/{name}/placements", methods=["GET"])
+    async def machine_placements(request: Request) -> Response:
+        got = auth(request)
+        if isinstance(got, JSONResponse):
+            return got
+        principal, mname = got
+        name = request.path_params["name"]
+        if principal == "machine" and mname != name:
+            return _err(403, "machine token may only pull its own placements")
+        rows = db().execute(
+            "SELECT * FROM api_placements WHERE machine = ?", (name,)
+        ).fetchall()
+        return JSONResponse({"placements": [placement_json(r) for r in rows]})
+
+    @route("/api/v1/machines/{name}/status", methods=["POST"])
+    async def machine_status(request: Request) -> Response:
+        got = auth(request)
+        if isinstance(got, JSONResponse):
+            return got
+        principal, mname = got
+        name = request.path_params["name"]
+        if principal == "machine" and mname != name:
+            return _err(403, "machine token may only report its own status")
+        if not db().execute(
+            "SELECT 1 FROM api_machines WHERE name = ? AND archived = 0", (name,)
+        ).fetchone():
+            return _err(404, f"no machine '{name}'")
+        await body_of(request)  # observed payload accepted; stored fields TBD
+        db().execute(
+            "UPDATE api_machines SET last_seen = ? WHERE name = ?", (_now(), name)
+        )
+        db().commit()
+        return JSONResponse({"ok": True})
+
+    # -- seats --------------------------------------------------------------
+
+    @route("/api/v1/seats", methods=["GET", "POST"])
+    async def seats(request: Request) -> Response:
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        if request.method == "GET":
+            rows = db().execute(
+                "SELECT * FROM api_seats WHERE archived = 0"
+            ).fetchall()
+            return JSONResponse({"seats": [seat_json(r) for r in rows]})
+        body = await body_of(request)
+        for field in ("repo", "machine", "folder"):
+            if not body.get(field):
+                return _err(422, f"{field} required")
+        # Identity is ASSIGNED here, never derived downstream — a container's
+        # hostname must never name a seat (runtime design, identity section).
+        identity = body.get("identity") or (
+            f"{body['repo'].rsplit('/', 1)[-1]}-{body['machine']}"
+        )
+        if db().execute(
+            "SELECT 1 FROM api_seats WHERE identity = ?", (identity,)
+        ).fetchone():
+            return _err(409, f"seat '{identity}' already exists")
+        db().execute(
+            "INSERT INTO api_seats (identity, repo, machine, folder, launch_args,"
+            " class, created) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                identity,
+                body["repo"],
+                body["machine"],
+                body["folder"],
+                body.get("launch_args", ""),
+                body.get("class", "squad"),
+                _now(),
+            ),
+        )
+        db().commit()
+        row = db().execute(
+            "SELECT * FROM api_seats WHERE identity = ?", (identity,)
+        ).fetchone()
+        return JSONResponse(seat_json(row), status_code=201)
+
+    @route("/api/v1/seats/{identity}", methods=["GET", "PATCH", "DELETE"])
+    async def seat_one(request: Request) -> Response:
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        identity = request.path_params["identity"]
+        row = db().execute(
+            "SELECT * FROM api_seats WHERE identity = ? AND archived = 0",
+            (identity,),
+        ).fetchone()
+        if not row:
+            return _err(404, f"no seat '{identity}'")
+        if request.method == "GET":
+            return JSONResponse(seat_json(row, presence=True))
+        if request.method == "PATCH":
+            body = await body_of(request)
+            db().execute(
+                "UPDATE api_seats SET launch_args = ?, class = ? WHERE identity = ?",
+                (
+                    body.get("launch_args", row["launch_args"]),
+                    body.get("class", row["class"]),
+                    identity,
+                ),
+            )
+            db().commit()
+            row = db().execute(
+                "SELECT * FROM api_seats WHERE identity = ?", (identity,)
+            ).fetchone()
+            return JSONResponse(seat_json(row))
+        if active_placements("seat = ?", (identity,)):
+            return _err(409, "seat has active placements; reclaim them first")
+        db().execute(
+            "UPDATE api_seats SET archived = 1 WHERE identity = ?", (identity,)
+        )
+        db().commit()
+        return JSONResponse({"identity": identity, "archived": True})
+
+    @route("/api/v1/seats/{identity}/clone", methods=["POST"])
+    async def seat_clone(request: Request) -> Response:
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        identity = request.path_params["identity"]
+        row = db().execute(
+            "SELECT * FROM api_seats WHERE identity = ? AND archived = 0",
+            (identity,),
+        ).fetchone()
+        if not row:
+            return _err(404, f"no seat '{identity}'")
+        body = await body_of(request)
+        suffix = body.get("suffix", "")
+        machine = body.get("machine", row["machine"])
+        if not suffix:
+            return _err(422, "suffix required")
+        new_identity = f"{identity}-{suffix}"
+        if db().execute(
+            "SELECT 1 FROM api_seats WHERE identity = ?", (new_identity,)
+        ).fetchone():
+            return _err(409, f"seat '{new_identity}' already exists")
+        db().execute(
+            "INSERT INTO api_seats (identity, repo, machine, folder, launch_args,"
+            " class, cloned_from, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                new_identity,
+                row["repo"],
+                machine,
+                row["folder"],
+                row["launch_args"],
+                row["class"],
+                identity,
+                _now(),
+            ),
+        )
+        db().commit()
+        new_row = db().execute(
+            "SELECT * FROM api_seats WHERE identity = ?", (new_identity,)
+        ).fetchone()
+        return JSONResponse(seat_json(new_row), status_code=201)
+
+    # -- squads -------------------------------------------------------------
+
+    @route("/api/v1/squads", methods=["GET", "POST"])
+    async def squads(request: Request) -> Response:
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        if request.method == "GET":
+            include_archived = (
+                request.query_params.get("include_archived") == "true"
+            )
+            where = "" if include_archived else "WHERE archived = 0"
+            rows = db().execute(f"SELECT * FROM api_squads {where}").fetchall()
+            return JSONResponse({"squads": [squad_json(r) for r in rows]})
+        body = await body_of(request)
+        name = body.get("name", "")
+        if not name:
+            return _err(422, "name required")
+        visibility = body.get("board_visibility", "shown")
+        if visibility not in ("shown", "hidden"):
+            return _err(422, "board_visibility must be shown|hidden")
+        # Archived squads keep their name reserved: history stays attributable.
+        if db().execute(
+            "SELECT 1 FROM api_squads WHERE name = ?", (name,)
+        ).fetchone():
+            return _err(409, f"squad '{name}' exists (or is archived; names are reserved)")
+        db().execute(
+            "INSERT INTO api_squads (name, description, board_visibility, created)"
+            " VALUES (?, ?, ?, ?)",
+            (name, body.get("description", ""), visibility, _now()),
+        )
+        db().commit()
+        row = db().execute(
+            "SELECT * FROM api_squads WHERE name = ?", (name,)
+        ).fetchone()
+        return JSONResponse(squad_json(row), status_code=201)
+
+    @route("/api/v1/squads/{name}", methods=["GET", "PATCH", "DELETE"])
+    async def squad_one(request: Request) -> Response:
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        name = request.path_params["name"]
+        row = db().execute(
+            "SELECT * FROM api_squads WHERE name = ? AND archived = 0", (name,)
+        ).fetchone()
+        if not row:
+            return _err(404, f"no squad '{name}'")
+        if request.method == "GET":
+            return JSONResponse(squad_json(row))
+        if request.method == "PATCH":
+            body = await body_of(request)
+            new_name = body.get("name", name)
+            if new_name != name and db().execute(
+                "SELECT 1 FROM api_squads WHERE name = ?", (new_name,)
+            ).fetchone():
+                return _err(409, f"squad '{new_name}' already exists")
+            visibility = body.get("board_visibility", row["board_visibility"])
+            if visibility not in ("shown", "hidden"):
+                return _err(422, "board_visibility must be shown|hidden")
+            # Rename cascades atomically: the record and every membership move
+            # in one transaction or not at all.
+            db().execute(
+                "UPDATE api_squads SET name = ?, description = ?,"
+                " board_visibility = ? WHERE name = ?",
+                (new_name, body.get("description", row["description"]),
+                 visibility, name),
+            )
+            db().execute(
+                "UPDATE squad_members SET squad = ? WHERE squad = ?",
+                (new_name, name),
+            )
+            db().commit()
+            row = db().execute(
+                "SELECT * FROM api_squads WHERE name = ?", (new_name,)
+            ).fetchone()
+            return JSONResponse(squad_json(row))
+        # DELETE — archive always; purge removes STRUCTURE only. Message and
+        # broadcast history is immortal by decision (2026-07-29): the fleet
+        # treats history as the record.
+        purge = request.query_params.get("purge") == "true"
+        out: dict[str, Any] = {"name": name, "archived": True}
+        if purge:
+            n = db().execute(
+                "SELECT COUNT(*) AS n FROM squad_members WHERE squad = ?", (name,)
+            ).fetchone()["n"]
+            db().execute("DELETE FROM squad_members WHERE squad = ?", (name,))
+            out["purged"] = {"memberships": n}
+            out["messages_retained"] = True
+        db().execute("UPDATE api_squads SET archived = 1 WHERE name = ?", (name,))
+        db().commit()
+        return JSONResponse(out)
+
+    @route("/api/v1/squads/{name}/members", methods=["GET"])
+    async def squad_members_list(request: Request) -> Response:
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        name = request.path_params["name"]
+        if not db().execute(
+            "SELECT 1 FROM api_squads WHERE name = ? AND archived = 0", (name,)
+        ).fetchone():
+            return _err(404, f"no squad '{name}'")
+        rows = db().execute(
+            "SELECT * FROM squad_members WHERE squad = ? ORDER BY joined", (name,)
+        ).fetchall()
+        return JSONResponse(
+            {
+                "members": [
+                    {
+                        "seat": r["agent"],
+                        "muted": bool(r["muted"]),
+                        "source": r["source"],
+                        "joined": r["joined"],
+                    }
+                    for r in rows
+                ]
+            }
+        )
+
+    @route(
+        "/api/v1/squads/{name}/members/{seat}",
+        methods=["PUT", "PATCH", "DELETE"],
+    )
+    async def squad_member_one(request: Request) -> Response:
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        name = request.path_params["name"]
+        seat = request.path_params["seat"]
+        if not db().execute(
+            "SELECT 1 FROM api_squads WHERE name = ? AND archived = 0", (name,)
+        ).fetchone():
+            return _err(404, f"no squad '{name}'")
+        if request.method == "PUT":
+            body = await body_of(request)
+            db().execute(
+                "INSERT INTO squad_members (agent, squad, muted, joined, source)"
+                " VALUES (?, ?, ?, ?, 'api')"
+                " ON CONFLICT(agent, squad) DO NOTHING",
+                (seat, name, int(bool(body.get("muted", False))), _now()),
+            )
+            db().commit()
+            return JSONResponse({"seat": seat, "squad": name})
+        member = db().execute(
+            "SELECT 1 FROM squad_members WHERE agent = ? AND squad = ?",
+            (seat, name),
+        ).fetchone()
+        if not member:
+            return _err(404, f"'{seat}' is not a member of '{name}'")
+        if request.method == "PATCH":
+            body = await body_of(request)
+            if "muted" in body:
+                db().execute(
+                    "UPDATE squad_members SET muted = ? WHERE agent = ? AND squad = ?",
+                    (int(bool(body["muted"])), seat, name),
+                )
+                db().commit()
+            return JSONResponse({"seat": seat, "squad": name})
+        db().execute(
+            "DELETE FROM squad_members WHERE agent = ? AND squad = ?", (seat, name)
+        )
+        db().commit()
+        return JSONResponse({"seat": seat, "squad": name, "removed": True})
+
+    @route("/api/v1/squads/{name}/broadcasts", methods=["GET"])
+    async def squad_broadcasts(request: Request) -> Response:
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        name = request.path_params["name"]
+        if not db().execute(
+            "SELECT 1 FROM api_squads WHERE name = ? AND archived = 0", (name,)
+        ).fetchone():
+            return _err(404, f"no squad '{name}'")
+        rows = db().execute(
+            "SELECT id, from_agent, content, timestamp FROM messages"
+            " WHERE to_agent = '*' AND audience = ? ORDER BY id DESC LIMIT 100",
+            (name,),
+        ).fetchall()
+        return JSONResponse(
+            {
+                "broadcasts": [
+                    {
+                        "id": r["id"],
+                        "from": r["from_agent"],
+                        "body": r["content"],
+                        "ts": r["timestamp"],
+                    }
+                    for r in rows
+                ]
+            }
+        )
+
+    # -- workspaces ---------------------------------------------------------
+
+    @route("/api/v1/workspaces", methods=["GET", "POST"])
+    async def workspaces(request: Request) -> Response:
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        if request.method == "GET":
+            rows = db().execute("SELECT * FROM api_workspaces").fetchall()
+            return JSONResponse(
+                {"workspaces": [workspace_json(r) for r in rows]}
+            )
+        body = await body_of(request)
+        if not body.get("name"):
+            return _err(422, "name required")
+        squad = body.get("squad", "")
+        if squad and not db().execute(
+            "SELECT 1 FROM api_squads WHERE name = ? AND archived = 0", (squad,)
+        ).fetchone():
+            return _err(404, f"no squad '{squad}' to type this workspace with")
+        cur = db().execute(
+            "INSERT INTO api_workspaces (name, machine, squad, listings, created)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (
+                body["name"],
+                body.get("machine", ""),
+                squad,
+                json.dumps(body.get("listings", [])),
+                _now(),
+            ),
+        )
+        db().commit()
+        row = db().execute(
+            "SELECT * FROM api_workspaces WHERE id = ?", (cur.lastrowid,)
+        ).fetchone()
+        return JSONResponse(workspace_json(row), status_code=201)
+
+    @route("/api/v1/workspaces/{wid}", methods=["GET", "PATCH", "DELETE"])
+    async def workspace_one(request: Request) -> Response:
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        wid = request.path_params["wid"]
+        row = db().execute(
+            "SELECT * FROM api_workspaces WHERE id = ?", (wid,)
+        ).fetchone()
+        if not row:
+            return _err(404, f"no workspace {wid}")
+        if request.method == "GET":
+            return JSONResponse(workspace_json(row))
+        if request.method == "PATCH":
+            body = await body_of(request)
+            listings = json.loads(row["listings"])
+            listings.extend(body.get("add_listings", []))
+            remove = {json.dumps(x, sort_keys=True) for x in body.get("remove_listings", [])}
+            listings = [
+                x for x in listings if json.dumps(x, sort_keys=True) not in remove
+            ]
+            db().execute(
+                "UPDATE api_workspaces SET listings = ? WHERE id = ?",
+                (json.dumps(listings), wid),
+            )
+            db().commit()
+            row = db().execute(
+                "SELECT * FROM api_workspaces WHERE id = ?", (wid,)
+            ).fetchone()
+            return JSONResponse(workspace_json(row))
+        db().execute("DELETE FROM api_workspaces WHERE id = ?", (wid,))
+        db().commit()
+        return JSONResponse({"id": row["id"], "removed": True})
+
+    def render_workspace_file(row: sqlite3.Row) -> dict:
+        listings = json.loads(row["listings"])
+        return {
+            "folders": [
+                {"path": x["path"]} for x in listings if "path" in x
+            ],
+            "settings": dict(WS_SETTINGS),
+        }
+
+    @route("/api/v1/workspaces/{wid}/file", methods=["GET"])
+    async def workspace_file(request: Request) -> Response:
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        wid = request.path_params["wid"]
+        row = db().execute(
+            "SELECT * FROM api_workspaces WHERE id = ?", (wid,)
+        ).fetchone()
+        if not row:
+            return _err(404, f"no workspace {wid}")
+        return JSONResponse(render_workspace_file(row))
+
+    # -- capsules -----------------------------------------------------------
+
+    def compose_capsule(squad_row: sqlite3.Row) -> tuple[dict, bytes]:
+        """Render every artifact a destination needs, hash each, tar the lot.
+
+        The capsule is FROZEN (a snapshot of squad state at compose time),
+        INERT (a tarball does nothing), SELF-CONTAINED (no source-machine
+        references) and VERIFIABLE (the manifest hashes every entry).
+        """
+        squad = squad_row["name"]
+        member_rows = db().execute(
+            "SELECT agent FROM squad_members WHERE squad = ? ORDER BY joined",
+            (squad,),
+        ).fetchall()
+        seats = []
+        for m in member_rows:
+            seat_row = db().execute(
+                "SELECT * FROM api_seats WHERE identity = ? AND archived = 0",
+                (m["agent"],),
+            ).fetchone()
+            if seat_row:
+                seats.append(seat_json(seat_row))
+            else:
+                seats.append({"identity": m["agent"]})
+
+        hub_url = os.environ.get("MCP_HUB_URL", "http://100.109.6.114:8090/mcp")
+        artifacts: dict[str, bytes] = {}
+        ws = {
+            "folders": [
+                {"path": s.get("folder", s["identity"])} for s in seats
+            ],
+            "settings": dict(WS_SETTINGS),
+        }
+        artifacts[f"{squad}.code-workspace"] = json.dumps(ws, indent=2).encode()
+        artifacts["mcp.json.template"] = json.dumps(
+            {"mcpServers": {"hub": {"type": "http", "url": f"{hub_url}?agent=__IDENTITY__"}}},
+            indent=2,
+        ).encode()
+        compose = {
+            "services": {
+                s["identity"]: {
+                    "image": "mcp-hub-seat:latest",
+                    "environment": {
+                        "SEAT_IDENTITY": s["identity"],
+                        "SEAT_REPO": s.get("repo", ""),
+                        "MCP_HUB_URL": hub_url,
+                    },
+                }
+                for s in seats
+            }
+        }
+        artifacts["docker-compose.yml"] = json.dumps(compose, indent=2).encode()
+        artifacts["bootstrap.sh"] = (
+            "#!/bin/sh\n# Realize this capsule on the local machine.\n"
+            "# Generated by the hub; identities are ASSIGNED in manifest.json —\n"
+            "# never derive a seat name from a container hostname.\n"
+        ).encode()
+
+        entries = [
+            {"path": path, "sha256": _sha(data)}
+            for path, data in sorted(artifacts.items())
+        ]
+        manifest = {"squad": squad, "seats": seats, "entries": entries}
+        manifest_bytes = json.dumps(manifest, indent=2).encode()
+
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+            for path, data in {**artifacts, "manifest.json": manifest_bytes}.items():
+                info = tarfile.TarInfo(name=path)
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+        return manifest, buf.getvalue()
+
+    @route("/api/v1/capsules", methods=["GET", "POST"])
+    async def capsules(request: Request) -> Response:
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        if request.method == "GET":
+            rows = db().execute(
+                "SELECT id, squad, manifest, created FROM api_capsules"
+            ).fetchall()
+            return JSONResponse(
+                {
+                    "capsules": [
+                        {
+                            "id": r["id"],
+                            "squad": r["squad"],
+                            "manifest": json.loads(r["manifest"]),
+                            "created": r["created"],
+                        }
+                        for r in rows
+                    ]
+                }
+            )
+        body = await body_of(request)
+        squad = body.get("squad", "")
+        squad_row = db().execute(
+            "SELECT * FROM api_squads WHERE name = ? AND archived = 0", (squad,)
+        ).fetchone()
+        if not squad_row:
+            return _err(404, f"no squad '{squad}'")
+        manifest, tarball = compose_capsule(squad_row)
+        cid = f"cap-{secrets.token_hex(8)}"
+        db().execute(
+            "INSERT INTO api_capsules (id, squad, manifest, tarball, created)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (cid, squad, json.dumps(manifest), tarball, _now()),
+        )
+        db().commit()
+        return JSONResponse(
+            {"id": cid, "squad": squad, "manifest": manifest}, status_code=201
+        )
+
+    @route("/api/v1/capsules/{cid}", methods=["GET", "DELETE"])
+    async def capsule_one(request: Request) -> Response:
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        cid = request.path_params["cid"]
+        row = db().execute(
+            "SELECT id, squad, manifest, created FROM api_capsules WHERE id = ?",
+            (cid,),
+        ).fetchone()
+        if not row:
+            return _err(404, f"no capsule '{cid}'")
+        if request.method == "GET":
+            return JSONResponse(
+                {
+                    "id": row["id"],
+                    "squad": row["squad"],
+                    "manifest": json.loads(row["manifest"]),
+                    "created": row["created"],
+                }
+            )
+        db().execute("DELETE FROM api_capsules WHERE id = ?", (cid,))
+        db().commit()
+        return JSONResponse({"id": cid, "removed": True})
+
+    @route("/api/v1/capsules/{cid}/download", methods=["GET"])
+    async def capsule_download(request: Request) -> Response:
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        cid = request.path_params["cid"]
+        row = db().execute(
+            "SELECT tarball FROM api_capsules WHERE id = ?", (cid,)
+        ).fetchone()
+        if not row:
+            return _err(404, f"no capsule '{cid}'")
+        return Response(
+            content=row["tarball"],
+            media_type="application/gzip",
+            headers={"content-disposition": f'attachment; filename="{cid}.tar.gz"'},
+        )
+
+    @route("/api/v1/capsules/{cid}/place", methods=["POST"])
+    async def capsule_place(request: Request) -> Response:
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        cid = request.path_params["cid"]
+        row = db().execute(
+            "SELECT manifest FROM api_capsules WHERE id = ?", (cid,)
+        ).fetchone()
+        if not row:
+            return _err(404, f"no capsule '{cid}'")
+        body = await body_of(request)
+        machine = body.get("machine", "")
+        if not db().execute(
+            "SELECT 1 FROM api_machines WHERE name = ? AND archived = 0",
+            (machine,),
+        ).fetchone():
+            return _err(404, f"no machine '{machine}'")
+        manifest = json.loads(row["manifest"])
+        ids = []
+        for seat in manifest["seats"]:
+            pid = f"pl-{secrets.token_hex(8)}"
+            db().execute(
+                "INSERT INTO api_placements (id, seat, machine, substrate,"
+                " desired, created) VALUES (?, ?, ?, 'docker', 'running', ?)",
+                (pid, seat["identity"], machine, _now()),
+            )
+            ids.append(pid)
+        db().commit()
+        return JSONResponse({"placements": ids}, status_code=201)
+
+    # -- placements ---------------------------------------------------------
+
+    @route("/api/v1/placements", methods=["GET", "POST"])
+    async def placements(request: Request) -> Response:
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        if request.method == "GET":
+            machine = request.query_params.get("machine")
+            if machine:
+                rows = db().execute(
+                    "SELECT * FROM api_placements WHERE machine = ?", (machine,)
+                ).fetchall()
+            else:
+                rows = db().execute("SELECT * FROM api_placements").fetchall()
+            return JSONResponse({"placements": [placement_json(r) for r in rows]})
+        body = await body_of(request)
+        substrate = body.get("substrate", "")
+        if substrate not in SUBSTRATES:
+            return _err(422, f"substrate must be one of {SUBSTRATES}")
+        seat = body.get("seat", "")
+        if not db().execute(
+            "SELECT 1 FROM api_seats WHERE identity = ? AND archived = 0", (seat,)
+        ).fetchone():
+            return _err(404, f"no seat '{seat}'")
+        machine = body.get("machine", "")
+        if not db().execute(
+            "SELECT 1 FROM api_machines WHERE name = ? AND archived = 0",
+            (machine,),
+        ).fetchone():
+            return _err(404, f"no machine '{machine}'")
+        pid = f"pl-{secrets.token_hex(8)}"
+        db().execute(
+            "INSERT INTO api_placements (id, seat, machine, substrate, desired,"
+            " created) VALUES (?, ?, ?, ?, ?, ?)",
+            (pid, seat, machine, substrate, body.get("desired", "running"), _now()),
+        )
+        db().commit()
+        row = db().execute(
+            "SELECT * FROM api_placements WHERE id = ?", (pid,)
+        ).fetchone()
+        return JSONResponse(placement_json(row), status_code=201)
+
+    @route("/api/v1/placements/{pid}", methods=["GET", "PATCH", "DELETE"])
+    async def placement_one(request: Request) -> Response:
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        pid = request.path_params["pid"]
+        row = db().execute(
+            "SELECT * FROM api_placements WHERE id = ?", (pid,)
+        ).fetchone()
+        if not row:
+            return _err(404, f"no placement '{pid}'")
+        if request.method == "GET":
+            return JSONResponse(placement_json(row))
+        if request.method == "PATCH":
+            body = await body_of(request)
+            desired = body.get("desired", row["desired"])
+            if desired not in ("running", "stopped"):
+                return _err(422, "desired must be running|stopped")
+            db().execute(
+                "UPDATE api_placements SET desired = ? WHERE id = ?",
+                (desired, pid),
+            )
+            db().commit()
+            row = db().execute(
+                "SELECT * FROM api_placements WHERE id = ?", (pid,)
+            ).fetchone()
+            return JSONResponse(placement_json(row))
+        # DELETE = reclaim request: harvest + verify + destroy, each pending
+        # until an edge executes and reports it. Never marked done here — the
+        # hub asserting completion would be the exact self-assertion the
+        # evidence contract forbids.
+        reclaim = {"harvest": "pending", "verify": "pending", "destroy": "pending"}
+        db().execute(
+            "UPDATE api_placements SET desired = 'reclaimed', reclaim = ?"
+            " WHERE id = ?",
+            (json.dumps(reclaim), pid),
+        )
+        db().commit()
+        return JSONResponse({"id": pid, "reclaim": reclaim}, status_code=202)
+
+    @route("/api/v1/placements/{pid}/observed", methods=["POST"])
+    async def placement_observed(request: Request) -> Response:
+        got = auth(request)
+        if isinstance(got, JSONResponse):
+            return got
+        principal, mname = got
+        pid = request.path_params["pid"]
+        row = db().execute(
+            "SELECT * FROM api_placements WHERE id = ?", (pid,)
+        ).fetchone()
+        if not row:
+            return _err(404, f"no placement '{pid}'")
+        if principal == "machine" and mname != row["machine"]:
+            return _err(403, "machine token may only report its own placements")
+        body = await body_of(request)
+        db().execute(
+            "UPDATE api_placements SET observed_state = ?, observed_at = ?,"
+            " observed_enum = ? WHERE id = ?",
+            (
+                body.get("state", ""),
+                _now(),
+                json.dumps(body.get("enumeration", {})),
+                pid,
+            ),
+        )
+        db().commit()
+        row = db().execute(
+            "SELECT * FROM api_placements WHERE id = ?", (pid,)
+        ).fetchone()
+        return JSONResponse(placement_json(row))

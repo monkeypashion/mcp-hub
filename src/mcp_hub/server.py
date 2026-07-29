@@ -3454,6 +3454,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 
     mcp._tool_manager.call_tool = _timed_call_tool
 
+    # The /api/v1 management surface (docs/hub-api-v1.md) — REST alongside
+    # MCP, same store. Mounted last so it can lean on everything above.
+    from mcp_hub.api_v1 import init_api_tables, mount_api
+
+    init_api_tables(_get_db(db_path))
+    mount_api(mcp, db_path, registry)
+
     return mcp
 
 
