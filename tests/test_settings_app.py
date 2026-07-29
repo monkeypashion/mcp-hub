@@ -181,3 +181,58 @@ async def test_every_editable_row_shows_its_current_value_as_selected():
         await pilot.pause()
         values = sorted(str(s.value) for s in app.query("Select"))
         assert values == ["hearing", "off"], values
+
+
+WS_ROWS = {
+    "hub_reachable": True,
+    "note": "",
+    "rows": [
+        {"name": "runtime", "machine": "dev-vm-1", "path": "/p/runtime.code-workspace",
+         "folders": 4, "error": "", "on_disk": True, "open_now": True,
+         "registered": True, "squad": "runtime"},
+        {"name": "feral", "machine": "dev-vm-1", "path": "/p/feral.code-workspace",
+         "folders": 1, "error": "", "on_disk": True, "open_now": False,
+         "registered": False, "squad": ""},
+        {"name": "ghost", "machine": "dev-vm-1", "path": "",
+         "folders": 0, "error": "", "on_disk": False, "open_now": False,
+         "registered": True, "squad": ""},
+    ],
+}
+
+
+@pytest.mark.asyncio
+async def test_workspaces_view_toggles_and_shows_drift():
+    """'w' swaps the detail pane to the manager view: every workspace with its
+    three truth columns, drift loud (feral = not registered, ghost = no file),
+    and 'w' again returns to the agent detail."""
+    app = _app()
+    app._workspaces_for = lambda: WS_ROWS
+    async with app.run_test(size=(110, 30)) as pilot:
+        await pilot.pause()
+        await pilot.press("w")
+        await pilot.pause()
+        text = "\n".join(
+            str(w.render()) for w in app.query("Static")
+        )
+        assert "WORKSPACES" in text
+        assert "runtime" in text and "● open" in text
+        assert "NOT REGISTERED" in text          # feral, loud
+        assert "NO FILE" in text                 # ghost, loud
+        await pilot.press("w")
+        await pilot.pause()
+        text = "\n".join(str(w.render()) for w in app.query("Static"))
+        assert "NOT REGISTERED" not in text      # back on agent detail
+
+
+@pytest.mark.asyncio
+async def test_workspaces_view_survives_collector_failure():
+    app = _app()
+    def boom():
+        raise RuntimeError("registry exploded")
+    app._workspaces_for = boom
+    async with app.run_test(size=(110, 30)) as pilot:
+        await pilot.pause()
+        await pilot.press("w")
+        await pilot.pause()
+        text = "\n".join(str(w.render()) for w in app.query("Static"))
+        assert "registry exploded" in text       # named, not crashed

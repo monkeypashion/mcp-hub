@@ -2151,6 +2151,33 @@ def settings_command(args: argparse.Namespace) -> int:
         # Ask the terminal BEFORE the app owns the tty — OSC 11 needs a quiet
         # line, and Textual's raw-mode setup would eat the reply.
         dark = terminal_prefers_dark()
+        def _workspaces():
+            from mcp_hub.workspace_data import collect_workspaces
+
+            class _Api:
+                def get_registry(self):
+                    import httpx
+
+                    token = os.environ.get("MCP_HUB_API_TOKEN", "")
+                    tok_file = pathlib.Path.home() / ".mcp-hub" / "api.token"
+                    if not token and tok_file.exists():
+                        token = tok_file.read_text().strip()
+                    base = DEFAULT_HUB_URL.rsplit("/mcp", 1)[0]
+                    r = httpx.get(
+                        f"{base}/api/v1/workspace-registry",
+                        headers={"Authorization": f"Bearer {token}"},
+                        timeout=5,
+                    )
+                    r.raise_for_status()
+                    return r.json()
+
+            host = _sanitize_ident(platform.node() or "unknown-host")
+            return collect_workspaces(
+                _Api(),
+                scan_dirs=[pathlib.Path.home() / "Projects", pathlib.Path.home()],
+                this_machine=host,
+            )
+
         SettingsApp(
             agents,
             scoped_to=getattr(args, "workspace", None),
@@ -2159,6 +2186,7 @@ def settings_command(args: argparse.Namespace) -> int:
             hub_bin=MCP_HUB_BIN,
             board_for=lambda: collect(SQUAD_BIN),
             dark=dark,
+            workspaces_for=_workspaces,
         ).run()
         return 0
     cwd = args.cwd or os.getcwd()
