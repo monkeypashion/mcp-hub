@@ -116,6 +116,15 @@ RECLAIM  = HARVEST + VERIFY + DESTROY
          third outcome "could not reclaim" is terminal and loud
 ```
 
+## Inbound context (added 2026-07-29, from spike-runtime's specimen)
+
+A placed unit's inbound context is **DM + own-squad broadcast + explicitly
+subscribed channels — nothing else**. Channel wakes are subscriber-scoped
+(shipped `017b95d`): a fresh seat starts with zero subscriptions, so bounded
+context is the *default* for every placement, not something each one claws
+back. This is the enforceable inbound half of the context budget (the
+outbound half being money/progress bounds, constraint ④).
+
 ## Identity
 
 - **Assigned over derived.** Derivation (git remote + hostname) collides or
