@@ -69,7 +69,9 @@ def plan(
         elif desired == "running":
             if not local["materialized"]:
                 actions.append({**base, "op": "materialize"})
-                actions.append({**base, "op": "start"})
+                # A just-materialized seat has no history: --continue would
+                # exit ("No conversation found to continue", live 2026-07-29).
+                actions.append({**base, "op": "start", "fresh": True})
             elif not local["running"]:
                 actions.append({**base, "op": "start"})
         elif desired == "stopped":
@@ -117,6 +119,44 @@ def observed_report(
         )
     state = "running" if enumeration.get("alive") else "stopped"
     return {"state": state, "enumeration": enumeration}
+
+
+def seed_first_launch(folder: str, claude_json: Path | None = None) -> bool:
+    """Pre-authorize a materialized seat's first launch — transport's rule,
+    inherited: the placement IS the operator's explicit trust act, so seed
+    folder trust + the hub MCP approval instead of parking the first launch
+    on dialogs nobody is watching (all three seams observed live 2026-07-29).
+
+    Missing file: ours to create. Unparseable file: NEVER clobber — fail
+    open, return False, the operator answers one dialog instead of losing
+    their settings.
+    """
+    import os
+    import tempfile
+
+    p = claude_json or (Path.home() / ".claude.json")
+    if not p.exists():
+        data: dict[str, Any] = {}
+    else:
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            assert isinstance(data, dict)
+        except Exception:  # noqa: BLE001 — any unreadable shape: hands off
+            return False
+    entry = data.setdefault("projects", {}).setdefault(folder, {})
+    entry["hasTrustDialogAccepted"] = True
+    enabled = entry.get("enabledMcpjsonServers")
+    enabled = enabled if isinstance(enabled, list) else []
+    if "hub" not in enabled:
+        enabled.append("hub")
+    entry["enabledMcpjsonServers"] = enabled
+    entry.setdefault("allowedTools", [])
+    entry.setdefault("disabledMcpjsonServers", [])
+    fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".claude.json.")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    os.replace(tmp, p)  # live file: replace atomically
+    return True
 
 
 class HubAPI:
@@ -191,7 +231,10 @@ class SquadExecutor:
         if op == "materialize":
             cmd = ["squad", "add", seat_spec.get("repo", "")]
         elif op == "start":
-            cmd = ["squad", "start", seat]
+            if action.get("fresh"):
+                cmd = ["squad", "restart", seat, "--fresh"]
+            else:
+                cmd = ["squad", "start", seat]
         elif op == "stop":
             cmd = ["squad", "stop", seat]
         elif op == "harvest":
@@ -212,6 +255,7 @@ def edge_apply(
     machine: str,
     runner: Any,
     scan_dirs: list[Path],
+    seeder: Any = None,
 ) -> dict[str, Any]:
     """One reconcile pass: pull → enumerate → plan → execute → report.
 
@@ -239,6 +283,16 @@ def edge_apply(
         }
 
     actions = plan(placements, enumerate_now())
+    # Injectable seeder: production seeds the real ~/.claude.json; tests
+    # inject a recorder. A side-effecting default reachable from tests wrote
+    # a bogus entry into a REAL claude.json once (2026-07-29) — hence
+    # injection, not discipline, as the guard.
+    seed = seed_first_launch if seeder is None else seeder
+    if any(a["op"] == "materialize" for a in actions):
+        for p in placements:
+            spec = p.get("seat_spec") or {}
+            if p["substrate"] == "worktree" and spec.get("folder"):
+                seed(spec["folder"])
     executor = SquadExecutor(runner)
     specs = {p["seat"]: (p.get("seat_spec") or {}) for p in placements}
     results = [executor.execute(a, specs.get(a["seat"], {})) for a in actions]

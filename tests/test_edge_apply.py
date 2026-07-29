@@ -29,6 +29,7 @@ from mcp_hub.edge import (
     edge_apply,
     observed_report,
     plan,
+    seed_first_launch,
 )
 
 
@@ -59,6 +60,18 @@ class TestPlan:
         assert [a["op"] for a in actions] == ["materialize", "start"]
         assert actions[0]["placement"] == "pl-1"
         assert actions[0]["seat"] == "widget-box-1"
+        # A just-materialized seat has NO conversation history: its first
+        # start must be fresh — `--continue` on a virgin seat exits with
+        # "No conversation found to continue" (live demo, 2026-07-29).
+        assert actions[1]["fresh"] is True
+
+    def test_start_of_existing_seat_is_not_fresh(self):
+        actions = plan(
+            placements=[_placement()],
+            local_seats={"widget-box-1": {"materialized": True, "running": False}},
+        )
+        assert actions[0]["op"] == "start"
+        assert not actions[0].get("fresh")
 
     def test_existing_running_seat_yields_no_actions(self):
         actions = plan(
@@ -177,6 +190,8 @@ class _RecordingRunner:
         self.commands.append(cmd)
         if cmd[:2] == ["squad", "start"]:
             self.sessions.add(cmd[2])
+        elif cmd[:2] == ["squad", "restart"]:
+            self.sessions.add(cmd[2])
         elif cmd[:2] == ["squad", "stop"]:
             self.sessions.discard(cmd[2])
         elif cmd[:2] == ["squad", "rm"]:
@@ -228,6 +243,48 @@ class TestExecutor:
         assert r.commands == []
         assert out["skipped"]
 
+    def test_fresh_start_uses_restart_fresh(self):
+        r = _RecordingRunner()
+        SquadExecutor(r).execute(
+            {"op": "start", "seat": "widget-box-1", "fresh": True}, self._spec()
+        )
+        assert ["squad", "restart", "widget-box-1", "--fresh"] in r.commands
+
+
+class TestSeedFirstLaunch:
+    def test_seeds_trust_and_hub_on_fresh_file(self, tmp_path: Path):
+        cj = tmp_path / ".claude.json"
+        ok = seed_first_launch("/home/x/repo", claude_json=cj)
+        assert ok
+        data = json.loads(cj.read_text())
+        entry = data["projects"]["/home/x/repo"]
+        assert entry["hasTrustDialogAccepted"] is True
+        assert entry["enabledMcpjsonServers"] == ["hub"]
+
+    def test_preserves_existing_entries(self, tmp_path: Path):
+        cj = tmp_path / ".claude.json"
+        cj.write_text(json.dumps({"projects": {"/other": {"keep": 1}}, "top": True}))
+        seed_first_launch("/home/x/repo", claude_json=cj)
+        data = json.loads(cj.read_text())
+        assert data["projects"]["/other"] == {"keep": 1}
+        assert data["top"] is True
+
+    def test_unparseable_file_fails_open_untouched(self, tmp_path: Path):
+        # Transport's rule, inherited: never clobber a real file we can't
+        # parse — the operator answers one dialog instead of losing settings.
+        cj = tmp_path / ".claude.json"
+        cj.write_text("{ definitely not json")
+        ok = seed_first_launch("/home/x/repo", claude_json=cj)
+        assert not ok
+        assert cj.read_text() == "{ definitely not json"
+
+    def test_idempotent(self, tmp_path: Path):
+        cj = tmp_path / ".claude.json"
+        seed_first_launch("/home/x/repo", claude_json=cj)
+        seed_first_launch("/home/x/repo", claude_json=cj)
+        entry = json.loads(cj.read_text())["projects"]["/home/x/repo"]
+        assert entry["enabledMcpjsonServers"] == ["hub"]  # no duplicate
+
 
 class TestEdgeApplyEndToEnd:
     """The full loop against the REAL API (in-process), fake shell only."""
@@ -264,17 +321,21 @@ class TestEdgeApplyEndToEnd:
         (tmp_path / "demo.code-workspace").write_text(json.dumps({"folders": []}))
         runner = _RecordingRunner()
         runner.pending_enroll = {"widget-box-1"}
+        seeded: list[str] = []
         api = HubAPI(client=hub, token=machine_token)
         summary = edge_apply(
             api,
             machine="box-1",
             runner=runner,
             scan_dirs=[tmp_path],
+            seeder=seeded.append,
         )
 
-        # It acted: materialize + start went through the squad verbs.
+        # It acted: materialize + FRESH start went through the squad verbs,
+        # and the seat folder was pre-authorized before launch.
         assert ["squad", "add", "acme/widget"] in runner.commands
-        assert ["squad", "start", "widget-box-1"] in runner.commands
+        assert ["squad", "restart", "widget-box-1", "--fresh"] in runner.commands
+        assert seeded == ["/home/x/w"]
         # It reported truthfully: the hub now shows the placement converged,
         # from enumeration the runner itself produced.
         got = hub.get(f"/api/v1/placements/{pid}", headers=op).json()
@@ -304,13 +365,14 @@ class TestEdgeApplyEndToEnd:
         )
         runner = _RecordingRunner()
         runner.pending_enroll = {"widget-box-2"}
+        seeded: list[str] = []
         api = HubAPI(client=hub, token=machine_token)
-        edge_apply(api, machine="box-2", runner=runner, scan_dirs=[])
+        edge_apply(api, machine="box-2", runner=runner, scan_dirs=[], seeder=seeded.append)
         n_first = len(runner.commands)
-        edge_apply(api, machine="box-2", runner=runner, scan_dirs=[])
+        edge_apply(api, machine="box-2", runner=runner, scan_dirs=[], seeder=seeded.append)
         # Second pass: state already converged; only enumeration (`squad ls`)
         # runs — no second materialize/start, nothing mutating.
-        assert runner.commands.count(["squad", "start", "widget-box-2"]) == 1
+        assert runner.commands.count(["squad", "restart", "widget-box-2", "--fresh"]) == 1
         mutating = [
             c
             for c in runner.commands[n_first:]
