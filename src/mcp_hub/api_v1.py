@@ -447,6 +447,10 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
         ).fetchall()
 
         def basename(path: str) -> str:
+            # NOTE (dev review, cosmetics): machine-less definitions match
+            # any machine's discovered basename, so same-named workspaces on
+            # two machines cross-satisfy registered/on_disk. Acceptable for
+            # the drift view; revisit if definitions ever bind actions.
             return path.rsplit("/", 1)[-1].removesuffix(".code-workspace")
 
         disc_names = {(d["machine"], basename(d["path"])) for d in disc}
@@ -672,6 +676,15 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
                 "UPDATE squad_members SET squad = ? WHERE squad = ?",
                 (new_name, name),
             )
+            # Queued squad-scoped broadcasts move too, or a member with
+            # unread items at rename time loses them silently — the drain
+            # matches audience against the NEW name (dev's review find,
+            # silent-loss family). History stays attributable under the
+            # surviving name, consistent with history-is-immortal.
+            db().execute(
+                "UPDATE messages SET audience = ? WHERE audience = ?",
+                (new_name, name),
+            )
             db().commit()
             row = db().execute(
                 "SELECT * FROM api_squads WHERE name = ?", (new_name,)
@@ -739,7 +752,8 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             db().execute(
                 "INSERT INTO squad_members (agent, squad, muted, joined, source)"
                 " VALUES (?, ?, ?, ?, 'api')"
-                " ON CONFLICT(agent, squad) DO NOTHING",
+                " ON CONFLICT(agent, squad)"
+                " DO UPDATE SET muted = excluded.muted",
                 (seat, name, int(bool(body.get("muted", False))), _now()),
             )
             db().commit()
@@ -957,6 +971,8 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             for path, data in {**artifacts, "manifest.json": manifest_bytes}.items():
                 info = tarfile.TarInfo(name=path)
                 info.size = len(data)
+                if path.endswith(".sh"):
+                    info.mode = 0o755  # a bootstrap that can't run isn't one
                 tf.addfile(info, io.BytesIO(data))
         return manifest, buf.getvalue()
 

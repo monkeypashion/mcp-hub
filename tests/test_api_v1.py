@@ -370,6 +370,61 @@ class TestSquads:
         ]
         assert [m["seat"] for m in members] == ["agent-r"]
 
+    def test_rename_cascades_queued_broadcast_audience(self, tmp_path, monkeypatch):
+        """Dev's review find, silent-loss family: a member with UNREAD
+        squad-scoped broadcasts at rename time must not lose them — the
+        drain matches audience against the NEW name, so the stamped rows
+        must move in the same transaction as the membership."""
+        import anyio
+        from starlette.testclient import TestClient
+
+        from mcp_hub.server import create_server
+
+        monkeypatch.setenv("MCP_HUB_API_TOKEN", OPERATOR_TOKEN)
+        server = create_server(db_path=tmp_path / "rename.db")
+
+        async def tool(name, args):
+            res = await server._tool_manager.call_tool(name, args)
+            for block in getattr(res, "content", res if isinstance(res, list) else []):
+                if hasattr(block, "text"):
+                    return block.text
+            return str(res)
+
+        with TestClient(server.streamable_http_app()) as client:
+            anyio.run(tool, "register", {"name": "speaker"})
+            anyio.run(tool, "register", {"name": "hearer"})
+            client.post("/api/v1/squads", json={"name": "oldsq"}, headers=H)
+            for a in ("speaker", "hearer"):
+                client.put(f"/api/v1/squads/oldsq/members/{a}", json={}, headers=H)
+            anyio.run(
+                tool,
+                "broadcast",
+                {"from_agent": "speaker", "message": "scoped payload",
+                 "scope": "oldsq", "priority": "low"},
+            )
+            r = client.patch(
+                "/api/v1/squads/oldsq", json={"name": "newsq"}, headers=H
+            )
+            assert r.status_code == 200
+            drained = anyio.run(
+                tool, "get_broadcasts_for_agent", {"agent_name": "hearer"}
+            )
+            assert "scoped payload" in drained, (
+                "queued broadcast lost across rename — the orphaned-audience leak"
+            )
+
+    def test_member_put_updates_mute_true_put_semantics(self, client):
+        # Dev's minor 1: PUT with muted:true on an EXISTING membership must
+        # take effect — a 200 that changed nothing is a silent no-op wearing
+        # a success code.
+        client.post("/api/v1/squads", json={"name": "putsq"}, headers=H)
+        client.put("/api/v1/squads/putsq/members/agent-m", json={}, headers=H)
+        client.put(
+            "/api/v1/squads/putsq/members/agent-m", json={"muted": True}, headers=H
+        )
+        members = client.get("/api/v1/squads/putsq/members", headers=H).json()["members"]
+        assert members[0]["muted"] is True
+
     def test_delete_archives_and_reserves_name(self, client):
         client.post("/api/v1/squads", json={"name": "doomed"}, headers=H)
         r = client.delete("/api/v1/squads/doomed", headers=H)
