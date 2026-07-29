@@ -147,6 +147,21 @@ Verb set (v0): `place(unit, substrate)` · `status()` (enumerated, not
 recorded) · `harvest(unit)` · `reclaim(unit)` · `abandon(unit)` (the loud
 third state).
 
+**Packaging (operator-decided 2026-07-29): by substrate.**
+- *Edge v1 — worktree substrate (the existing fleet):* a host CLI verb
+  (`mcp-hub edge apply`) on the heal-timer cadence. The things it manages are
+  host processes (tmux, claude, VSCode workspaces); a container cannot reach
+  them without privilege hacks worse than the install they avoid — and the
+  existing fleet already has the venv everywhere.
+- *Edge v2 — docker substrate (scale-out):* the edge **is a container**
+  (docker.sock mounted, machine token as env), realizing capsules as sibling
+  containers. A fresh server's only prerequisite is Docker: one `docker run`
+  joins it to the fleet — the portability model. The edge image and the
+  capsule seat image share a base layer, collapsing installation from N
+  machines to one Dockerfile.
+- The realizer brain (`edge.py`) is substrate-agnostic by construction (pure
+  planning/reporting, execution injected); v1 and v2 differ only in executor.
+
 ## Memory across clones
 
 Exists, shipped: export/import/verify ceremony (hash-compared convergence

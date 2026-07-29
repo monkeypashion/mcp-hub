@@ -176,6 +176,25 @@ class TestMachines:
         assert r.status_code == 200
         assert r.json()["placements"] == []
 
+    def test_edge_pull_embeds_seat_specs(self, client):
+        # The pull is "full desired state for this box": a machine token
+        # cannot read /seats/*, so materialization data must ride along.
+        token = _machine(client, "box-e2")["token"]
+        seat = _seat(client, machine="box-e2")
+        client.post(
+            "/api/v1/placements",
+            json={"seat": seat["identity"], "machine": "box-e2", "substrate": "worktree"},
+            headers=H,
+        )
+        r = client.get(
+            "/api/v1/machines/box-e2/placements",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        spec = r.json()["placements"][0]["seat_spec"]
+        assert spec["repo"] == "acme/widget"
+        assert spec["folder"]
+        assert "launch_args" in spec
+
     def test_edge_pull_foreign_machine_403(self, client):
         _machine(client, "box-f")
         other = _machine(client, "box-g")["token"]

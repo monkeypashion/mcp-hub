@@ -3483,6 +3483,7 @@ _CLI_SUBCOMMANDS = {
     "board",
     "mute",
     "rebind-url",
+    "edge",
 }
 
 

@@ -347,7 +347,18 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
         rows = db().execute(
             "SELECT * FROM api_placements WHERE machine = ?", (name,)
         ).fetchall()
-        return JSONResponse({"placements": [placement_json(r) for r in rows]})
+        out = []
+        for r in rows:
+            p = placement_json(r)
+            # Full desired state: the machine token can't read /seats/*, so
+            # everything materialization needs rides in the pull itself.
+            seat_row = db().execute(
+                "SELECT * FROM api_seats WHERE identity = ?", (r["seat"],)
+            ).fetchone()
+            if seat_row:
+                p["seat_spec"] = seat_json(seat_row)
+            out.append(p)
+        return JSONResponse({"placements": out})
 
     @route("/api/v1/machines/{name}/status", methods=["POST"])
     async def machine_status(request: Request) -> Response:
