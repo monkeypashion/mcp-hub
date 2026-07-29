@@ -102,6 +102,15 @@ def init_api_tables(conn: sqlite3.Connection) -> None:
             tarball  BLOB NOT NULL,
             created  REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS api_discovered_workspaces (
+            machine        TEXT NOT NULL,
+            path           TEXT NOT NULL,
+            folders        INTEGER,
+            error          TEXT NOT NULL DEFAULT '',
+            reported_at    REAL NOT NULL,
+            last_open_ping REAL NOT NULL DEFAULT 0,
+            PRIMARY KEY (machine, path)
+        );
         CREATE TABLE IF NOT EXISTS api_placements (
             id             TEXT PRIMARY KEY,
             seat           TEXT NOT NULL,
@@ -373,12 +382,100 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             "SELECT 1 FROM api_machines WHERE name = ? AND archived = 0", (name,)
         ).fetchone():
             return _err(404, f"no machine '{name}'")
-        await body_of(request)  # observed payload accepted; stored fields TBD
+        body = await body_of(request)
+        now = _now()
+        # Discovered workspaces: SNAPSHOT semantics — the report replaces the
+        # machine's set (an accreting registry lies by staleness), but board
+        # presence pings survive for paths that still exist.
+        if "workspaces" in body:
+            pings = {
+                r["path"]: r["last_open_ping"]
+                for r in db().execute(
+                    "SELECT path, last_open_ping FROM api_discovered_workspaces"
+                    " WHERE machine = ?",
+                    (name,),
+                ).fetchall()
+            }
+            db().execute(
+                "DELETE FROM api_discovered_workspaces WHERE machine = ?", (name,)
+            )
+            for ws in body["workspaces"]:
+                db().execute(
+                    "INSERT INTO api_discovered_workspaces"
+                    " (machine, path, folders, error, reported_at, last_open_ping)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        name,
+                        ws["path"],
+                        ws.get("folders"),
+                        ws.get("error", ""),
+                        now,
+                        pings.get(ws["path"], 0),
+                    ),
+                )
+        # Board presence: "this workspace is open, operator eyes on" — a fact
+        # only the board can know. Upserts, because the board may report a
+        # workspace no edge has discovered yet (presence itself discovers).
+        if body.get("workspace_open"):
+            db().execute(
+                "INSERT INTO api_discovered_workspaces"
+                " (machine, path, reported_at, last_open_ping)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(machine, path)"
+                " DO UPDATE SET last_open_ping = excluded.last_open_ping",
+                (name, body["workspace_open"], now, now),
+            )
         db().execute(
-            "UPDATE api_machines SET last_seen = ? WHERE name = ?", (_now(), name)
+            "UPDATE api_machines SET last_seen = ? WHERE name = ?", (now, name)
         )
         db().commit()
         return JSONResponse({"ok": True})
+
+    OPEN_NOW_WINDOW = 180.0  # seconds; board polls far faster than this
+
+    @route("/api/v1/workspace-registry", methods=["GET"])
+    async def workspace_registry(request: Request) -> Response:
+        """The manager's one view: registered, on-disk, open-now — drift
+        visible in every direction, nothing lost track of."""
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        now = _now()
+        defs = db().execute("SELECT * FROM api_workspaces").fetchall()
+        disc = db().execute(
+            "SELECT * FROM api_discovered_workspaces ORDER BY machine, path"
+        ).fetchall()
+
+        def basename(path: str) -> str:
+            return path.rsplit("/", 1)[-1].removesuffix(".code-workspace")
+
+        disc_names = {(d["machine"], basename(d["path"])) for d in disc}
+        def_names = set()
+        definitions = []
+        for w in defs:
+            key_machine = w["machine"]
+            on_disk = (key_machine, w["name"]) in disc_names or (
+                not key_machine
+                and any(n == w["name"] for _, n in disc_names)
+            )
+            def_names.add((key_machine, w["name"]))
+            definitions.append({**workspace_json(w), "on_disk": on_disk})
+        discovered = [
+            {
+                "machine": d["machine"],
+                "path": d["path"],
+                "folders": d["folders"],
+                "error": d["error"],
+                "reported_at": d["reported_at"],
+                "open_now": (now - d["last_open_ping"]) < OPEN_NOW_WINDOW,
+                "registered": (d["machine"], basename(d["path"])) in def_names
+                or ("", basename(d["path"])) in def_names,
+            }
+            for d in disc
+        ]
+        return JSONResponse(
+            {"definitions": definitions, "discovered": discovered}
+        )
 
     # -- seats --------------------------------------------------------------
 

@@ -520,6 +520,107 @@ class TestCapsules:
 
 
 # ---------------------------------------------------------------------------
+# Workspace registry — never lose track of a workspace
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspaceRegistry:
+    def _report(self, client, token, workspaces, extra=None):
+        body = {"seats": [], "workspaces": workspaces}
+        body.update(extra or {})
+        r = client.post(
+            "/api/v1/machines/box-1/status",
+            json=body,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 200, r.text
+
+    def test_discovered_workspaces_persist(self, client):
+        token = _machine(client)["token"]
+        self._report(
+            client, token, [{"path": "/home/x/Projects/alpha.code-workspace", "folders": 3}]
+        )
+        reg = client.get("/api/v1/workspace-registry", headers=H).json()
+        found = [d for d in reg["discovered"] if d["path"].endswith("alpha.code-workspace")]
+        assert len(found) == 1
+        assert found[0]["machine"] == "box-1"
+        assert found[0]["folders"] == 3
+
+    def test_report_is_a_snapshot_not_an_append(self, client):
+        # A deleted workspace file must disappear from the registry at the
+        # next report — a registry that only accretes lies by staleness.
+        token = _machine(client)["token"]
+        self._report(client, token, [{"path": "/p/one.code-workspace", "folders": 1}])
+        self._report(client, token, [{"path": "/p/two.code-workspace", "folders": 1}])
+        paths = [d["path"] for d in client.get(
+            "/api/v1/workspace-registry", headers=H
+        ).json()["discovered"]]
+        assert "/p/two.code-workspace" in paths
+        assert "/p/one.code-workspace" not in paths
+
+    def test_broken_workspace_file_is_kept_with_error(self, client):
+        token = _machine(client)["token"]
+        self._report(
+            client, token, [{"path": "/p/broken.code-workspace", "error": "bad JSONC"}]
+        )
+        d = client.get("/api/v1/workspace-registry", headers=H).json()["discovered"]
+        assert d[0]["error"] == "bad JSONC"
+
+    def test_board_presence_marks_open_now(self, client):
+        token = _machine(client)["token"]
+        self._report(
+            client,
+            token,
+            [{"path": "/p/live.code-workspace", "folders": 2}],
+            extra={"workspace_open": "/p/live.code-workspace"},
+        )
+        d = client.get("/api/v1/workspace-registry", headers=H).json()["discovered"]
+        assert d[0]["open_now"] is True
+
+    def test_presence_survives_next_report_without_ping(self, client):
+        # The edge's periodic report must not clobber the board's open
+        # signal for paths that still exist.
+        token = _machine(client)["token"]
+        self._report(
+            client,
+            token,
+            [{"path": "/p/live.code-workspace", "folders": 2}],
+            extra={"workspace_open": "/p/live.code-workspace"},
+        )
+        self._report(client, token, [{"path": "/p/live.code-workspace", "folders": 2}])
+        d = client.get("/api/v1/workspace-registry", headers=H).json()["discovered"]
+        assert d[0]["open_now"] is True
+
+    def test_drift_annotations_both_directions(self, client):
+        token = _machine(client)["token"]
+        # Registered AND on disk:
+        client.post(
+            "/api/v1/workspaces",
+            json={"name": "alpha", "machine": "box-1", "listings": []},
+            headers=H,
+        )
+        # Registered but NOT on disk:
+        client.post(
+            "/api/v1/workspaces",
+            json={"name": "ghost", "machine": "box-1", "listings": []},
+            headers=H,
+        )
+        self._report(
+            client, token, [{"path": "/p/alpha.code-workspace", "folders": 1},
+                            {"path": "/p/feral.code-workspace", "folders": 1}]
+        )
+        reg = client.get("/api/v1/workspace-registry", headers=H).json()
+        defs = {w["name"]: w for w in reg["definitions"]}
+        assert defs["alpha"]["on_disk"] is True
+        assert defs["ghost"]["on_disk"] is False
+        disc = {d["path"].rsplit("/", 1)[-1]: d for d in reg["discovered"]}
+        assert disc["alpha.code-workspace"]["registered"] is True
+        # Feral: exists on disk, hub never told — the losing-track case,
+        # now visible instead of silent.
+        assert disc["feral.code-workspace"]["registered"] is False
+
+
+# ---------------------------------------------------------------------------
 # Placements — the edge boundary
 # ---------------------------------------------------------------------------
 
