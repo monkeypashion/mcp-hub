@@ -2081,12 +2081,18 @@ def settings_command(args: argparse.Namespace) -> int:
             print("the settings panel needs textual:  pip install textual",
                   file=sys.stderr)
             return 1
+        from .board_data import collect, terminal_prefers_dark
+        # Ask the terminal BEFORE the app owns the tty — OSC 11 needs a quiet
+        # line, and Textual's raw-mode setup would eat the reply.
+        dark = terminal_prefers_dark()
         SettingsApp(
             agents,
             scoped_to=getattr(args, "workspace", None),
             model_for=_settings_model,
             squad_bin=SQUAD_BIN,
             hub_bin=MCP_HUB_BIN,
+            board_for=lambda: collect(SQUAD_BIN),
+            dark=dark,
         ).run()
         return 0
     cwd = args.cwd or os.getcwd()
@@ -3438,6 +3444,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    board = sub.add_parser(
+        "board",
+        help="SQUAD BOARD — the live fleet and each agent's settings, one screen",
+        description=(
+            "The operator's view: who needs you, who is working, who is idle, "
+            "each agent's blocking question with answer buttons, git and token "
+            "usage — with the settings sheet underneath. This is `settings "
+            "--tui` under the name the screen actually wears; both spellings "
+            "stay because the cockpit predates the rename."
+        ),
+    )
+    board.add_argument(
+        "--workspace", default=None,
+        help="A .code-workspace file to scope the roster to (see `settings --workspace`)",
+    )
+
     mute = sub.add_parser(
         "mute",
         help="Silence (or unsilence) one squad's broadcasts for one agent",
@@ -3539,6 +3561,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.subcommand == "identity":
         return identity_command(args)
     if args.subcommand == "settings":
+        return settings_command(args)
+    if args.subcommand == "board":
+        # `board` IS the panel: settings --tui wearing the screen's real name.
+        args.tui = True
+        args.cwd = None
+        args.json = False
         return settings_command(args)
     if args.subcommand == "mute":
         return mute_command(args)

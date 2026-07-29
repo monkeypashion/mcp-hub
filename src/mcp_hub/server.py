@@ -3473,6 +3473,7 @@ _CLI_SUBCOMMANDS = {
     "transport-history",
     "identity",
     "settings",
+    "board",
     "mute",
     "rebind-url",
 }

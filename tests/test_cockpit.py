@@ -511,21 +511,20 @@ def _cockpit(box, tmp_path):
     return ws, work
 
 
-def test_the_cockpit_opens_a_board_and_a_settings_tab(box, tmp_path):
-    """Both are the operator's own views rather than agents, and both are made
-    the same way — a terminal in the panel. That is the whole reason the
-    settings panel is shaped like this: it asks nothing of VSCode's UI, so it
-    can sit beside the agents instead of hiding them.
-
-    This path had never executed in a test at all — the harness reported no
-    workspace folders, so the gate above it always returned early.
+def test_the_cockpit_opens_one_board_tab_not_two_views(box, tmp_path):
+    """ONE operator view since 2026-07-29: the settings panel absorbed the
+    text board (operator: "consolidate the two items into one"), so the
+    cockpit opens `mcp-hub board` and must NOT also start the old
+    `squad board -w` loop or a separate settings tab — two tabs would be the
+    same data, one of them rendered worse.
     """
     ws, work = _cockpit(box, tmp_path)
     out = _drive(box, "run", "squad.stop", terminal="demo · idle",
                  wsfile=str(ws), wsfolders=[work])
     launched = " ".join(out["sent"])
-    assert "board -w" in launched, out["sent"]
-    assert "settings --tui" in launched, out["sent"]
+    assert " board" in launched, out["sent"]
+    assert "board -w" not in launched, out["sent"]
+    assert "settings --tui" not in launched, out["sent"]
 
 
 def test_a_roster_change_does_not_yank_the_panel_to_the_board(box, tmp_path):
@@ -542,14 +541,14 @@ def test_a_roster_change_does_not_yank_the_panel_to_the_board(box, tmp_path):
         f"revealed the board {len(boards)} times — a rebuild stole the view"
 
 
-def test_the_settings_tab_is_scoped_to_the_open_workspace(box, tmp_path):
+def test_the_board_tab_is_scoped_to_the_open_workspace(box, tmp_path):
     """Same folder-membership rule the tabs themselves use, so the panel lists
     exactly the agents whose tabs are beside it — rather than every agent on
     the machine, which is a different and much longer list."""
     ws, work = _cockpit(box, tmp_path)
     out = _drive(box, "run", "squad.stop", terminal="demo · idle",
                  wsfile=str(ws), wsfolders=[work])
-    line = next(s for s in out["sent"] if "settings --tui" in s)
+    line = next(s for s in out["sent"] if " board" in s)
     assert f"--workspace {json.dumps(str(ws))}" in line, line
 
 
