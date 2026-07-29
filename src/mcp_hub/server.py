@@ -510,6 +510,33 @@ def init_db(db_path: Path = DB_PATH) -> None:
     )
     conn.commit()
 
+    # Per-channel subscriptions (2026-07-29, operator-approved): channel
+    # wakes become opt-in — post() fans out to SUBSCRIBERS, not the fleet
+    # (a #deletions post woke a runtime-only clone; squad walls never
+    # applied to channels). last_seen_id is the per-(agent,channel) cursor
+    # slot. Seed rule on first creation: every existing agent subscribed to
+    # every existing channel — the upgrade itself silences nobody; leaving
+    # is a deliberate act via subscribe_channel.
+    subs_new = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='channel_subscriptions'"
+    ).fetchone() is None
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS channel_subscriptions (
+               agent        TEXT NOT NULL,
+               channel      TEXT NOT NULL,
+               subscribed   INTEGER NOT NULL DEFAULT 1,
+               last_seen_id INTEGER NOT NULL DEFAULT 0,
+               PRIMARY KEY (agent, channel)
+           )"""
+    )
+    if subs_new:
+        conn.execute(
+            "INSERT OR IGNORE INTO channel_subscriptions (agent, channel) "
+            "SELECT a.name, c.name FROM agents a CROSS JOIN channels c"
+        )
+    conn.commit()
+
     # Legacy: `agents.team` was the single-squad column shipped earlier the same
     # day (ba515ea) and superseded within hours by multi-membership. It is left
     # in place rather than dropped — SQLite column drops are fiddly and it is
@@ -2308,10 +2335,10 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         """Create a named channel for topical posts.
 
         Channels are for grouping conversation by topic (e.g. "deploys",
-        "qa", "research"). Posts to a channel still reach every connected
-        agent today (we don't have per-channel subscriptions yet) but they
-        carry the channel as a label so retrospective queries can scope
-        cleanly.
+        "qa", "research"). Wakes go to SUBSCRIBERS only: creating or posting
+        subscribes you, subscribe_channel opts anyone in or out, and reading
+        (get_channel_messages/get_history) stays open to every agent —
+        scoping is delivery, not confidentiality.
 
         Note: the name `"general"` is reserved for the global broadcast feed
         (use `broadcast` for that). Other names can be anything reasonable.
@@ -2334,14 +2361,62 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 "VALUES (?, ?, ?, ?)",
                 (name, created_by, now, description),
             )
+            # Creating a channel is the strongest engagement there is.
+            conn.execute(
+                "INSERT INTO channel_subscriptions (agent, channel, subscribed) "
+                "VALUES (?, ?, 1) ON CONFLICT(agent, channel) "
+                "DO UPDATE SET subscribed = 1",
+                (created_by, name),
+            )
             conn.commit()
-            return f"Channel '{name}' created."
+            return f"Channel '{name}' created (you are subscribed)."
         except sqlite3.IntegrityError:
             return f"Channel '{name}' already exists."
 
     @mcp.tool()
-    def list_channels() -> str:
+    def subscribe_channel(name: str, channel: str, subscribed: bool = True) -> str:
+        """Opt in or out of a channel's WAKES (posts at normal/urgent).
+
+        Subscription controls delivery only: an unsubscribed agent can still
+        read the channel any time via get_channel_messages/get_history —
+        scoping is delivery, not confidentiality. Posting to a channel
+        re-subscribes you (engagement opts in; silence never does).
+
+        Args:
+            name: Your agent name.
+            channel: Channel to change.
+            subscribed: True to receive wakes, False to stop them.
+        """
+        conn = _get_db(db_path)
+        if not conn.execute(
+            "SELECT 1 FROM channels WHERE name = ?", (channel,)
+        ).fetchone():
+            return f"No channel '{channel}'. See list_channels()."
+        conn.execute(
+            "INSERT INTO channel_subscriptions (agent, channel, subscribed) "
+            "VALUES (?, ?, ?) ON CONFLICT(agent, channel) "
+            "DO UPDATE SET subscribed = excluded.subscribed",
+            (name, channel, int(bool(subscribed))),
+        )
+        conn.commit()
+        if subscribed:
+            return (
+                f"'{name}' subscribed to #{channel} — normal/urgent posts "
+                f"will wake you."
+            )
+        return (
+            f"'{name}' unsubscribed from #{channel} — no more wakes; you can "
+            f"still read it any time via get_channel_messages()."
+        )
+
+    @mcp.tool()
+    def list_channels(agent: str = "") -> str:
         """List all named channels.
+
+        Pass your agent name to see YOUR subscription state per channel —
+        wakes are opt-in, so a channel you never engaged with will not wake
+        you, and this is where you find that out (a newborn seat subscribes
+        to nothing; silence is invisible unless shown).
 
         The global broadcast feed is not a channel and is not listed here —
         it's always available via broadcast() / get_broadcasts().
@@ -2353,12 +2428,33 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         ).fetchall()
         if not rows:
             return "No channels. Create one with create_channel()."
+        subs: set[str] = set()
+        if agent:
+            subs = {
+                r["channel"]
+                for r in conn.execute(
+                    "SELECT channel FROM channel_subscriptions "
+                    "WHERE agent = ? AND subscribed = 1",
+                    (agent,),
+                )
+            }
         lines = []
         for r in rows:
             line = f"**#{r['name']}**"
+            if agent:
+                line += (
+                    " ✔ subscribed" if r["name"] in subs
+                    else " ○ not subscribed (no wakes; subscribe_channel to opt in)"
+                )
             if r["description"]:
                 line += f" — {r['description']}"
             lines.append(line)
+        if agent and not subs:
+            lines.append(
+                "\nYou are subscribed to NO channels — you will not be woken "
+                "by any channel post. Reading is always open; wakes need "
+                "subscribe_channel()."
+            )
         return "\n".join(lines)
 
     @mcp.tool()
@@ -2373,8 +2469,10 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 
         The channel must already exist (use `create_channel` first). Same
         priority semantics as `broadcast`: "low" persists to channel
-        history without firing wake; "normal" wakes every connected agent;
-        "urgent" wakes with the priority surfaced in the rendered tag.
+        history without firing wake; "normal" wakes every connected
+        SUBSCRIBER of the channel; "urgent" ditto with the priority surfaced
+        in the rendered tag. Posting subscribes you; reading stays open to
+        everyone (delivery, not confidentiality).
 
         For global messages every agent should see, use `broadcast`. For
         a single recipient, use `send`.
@@ -2423,13 +2521,33 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         )
         conn.commit()
 
+        # Posting is engagement: it (re)subscribes the poster. Silence
+        # never subscribes anyone.
+        conn.execute(
+            "INSERT INTO channel_subscriptions (agent, channel, subscribed) "
+            "VALUES (?, ?, 1) ON CONFLICT(agent, channel) "
+            "DO UPDATE SET subscribed = 1",
+            (from_agent, channel),
+        )
+        conn.commit()
+
         if priority in _NO_WAKE_PRIORITIES:
             return (
                 f"Posted to #{channel} (priority={priority}; no wake — "
-                f"agents will see it via get_channel_messages())."
+                f"subscribers will see it via get_channel_messages())."
             )
 
-        recipients = [a for a in registry.names() if a != from_agent]
+        subscribers = {
+            r["agent"]
+            for r in conn.execute(
+                "SELECT agent FROM channel_subscriptions "
+                "WHERE channel = ? AND subscribed = 1",
+                (channel,),
+            )
+        }
+        recipients = [
+            a for a in registry.names() if a != from_agent and a in subscribers
+        ]
 
         # Parallel fan-out — same rationale as broadcast(). Posts have no
         # per-recipient cursor to advance, so the post-loop simply counts
@@ -2453,9 +2571,12 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 tg.start_soon(_push_one, agent)
 
         woke = sum(1 for o in push_results.values() if o.delivered)
+        # The receipt names its population (a string identical in a broken
+        # world is a rendering, not evidence — spike-runtime, 2026-07-29).
         return (
             f"Posted to #{channel} (priority={priority}; "
-            f"woke {woke}/{len(recipients)} connected agents)."
+            f"woke {woke}/{len(recipients)} connected subscriber(s) of "
+            f"{len(subscribers) - 1} subscribed besides you)."
         ) + _verbosity_advisory(message)
 
     @mcp.tool()
@@ -3454,6 +3575,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 
     mcp._tool_manager.call_tool = _timed_call_tool
 
+    # The /api/v1 management surface (docs/hub-api-v1.md) — REST alongside
+    # MCP, same store. Mounted last so it can lean on everything above.
+    from mcp_hub.api_v1 import init_api_tables, mount_api
+
+    init_api_tables(_get_db(db_path))
+    mount_api(mcp, db_path, registry)
+
     return mcp
 
 
@@ -3476,6 +3604,7 @@ _CLI_SUBCOMMANDS = {
     "board",
     "mute",
     "rebind-url",
+    "edge",
 }
 
 

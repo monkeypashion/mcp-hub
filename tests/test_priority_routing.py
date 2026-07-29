@@ -1354,6 +1354,10 @@ async def test_create_channel_then_post(server):
         async def send_notification(self, _n): ...
 
     registry.bind("bob", _FakeSess())
+    # Channel wakes are subscriber-scoped (2026-07-29): bob opts in first.
+    await _call_tool(
+        server, "subscribe_channel", {"name": "bob", "channel": "deploys"}
+    )
 
     with patch.object(registry, "push", AsyncMock(return_value=False)) as push:
         out = await _call_tool(

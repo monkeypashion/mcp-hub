@@ -1570,6 +1570,72 @@ def _dig(data: Any, path: list[str]) -> Any:
     return data
 
 
+def edge_command(args: argparse.Namespace) -> int:
+    """One edge reconcile pass — `mcp-hub edge apply`."""
+    from mcp_hub.edge import HubAPI, edge_apply, plan
+
+    Path = pathlib.Path
+
+    machine = args.machine or _sanitize_ident(platform.node() or "unknown-host")
+    token = args.token or os.environ.get("MCP_HUB_MACHINE_TOKEN", "")
+    if not token:
+        print("edge: no machine token (--token or $MCP_HUB_MACHINE_TOKEN)")
+        return 2
+
+    # The hub URL points at /mcp for MCP clients; the API lives beside it.
+    base = args.hub_url.rsplit("/mcp", 1)[0]
+    api = HubAPI(base_url=base, token=token)
+
+    def runner(cmd: list[str], cwd: str | None = None) -> tuple[int, str]:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, cwd=cwd, timeout=600
+        )
+        return proc.returncode, (proc.stdout + proc.stderr)
+
+    scan_dirs = [Path(d) for d in (args.scan_dir or [])] or [
+        Path.home() / "Projects",
+        Path.home(),
+    ]
+
+    if args.dry_run:
+        placements = api.pull_placements(machine)
+        rc, out = runner(["squad", "ls"])
+        enrolled = {}
+        if rc == 0:
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] in ("up", "down"):
+                    enrolled[parts[0]] = parts[1] == "up"
+        local = {
+            p["seat"]: {
+                "materialized": p["seat"] in enrolled,
+                "running": enrolled.get(p["seat"], False),
+            }
+            for p in placements
+        }
+        actions = plan(placements, local)
+        print(f"edge apply --dry-run: {len(placements)} placement(s), would run:")
+        for a in actions:
+            print(f"  {a['op']:12s} {a['seat']}" + (
+                f"  ({a['reason']})" if a.get("reason") else ""
+            ))
+        if not actions:
+            print("  nothing — desired state already holds")
+        return 0
+
+    summary = edge_apply(api, machine=machine, runner=runner, scan_dirs=scan_dirs)
+    print(
+        f"edge apply: {summary['placements']} placement(s), "
+        f"{len(summary['actions'])} action(s), "
+        f"{summary['observed_reported']} observed report(s), "
+        f"{summary['workspaces_reported']} workspace(s) discovered"
+    )
+    for a in summary["actions"]:
+        detail = a.get("reason") or a.get("deferred") or f"rc={a.get('rc')}"
+        print(f"  {a['op']:12s} {a['seat']}  {detail}")
+    return 0
+
+
 def rebind_url_command(args: argparse.Namespace) -> int:
     """Stamp ?agent=<derived name> into this seat's hub URL — the per-seat
     rollout leg of transport-level auto-rebind."""
@@ -2085,6 +2151,33 @@ def settings_command(args: argparse.Namespace) -> int:
         # Ask the terminal BEFORE the app owns the tty — OSC 11 needs a quiet
         # line, and Textual's raw-mode setup would eat the reply.
         dark = terminal_prefers_dark()
+        def _workspaces():
+            from mcp_hub.workspace_data import collect_workspaces
+
+            class _Api:
+                def get_registry(self):
+                    import httpx
+
+                    token = os.environ.get("MCP_HUB_API_TOKEN", "")
+                    tok_file = pathlib.Path.home() / ".mcp-hub" / "api.token"
+                    if not token and tok_file.exists():
+                        token = tok_file.read_text().strip()
+                    base = DEFAULT_HUB_URL.rsplit("/mcp", 1)[0]
+                    r = httpx.get(
+                        f"{base}/api/v1/workspace-registry",
+                        headers={"Authorization": f"Bearer {token}"},
+                        timeout=5,
+                    )
+                    r.raise_for_status()
+                    return r.json()
+
+            host = _sanitize_ident(platform.node() or "unknown-host")
+            return collect_workspaces(
+                _Api(),
+                scan_dirs=[pathlib.Path.home() / "Projects", pathlib.Path.home()],
+                this_machine=host,
+            )
+
         SettingsApp(
             agents,
             scoped_to=getattr(args, "workspace", None),
@@ -2093,6 +2186,7 @@ def settings_command(args: argparse.Namespace) -> int:
             hub_bin=MCP_HUB_BIN,
             board_for=lambda: collect(SQUAD_BIN),
             dark=dark,
+            workspaces_for=_workspaces,
         ).run()
         return 0
     cwd = args.cwd or os.getcwd()
@@ -3523,6 +3617,47 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="Print the rewritten URL; write nothing"
     )
 
+    edge = sub.add_parser(
+        "edge",
+        help="Edge realizer: reconcile this machine toward the hub's desired state",
+        description=(
+            "One reconcile pass against /api/v1: pull this machine's "
+            "placements (machine token), realize worktree-substrate ones via "
+            "the squad verbs, then report observed state BY ENUMERATION plus "
+            "every .code-workspace file discovered — the workspace registry's "
+            "never-lose-track leg. Docker-substrate placements are skipped "
+            "loudly (the container credential story is undesigned). Run it "
+            "from the heal timer for continuous reconciliation."
+        ),
+    )
+    edge.add_argument("action", choices=["apply"], help="apply: one reconcile pass")
+    edge.add_argument(
+        "--hub-url",
+        default=DEFAULT_HUB_URL,
+        help="Hub base URL (default: $MCP_HUB_URL or built-in)",
+    )
+    edge.add_argument(
+        "--machine",
+        default=None,
+        help="Machine name as enrolled on the hub (default: sanitized hostname)",
+    )
+    edge.add_argument(
+        "--token",
+        default=None,
+        help="Machine token (default: $MCP_HUB_MACHINE_TOKEN)",
+    )
+    edge.add_argument(
+        "--scan-dir",
+        action="append",
+        default=None,
+        help="Workspace scan dir (repeatable; default: ~/Projects and ~)",
+    )
+    edge.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Pull, plan and print actions; execute nothing, report nothing",
+    )
+
     return parser
 
 
@@ -3574,6 +3709,8 @@ def main(argv: list[str] | None = None) -> int:
         return transport_history_command(args)
     if args.subcommand == "rebind-url":
         return rebind_url_command(args)
+    if args.subcommand == "edge":
+        return edge_command(args)
 
     parser.print_help()
     return 0

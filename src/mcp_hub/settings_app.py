@@ -220,14 +220,17 @@ class SettingsApp(App):
         ("r", "reload", "Reload"),
         ("t", "toggle_theme", "Light/dark"),
         ("n", "next_hand", "Next needs-you"),
+        ("w", "toggle_workspaces", "Workspaces"),
     ]
 
     def __init__(self, agents: list[dict[str, str]], scoped_to: str | None,
                  model_for, squad_bin: str, hub_bin: str,
                  board_for=None, dark: bool | None = None,
-                 poll_seconds: float = 3.0):
+                 poll_seconds: float = 3.0, workspaces_for=None):
         super().__init__()
         self.agents = agents
+        self._workspaces_for = workspaces_for  # injected; None hides the view
+        self.show_workspaces = False
         self.scoped_to = scoped_to
         self._model_for = model_for       # injected so tests need no real repo
         self._board_for = board_for       # injected so tests need no real fleet
@@ -502,6 +505,9 @@ class SettingsApp(App):
         await detail.remove_children()      # AWAITED: mounts below raced it
         self._gen += 1
         self._live_key = None
+        if self.show_workspaces:
+            await detail.mount_all(self._workspace_widgets())
+            return
         if not self.agents:
             await detail.mount(Static("no agents in this workspace", classes="note"))
             return
@@ -636,6 +642,56 @@ class SettingsApp(App):
 
     def _set_status(self, text: str) -> None:
         self.query_one("#status", Static).update(text)
+
+    def _workspace_widgets(self) -> list[Any]:
+        """The manager's view: every workspace, three truth columns, drift
+        loud. Rendered from collect_workspaces — no ids on rows, so this view
+        can never recreate the DuplicateIds crash."""
+        out: list[Any] = [Static(
+            "▌WORKSPACES   registered · on disk · open — drift shown, "
+            "nothing lost track of", classes="section section-live")]
+        if self._workspaces_for is None:
+            out.append(Static("workspace registry not wired on this build",
+                              classes="note"))
+            return out
+        try:
+            data = self._workspaces_for()
+        except Exception as exc:  # noqa: BLE001 — the view must never crash
+            out.append(Static(f"workspace data: {exc}", classes="note"))
+            return out
+        if data.get("note"):
+            out.append(Static(data["note"], classes="note"))
+        for r in data.get("rows", []):
+            reg = {True: "✔ hub", False: "✗ NOT REGISTERED", None: "? hub"}[
+                r.get("registered")]
+            disk = "✔ disk" if r.get("on_disk") else "✗ NO FILE"
+            open_now = "● open" if r.get("open_now") else ""
+            drift = (r.get("registered") is False) or not r.get("on_disk")
+            name = f"{r['name']}  ·{r['machine']}" if r.get("machine") else r["name"]
+            squad = f"  [{r['squad']}]" if r.get("squad") else ""
+            cols = "   ".join(x for x in (reg, disk, open_now) if x)
+            out.append(Vertical(
+                Horizontal(
+                    Label(name, classes="label"),
+                    Static(cols, classes=_value_class(
+                        "unknown" if drift else "on")),
+                    classes="row-line",
+                ),
+                Static(
+                    (r.get("error") and f"⚠ {r['error']}")
+                    or (r.get("path") or "definition only — nothing materialized")
+                    + squad,
+                    classes="source",
+                ),
+                classes="row",
+            ))
+        if not data.get("rows"):
+            out.append(Static("no workspaces found anywhere", classes="note"))
+        return out
+
+    async def action_toggle_workspaces(self) -> None:
+        self.show_workspaces = not self.show_workspaces
+        await self.refresh_detail()
 
     async def action_reload(self) -> None:
         await self.refresh_detail()
