@@ -1599,15 +1599,17 @@ def edge_command(args: argparse.Namespace) -> int:
 
     if args.dry_run:
         placements = api.pull_placements(machine)
-        rc, out = runner(["tmux", "-L", "squad", "ls", "-F", "#S"])
-        sessions = set(out.splitlines()) if rc == 0 else set()
+        rc, out = runner(["squad", "ls"])
+        enrolled = {}
+        if rc == 0:
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] in ("up", "down"):
+                    enrolled[parts[0]] = parts[1] == "up"
         local = {
             p["seat"]: {
-                "folder_exists": bool(
-                    (p.get("seat_spec") or {}).get("folder")
-                    and Path(p["seat_spec"]["folder"]).is_dir()
-                ),
-                "running": p["seat"] in sessions,
+                "materialized": p["seat"] in enrolled,
+                "running": enrolled.get(p["seat"], False),
             }
             for p in placements
         }

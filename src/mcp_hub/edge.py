@@ -32,9 +32,12 @@ def plan(
 ) -> list[dict[str, Any]]:
     """Diff desired placements against enumerated local seat state.
 
-    `local_seats` maps seat identity -> {"folder_exists": bool,
-    "running": bool} as ENUMERATED by the caller (tmux + filesystem), never
-    read from any record.
+    `local_seats` maps seat identity -> {"materialized": bool,
+    "running": bool} as ENUMERATED by the caller (squad ls: roster
+    enrollment + tmux liveness), never read from any record. "materialized"
+    means ENROLLED — a folder on disk that squad doesn't know is not
+    startable, which is why folder existence was the wrong signal (found the
+    hour before the first live run, via a repo that existed unenrolled).
     """
     actions: list[dict[str, Any]] = []
     for p in placements:
@@ -50,7 +53,7 @@ def plan(
                 }
             )
             continue
-        local = local_seats.get(seat, {"folder_exists": False, "running": False})
+        local = local_seats.get(seat, {"materialized": False, "running": False})
         desired = p["desired"]
         if desired == "reclaimed":
             # Harvest before destroy, always: the memory delta is work
@@ -64,7 +67,7 @@ def plan(
                 ]
             )
         elif desired == "running":
-            if not local["folder_exists"]:
+            if not local["materialized"]:
                 actions.append({**base, "op": "materialize"})
                 actions.append({**base, "op": "start"})
             elif not local["running"]:
@@ -209,29 +212,31 @@ def edge_apply(
     machine: str,
     runner: Any,
     scan_dirs: list[Path],
-    folder_exists: Any = None,
 ) -> dict[str, Any]:
     """One reconcile pass: pull → enumerate → plan → execute → report.
 
     Reports are built from a FRESH enumeration taken after execution — the
     loop observes the effect of its own actions rather than assuming them.
     """
-    if folder_exists is None:
-        folder_exists = lambda p: bool(p) and Path(p).is_dir()  # noqa: E731
-
     placements = api.pull_placements(machine)
 
     def enumerate_now() -> dict[str, dict[str, Any]]:
-        rc, out = runner(["tmux", "-L", "squad", "ls", "-F", "#S"])
-        sessions = set(out.splitlines()) if rc == 0 else set()
-        local: dict[str, dict[str, Any]] = {}
-        for p in placements:
-            spec = p.get("seat_spec") or {}
-            local[p["seat"]] = {
-                "folder_exists": folder_exists(spec.get("folder", "")),
-                "running": p["seat"] in sessions,
+        # One truthful source for both facts: `squad ls` rows carry roster
+        # enrollment (the row exists) and tmux liveness (the up/down column).
+        rc, out = runner(["squad", "ls"])
+        enrolled: dict[str, bool] = {}
+        if rc == 0:
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] in ("up", "down"):
+                    enrolled[parts[0]] = parts[1] == "up"
+        return {
+            p["seat"]: {
+                "materialized": p["seat"] in enrolled,
+                "running": enrolled.get(p["seat"], False),
             }
-        return local
+            for p in placements
+        }
 
     actions = plan(placements, enumerate_now())
     executor = SquadExecutor(runner)
@@ -245,7 +250,7 @@ def edge_apply(
         enumeration = {
             "tmux_session": p["seat"],
             "alive": state["running"],
-            "folder_exists": state["folder_exists"],
+            "enrolled": state["materialized"],
         }
         api.push_observed(p["id"], observed_report(p, enumeration))
         reported += 1

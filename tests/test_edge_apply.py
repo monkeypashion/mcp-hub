@@ -63,28 +63,28 @@ class TestPlan:
     def test_existing_running_seat_yields_no_actions(self):
         actions = plan(
             placements=[_placement()],
-            local_seats={"widget-box-1": {"folder_exists": True, "running": True}},
+            local_seats={"widget-box-1": {"materialized": True, "running": True}},
         )
         assert actions == []
 
     def test_existing_stopped_seat_yields_start_only(self):
         actions = plan(
             placements=[_placement()],
-            local_seats={"widget-box-1": {"folder_exists": True, "running": False}},
+            local_seats={"widget-box-1": {"materialized": True, "running": False}},
         )
         assert [a["op"] for a in actions] == ["start"]
 
     def test_desired_stopped_running_seat_yields_stop(self):
         actions = plan(
             placements=[_placement(desired="stopped")],
-            local_seats={"widget-box-1": {"folder_exists": True, "running": True}},
+            local_seats={"widget-box-1": {"materialized": True, "running": True}},
         )
         assert [a["op"] for a in actions] == ["stop"]
 
     def test_reclaimed_yields_harvest_verify_destroy_in_order(self):
         actions = plan(
             placements=[_placement(desired="reclaimed")],
-            local_seats={"widget-box-1": {"folder_exists": True, "running": False}},
+            local_seats={"widget-box-1": {"materialized": True, "running": False}},
         )
         assert [a["op"] for a in actions] == ["harvest", "verify", "destroy"]
 
@@ -102,7 +102,7 @@ class TestPlan:
         p["status"] = "converged"
         actions = plan(
             placements=[p],
-            local_seats={"widget-box-1": {"folder_exists": True, "running": True}},
+            local_seats={"widget-box-1": {"materialized": True, "running": True}},
         )
         assert actions == []
 
@@ -171,19 +171,31 @@ class _RecordingRunner:
     def __init__(self) -> None:
         self.commands: list[list[str]] = []
         self.sessions: set[str] = set()
-        self.folders: set[str] = set()
+        self.enrolled: set[str] = set()
 
     def __call__(self, cmd: list[str], cwd: str | None = None) -> tuple[int, str]:
         self.commands.append(cmd)
         if cmd[:2] == ["squad", "start"]:
             self.sessions.add(cmd[2])
-        elif cmd[:2] in (["squad", "stop"], ["squad", "rm"]):
+        elif cmd[:2] == ["squad", "stop"]:
             self.sessions.discard(cmd[2])
+        elif cmd[:2] == ["squad", "rm"]:
+            self.sessions.discard(cmd[2])
+            self.enrolled.discard(cmd[2])
         elif cmd[:2] == ["squad", "add"]:
-            self.folders.add(cmd[2])
-        if cmd[:3] == ["tmux", "-L", "squad"]:
-            return 0, "\n".join(sorted(self.sessions))
+            # `squad add org/repo` enrolls the derived seat; the fake maps the
+            # repo tail to the seat name the tests use (<repo>-box-N is close
+            # enough not to matter — enrollment is tracked per demo seat).
+            self.enrolled |= {s for s in self.pending_enroll}
+        if cmd[:2] == ["squad", "ls"]:
+            lines = [
+                f"{name} {'up' if name in self.sessions else 'down'} -"
+                for name in sorted(self.enrolled)
+            ]
+            return 0, "\n".join(lines)
         return 0, "ok"
+
+    pending_enroll: set[str] = set()
 
 
 class TestExecutor:
@@ -251,13 +263,13 @@ class TestEdgeApplyEndToEnd:
 
         (tmp_path / "demo.code-workspace").write_text(json.dumps({"folders": []}))
         runner = _RecordingRunner()
+        runner.pending_enroll = {"widget-box-1"}
         api = HubAPI(client=hub, token=machine_token)
         summary = edge_apply(
             api,
             machine="box-1",
             runner=runner,
             scan_dirs=[tmp_path],
-            folder_exists=lambda p: bool(runner.folders),
         )
 
         # It acted: materialize + start went through the squad verbs.
@@ -291,12 +303,17 @@ class TestEdgeApplyEndToEnd:
             headers=op,
         )
         runner = _RecordingRunner()
+        runner.pending_enroll = {"widget-box-2"}
         api = HubAPI(client=hub, token=machine_token)
-        fe = lambda p: bool(runner.folders)  # noqa: E731
-        edge_apply(api, machine="box-2", runner=runner, scan_dirs=[], folder_exists=fe)
+        edge_apply(api, machine="box-2", runner=runner, scan_dirs=[])
         n_first = len(runner.commands)
-        edge_apply(api, machine="box-2", runner=runner, scan_dirs=[], folder_exists=fe)
-        # Second pass: state already converged; only enumeration commands run,
-        # no second materialize/start.
+        edge_apply(api, machine="box-2", runner=runner, scan_dirs=[])
+        # Second pass: state already converged; only enumeration (`squad ls`)
+        # runs — no second materialize/start, nothing mutating.
         assert runner.commands.count(["squad", "start", "widget-box-2"]) == 1
-        assert len([c for c in runner.commands[n_first:] if c[0] == "squad"]) == 0
+        mutating = [
+            c
+            for c in runner.commands[n_first:]
+            if c[0] == "squad" and c[1] != "ls"
+        ]
+        assert mutating == []
