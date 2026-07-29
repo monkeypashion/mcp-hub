@@ -296,23 +296,88 @@ async def test_polling_a_waiting_agent_does_not_crash_or_churn_its_buttons():
     def snapshot():
         tick["n"] += 1
         snap = _snapshot()
-        # seconds advance every scan; the rendered "2m" does not
-        snap["agents"]["beta"]["waiting_seconds"] = 134 + tick["n"]
+        # SUB-MINUTE ticks: seconds advance every scan but stay inside the
+        # same minute, so the rendered "2m" never changes. Wrapping is
+        # deliberate — an unbounded 134+n crosses 180s and the displayed
+        # minute becomes "3m", which SHOULD rebuild, so the fixture would be
+        # constructing the opposite of the condition under test. It did, and
+        # the test failed ~50% of runs while the code was correct.
+        # % 45 (fb's bound, adopted for convergence): 134..178 — 45 distinct
+        # values that all render "2m", so ANY number of ticks proves no
+        # rebuild, rather than only the few that fit a narrow window.
+        snap["agents"]["beta"]["waiting_seconds"] = 134 + (tick["n"] % 45)
         return snap
 
     app = _app(board=snapshot)
-    app._poll_seconds = 0.05
     async with app.run_test(size=(120, 34)) as pilot:
-        await pilot.pause()
+        # WAIT for the mount-time poll to be APPLIED before touching anything.
+        # It runs on a worker thread, so whether it lands before or after the
+        # click is pure scheduling — and it is the difference between the live
+        # section rendering None and rendering beta, i.e. a legitimately
+        # different render key. Racing it made this test fail ~50% of runs.
+        for _ in range(50):
+            await pilot.pause()
+            if "beta" in (app.board.get("agents") or {}):
+                break
+        assert "beta" in (app.board.get("agents") or {}), "board data never arrived"
         items = app.query("#agents > ListItem")
         await pilot.click(items[1])                    # beta, the waiting one
         await pilot.pause()
-        gen_after_select = app._gen
+        await pilot.pause()
+        key_after_select = app._live_key
+        assert key_after_select is not None, "live section never rendered beta"
         for _ in range(6):                             # several poll applications
             app._apply_board(snapshot())
             await pilot.pause()
         assert app.is_running                          # the crash, pinned
         buttons = list(app.query("Button"))
         assert len(buttons) == 3, f"{len(buttons)} buttons — duplicate mounts survived"
-        assert app._gen == gen_after_select, \
-            "sub-minute timer ticks rebuilt the live section under the pointer"
+        # The RENDER KEY, not the _gen counter. _gen is bumped by every
+        # rebuild from any source, including the mount-time poll whose worker
+        # lands at a nondeterministic point relative to the click — keying the
+        # assertion on it made this test fail ~50% of runs on the very commit
+        # it protects, and I nearly blamed an innocent merge for it
+        # (2026-07-29 night). The invariant that actually matters is that a
+        # sub-minute tick does not CHANGE WHAT WOULD BE RENDERED, so nothing
+        # under the operator's pointer is torn down.
+        assert app._live_key == key_after_select, \
+            "sub-minute timer ticks changed the live render key"
+
+
+@pytest.mark.asyncio
+async def test_rebuilding_a_waiting_agents_live_section_repeatedly_does_not_crash():
+    """THE CRASH ITSELF — the operator's ("as soon as it loaded, the page
+    crashed", 2026-07-29). Its sibling above pins the no-churn property, and
+    de-flaking that one silently cost this coverage: with a stable render key
+    the section is never rebuilt, so a fixed id has nothing to collide with and
+    the crash mutant PASSED it. A property test and a crash test need
+    different fixtures — this one forces a rebuild on every tick by crossing
+    the displayed minute, which is when the answer buttons are actually torn
+    down and remounted.
+    """
+    tick = {"n": 0}
+
+    def snapshot():
+        tick["n"] += 1
+        snap = _snapshot()
+        # a whole minute per tick: the rendered value changes every time, so
+        # the live section — buttons and all — is genuinely rebuilt
+        snap["agents"]["beta"]["waiting_seconds"] = 134 + 60 * tick["n"]
+        return snap
+
+    app = _app(board=snapshot)
+    async with app.run_test(size=(120, 34)) as pilot:
+        for _ in range(50):
+            await pilot.pause()
+            if "beta" in (app.board.get("agents") or {}):
+                break
+        await pilot.click(app.query("#agents > ListItem")[1])   # beta, waiting
+        await pilot.pause()
+        for _ in range(8):
+            app._apply_board(snapshot())
+            await pilot.pause()
+            await pilot.pause()
+        assert app.is_running, "the panel died while rebuilding the live section"
+        buttons = [str(b.label) for b in app.query("Button")]
+        assert buttons == ["yes", "no", "always"], \
+            f"{buttons} — duplicate or lost mounts across rebuilds"
