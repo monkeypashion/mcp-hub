@@ -166,8 +166,8 @@ Select { width: 30; height: 1; }
 .live-question { color: $error; height: auto; padding: 0 0 0 2; }
 .live-next { color: $text; height: auto; padding: 0 0 0 2; }
 .live-unshipped { color: $secondary; height: 1; width: 1fr; }
-#answers { height: 3; padding: 0 0 0 2; }
-#answers Button { margin: 0 2 0 0; min-width: 10; }
+.answers { height: 3; padding: 0 0 0 2; }
+.answers Button { margin: 0 2 0 0; min-width: 10; }
 """
 
 
@@ -364,7 +364,7 @@ class SettingsApp(App):
             ) if b]
             line.update(" ".join(bits))
         # the detail's live section follows the selected agent
-        self._refresh_live_section()
+        self.call_later(self._refresh_live_section)
 
     def _live_widgets(self, rec: dict[str, Any] | None) -> list[Any]:
         """The board's view of ONE agent, as widgets. Everything here is a
@@ -395,11 +395,19 @@ class SettingsApp(App):
             # squad answer is FAIL-CLOSED: it presses a digit only when a
             # visible option matches the intent, so these buttons cannot
             # answer a dialog that is not on that agent's screen.
+            #
+            # classes= for the container, NOT a fixed id. The live section is
+            # torn down and remounted on content change, removal is
+            # asynchronous, and a fixed id here is exactly the DuplicateIds
+            # crash the _gen discipline exists to prevent — the operator's
+            # first click on a waiting agent found it (2026-07-29: "as soon
+            # as it loaded, the page crashed"). The buttons keep their
+            # gen-baked ids for the Pressed handler.
             out.append(Horizontal(
                 Button("yes", id=f"ans-{g}-yes", variant="success", compact=True),
                 Button("no", id=f"ans-{g}-no", variant="error", compact=True),
                 Button("always", id=f"ans-{g}-always", variant="warning", compact=True),
-                id="answers",
+                classes="answers",
             ))
 
         nxt = rec.get("next")
@@ -446,14 +454,36 @@ class SettingsApp(App):
             ))
         return out
 
-    def _refresh_live_section(self) -> None:
-        """Rebuild #live ONLY when its content changed — the poll ticks every
-        few seconds and a rebuild under the operator's pointer would eat the
-        click they were about to make on an answer button."""
+    @staticmethod
+    def _live_render_key(rec: dict[str, Any] | None) -> tuple:
+        """What the live section DISPLAYS, not the raw record. waiting_seconds
+        ticks on every scan, so keying on repr(rec) rebuilt the section — and
+        its buttons — every 3s for precisely the agents whose buttons the
+        operator is about to click. Key on the rendered forms instead: the
+        timer only changes this key when the displayed minute does."""
+        if rec is None:
+            return (None,)
+        nxt = rec.get("next") or {}
+        return (
+            rec.get("state"), _hms(rec.get("waiting_seconds", 0)),
+            rec.get("action"), rec.get("question"),
+            nxt.get("source"), nxt.get("age"), nxt.get("hand"),
+            nxt.get("text"), nxt.get("ask"), nxt.get("net"),
+            rec.get("branch"), rec.get("dirty"), rec.get("unpushed"),
+            rec.get("usage_today"), rec.get("usage_hour"),
+        )
+
+    async def _refresh_live_section(self) -> None:
+        """Rebuild #live ONLY when its rendered content changed, and AWAIT the
+        teardown. remove_children() is asynchronous: unawaited, the previous
+        render's widgets are still in the tree when the next ones mount, and
+        any fixed id collides — DuplicateIds took the whole app down the first
+        time the operator selected a waiting agent (2026-07-29). Same defect,
+        same cure as refresh_detail's, documented on _gen."""
         if not self.agents:
             return
         rec = (self.board.get("agents") or {}).get(self.agents[self.agent_ix]["agent"])
-        key = (self.agent_ix, repr(rec), repr(self.board.get("error")))
+        key = (self.agent_ix, self._live_render_key(rec), repr(self.board.get("error")))
         if key == self._live_key:
             return
         self._live_key = key
@@ -462,8 +492,8 @@ class SettingsApp(App):
         except Exception:  # noqa: BLE001 — detail mid-rebuild; refresh_detail will paint it
             return
         self._gen += 1
-        live.remove_children()
-        live.mount_all(self._live_widgets(rec))
+        await live.remove_children()
+        await live.mount_all(self._live_widgets(rec))
 
     # ---- rendering the selected agent ----
 
@@ -485,7 +515,7 @@ class SettingsApp(App):
             self.model = None
             widgets.append(Static(f"could not read settings: {exc}", classes="note"))
             await detail.mount_all(widgets)
-            self._refresh_live_section()
+            await self._refresh_live_section()
             return
         if not self.model:
             # Not a failure — a folder with no hub identity. Saying so beats an
@@ -495,7 +525,7 @@ class SettingsApp(App):
                 "remote plus ~/.mcp-hub/config.json, so a plain folder added with "
                 "`squad add-folder` has none.", classes="note"))
             await detail.mount_all(widgets)
-            self._refresh_live_section()
+            await self._refresh_live_section()
             return
         for si, section in enumerate(self.model.get("sections", [])):
             head = section["title"]
@@ -505,7 +535,7 @@ class SettingsApp(App):
             for ri, row in enumerate(section.get("rows", [])):
                 widgets.append(self._row_widget(si, ri, row))
         await detail.mount_all(widgets)     # one mount: never seen half-built
-        self._refresh_live_section()
+        await self._refresh_live_section()
 
     def _row_widget(self, si: int, ri: int, row: dict[str, Any]) -> Vertical:
         edit = row.get("edit")

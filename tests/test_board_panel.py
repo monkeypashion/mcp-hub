@@ -276,3 +276,43 @@ def test_collect_recap_hand_needs_idle(tmp_path):
     exe = _fake_squad(tmp_path, _scan(("beta", "working")))
     snap = board_data.collect(exe, home=home, now=100000.0)
     assert snap["agents"]["beta"]["next"]["hand"] is False
+
+
+@pytest.mark.asyncio
+async def test_polling_a_waiting_agent_does_not_crash_or_churn_its_buttons():
+    """The operator's first real click on a waiting agent took the app down:
+    waiting_seconds ticks on every scan, so the live section — and the answer
+    buttons' container, which carried a FIXED id — was torn down and remounted
+    every poll, and remove_children() is asynchronous, so the previous
+    container was still in the tree when the next one mounted: DuplicateIds,
+    app dead ("as soon as it loaded, the page crashed", 2026-07-29).
+
+    Two properties pinned: many polls over a waiting agent crash nothing, and
+    a tick that does not change the DISPLAYED minute does not rebuild the
+    section at all (a rebuild under the pointer eats the click it was built
+    to receive)."""
+    tick = {"n": 0}
+
+    def snapshot():
+        tick["n"] += 1
+        snap = _snapshot()
+        # seconds advance every scan; the rendered "2m" does not
+        snap["agents"]["beta"]["waiting_seconds"] = 134 + tick["n"]
+        return snap
+
+    app = _app(board=snapshot)
+    app._poll_seconds = 0.05
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        items = app.query("#agents > ListItem")
+        await pilot.click(items[1])                    # beta, the waiting one
+        await pilot.pause()
+        gen_after_select = app._gen
+        for _ in range(6):                             # several poll applications
+            app._apply_board(snapshot())
+            await pilot.pause()
+        assert app.is_running                          # the crash, pinned
+        buttons = list(app.query("Button"))
+        assert len(buttons) == 3, f"{len(buttons)} buttons — duplicate mounts survived"
+        assert app._gen == gen_after_select, \
+            "sub-minute timer ticks rebuilt the live section under the pointer"
