@@ -190,3 +190,20 @@ def test_migration_seeds_existing_fleet_fully_subscribed(tmp_path: Path):
     assert len(rows) == 4  # 2 agents × 2 channels
     assert all(r[2] == 1 for r in rows)
     conn.close()
+
+
+@pytest.mark.asyncio
+async def test_list_channels_shows_own_subscription_state(server):
+    """The newborn-seat gap (dev's review): a seat subscribed to nothing must
+    be able to SEE that — silent nondelivery is invisible unless shown."""
+    await _agent(server, "newborn")
+    await _agent(server, "maker")
+    await _call(server, "create_channel", {"name": "topic", "created_by": "maker"})
+    out = await _call(server, "list_channels", {"agent": "newborn"})
+    assert "not subscribed" in out
+    assert "subscribed to NO channels" in out
+    out_maker = await _call(server, "list_channels", {"agent": "maker"})
+    assert "✔ subscribed" in out_maker
+    # No agent argument: the plain listing, unchanged shape.
+    plain = await _call(server, "list_channels", {})
+    assert "subscribed" not in plain

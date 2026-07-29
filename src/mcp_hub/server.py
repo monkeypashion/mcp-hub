@@ -2410,8 +2410,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         )
 
     @mcp.tool()
-    def list_channels() -> str:
+    def list_channels(agent: str = "") -> str:
         """List all named channels.
+
+        Pass your agent name to see YOUR subscription state per channel —
+        wakes are opt-in, so a channel you never engaged with will not wake
+        you, and this is where you find that out (a newborn seat subscribes
+        to nothing; silence is invisible unless shown).
 
         The global broadcast feed is not a channel and is not listed here —
         it's always available via broadcast() / get_broadcasts().
@@ -2423,12 +2428,33 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         ).fetchall()
         if not rows:
             return "No channels. Create one with create_channel()."
+        subs: set[str] = set()
+        if agent:
+            subs = {
+                r["channel"]
+                for r in conn.execute(
+                    "SELECT channel FROM channel_subscriptions "
+                    "WHERE agent = ? AND subscribed = 1",
+                    (agent,),
+                )
+            }
         lines = []
         for r in rows:
             line = f"**#{r['name']}**"
+            if agent:
+                line += (
+                    " ✔ subscribed" if r["name"] in subs
+                    else " ○ not subscribed (no wakes; subscribe_channel to opt in)"
+                )
             if r["description"]:
                 line += f" — {r['description']}"
             lines.append(line)
+        if agent and not subs:
+            lines.append(
+                "\nYou are subscribed to NO channels — you will not be woken "
+                "by any channel post. Reading is always open; wakes need "
+                "subscribe_channel()."
+            )
         return "\n".join(lines)
 
     @mcp.tool()
