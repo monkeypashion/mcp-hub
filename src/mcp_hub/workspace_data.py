@@ -127,6 +127,11 @@ def collect_workspaces(
     return {
         "hub_reachable": hub_reachable,
         "note": note,
+        # Returned rather than re-derived by the view: the caller already
+        # resolved it, and a second derivation is a second chance to disagree
+        # (squad deriving from basename while the cli derives from the git
+        # remote is exactly how a clone's statusline came to read `hub ?`).
+        "this_machine": this_machine,
         "rows": sorted(
             rows.values(), key=lambda r: (r["machine"], r["name"])
         ),

@@ -34,12 +34,14 @@ def _row(name, machine, **kw):
     return base
 
 
-def _app(rows, note="", reachable=True):
+def _app(rows, note="", reachable=True, this_machine="here", scoped_to=None):
     return SettingsApp(
-        AGENTS, scoped_to=None, model_for=lambda c: {"agent": "x", "sections": []},
+        AGENTS, scoped_to=scoped_to,
+        model_for=lambda c: {"agent": "x", "sections": []},
         squad_bin="/s", hub_bin="/h", board_for=None, poll_seconds=3600,
         workspaces_for=lambda: {
-            "hub_reachable": reachable, "note": note, "rows": rows
+            "hub_reachable": reachable, "note": note, "rows": rows,
+            "this_machine": this_machine,
         },
     )
 
@@ -47,6 +49,15 @@ def _app(rows, note="", reachable=True):
 async def _texts(app, cls):
     det = app.query_one("#detail")
     return [str(n.content) for n in det.query(Static) if cls in n.classes]
+
+
+async def _headings(app):
+    """Machine headings in document order, local or remote alike."""
+    det = app.query_one("#detail")
+    return [
+        str(n.content) for n in det.query(Static)
+        if {"ws-machine", "ws-machine-remote"} & set(n.classes)
+    ]
 
 
 @pytest.mark.asyncio
@@ -60,9 +71,9 @@ async def test_rows_are_grouped_under_one_heading_per_machine():
         app.show_workspaces = True
         await app.refresh_detail()
         await pilot.pause()
-        heads = await _texts(app, "ws-machine")
-        assert heads == ["fireblade-wsl", "dev-vm-1"]
+        heads = await _headings(app)
         # One heading per machine, not one per row.
+        assert [h.split("  ·")[0] for h in heads] == ["fireblade-wsl", "dev-vm-1"]
         body = await _texts(app, "ws-row")
         assert len(body) == 4
 
@@ -156,6 +167,82 @@ async def test_paths_are_home_shortened_so_the_row_stays_short():
         text = (await _texts(app, "ws-row"))[0]
         assert "~/Projects" in text
         assert "/home/" not in text
+
+
+@pytest.mark.asyncio
+async def test_machine_headings_say_which_box_is_local():
+    """Which machine a workspace lives on decides whether you can open it —
+    it should never have to be inferred from the hostname."""
+    rows = [_row("a", "here"), _row("b", "dev-vm-1")]
+    app = _app(rows, this_machine="here")
+    async with app.run_test(size=(120, 30)) as pilot:
+        app.show_workspaces = True
+        await app.refresh_detail()
+        await pilot.pause()
+        local = await _texts(app, "ws-machine")
+        remote = await _texts(app, "ws-machine-remote")
+        assert local == ["here  · this machine"]
+        assert remote == ["dev-vm-1  · remote"]
+
+
+@pytest.mark.asyncio
+async def test_the_workspace_this_board_is_looking_at_is_marked_HERE():
+    rows = [_row("mine", "here", open_now=True), _row("other", "here", open_now=True)]
+    app = _app(rows, scoped_to="/home/monke/Projects/mine.code-workspace")
+    async with app.run_test(size=(120, 30)) as pilot:
+        app.show_workspaces = True
+        await app.refresh_detail()
+        await pilot.pause()
+        mine = await _texts(app, "ws-row-here")
+        others = await _texts(app, "ws-row-open")
+        assert len(mine) == 1 and "mine" in mine[0] and "◉ here" in mine[0]
+        # The other open workspace is still marked open, just not as yours.
+        assert len(others) == 1 and "other" in others[0] and "● open" in others[0]
+
+
+@pytest.mark.asyncio
+async def test_an_unscoped_board_marks_nothing_as_here():
+    """No --workspace means the board is not standing in one."""
+    app = _app([_row("a", "here", open_now=True)], scoped_to=None)
+    async with app.run_test(size=(120, 30)) as pilot:
+        app.show_workspaces = True
+        await app.refresh_detail()
+        await pilot.pause()
+        assert await _texts(app, "ws-row-here") == []
+        assert len(await _texts(app, "ws-row-open")) == 1
+
+
+@pytest.mark.asyncio
+async def test_drift_outranks_both_open_states():
+    """A workspace can be open AND feral. It must read as feral — attention
+    beats status, or the colour that means 'fix me' is the one you lose."""
+    app = _app(
+        [_row("mine", "here", open_now=True, registered=False)],
+        scoped_to="/home/monke/Projects/mine.code-workspace",
+    )
+    async with app.run_test(size=(120, 30)) as pilot:
+        app.show_workspaces = True
+        await app.refresh_detail()
+        await pilot.pause()
+        assert await _texts(app, "ws-row-here") == []
+        assert await _texts(app, "ws-row-open") == []
+        drift = await _texts(app, "ws-row-drift")
+        assert len(drift) == 1
+        assert "◉ here" in drift[0]      # still marked, just not coloured as ok
+        assert "not registered" in drift[0]
+
+
+def test_collect_returns_the_machine_it_was_asked_about(tmp_path):
+    """The view must not re-derive the local machine name — a second
+    derivation is a second chance to disagree."""
+    from mcp_hub.workspace_data import collect_workspaces
+
+    class _Api:
+        def get_registry(self):
+            return {"definitions": [], "discovered": []}
+
+    out = collect_workspaces(_Api(), [tmp_path], "box-9")
+    assert out["this_machine"] == "box-9"
 
 
 def test_short_dir_leaves_paths_outside_home_alone():

@@ -160,7 +160,10 @@ Select { width: 30; height: 1; }
 .note { color: $warning; padding: 1 0; height: auto; }
 /* workspace manager: one Static per row, so nothing can overflow its line */
 .ws-machine { color: $primary; text-style: bold; height: auto; padding: 1 0 0 0; }
+.ws-machine-remote { color: $text-muted; height: auto; padding: 1 0 0 0; }
 .ws-row { color: $text; height: 1; width: 1fr; }
+.ws-row-open { color: $success; height: 1; width: 1fr; }
+.ws-row-here { color: $accent; text-style: bold; height: 1; width: 1fr; }
 .ws-row-drift { color: $warning; height: 1; width: 1fr; }
 #status { dock: bottom; height: 1; padding: 0 2; background: $panel; }
 
@@ -726,16 +729,32 @@ class SettingsApp(App):
         # wrapped. Nothing here can overflow: the text is measured first.
         name_w = max((len(r["name"]) for r in rows), default=8)
         name_w = min(max(name_w, 8), 22)
+        here = data.get("this_machine")
         machine = object()  # sentinel: never equal to a real machine name
         for r in rows:
             if r.get("machine") != machine:
                 machine = r.get("machine")
-                out.append(Static(machine or "(machine unknown)",
-                                  classes="ws-machine"))
+                local = machine == here
+                # Which box a workspace lives on decides whether you can open
+                # it, so it should not have to be inferred from the name.
+                out.append(Static(
+                    f"{machine or '(machine unknown)'}"
+                    f"{'  · this machine' if local else '  · remote'}",
+                    classes="ws-machine" if local else "ws-machine-remote",
+                ))
             reg = {True: "✔ hub", False: "✗ hub", None: "? hub"}[
                 r.get("registered")]
             disk = "✔ disk" if r.get("on_disk") else "✗ disk"
-            open_now = "● open" if r.get("open_now") else "      "
+            # Three states, not two: nobody has it open · someone does · YOU
+            # are looking at it right now. The board knows its own --workspace,
+            # so the third is free and is the one the operator is standing in.
+            mine = bool(self.scoped_to) and r.get("path") == self.scoped_to
+            if mine:
+                open_now = "◉ here"
+            elif r.get("open_now"):
+                open_now = "● open"
+            else:
+                open_now = "      "
             drift = (r.get("registered") is False) or not r.get("on_disk")
             # Drift says what it IS, in words, at the end of the line — the
             # short columns stay aligned and the reason still reads loudly.
@@ -749,9 +768,19 @@ class SettingsApp(App):
                 tail = self._short_dir(r.get("path"))
             if r.get("squad"):
                 tail = f"{tail}  [{r['squad']}]"
+            # Drift outranks both open states: attention beats status. A row
+            # that is open AND feral must read as feral.
+            if drift:
+                row_class = "ws-row-drift"
+            elif mine:
+                row_class = "ws-row-here"
+            elif r.get("open_now"):
+                row_class = "ws-row-open"
+            else:
+                row_class = "ws-row"
             out.append(Static(
                 f"  {r['name']:<{name_w}}  {reg:<6} {disk:<7} {open_now}  {tail}",
-                classes="ws-row-drift" if drift else "ws-row",
+                classes=row_class,
             ))
         if not data.get("rows"):
             out.append(Static("no workspaces found anywhere", classes="note"))
