@@ -3606,6 +3606,7 @@ _CLI_SUBCOMMANDS = {
     "rebind-url",
     "edge",
     "workspaces",
+    "machines",
 }
 
 

@@ -24,6 +24,7 @@ import pathlib
 from typing import Any
 
 TOKEN_FILE = pathlib.Path.home() / ".mcp-hub" / "api.token"
+MACHINE_TOKEN_FILE = pathlib.Path.home() / ".mcp-hub" / "machine.token"
 
 
 class ApiUnavailable(Exception):
@@ -143,6 +144,35 @@ class OperatorApi:
 
     def push_status(self, machine: str, payload: dict[str, Any]) -> None:
         self._request("POST", f"/api/v1/machines/{machine}/status", json=payload)
+
+    def list_machines(self) -> list[dict[str, Any]]:
+        return self._request("GET", "/api/v1/machines").json()["machines"]
+
+    def enrol_machine(
+        self,
+        name: str,
+        os_name: str = "linux",
+        capabilities: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Enrol and return the machine record — INCLUDING its token.
+
+        The token is returned exactly once, at creation: the hub stores only
+        a hash and has no rotation endpoint, so a caller that drops it has
+        destroyed it. Callers must persist before doing anything else.
+        """
+        return self._request(
+            "POST",
+            "/api/v1/machines",
+            json={
+                "name": name,
+                "os": os_name,
+                # A DICT, not a list: the PATCH handler does caps.update(...),
+                # which raises on a list. The two machines enrolled by hand
+                # during the 2026-07-30 rollout carry lists and will need
+                # fixing before anyone PATCHes them.
+                "capabilities": capabilities or {"worktree": True},
+            },
+        ).json()
 
 
 def _body_snippet(r: Any) -> str:

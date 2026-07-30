@@ -250,6 +250,14 @@ class SquadExecutor:
         return {**base, "rc": rc, "output": out[-400:]}
 
 
+class EnumerationFailed(RuntimeError):
+    """The substrate could not be enumerated, so nothing may be claimed.
+
+    Distinct from "enumerated, found nothing": the second is a fact, the
+    first is the absence of one. Only the second may reach a report.
+    """
+
+
 def edge_apply(
     api: HubAPI,
     machine: str,
@@ -268,12 +276,23 @@ def edge_apply(
         # One truthful source for both facts: `squad ls` rows carry roster
         # enrollment (the row exists) and tmux liveness (the up/down column).
         rc, out = runner(["squad", "ls"])
+        if rc != 0:
+            # A failed enumeration used to fall through as an EMPTY set, which
+            # is not "nothing is enrolled" — it is "I did not look". Every
+            # placement would then plan a `materialize`, and the run would
+            # report observations it never made. That is the evidence
+            # contract's first rule inverted: an assertion over an empty set
+            # must be a hard error, never a quiet success.
+            raise EnumerationFailed(
+                f"`squad ls` failed (rc={rc}) — refusing to plan or report "
+                f"against state this pass never observed. Output: "
+                f"{out.strip()[:300]}"
+            )
         enrolled: dict[str, bool] = {}
-        if rc == 0:
-            for line in out.splitlines():
-                parts = line.split()
-                if len(parts) >= 2 and parts[1] in ("up", "down"):
-                    enrolled[parts[0]] = parts[1] == "up"
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] in ("up", "down"):
+                enrolled[parts[0]] = parts[1] == "up"
         return {
             p["seat"]: {
                 "materialized": p["seat"] in enrolled,

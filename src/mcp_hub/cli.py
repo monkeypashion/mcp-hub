@@ -31,6 +31,7 @@ import os
 import pathlib
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -1587,9 +1588,23 @@ def edge_command(args: argparse.Namespace) -> int:
     api = HubAPI(base_url=base, token=token)
 
     def runner(cmd: list[str], cwd: str | None = None) -> tuple[int, str]:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, cwd=cwd, timeout=600
-        )
+        exe = _resolve_tool(cmd[0]) if cmd else None
+        if exe is None:
+            # A raw FileNotFoundError traceback names a symptom, not a cause,
+            # and this runs from the heal timer where nobody reads tracebacks.
+            return 127, (
+                f"{cmd[0]}: not found — looked on PATH and at "
+                f"{_TOOL_PATHS.get(cmd[0], '(no fixed location)')}. "
+                "A non-interactive shell (ssh, systemd timer, cron) does not "
+                "get ~/.local/bin on PATH."
+            )
+        try:
+            proc = subprocess.run(
+                [exe, *cmd[1:]], capture_output=True, text=True, cwd=cwd,
+                timeout=600,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            return 127, f"{cmd[0]}: {type(e).__name__}: {e}"
         return proc.returncode, (proc.stdout + proc.stderr)
 
     scan_dirs = [Path(d) for d in (args.scan_dir or [])] or [
@@ -1600,12 +1615,18 @@ def edge_command(args: argparse.Namespace) -> int:
     if args.dry_run:
         placements = api.pull_placements(machine)
         rc, out = runner(["squad", "ls"])
+        if rc != 0:
+            # Same rule as the real pass: a dry run that cannot see the
+            # substrate must not print a plan, because the plan would be
+            # computed against an empty set it mistook for an observation.
+            print(f"edge: cannot enumerate this machine — {out.strip()[:300]}",
+                  file=sys.stderr)
+            return 1
         enrolled = {}
-        if rc == 0:
-            for line in out.splitlines():
-                parts = line.split()
-                if len(parts) >= 2 and parts[1] in ("up", "down"):
-                    enrolled[parts[0]] = parts[1] == "up"
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] in ("up", "down"):
+                enrolled[parts[0]] = parts[1] == "up"
         local = {
             p["seat"]: {
                 "materialized": p["seat"] in enrolled,
@@ -1623,7 +1644,14 @@ def edge_command(args: argparse.Namespace) -> int:
             print("  nothing — desired state already holds")
         return 0
 
-    summary = edge_apply(api, machine=machine, runner=runner, scan_dirs=scan_dirs)
+    from mcp_hub.edge import EnumerationFailed
+    try:
+        summary = edge_apply(
+            api, machine=machine, runner=runner, scan_dirs=scan_dirs
+        )
+    except EnumerationFailed as e:
+        print(f"edge: {e}", file=sys.stderr)
+        return 1
     print(
         f"edge apply: {summary['placements']} placement(s), "
         f"{len(summary['actions'])} action(s), "
@@ -1700,6 +1728,80 @@ def _workspace_listings(path: pathlib.Path) -> list[str]:
         return []
 
 
+def machines_command(args: argparse.Namespace, api: Any = None) -> int:
+    """Machine enrolment — `mcp-hub machines list|enrol`.
+
+    Enrolment had no verb at all, so the 2026-07-30 rollout was done with raw
+    curl, and the machine token it returns ONCE was lost to a shell pipeline.
+    Persisting the token is therefore the first thing this does with it.
+    """
+    from mcp_hub.operator_api import (
+        MACHINE_TOKEN_FILE,
+        ApiUnavailable,
+        OperatorApi,
+        api_base,
+    )
+
+    if api is None:
+        api = OperatorApi(api_base(args.hub_url))
+    name = args.name or _sanitize_ident(platform.node() or "unknown-host")
+
+    if args.action == "list":
+        try:
+            machines = api.list_machines()
+        except ApiUnavailable as e:
+            print(str(e), file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(machines, indent=2))
+            return 0
+        if not machines:
+            print("no machines enrolled")
+            return 0
+        for m in machines:
+            seen = m.get("last_seen")
+            when = f"last seen {int(time.time() - seen)}s ago" if seen else "never seen"
+            print(f"{m['name']:<20} {m.get('os', ''):<8} {when}")
+        return 0
+
+    # -- enrol ------------------------------------------------------------
+    dest = pathlib.Path(args.token_file) if args.token_file else MACHINE_TOKEN_FILE
+    if dest.exists() and not args.force:
+        print(f"{dest} already exists — refusing to overwrite a machine token "
+              "that may be the only copy (pass --force if you mean it)",
+              file=sys.stderr)
+        return 1
+    try:
+        rec = api.enrol_machine(name, args.os, None)
+    except ApiUnavailable as e:
+        msg = str(e)
+        if "409" in msg:
+            print(f"machine '{name}' is already enrolled. The hub stores only a "
+                  "token HASH and has no rotation endpoint, so its original "
+                  "token cannot be re-issued — the operator token works for "
+                  "the machine endpoints in the meantime.", file=sys.stderr)
+            return 1
+        print(msg, file=sys.stderr)
+        return 1
+
+    token = rec.get("token", "")
+    if not token:
+        print(f"enrolled '{name}' but the hub returned no token — nothing to "
+              "save, and it cannot be requested again", file=sys.stderr)
+        return 1
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(token, encoding="utf-8")
+    dest.chmod(0o600)
+    digest = hashlib.sha256(token.encode()).hexdigest()[:12]
+    print(f"enrolled '{name}' ({rec.get('os', '')})")
+    print(f"machine token written to {dest} (mode 0600, sha256 {digest})")
+    if args.print_token:
+        print(f"token: {token}")
+    else:
+        print("(pass --print-token to display it; it cannot be retrieved later)")
+    return 0
+
+
 def workspaces_command(args: argparse.Namespace, api: Any = None) -> int:
     """The workspace registry from the command line.
 
@@ -1729,11 +1831,13 @@ def workspaces_command(args: argparse.Namespace, api: Any = None) -> int:
         # meant to be the same picture in a different medium, not a second
         # dialect of it.
         name_w = min(max((len(r["name"]) for r in data["rows"]), default=8), 22)
+        here = data.get("this_machine")
         machine = object()
         for r in data["rows"]:
             if r["machine"] != machine:
                 machine = r["machine"]
-                print(machine or "(machine unknown)")
+                suffix = "  · this machine" if machine == here else "  · remote"
+                print(f"{machine or '(machine unknown)'}{suffix}")
             reg = {True: "✔ hub", False: "✗ hub", None: "? hub"}[r["registered"]]
             disk = "✔ disk" if r["on_disk"] else "✗ disk"
             open_now = "● open" if r["open_now"] else "      "
@@ -2253,6 +2357,20 @@ def _record_mute_in_cache(agent: str, squad: str, muted: bool) -> None:
 # solve, and solving them badly cost the operator an evening.
 SQUAD_BIN = str(pathlib.Path.home() / ".local" / "bin" / "squad")
 MCP_HUB_BIN = str(pathlib.Path.home() / ".local" / "bin" / "mcp-hub")
+
+# The same two tools, found the same way in every kind of shell. `squad` on
+# PATH is an INTERACTIVE-shell assumption: ssh commands, systemd timers and
+# cron get a bare PATH without ~/.local/bin, and `edge apply` — which is meant
+# to run from the heal timer — died there on a FileNotFoundError traceback.
+_TOOL_PATHS = {"squad": SQUAD_BIN, "mcp-hub": MCP_HUB_BIN}
+
+
+def _resolve_tool(name: str) -> str | None:
+    """Absolute path for a known tool: its install location, else PATH."""
+    fixed = _TOOL_PATHS.get(name)
+    if fixed and os.path.exists(fixed):
+        return fixed
+    return shutil.which(name)
 
 
 def settings_command(args: argparse.Namespace) -> int:
@@ -3738,6 +3856,44 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="Print the rewritten URL; write nothing"
     )
 
+    machines = sub.add_parser(
+        "machines",
+        help="Machine enrolment on the hub — required before presence or edge",
+        description=(
+            "A machine must have a row on the hub before it can report "
+            "anything: both the board's presence ping and `edge apply` 404 "
+            "without one. `enrol` returns a machine token EXACTLY ONCE — the "
+            "hub keeps only a hash and has no rotation endpoint — so this "
+            "writes it to disk before printing anything."
+        ),
+    )
+    machines.add_argument(
+        "action", choices=["list", "enrol"],
+        help="list: enrolled machines · enrol: add this machine",
+    )
+    machines.add_argument(
+        "name", nargs="?", default=None,
+        help="Machine name (default: sanitized hostname)",
+    )
+    machines.add_argument("--os", default="linux", help="OS label for the record")
+    machines.add_argument(
+        "--token-file", default=None,
+        help="Where to write the machine token (default: ~/.mcp-hub/machine.token)",
+    )
+    machines.add_argument(
+        "--force", action="store_true",
+        help="Overwrite an existing machine token file",
+    )
+    machines.add_argument(
+        "--print-token", action="store_true",
+        help="Also print the token (it cannot be retrieved later)",
+    )
+    machines.add_argument(
+        "--hub-url", default=DEFAULT_HUB_URL,
+        help="Hub base URL (default: $MCP_HUB_URL or built-in)",
+    )
+    machines.add_argument("--json", action="store_true", help="Machine-readable output")
+
     workspaces = sub.add_parser(
         "workspaces",
         help="The workspace registry: what this machine has, what the hub knows",
@@ -3880,6 +4036,8 @@ def main(argv: list[str] | None = None) -> int:
         return edge_command(args)
     if args.subcommand == "workspaces":
         return workspaces_command(args)
+    if args.subcommand == "machines":
+        return machines_command(args)
 
     parser.print_help()
     return 0
