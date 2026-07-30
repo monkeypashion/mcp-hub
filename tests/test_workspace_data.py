@@ -71,6 +71,60 @@ class TestCollect:
         # defaulted to False, which would read as "feral" and mislead.
         assert rows["solo"]["registered"] is None
 
+    def test_a_hub_that_answered_makes_an_unmatched_file_FERAL_not_unknown(
+        self, tmp_path: Path
+    ):
+        """The drift state this column exists for must be reachable.
+
+        A hub that answered has told us everything it knows, so a local file
+        it has no definition for is unregistered — not "unknown". Leaving it
+        None meant `✗ NOT REGISTERED` could never appear on any machine that
+        had not run `edge apply`, i.e. on any machine in the fleet.
+        """
+        _local(tmp_path, "feral")
+        out = collect_workspaces(_FakeAPI(), scan_dirs=[tmp_path], this_machine="here")
+        assert out["hub_reachable"] is True
+        assert out["rows"][0]["registered"] is False
+
+    def test_but_an_ABSENT_hub_still_leaves_the_question_open(self, tmp_path: Path):
+        """The other half of the same rule: only an answer can convict."""
+        _local(tmp_path, "feral")
+        out = collect_workspaces(
+            _FakeAPI(fail=True), scan_dirs=[tmp_path], this_machine="here"
+        )
+        assert out["rows"][0]["registered"] is None
+
+    def test_an_operator_ready_reason_is_shown_VERBATIM_not_called_unreachable(
+        self, tmp_path: Path
+    ):
+        """A hub that answers is not an outage, and must not be called one.
+
+        `ApiUnavailable` messages already name their own fix. Wrapping them in
+        "hub registry unreachable (...)" is what sent the operator hunting for
+        a downed hub when the real cause was a missing local token.
+        """
+        from mcp_hub.operator_api import ApiUnavailable
+
+        class _Off:
+            def get_registry(self):
+                raise ApiUnavailable(
+                    "the hub's management API is disabled"
+                    " (MCP_HUB_API_TOKEN is not set on the hub)"
+                )
+
+        _local(tmp_path, "solo")
+        out = collect_workspaces(_Off(), scan_dirs=[tmp_path], this_machine="here")
+        assert out["hub_reachable"] is False
+        assert out["note"] == (
+            "the hub's management API is disabled"
+            " (MCP_HUB_API_TOKEN is not set on the hub) — local scan only"
+        )
+        assert "unreachable" not in out["note"]
+        # Degrading is unchanged: the scan still answers, registration unknown.
+        rows = {r["name"]: r for r in out["rows"]}
+        assert rows["solo"]["on_disk"] is True
+        assert rows["solo"]["registered"] is None
+
     def test_local_file_wins_over_stale_fleet_discovery_of_same_machine(
         self, tmp_path: Path
     ):
