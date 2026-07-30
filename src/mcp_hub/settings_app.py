@@ -226,10 +226,15 @@ class SettingsApp(App):
     def __init__(self, agents: list[dict[str, str]], scoped_to: str | None,
                  model_for, squad_bin: str, hub_bin: str,
                  board_for=None, dark: bool | None = None,
-                 poll_seconds: float = 3.0, workspaces_for=None):
+                 poll_seconds: float = 3.0, workspaces_for=None,
+                 presence_ping=None, presence_seconds: float = 60.0):
         super().__init__()
         self.agents = agents
         self._workspaces_for = workspaces_for  # injected; None hides the view
+        self._presence_ping = presence_ping    # injected; None disables it
+        # Well inside the hub's 180s open-now window, so a single dropped
+        # ping never blinks the workspace out of the manager's view.
+        self._presence_seconds = presence_seconds
         self.show_workspaces = False
         self.scoped_to = scoped_to
         self._model_for = model_for       # injected so tests need no real repo
@@ -241,6 +246,7 @@ class SettingsApp(App):
         self.agent_ix = 0
         self.model: dict[str, Any] | None = None
         self.board: dict[str, Any] = {"agents": {}, "counts": {}, "error": None}
+        self._presence_error: str | None = None
         self._live_key: tuple | None = None
         # Bumped every redraw and baked into each widget id. remove_children()
         # is ASYNCHRONOUS, so a widget from the previous render can still be in
@@ -299,6 +305,13 @@ class SettingsApp(App):
         if self._board_for is not None:
             self._poll_board()                      # first paint: don't wait 3s
             self.set_interval(self._poll_seconds, self._poll_board)
+        # Presence needs BOTH a reporter and a workspace to report. Unscoped
+        # (`mcp-hub board` with no --workspace) there is genuinely nothing
+        # open to name, and inventing one would put a phantom row in the
+        # manager on every machine that ever opened a bare board.
+        if self._presence_ping is not None and self.scoped_to:
+            self._push_presence()                   # claim the row immediately
+            self.set_interval(self._presence_seconds, self._push_presence)
 
     def _first_with_settings(self) -> int:
         for i, a in enumerate(self.agents):
@@ -324,6 +337,30 @@ class SettingsApp(App):
         except Exception as exc:  # noqa: BLE001 — a dashboard never takes the app down
             snap = {"agents": {}, "counts": {}, "error": str(exc)[:120]}
         self.call_from_thread(self._apply_board, snap)
+
+    # ---- presence: the one fact only this process knows ----
+
+    def _push_presence(self) -> None:
+        """Report "this workspace is open" — on its OWN worker group.
+
+        Sharing `board-poll` would make the two cancel each other: both are
+        exclusive, and a 60s network call landing mid-scan would drop the
+        board's refresh on the floor.
+        """
+        self.run_worker(self._send_presence, thread=True,
+                        group="presence-ping", exclusive=True)
+
+    def _send_presence(self) -> None:
+        try:
+            self._presence_ping(self.scoped_to)
+        except Exception as exc:  # noqa: BLE001
+            # Deliberately quiet in the UI: the hub being unconfigured is
+            # already stated, in a full sentence, at the top of the `w` view.
+            # Saying it a second time on a 60s timer would be noise, and a
+            # dashboard never takes the app down.
+            self._presence_error = str(exc)[:160]
+        else:
+            self._presence_error = None
 
     def _apply_board(self, snap: dict[str, Any]) -> None:
         self.board = snap

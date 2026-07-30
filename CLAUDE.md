@@ -371,6 +371,58 @@ The launch dance is deliberately **not** taught to click these: auto-trusting
 arbitrary repo content defeats the point of the prompt. Seeding makes it an
 explicit act by whoever authorised the transport.
 
+## Workspace manager — three truth columns
+
+The board's **`w`** view (and `mcp-hub workspaces list`, the same data as text)
+answers one question per workspace, from three independent sources:
+
+```
+registered   the hub's /api/v1 registry — a DEFINITION someone made
+on disk      a real .code-workspace file (local scan + fleet edge reports)
+open now     a board is watching it right now (presence ping, 180s window)
+```
+
+Drift is the product: a file nobody defined and a definition nothing
+materialized are both visible, in both directions. `registered` is **`None`
+(`? hub`) when the hub can't answer** — never `False`, because "feral" is an
+accusation the data has to support.
+
+**It needs an operator token per machine** — `~/.mcp-hub/api.token` (mode
+`0600`), or `$MCP_HUB_API_TOKEN`. Without it you get the local scan only,
+which is a `find` with extra steps: the cross-machine merge is the whole
+point. The hub also needs `MCP_HUB_API_TOKEN` set in its own environment, or
+`/api/v1` is **off and loud** (503 to everything, authenticated or not).
+
+Those are three different failures and the manager names them separately —
+"no token on this machine", "the hub's management API is disabled", and
+"unreachable". They used to collapse into one message, which reported a
+healthy hub as an outage: an empty token makes httpx refuse to build the
+`Bearer` header, so the request never left the box and the error described a
+string. See `operator_api.py` — the distinction IS the feature.
+
+```bash
+mcp-hub workspaces list                    # the w view as text
+mcp-hub workspaces register --all --dry-run
+mcp-hub workspaces register --all --squad dreamteam
+mcp-hub workspaces register ~/Projects/squad.code-workspace
+```
+
+**Register before reading the drift column.** Until a workspace is POSTed to
+the hub, *every* workspace in the fleet is unregistered, so the column says
+the same thing about all of them and means nothing. Registering is what makes
+a later "missing" worth acting on. Re-running is safe — an existing name on
+this machine (or a machine-less, fleet-wide definition covering it) is
+skipped and reported, never duplicated.
+
+**`open now` has exactly one producer**: a board launched with `--workspace`
+pings `POST /api/v1/machines/<machine>/status` every 60s against the hub's
+180s window, so two consecutive drops are survivable. An **unscoped** board
+reports nothing at all — inventing a path would plant a phantom row on every
+machine that ever ran a bare `mcp-hub board`. The endpoint shipped before the
+sender did, which meant the column was blank fleet-wide while looking like a
+working feature; if you add a fourth column, add its producer in the same
+change.
+
 ## Stop hook — auto-surface queued messages
 
 Channels-based wake fires for `priority="normal"` and `"urgent"` messages, but `"low"` messages are deliberately queue-only (no wake). Without a Stop hook, agents only see queued items when they happen to call `get_messages()` — which often means never. The Stop hook closes that gap by auto-checking the inbox at every turn boundary. It also self-heals the keep-alive daemon: if no live daemon owns the agent's pidfile at a turn boundary, one is spawned detached (singleton-capped, fail-open).
