@@ -1683,6 +1683,128 @@ def rebind_url_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _workspace_scan_dirs() -> list[pathlib.Path]:
+    return [pathlib.Path.home() / "Projects", pathlib.Path.home()]
+
+
+def _workspace_listings(path: pathlib.Path) -> list[str]:
+    """The folder paths a workspace file lists, or [] if it won't parse.
+
+    Comments are stripped the same way `edge.discover_workspaces` strips
+    them: these files are JSONC by convention and hand-edited in practice.
+    """
+    try:
+        raw = re.sub(r"//[^\n]*", "", path.read_text(encoding="utf-8"))
+        return [f.get("path", "") for f in json.loads(raw).get("folders", [])]
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def workspaces_command(args: argparse.Namespace, api: Any = None) -> int:
+    """The workspace registry from the command line.
+
+    `api` is injected by tests so none of this needs a socket.
+    """
+    from mcp_hub.edge import discover_workspaces
+    from mcp_hub.operator_api import ApiUnavailable, OperatorApi, api_base
+    from mcp_hub.workspace_data import collect_workspaces
+
+    machine = args.machine or _sanitize_ident(platform.node() or "unknown-host")
+    if api is None:
+        api = OperatorApi(api_base(args.hub_url))
+    scan_dirs = [pathlib.Path(d) for d in (getattr(args, "scan_dir", None) or [])] \
+        or _workspace_scan_dirs()
+
+    if args.action == "list":
+        data = collect_workspaces(api, scan_dirs, machine)
+        if args.json:
+            print(json.dumps(data, indent=2))
+            return 0
+        if data["note"]:
+            print(data["note"])
+        if not data["rows"]:
+            print("no workspaces found anywhere")
+            return 0
+        # Grouped by machine, same shape as the board's `w` view — this is
+        # meant to be the same picture in a different medium, not a second
+        # dialect of it.
+        name_w = min(max((len(r["name"]) for r in data["rows"]), default=8), 22)
+        machine = object()
+        for r in data["rows"]:
+            if r["machine"] != machine:
+                machine = r["machine"]
+                print(machine or "(machine unknown)")
+            reg = {True: "✔ hub", False: "✗ hub", None: "? hub"}[r["registered"]]
+            disk = "✔ disk" if r["on_disk"] else "✗ disk"
+            open_now = "● open" if r["open_now"] else "      "
+            if r["error"]:
+                tail = f"⚠ {r['error']}"
+            elif not r["on_disk"]:
+                tail = "ghost — registered, no file"
+            elif r["registered"] is False:
+                tail = f"not registered   {r['path']}"
+            else:
+                tail = r["path"]
+            if r["squad"]:
+                tail = f"{tail}  [{r['squad']}]"
+            print(f"  {r['name']:<{name_w}}  {reg:<6} {disk:<7} {open_now}  {tail}")
+        return 0
+
+    # -- register ---------------------------------------------------------
+    if args.paths:
+        targets = [pathlib.Path(p) for p in args.paths]
+        missing = [str(p) for p in targets if not p.is_file()]
+        if missing:
+            print(f"no such workspace file: {', '.join(missing)}", file=sys.stderr)
+            return 1
+    elif args.all:
+        targets = [pathlib.Path(w["path"]) for w in discover_workspaces(scan_dirs)]
+    else:
+        print("name the workspace files to register, or pass --all",
+              file=sys.stderr)
+        return 1
+    if not targets:
+        print("no .code-workspace files found on this machine — nothing to register")
+        return 0
+
+    try:
+        existing = {
+            (w.get("machine", ""), w.get("name", "")) for w in api.list_workspaces()
+        }
+    except ApiUnavailable as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    created, skipped, failed = [], [], []
+    for path in targets:
+        name = path.name.removesuffix(".code-workspace")
+        # A definition with no machine is fleet-wide, so it satisfies this
+        # machine's row too — checking both stops a second register from
+        # silently duplicating what an earlier machine-less one already covers.
+        if (machine, name) in existing or ("", name) in existing:
+            skipped.append(name)
+            continue
+        listings = _workspace_listings(path)
+        if args.dry_run:
+            created.append(f"{name} ({len(listings)} folder(s))")
+            continue
+        try:
+            api.create_workspace(name, machine, args.squad, listings)
+            created.append(f"{name} ({len(listings)} folder(s))")
+        except ApiUnavailable as e:
+            failed.append(f"{name}: {e}")
+
+    verb = "would register" if args.dry_run else "registered"
+    for n in created:
+        print(f"{verb}: {n}")
+    for n in skipped:
+        print(f"already registered, left alone: {n}")
+    for n in failed:
+        print(f"FAILED {n}", file=sys.stderr)
+    print(f"{len(created)} {verb}, {len(skipped)} already there, {len(failed)} failed")
+    return 1 if failed else 0
+
+
 def identity_command(args: argparse.Namespace) -> int:
     """Print the derived identity for a worktree — the ONE source of truth.
 
@@ -2152,30 +2274,28 @@ def settings_command(args: argparse.Namespace) -> int:
         # line, and Textual's raw-mode setup would eat the reply.
         dark = terminal_prefers_dark()
         def _workspaces():
+            from mcp_hub.operator_api import OperatorApi, api_base
             from mcp_hub.workspace_data import collect_workspaces
-
-            class _Api:
-                def get_registry(self):
-                    import httpx
-
-                    token = os.environ.get("MCP_HUB_API_TOKEN", "")
-                    tok_file = pathlib.Path.home() / ".mcp-hub" / "api.token"
-                    if not token and tok_file.exists():
-                        token = tok_file.read_text().strip()
-                    base = DEFAULT_HUB_URL.rsplit("/mcp", 1)[0]
-                    r = httpx.get(
-                        f"{base}/api/v1/workspace-registry",
-                        headers={"Authorization": f"Bearer {token}"},
-                        timeout=5,
-                    )
-                    r.raise_for_status()
-                    return r.json()
 
             host = _sanitize_ident(platform.node() or "unknown-host")
             return collect_workspaces(
-                _Api(),
+                OperatorApi(api_base(DEFAULT_HUB_URL)),
                 scan_dirs=[pathlib.Path.home() / "Projects", pathlib.Path.home()],
                 this_machine=host,
+            )
+
+        def _presence_ping(workspace_path: str) -> None:
+            """Tell the hub this workspace is open in front of a human.
+
+            Only the board can know this — no scan infers it — so if this
+            never fires, the manager's third column is dead weight. Errors
+            are the caller's to swallow; this is a dashboard.
+            """
+            from mcp_hub.operator_api import OperatorApi, api_base
+
+            host = _sanitize_ident(platform.node() or "unknown-host")
+            OperatorApi(api_base(DEFAULT_HUB_URL)).push_status(
+                host, {"workspace_open": workspace_path}
             )
 
         SettingsApp(
@@ -2187,6 +2307,7 @@ def settings_command(args: argparse.Namespace) -> int:
             board_for=lambda: collect(SQUAD_BIN),
             dark=dark,
             workspaces_for=_workspaces,
+            presence_ping=_presence_ping,
         ).run()
         return 0
     cwd = args.cwd or os.getcwd()
@@ -3617,6 +3738,52 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="Print the rewritten URL; write nothing"
     )
 
+    workspaces = sub.add_parser(
+        "workspaces",
+        help="The workspace registry: what this machine has, what the hub knows",
+        description=(
+            "`list` is the board's `w` view as text — every .code-workspace "
+            "found here, merged with the hub's registry, three truth columns. "
+            "`register` is the missing half: until a workspace is POSTed to "
+            "/api/v1/workspaces it reads as an unregistered file, so a fresh "
+            "hub makes every workspace you own look like drift. Registering "
+            "is what makes a MISSING one mean something."
+        ),
+    )
+    workspaces.add_argument(
+        "action", choices=["list", "register"],
+        help="list: the merged view · register: define workspaces on the hub",
+    )
+    workspaces.add_argument(
+        "paths", nargs="*",
+        help="Workspace files to register (default with --all: every one found here)",
+    )
+    workspaces.add_argument(
+        "--all", action="store_true",
+        help="register: every .code-workspace discovered on this machine",
+    )
+    workspaces.add_argument(
+        "--squad", default="",
+        help="register: type these workspaces with a squad (must exist on the hub)",
+    )
+    workspaces.add_argument(
+        "--machine", default=None,
+        help="Machine name (default: sanitized hostname)",
+    )
+    workspaces.add_argument(
+        "--hub-url", default=DEFAULT_HUB_URL,
+        help="Hub base URL (default: $MCP_HUB_URL or built-in)",
+    )
+    workspaces.add_argument(
+        "--scan-dir", action="append", default=None,
+        help="Workspace scan dir (repeatable; default: ~/Projects and ~)",
+    )
+    workspaces.add_argument(
+        "--dry-run", action="store_true",
+        help="register: print what would be created; write nothing",
+    )
+    workspaces.add_argument("--json", action="store_true", help="Machine-readable output")
+
     edge = sub.add_parser(
         "edge",
         help="Edge realizer: reconcile this machine toward the hub's desired state",
@@ -3711,6 +3878,8 @@ def main(argv: list[str] | None = None) -> int:
         return rebind_url_command(args)
     if args.subcommand == "edge":
         return edge_command(args)
+    if args.subcommand == "workspaces":
+        return workspaces_command(args)
 
     parser.print_help()
     return 0

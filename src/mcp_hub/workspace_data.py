@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from mcp_hub.edge import discover_workspaces
+from mcp_hub.operator_api import ApiUnavailable
 
 
 def _name_of(path: str) -> str:
@@ -57,6 +58,13 @@ def collect_workspaces(
     note = ""
     try:
         registry = api.get_registry()
+    except ApiUnavailable as e:
+        # Already an operator-ready sentence naming its own fix — "no token
+        # here", "API disabled on the hub" and "unreachable" are different
+        # problems, and the manager must not flatten them into an outage.
+        hub_reachable = False
+        note = f"{e} — local scan only"
+        registry = {"definitions": [], "discovered": []}
     except Exception as e:  # noqa: BLE001 — any transport failure degrades
         hub_reachable = False
         note = f"hub registry unreachable ({e}) — local scan only"
@@ -106,6 +114,15 @@ def collect_workspaces(
                 "registered": True,
                 "squad": w.get("squad", ""),
             }
+
+    # A hub that ANSWERED has told us everything it knows. Anything still
+    # unmatched is therefore not registered — a feral file — and saying
+    # "unknown" about it hides the one state this column exists to show.
+    # Only an absent hub leaves the question genuinely open.
+    if hub_reachable:
+        for r in rows.values():
+            if r["registered"] is None:
+                r["registered"] = False
 
     return {
         "hub_reachable": hub_reachable,

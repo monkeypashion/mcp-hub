@@ -3605,6 +3605,7 @@ _CLI_SUBCOMMANDS = {
     "mute",
     "rebind-url",
     "edge",
+    "workspaces",
 }
 
 

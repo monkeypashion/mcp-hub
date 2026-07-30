@@ -28,6 +28,7 @@ OSC 11 before the app takes the tty; `t` flips it live if the answer was wrong.
 """
 from __future__ import annotations
 
+import pathlib
 import subprocess
 from typing import Any
 
@@ -157,6 +158,10 @@ Screen { layout: vertical; }
 .source { color: $text-muted; height: 1; padding: 0 0 0 24; }
 Select { width: 30; height: 1; }
 .note { color: $warning; padding: 1 0; height: auto; }
+/* workspace manager: one Static per row, so nothing can overflow its line */
+.ws-machine { color: $primary; text-style: bold; height: auto; padding: 1 0 0 0; }
+.ws-row { color: $text; height: 1; width: 1fr; }
+.ws-row-drift { color: $warning; height: 1; width: 1fr; }
 #status { dock: bottom; height: 1; padding: 0 2; background: $panel; }
 
 /* live section — height:auto or it is the collapsing-1fr child the comment
@@ -226,10 +231,15 @@ class SettingsApp(App):
     def __init__(self, agents: list[dict[str, str]], scoped_to: str | None,
                  model_for, squad_bin: str, hub_bin: str,
                  board_for=None, dark: bool | None = None,
-                 poll_seconds: float = 3.0, workspaces_for=None):
+                 poll_seconds: float = 3.0, workspaces_for=None,
+                 presence_ping=None, presence_seconds: float = 60.0):
         super().__init__()
         self.agents = agents
         self._workspaces_for = workspaces_for  # injected; None hides the view
+        self._presence_ping = presence_ping    # injected; None disables it
+        # Well inside the hub's 180s open-now window, so a single dropped
+        # ping never blinks the workspace out of the manager's view.
+        self._presence_seconds = presence_seconds
         self.show_workspaces = False
         self.scoped_to = scoped_to
         self._model_for = model_for       # injected so tests need no real repo
@@ -241,6 +251,7 @@ class SettingsApp(App):
         self.agent_ix = 0
         self.model: dict[str, Any] | None = None
         self.board: dict[str, Any] = {"agents": {}, "counts": {}, "error": None}
+        self._presence_error: str | None = None
         self._live_key: tuple | None = None
         # Bumped every redraw and baked into each widget id. remove_children()
         # is ASYNCHRONOUS, so a widget from the previous render can still be in
@@ -299,6 +310,13 @@ class SettingsApp(App):
         if self._board_for is not None:
             self._poll_board()                      # first paint: don't wait 3s
             self.set_interval(self._poll_seconds, self._poll_board)
+        # Presence needs BOTH a reporter and a workspace to report. Unscoped
+        # (`mcp-hub board` with no --workspace) there is genuinely nothing
+        # open to name, and inventing one would put a phantom row in the
+        # manager on every machine that ever opened a bare board.
+        if self._presence_ping is not None and self.scoped_to:
+            self._push_presence()                   # claim the row immediately
+            self.set_interval(self._presence_seconds, self._push_presence)
 
     def _first_with_settings(self) -> int:
         for i, a in enumerate(self.agents):
@@ -324,6 +342,30 @@ class SettingsApp(App):
         except Exception as exc:  # noqa: BLE001 — a dashboard never takes the app down
             snap = {"agents": {}, "counts": {}, "error": str(exc)[:120]}
         self.call_from_thread(self._apply_board, snap)
+
+    # ---- presence: the one fact only this process knows ----
+
+    def _push_presence(self) -> None:
+        """Report "this workspace is open" — on its OWN worker group.
+
+        Sharing `board-poll` would make the two cancel each other: both are
+        exclusive, and a 60s network call landing mid-scan would drop the
+        board's refresh on the floor.
+        """
+        self.run_worker(self._send_presence, thread=True,
+                        group="presence-ping", exclusive=True)
+
+    def _send_presence(self) -> None:
+        try:
+            self._presence_ping(self.scoped_to)
+        except Exception as exc:  # noqa: BLE001
+            # Deliberately quiet in the UI: the hub being unconfigured is
+            # already stated, in a full sentence, at the top of the `w` view.
+            # Saying it a second time on a 60s timer would be noise, and a
+            # dashboard never takes the app down.
+            self._presence_error = str(exc)[:160]
+        else:
+            self._presence_error = None
 
     def _apply_board(self, snap: dict[str, Any]) -> None:
         self.board = snap
@@ -643,6 +685,19 @@ class SettingsApp(App):
     def _set_status(self, text: str) -> None:
         self.query_one("#status", Static).update(text)
 
+    @staticmethod
+    def _short_dir(path: str | None) -> str:
+        """The parent directory, home-shortened. `~` is worth 11 cells here."""
+        if not path:
+            return "definition only — nothing materialized"
+        parent = str(pathlib.PurePosixPath(path).parent)
+        home = str(pathlib.Path.home())
+        if parent == home:
+            return "~"
+        if parent.startswith(home + "/"):
+            return "~/" + parent[len(home) + 1:]
+        return parent
+
     def _workspace_widgets(self) -> list[Any]:
         """The manager's view: every workspace, three truth columns, drift
         loud. Rendered from collect_workspaces — no ids on rows, so this view
@@ -661,29 +716,42 @@ class SettingsApp(App):
             return out
         if data.get("note"):
             out.append(Static(data["note"], classes="note"))
-        for r in data.get("rows", []):
-            reg = {True: "✔ hub", False: "✗ NOT REGISTERED", None: "? hub"}[
+        rows = data.get("rows", [])
+        # ONE Static per row, pre-formatted. The previous shape was a
+        # Horizontal of a fixed-width Label plus a 1fr Static, inherited from
+        # the settings rows — where the value is short. A workspace row
+        # carries an absolute path, and the value was sized to the FULL row
+        # width while starting after the 24-cell label, so it overflowed the
+        # row by exactly the label's width and the whole thing read as
+        # wrapped. Nothing here can overflow: the text is measured first.
+        name_w = max((len(r["name"]) for r in rows), default=8)
+        name_w = min(max(name_w, 8), 22)
+        machine = object()  # sentinel: never equal to a real machine name
+        for r in rows:
+            if r.get("machine") != machine:
+                machine = r.get("machine")
+                out.append(Static(machine or "(machine unknown)",
+                                  classes="ws-machine"))
+            reg = {True: "✔ hub", False: "✗ hub", None: "? hub"}[
                 r.get("registered")]
-            disk = "✔ disk" if r.get("on_disk") else "✗ NO FILE"
-            open_now = "● open" if r.get("open_now") else ""
+            disk = "✔ disk" if r.get("on_disk") else "✗ disk"
+            open_now = "● open" if r.get("open_now") else "      "
             drift = (r.get("registered") is False) or not r.get("on_disk")
-            name = f"{r['name']}  ·{r['machine']}" if r.get("machine") else r["name"]
-            squad = f"  [{r['squad']}]" if r.get("squad") else ""
-            cols = "   ".join(x for x in (reg, disk, open_now) if x)
-            out.append(Vertical(
-                Horizontal(
-                    Label(name, classes="label"),
-                    Static(cols, classes=_value_class(
-                        "unknown" if drift else "on")),
-                    classes="row-line",
-                ),
-                Static(
-                    (r.get("error") and f"⚠ {r['error']}")
-                    or (r.get("path") or "definition only — nothing materialized")
-                    + squad,
-                    classes="source",
-                ),
-                classes="row",
+            # Drift says what it IS, in words, at the end of the line — the
+            # short columns stay aligned and the reason still reads loudly.
+            if r.get("error"):
+                tail = f"⚠ {r['error']}"
+            elif not r.get("on_disk"):
+                tail = "ghost — registered, no file"
+            elif r.get("registered") is False:
+                tail = "not registered   " + self._short_dir(r.get("path"))
+            else:
+                tail = self._short_dir(r.get("path"))
+            if r.get("squad"):
+                tail = f"{tail}  [{r['squad']}]"
+            out.append(Static(
+                f"  {r['name']:<{name_w}}  {reg:<6} {disk:<7} {open_now}  {tail}",
+                classes="ws-row-drift" if drift else "ws-row",
             ))
         if not data.get("rows"):
             out.append(Static("no workspaces found anywhere", classes="note"))
