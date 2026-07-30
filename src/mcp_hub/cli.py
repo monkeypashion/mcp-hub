@@ -1725,14 +1725,29 @@ def workspaces_command(args: argparse.Namespace, api: Any = None) -> int:
         if not data["rows"]:
             print("no workspaces found anywhere")
             return 0
+        # Grouped by machine, same shape as the board's `w` view — this is
+        # meant to be the same picture in a different medium, not a second
+        # dialect of it.
+        name_w = min(max((len(r["name"]) for r in data["rows"]), default=8), 22)
+        machine = object()
         for r in data["rows"]:
-            reg = {True: "✔ hub", False: "✖ hub", None: "? hub"}[r["registered"]]
-            disk = "✔ disk" if r["on_disk"] else "✖ disk"
-            open_now = "● open" if r["open_now"] else ""
-            print(
-                f"{r['name']:<20} ·{r['machine']:<16} {reg}  {disk}  {open_now}"
-                f"  {r['path'] or '(no local file)'}{r['error']}"
-            )
+            if r["machine"] != machine:
+                machine = r["machine"]
+                print(machine or "(machine unknown)")
+            reg = {True: "✔ hub", False: "✗ hub", None: "? hub"}[r["registered"]]
+            disk = "✔ disk" if r["on_disk"] else "✗ disk"
+            open_now = "● open" if r["open_now"] else "      "
+            if r["error"]:
+                tail = f"⚠ {r['error']}"
+            elif not r["on_disk"]:
+                tail = "ghost — registered, no file"
+            elif r["registered"] is False:
+                tail = f"not registered   {r['path']}"
+            else:
+                tail = r["path"]
+            if r["squad"]:
+                tail = f"{tail}  [{r['squad']}]"
+            print(f"  {r['name']:<{name_w}}  {reg:<6} {disk:<7} {open_now}  {tail}")
         return 0
 
     # -- register ---------------------------------------------------------

@@ -115,6 +115,15 @@ def collect_workspaces(
                 "squad": w.get("squad", ""),
             }
 
+    # A hub that ANSWERED has told us everything it knows. Anything still
+    # unmatched is therefore not registered — a feral file — and saying
+    # "unknown" about it hides the one state this column exists to show.
+    # Only an absent hub leaves the question genuinely open.
+    if hub_reachable:
+        for r in rows.values():
+            if r["registered"] is None:
+                r["registered"] = False
+
     return {
         "hub_reachable": hub_reachable,
         "note": note,

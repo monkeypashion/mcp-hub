@@ -216,12 +216,19 @@ async def test_workspaces_view_toggles_and_shows_drift():
         )
         assert "WORKSPACES" in text
         assert "runtime" in text and "● open" in text
-        assert "NOT REGISTERED" in text          # feral, loud
-        assert "NO FILE" in text                 # ghost, loud
+        # Drift is still named in WORDS, not left to a glyph — the columns
+        # went short (✗ hub / ✗ disk) so rows stay aligned, and the reason
+        # moved to the end of the line where it still reads loudly.
+        assert "not registered" in text          # feral, loud
+        # NOT "ghost": the fixture has a row NAMED ghost, so that assertion
+        # passed while the drift text was empty (caught by mutating the tail
+        # away — it survived). Assert the wording only the tail can produce.
+        assert "registered, no file" in text     # ghost, loud
+        assert "✗ hub" in text and "✗ disk" in text
         await pilot.press("w")
         await pilot.pause()
         text = "\n".join(str(w.render()) for w in app.query("Static"))
-        assert "NOT REGISTERED" not in text      # back on agent detail
+        assert "not registered" not in text      # back on agent detail
 
 
 @pytest.mark.asyncio
