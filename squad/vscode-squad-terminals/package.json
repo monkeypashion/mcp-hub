@@ -2,7 +2,7 @@
   "name": "squad-terminals",
   "displayName": "Squad Terminals",
   "description": "Auto-opens one plain terminal per squad agent (squad attach) with icon+color, and adds per-agent squad actions to the terminal tab context menu.",
-  "version": "0.30.0",
+  "version": "0.31.0",
   "publisher": "monkeypashion",
   "engines": {
     "vscode": "^1.90.0"
@@ -30,22 +30,22 @@
       },
       {
         "command": "squad.sendPrompt",
-        "title": "Send prompt…",
+        "title": "Send prompt\u2026",
         "category": "Squad"
       },
       {
         "command": "squad.stockPrompt",
-        "title": "Stock prompt…",
+        "title": "Stock prompt\u2026",
         "category": "Squad"
       },
       {
         "command": "squad.broadcast",
-        "title": "Broadcast to squad via this agent…",
+        "title": "Broadcast to squad via this agent\u2026",
         "category": "Squad"
       },
       {
         "command": "squad.dmVia",
-        "title": "Message agent(s) via this one…",
+        "title": "Message agent(s) via this one\u2026",
         "category": "Squad"
       },
       {
@@ -140,7 +140,7 @@
       },
       {
         "command": "squad.slash.custom",
-        "title": "Slash command…",
+        "title": "Slash command\u2026",
         "category": "Squad"
       },
       {
@@ -165,7 +165,7 @@
       },
       {
         "command": "squad.transport",
-        "title": "Transport to workspace…",
+        "title": "Transport to workspace\u2026",
         "category": "Squad"
       },
       {
@@ -175,12 +175,12 @@
       },
       {
         "command": "squad.transportAll",
-        "title": "Transport ALL agents to workspace…",
+        "title": "Transport ALL agents to workspace\u2026",
         "category": "Squad"
       },
       {
         "command": "squad.addFolder",
-        "title": "Add existing folder as agent…",
+        "title": "Add existing folder as agent\u2026",
         "category": "Squad"
       },
       {
@@ -190,7 +190,7 @@
       },
       {
         "command": "squad.transportWorkspace",
-        "title": "Workspace: transport it to…",
+        "title": "Workspace: transport it to\u2026",
         "category": "Squad"
       },
       {
@@ -205,17 +205,37 @@
       },
       {
         "command": "squad.addFromGitHub",
-        "title": "Clone from GitHub as agent…",
+        "title": "Clone from GitHub as agent\u2026",
         "category": "Squad"
       },
       {
         "command": "squad.teardownWorkspace",
-        "title": "Workspace: tear it down…",
+        "title": "Workspace: tear it down\u2026",
         "category": "Squad"
       },
       {
         "command": "squad.settings",
-        "title": "Settings…",
+        "title": "Settings\u2026",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.focus.30",
+        "title": "Focus: 30 minutes",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.focus.60",
+        "title": "Focus: 1 hour",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.focus.120",
+        "title": "Focus: 2 hours",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.focus.off",
+        "title": "Focus: off (wakes resume now)",
         "category": "Squad"
       }
     ],
@@ -251,6 +271,10 @@
       {
         "id": "squad.enrolMenu",
         "label": "Add & remove"
+      },
+      {
+        "id": "squad.focusMenu",
+        "label": "Focus (do not disturb)"
       }
     ],
     "menus": {
@@ -349,6 +373,11 @@
         {
           "command": "squad.settings",
           "group": "5_settings@1",
+          "when": "squad.isAgent"
+        },
+        {
+          "submenu": "squad.focusMenu",
+          "group": "1_talk@5",
           "when": "squad.isAgent"
         }
       ],
@@ -495,6 +524,28 @@
           "command": "squad.teardownWorkspace",
           "group": "3_danger@2"
         }
+      ],
+      "squad.focusMenu": [
+        {
+          "command": "squad.focus.30",
+          "group": "1_on@1",
+          "when": "squad.isAgent"
+        },
+        {
+          "command": "squad.focus.60",
+          "group": "1_on@2",
+          "when": "squad.isAgent"
+        },
+        {
+          "command": "squad.focus.120",
+          "group": "1_on@3",
+          "when": "squad.isAgent"
+        },
+        {
+          "command": "squad.focus.off",
+          "group": "2_off@1",
+          "when": "squad.isAgent"
+        }
       ]
     },
     "configuration": {
@@ -510,8 +561,8 @@
           "default": "confirm",
           "enumDescriptions": [
             "Focusing a down agent's terminal shows a one-click 'Start & attach' prompt (default).",
-            "Focusing a down agent's terminal starts claude immediately — zero-click; window-restore/panel-reveal focus events can start an agent from a glance.",
-            "Never auto-start; use the tab context menu (Squad → Start & attach)."
+            "Focusing a down agent's terminal starts claude immediately \u2014 zero-click; window-restore/panel-reveal focus events can start an agent from a glance.",
+            "Never auto-start; use the tab context menu (Squad \u2192 Start & attach)."
           ],
           "description": "What happens when you focus the terminal of an agent that is down."
         }
