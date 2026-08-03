@@ -2291,6 +2291,45 @@ async def _mute_squad(hub_url: str, name: str, squad: str, muted: bool) -> str:
             )) or ""
 
 
+async def _set_focus(hub_url: str, name: str, minutes: int, reason: str) -> str:
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    async with streamablehttp_client(
+        _ephemeral_hub_url(hub_url), timeout=15
+    ) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            return _extract_text(await session.call_tool(
+                "focus",
+                {"agent_name": name, "minutes": minutes, "reason": reason},
+            )) or ""
+
+
+def focus_command(args: argparse.Namespace) -> int:
+    """Do-not-disturb for one agent, for a bounded time.
+
+    A CLI verb because the cockpit shells out rather than calling MCP tools,
+    and because the operator is often the one who knows an agent is about to
+    be busy in a way the hub cannot see.
+    """
+    name = args.agent
+    if not name:
+        cwd = args.cwd or os.getcwd()
+        name, _project = _derive_agent_identity(cwd)
+        if not name:
+            print(f"no derived identity for {cwd} — pass --agent", file=sys.stderr)
+            return 1
+    minutes = 0 if args.off else args.minutes
+    try:
+        reply = asyncio.run(_set_focus(args.hub_url, name, minutes, args.reason))
+    except Exception as exc:  # noqa: BLE001
+        print(f"!! focus failed: {exc}", file=sys.stderr)
+        return 1
+    print(reply or f"{name}: focus {'off' if minutes <= 0 else f'{minutes}m'}")
+    return 0
+
+
 def mute_command(args: argparse.Namespace) -> int:
     """Silence one squad's broadcasts for one agent, without leaving it.
 
@@ -3856,6 +3895,34 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="Print the rewritten URL; write nothing"
     )
 
+    focus_p = sub.add_parser(
+        "focus",
+        help="Do not disturb — suppress an agent's wakes for a bounded time",
+        description=(
+            "The hub knows 'in a turn' and 'idle', and treats idle as safe to "
+            "interrupt — so an agent babysitting a deploy looks exactly like "
+            "one doing nothing. Focus is the third state. Nothing is dropped: "
+            "messages queue and surface at the next turn boundary. `urgent` "
+            "still gets through, and focus EXPIRES on its own, because a "
+            "silencer you can leave on forever is a silent-drop bug."
+        ),
+    )
+    focus_p.add_argument(
+        "minutes", nargs="?", type=int, default=60,
+        help="How long to stay focused (default 60, capped at 480)",
+    )
+    focus_p.add_argument("--off", action="store_true", help="End focus now")
+    focus_p.add_argument("--reason", default="", help="Shown to anyone reaching you")
+    focus_p.add_argument(
+        "--agent", default=None,
+        help="Agent name (default: derived from --cwd)",
+    )
+    focus_p.add_argument("--cwd", default=None, help="Worktree for identity derivation")
+    focus_p.add_argument(
+        "--hub-url", default=DEFAULT_HUB_URL,
+        help="Hub base URL (default: $MCP_HUB_URL or built-in)",
+    )
+
     machines = sub.add_parser(
         "machines",
         help="Machine enrolment on the hub — required before presence or edge",
@@ -4038,6 +4105,8 @@ def main(argv: list[str] | None = None) -> int:
         return workspaces_command(args)
     if args.subcommand == "machines":
         return machines_command(args)
+    if args.subcommand == "focus":
+        return focus_command(args)
 
     parser.print_help()
     return 0

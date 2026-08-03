@@ -86,6 +86,10 @@ class _PushOutcome(NamedTuple):
 
     delivered: bool
     primary: bool
+    # Why no wake fired, when the reason is a DELIBERATE suppression rather
+    # than an absent binding. Empty for "not bound" — the sender needs to be
+    # able to tell "they chose not to be interrupted" from "they are gone".
+    suppressed: str = ""
 
 
 # Allowed priority values for send/broadcast. The hub uses priority to decide
@@ -100,6 +104,31 @@ class _PushOutcome(NamedTuple):
 #               tag's meta so receivers can visually flag it.
 _VALID_PRIORITIES = {"low", "normal", "urgent"}
 _NO_WAKE_PRIORITIES = {"low"}
+
+# Focus mode. `urgent` PIERCES it: a focus that also swallows "production
+# incident" is one nobody dares switch on, and an unusable silencer just
+# returns everyone to the convention it replaced. Everything else queues and
+# surfaces at the next Stop-hook boundary, so focus delays messages — it
+# never drops them.
+_FOCUS_PIERCING_PRIORITIES = {"urgent"}
+
+
+def _fmt_minutes(seconds: float) -> str:
+    """'45m' / '2h10m' — focus is always reported with its time REMAINING.
+
+    A bare "focused" invites the question this is meant to pre-empt: for how
+    much longer, and do I wait or escalate?
+    """
+    mins = max(0, int(seconds // 60))
+    if mins < 60:
+        return f"{mins}m"
+    return f"{mins // 60}h{mins % 60:02d}m"
+
+
+FOCUS_DEFAULT_MINUTES = 60
+# A cap, not a suggestion. Focus is a silencer; an unbounded one is the
+# silent-drop failure mode this codebase keeps re-learning.
+FOCUS_MAX_MINUTES = 480
 
 # broadcast(scope=...) takes a SQUAD NAME, so one word has to be reserved for
 # "everyone". A squad actually called "fleet" would make `scope="fleet"` mean
@@ -600,6 +629,26 @@ def init_db(db_path: Path = DB_PATH) -> None:
     for col_sql in (
         "ALTER TABLE agents ADD COLUMN is_idle INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE agents ADD COLUMN last_idle_at REAL NOT NULL DEFAULT 0",
+    ):
+        try:
+            conn.execute(col_sql)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+    # Migrate: focus mode. The hub models two states — in a turn, and idle —
+    # and treats idle as safe to interrupt. But an agent watching a deploy or
+    # tailing a log is idle-at-the-keyboard and operationally busy, and the
+    # hub cannot see that kind of busy; the only defence was a convention
+    # telling senders to hold off, which fails exactly when the fleet is busy.
+    #
+    # focus_until is an EXPIRY, not a flag, and that is the whole safety
+    # design: a silencer that can be left on forever is a silent-drop bug
+    # waiting to happen, and this codebase has shipped enough of those. A
+    # forgotten focus lapses on its own.
+    for col_sql in (
+        "ALTER TABLE agents ADD COLUMN focus_until REAL NOT NULL DEFAULT 0",
+        "ALTER TABLE agents ADD COLUMN focus_reason TEXT NOT NULL DEFAULT ''",
     ):
         try:
             conn.execute(col_sql)
@@ -1432,6 +1481,25 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # active set — the underlying session_id has been DELETEd/crashed.
         return False
 
+    def _focus_remaining(agent: str) -> float:
+        """Seconds of focus left for `agent`, or 0 when not focused.
+
+        Reads the expiry rather than a flag, so an expired focus needs no
+        sweeper and no cleanup job: it simply stops being true. Fail-soft —
+        a DB error here must never swallow a wake, so the failure direction
+        is "deliver anyway".
+        """
+        try:
+            conn = _get_db(db_path)
+            row = conn.execute(
+                "SELECT focus_until FROM agents WHERE name = ?", (agent,)
+            ).fetchone()
+        except Exception:  # noqa: BLE001 — never silence a message on error
+            return 0.0
+        if not row or not row["focus_until"]:
+            return 0.0
+        return max(0.0, float(row["focus_until"]) - time.time())
+
     def _stamp_pushed(conn: Any, ids: list[int], agent: str) -> None:
         """Record the recipient's CURRENT binding generation on messages we
         just pushed live to them.
@@ -1491,6 +1559,18 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # while the primary is left untouched for the reaper / wake-ack paths
         # that own its lifecycle — dropping it on a transient push failure is
         # the exact mistake the mark-read-on-push incident warned against.
+        # Focus gate. Deliberately HERE and not at the five call sites: every
+        # wake in the hub funnels through this function, so one gate cannot be
+        # bypassed by a path someone forgets to update — and a silencer that
+        # covers four of five paths is worse than none, because it is trusted.
+        # Priority rides in `meta`, which every caller already populates.
+        focus_left = _focus_remaining(agent)
+        if focus_left > 0 and meta.get("priority") not in _FOCUS_PIERCING_PRIORITIES:
+            return _PushOutcome(
+                False, False,
+                f"focus mode, {_fmt_minutes(focus_left)} left",
+            )
+
         sessions = registry.sessions(agent)
         if not sessions:
             return _PushOutcome(False, False)  # never bound
@@ -1935,7 +2015,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             # liveness gate; if the agent's process is gone, the binding
             # gets reaped and ⚡ disappears.
             idle = " 💤" if r["is_idle"] else ""
-            line = f"{status} **{r['name']}**{wake}{idle}"
+            # 🔕 with its REMAINING time. A silencer nobody can see is how a
+            # delayed message becomes an apparently-ignored one: the sender
+            # needs to distinguish "chose not to be interrupted, back in 20m"
+            # from "offline", and those look identical without this.
+            left = _focus_remaining(r["name"])
+            focus = f" 🔕 {_fmt_minutes(left)}" if left > 0 else ""
+            line = f"{status} **{r['name']}**{wake}{idle}{focus}"
             if r["project"]:
                 line += f" ({r['project']})"
             if r["bio"]:
@@ -2112,14 +2198,25 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # or explicit). Worst case, a live-surfaced push is seen once more on the
         # next inbox pull — a harmless duplicate, vs. the silent loss this fixes.
 
-        return (
-            f"Message sent to '{to}' (priority={priority})."
-            if outcome.delivered
-            else (
+        if outcome.delivered:
+            body = f"Message sent to '{to}' (priority={priority})."
+        elif outcome.suppressed:
+            # NOT "offline". The recipient is there and chose not to be
+            # interrupted; telling the sender otherwise invites a pointless
+            # relaunch hunt, and hides the one fact that decides what to do
+            # next — how long until they surface, and whether to escalate.
+            body = (
+                f"Message queued for '{to}' (priority={priority}; "
+                f"{outcome.suppressed} — NOT offline). It surfaces at their "
+                "next turn boundary; send urgent only if it genuinely cannot "
+                "wait."
+            )
+        else:
+            body = (
                 f"Message sent to '{to}' (priority={priority}; recipient "
                 f"offline — will see on next register/get_messages)."
             )
-        ) + _verbosity_advisory(message)
+        return body + _verbosity_advisory(message)
 
     # -- Broadcast --
 
@@ -3376,6 +3473,65 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         lines.reverse()
         return "\n".join(lines)
 
+    # -- Focus --
+
+    @mcp.tool()
+    def focus(
+        agent_name: str, minutes: int = FOCUS_DEFAULT_MINUTES, reason: str = ""
+    ) -> str:
+        """Suppress your own wakes for a while — "do not disturb".
+
+        The hub knows two states: in a turn, and idle. It treats idle as safe
+        to interrupt, so an agent babysitting a deploy or tailing a log looks
+        exactly like one doing nothing. Focus is the third state.
+
+        Nothing is DROPPED. Messages queue as normal and surface at your next
+        Stop-hook boundary; focus only decides whether they interrupt you now.
+
+        `urgent` still gets through, deliberately — a focus that swallowed
+        "production incident" is one nobody would dare turn on.
+
+        Args:
+            agent_name: Your agent name.
+            minutes: How long, capped at FOCUS_MAX_MINUTES. Pass 0 to end
+                focus immediately.
+            reason: Optional note shown to anyone who tries to reach you.
+        """
+        conn = _get_db(db_path)
+        if not conn.execute(
+            "SELECT 1 FROM agents WHERE name = ?", (agent_name,)
+        ).fetchone():
+            return f"No such agent '{agent_name}' — register() first."
+
+        if minutes <= 0:
+            conn.execute(
+                "UPDATE agents SET focus_until = 0, focus_reason = '' "
+                "WHERE name = ?",
+                (agent_name,),
+            )
+            conn.commit()
+            return f"Focus off for '{agent_name}' — wakes resume immediately."
+
+        capped = min(int(minutes), FOCUS_MAX_MINUTES)
+        until = time.time() + capped * 60
+        conn.execute(
+            "UPDATE agents SET focus_until = ?, focus_reason = ? WHERE name = ?",
+            (until, reason, agent_name),
+        )
+        conn.commit()
+        note = f" ({reason})" if reason else ""
+        capped_note = (
+            f" — capped from {minutes} at the {FOCUS_MAX_MINUTES}-minute maximum"
+            if capped != int(minutes) else ""
+        )
+        return (
+            f"Focus on for '{agent_name}': {capped}m{note}, until "
+            f"{time.strftime('%H:%M', time.localtime(until))}{capped_note}. "
+            "Normal DMs, posts and broadcasts will queue without waking you; "
+            "urgent still gets through; everything surfaces at your next turn "
+            "boundary. It expires on its own — nothing to remember to undo."
+        )
+
     # -- Utility --
 
     @mcp.tool()
@@ -3607,6 +3763,7 @@ _CLI_SUBCOMMANDS = {
     "edge",
     "workspaces",
     "machines",
+    "focus",
 }
 
 

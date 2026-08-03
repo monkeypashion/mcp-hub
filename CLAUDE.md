@@ -86,6 +86,43 @@ When in doubt: `send` for one agent, `post` for a topic, `broadcast` for your sq
 
 For low-prio DMs, the registry binding is the liveness gate — if the agent's session crashes, the heartbeat daemon dies and the activity-based reaper drops the binding. So `is_idle=1` on a bound agent is meaningful indefinitely; long-idle bound agents still receive Case 1 wakes correctly.
 
+## Focus mode — the third state
+
+`focus(agent_name, minutes=60, reason="")` — suppress your own wakes for a
+bounded time. `minutes=0` ends it. Also `mcp-hub focus [minutes] [--off]
+[--reason ...]`.
+
+The hub knows two states, **in a turn** and **idle**, and treats idle as safe
+to interrupt. But an agent babysitting a deploy or tailing a log is
+idle-at-the-keyboard and *operationally* busy, and the hub cannot see that kind
+of busy — the only defence used to be a convention asking senders to hold off,
+which fails exactly when the fleet is busy enough to need it.
+
+- **Nothing is dropped.** Messages queue as normal and surface at the next
+  Stop-hook boundary. Focus decides whether they *interrupt*, never whether
+  they arrive.
+- **`urgent` pierces it**, deliberately. A focus that swallowed "production
+  incident" is one nobody would dare switch on, and an unusable silencer just
+  returns everyone to the convention it replaced.
+- **It expires on its own** (default 60 min, hard cap 480). The stored value is
+  an EXPIRY, not a flag — that is the safety design, not a convenience. A
+  silencer that can be left on forever is a silent-drop bug waiting to happen,
+  and this codebase has shipped enough of those.
+- **It is visible**: `list_agents()` shows `🔕` with the time remaining, and a
+  sender who is queued behind it is told *"focus mode, 20m left — NOT
+  offline"*. A silencer nobody can see turns a delayed message into an
+  apparently-ignored one, and sends the sender hunting for a relaunch.
+
+The gate lives in `push_channel`, the single function every wake funnels
+through — DMs, channel posts and broadcasts alike. That is deliberate: a
+silencer covering four of five routes is worse than none, because it gets
+trusted. Priority rides in the notification `meta`, which every call site
+already populates.
+
+Focus is **attention**, not membership or subscription: `mute_squad` silences
+one squad permanently, `subscribe_channel` decides which channels can wake you
+at all, and focus silences *everything except urgent*, briefly.
+
 ## Channels-based idle-wake
 
 If you launch your Claude Code session with `--dangerously-load-development-channels server:hub` (or `--channels plugin:hub@...` once the marketplace plugin lands), incoming DMs and broadcasts wake your session from idle — no polling needed. After launch, call `register()` so the hub binds your session for push.
