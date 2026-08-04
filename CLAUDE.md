@@ -408,10 +408,71 @@ The launch dance is deliberately **not** taught to click these: auto-trusting
 arbitrary repo content defeats the point of the prompt. Seeding makes it an
 explicit act by whoever authorised the transport.
 
+## The fleet tree — one left panel, machines → workspaces → seats
+
+The board's left panel is a **tree**, and it replaced two surfaces that were
+always projections of one structure: a flat roster of this machine's agents,
+and a separate `w` keystroke listing every workspace on every box.
+
+```
+▾ fireblade-wsl · this machine
+  ▾ ◉ showcase
+      🔴 🙋 mcp-hub-fireblade-wsl   42% waiting 4m
+      ▶ dreamteam-fireblade         18% working
+  ▸ ● xport
+  ▸   feral            not registered      ← drift, in words
+▸ dev-vm-1 · remote   ⚠ 1 drift
+```
+
+Three levels, and the middle one carries the three truth columns below.
+This machine opens expanded, other boxes folded — you act on the box you are
+sitting at. `e` expands everything; `n` still jumps to the next raised hand,
+now in tree order.
+
+**A remote seat is visibly thinner than a local one, on purpose.** Local seats
+come from `squad board --json`, which scraped their panes — state, context,
+waiting time are real. Remote seats come from `~/.mcp-hub/fleet-board.json`,
+the daemons' fleet snapshot, which carries presence and *nothing else*. There
+is no pane to scrape on another machine, and smoothing that over is the
+"delivered live" mistake in a new costume.
+
+**A stale snapshot reads as `not reporting`, never as a quiet fleet.** Past 5
+minutes (`fleet_tree.FLEET_STALE_SECONDS`) every remote state becomes
+`unknown` and the machine node says so — an instrument that stopped being
+written must not be read as a measurement. `ts: 0` (no file at all) is stale
+too, or an absent instrument would read as a perfect one.
+
+**Nothing is dropped.** A seat whose name matches no enrolled machine lands
+under `(machine unknown)` rather than vanishing. Machine attribution is
+`-<machine>` *containment*, longest match wins — not `endswith`, because
+`mcp-hub-fireblade-wsl-xport` is a real transport-suffixed name that would
+otherwise be homeless.
+
+The join is `fleet_tree.build_tree` — pure data, tested without a terminal.
+The widget only renders it. Note that **tree labels carry resolved hex, not
+CSS variables**, so `action_toggle_theme` has to relabel; and a **Tree clips
+rather than wraps**, so a label that outgrows the panel fails silently — the
+width is measured in `test_workspace_view.py`, which is what caught the
+machine label overflowing when it carried seat counts.
+
+### Ctrl+P — the command palette
+
+Every verb, by typing instead of by keystroke. Focus (30m/1h/2h/off) for the
+selected seat, `answer yes|no|always`, restart/stop/start, register a
+workspace, and *go to* any seat or workspace by name.
+
+The list is built by `SettingsApp.palette_commands()`, not by the provider, so
+it is testable without opening a palette and there is only one list to keep
+current. **A command is only offered where it can actually be performed**:
+`focus` is a hub fact and works by name from anywhere, but `answer` and
+`restart` are tmux on *this* box, so they never appear for a remote seat.
+Same rule as the settings rows — the panel cannot offer an edit the underlying
+verb cannot make.
+
 ## Workspace manager — three truth columns
 
-The board's **`w`** view (and `mcp-hub workspaces list`, the same data as text)
-answers one question per workspace, from three independent sources:
+The tree's workspace level (and `mcp-hub workspaces list`, the same data as
+text) answers one question per workspace, from three independent sources:
 
 ```
 registered   the hub's /api/v1 registry — a DEFINITION someone made

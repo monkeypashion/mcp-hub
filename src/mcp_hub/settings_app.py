@@ -7,6 +7,19 @@ settings sheet, which was already here. The board half is a RENDERER of
 `squad board --json` plus the documented caches (board_data.collect); it never
 re-scrapes panes, which is the board's own single-source rule.
 
+The left panel is a TREE — machines, then workspaces, then the seats inside
+them (2026-08-04: "can't we have a grouping system for remote/local — save
+having the separate `w` workspaces view?"). It replaces two surfaces that were
+always projections of one structure: a flat roster of this machine's agents,
+and a separate keystroke showing every workspace on every box. The join lives
+in `fleet_tree.build_tree`, not here, so it is testable without a terminal.
+
+The tree's honesty rule, inherited from the `w` view it absorbed: a REMOTE row
+is visibly thinner than a local one. There is no pane to scrape on another
+machine, so remote seats carry presence and nothing else, and a fleet snapshot
+that has stopped being written reads as "not reporting" rather than as a quiet
+fleet. Drift still outranks every status — attention beats information.
+
 Why a framework rather than the hand-rolled curses version this replaces: the
 keyboard, focus, mouse and widget behaviour are exactly what I got wrong by
 hand — one line binding ESC to quit made every arrow key exit the program,
@@ -30,10 +43,13 @@ from __future__ import annotations
 
 import pathlib
 import subprocess
+import time
 from typing import Any
 
+from rich.markup import escape
 from textual import on
 from textual.app import App, ComposeResult
+from textual.command import DiscoveryHit, Hit, Hits, Provider
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.theme import Theme
 from textual.widgets import (
@@ -41,11 +57,13 @@ from textual.widgets import (
     Footer,
     Header,
     Label,
-    ListItem,
-    ListView,
     Select,
     Static,
+    Tree,
 )
+from textual.widgets.tree import TreeNode
+
+from mcp_hub.fleet_tree import build_tree, structure_key
 
 # Claude's own palette, read out of the Claude Code binary's CSS custom
 # properties rather than recalled — `--clay: #d97757`, `--clay-emphasized`,
@@ -125,20 +143,21 @@ Screen { layout: vertical; }
 /* Explicit heights everywhere. Textual containers default to 1fr, and a 1fr
    child inside an auto-height parent collapses to nothing — which rendered
    exactly one row of the panel and blank space below it. */
-#agents {
-    width: 38;
+/* Wider than the old flat roster: the tree carries three levels of indent
+   plus a live tail. 52 is what a `mcp-hub-fireblade-wsl-xport` leaf needs at
+   full depth with its context and state still attached — measured, because a
+   Tree CLIPS rather than wraps and an overflow here would be silent. */
+#fleet {
+    width: 52;
     border-right: solid #d8d8d8;
     background: $surface;
     height: 1fr;
+    padding: 0 1;
 }
-#agents > ListItem { height: 2; padding: 0 1; }
-#agents > ListItem.-highlight { background: #e8e8e8; color: $foreground; }
-.agent-name { text-style: bold; height: 1; color: $primary; }
-.agent-live { color: $text-muted; height: 1; }
-/* the board vocabulary on the roster: the NAME wears the state */
-.st-waiting .agent-name { color: $error; }
-.st-working .agent-name { color: $success; }
-.st-down    .agent-name { color: $warning; }
+#fleet > .tree--guides { color: $panel; }
+#fleet > .tree--guides-hover { color: $panel; }
+#fleet > .tree--guides-selected { color: $accent; }
+#fleet > .tree--cursor { background: #e8e8e8; color: $foreground; text-style: none; }
 
 #detail { padding: 0 2; height: 1fr; }
 .section {
@@ -158,13 +177,12 @@ Screen { layout: vertical; }
 .source { color: $text-muted; height: 1; padding: 0 0 0 24; }
 Select { width: 30; height: 1; }
 .note { color: $warning; padding: 1 0; height: auto; }
-/* workspace manager: one Static per row, so nothing can overflow its line */
-.ws-machine { color: $primary; text-style: bold; height: auto; padding: 1 0 0 0; }
-.ws-machine-remote { color: $text-muted; height: auto; padding: 1 0 0 0; }
+/* the seats listed inside a workspace's detail pane. The manager's own rows
+   moved into the tree, where drift and presence are carried by the label's
+   colour — the .ws-machine/.ws-row-here/.ws-row-drift classes went with them
+   rather than lingering as CSS nothing selects. */
 .ws-row { color: $text; height: 1; width: 1fr; }
 .ws-row-open { color: $success; height: 1; width: 1fr; }
-.ws-row-here { color: $accent; text-style: bold; height: 1; width: 1fr; }
-.ws-row-drift { color: $warning; height: 1; width: 1fr; }
 #status { dock: bottom; height: 1; padding: 0 2; background: $panel; }
 
 /* live section — height:auto or it is the collapsing-1fr child the comment
@@ -218,32 +236,77 @@ def _human_tok(n: int) -> str:
     return str(n)
 
 
+class SquadCommands(Provider):
+    """Every verb the board can run, reachable by typing.
+
+    The board's actions were all bound to single keys or buried in a dropdown,
+    which does not scale: `focus` alone is four commands, and the useful ones
+    are per-agent. Ctrl+P asks for a name instead of a keystroke.
+
+    The list is built by the app (`palette_commands`), not here, so it can be
+    tested without opening a palette — and so a command can never be offered
+    for a selection that cannot perform it: the app knows whether the cursor
+    is on a local seat, a remote one, or a workspace.
+    """
+
+    @property
+    def _app(self) -> "SettingsApp":
+        return self.app  # type: ignore[return-value]
+
+    async def discover(self) -> Hits:
+        # Discovery shows what is possible RIGHT NOW, before any typing —
+        # so it is the same list, not a hand-picked subset that could drift.
+        for title, help_text, run in self._app.palette_commands()[:12]:
+            yield DiscoveryHit(title, run, help=help_text)
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for title, help_text, run in self._app.palette_commands():
+            score = matcher.match(title)
+            if score > 0:
+                yield Hit(score, matcher.highlight(title), run, help=help_text)
+
+
 class SettingsApp(App):
     """One screen: the live fleet on the left, the selected agent —
     board detail on top, settings below — on the right."""
 
+    COMMANDS = App.COMMANDS | {SquadCommands}
     CSS = CSS
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("r", "reload", "Reload"),
         ("t", "toggle_theme", "Light/dark"),
         ("n", "next_hand", "Next needs-you"),
-        ("w", "toggle_workspaces", "Workspaces"),
+        ("e", "expand_all", "Expand/collapse"),
     ]
 
     def __init__(self, agents: list[dict[str, str]], scoped_to: str | None,
                  model_for, squad_bin: str, hub_bin: str,
                  board_for=None, dark: bool | None = None,
                  poll_seconds: float = 3.0, workspaces_for=None,
-                 presence_ping=None, presence_seconds: float = 60.0):
+                 presence_ping=None, presence_seconds: float = 60.0,
+                 fleet_for=None, listings_for=None, this_machine: str = "",
+                 workspaces_seconds: float = 30.0, now=None):
         super().__init__()
         self.agents = agents
-        self._workspaces_for = workspaces_for  # injected; None hides the view
+        # Passed in rather than derived here: `mcp-hub identity` owns machine
+        # naming, and a second derivation is a second chance to disagree —
+        # squad deriving from basename while the cli derived from the git
+        # remote is exactly how a clone's statusline came to read `hub ?`.
+        self._this_machine = this_machine
+        self._workspaces_for = workspaces_for  # injected; None → local only
+        self._fleet_for = fleet_for            # injected; None → no remote rows
+        self._listings_for = listings_for      # injected; reads a local ws file
         self._presence_ping = presence_ping    # injected; None disables it
         # Well inside the hub's 180s open-now window, so a single dropped
         # ping never blinks the workspace out of the manager's view.
         self._presence_seconds = presence_seconds
-        self.show_workspaces = False
+        # The registry is a network round trip and workspaces do not move
+        # every three seconds; presence inside it does, but the hub's own
+        # open-now window is 180s, so 30 is ten times finer than the fact.
+        self._workspaces_seconds = workspaces_seconds
+        self._now = now or time.time
         self.scoped_to = scoped_to
         self._model_for = model_for       # injected so tests need no real repo
         self._board_for = board_for       # injected so tests need no real fleet
@@ -254,6 +317,15 @@ class SettingsApp(App):
         self.agent_ix = 0
         self.model: dict[str, Any] | None = None
         self.board: dict[str, Any] = {"agents": {}, "counts": {}, "error": None}
+        # Until the registry answers, the tree is this machine's roster and
+        # says so. An empty dict here would render as "no workspaces anywhere",
+        # which is an assertion nothing has made yet.
+        self.workspaces: dict[str, Any] = {"rows": [], "machines": [], "note": ""}
+        self.fleet: dict[str, Any] = {"ts": 0, "agents": []}
+        self.tree_model: dict[str, Any] = {"machines": []}
+        self.selected: dict[str, Any] | None = None
+        self._pending_key: str | None = None
+        self._structure: tuple | None = None
         self._presence_error: str | None = None
         self._live_key: tuple | None = None
         # Bumped every redraw and baked into each widget id. remove_children()
@@ -270,24 +342,10 @@ class SettingsApp(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal(id="body"):
-            yield ListView(
-                *[
-                    # Stable per-index ids: the roster is fixed for the app's
-                    # life, so these labels are UPDATED on every poll rather
-                    # than rebuilt — no churn under the operator's cursor.
-                    ListItem(
-                        Vertical(
-                            Label(a["agent"], classes="agent-name",
-                                  id=f"name-{i}"),
-                            Label(a.get("klass", ""), classes="agent-live",
-                                  id=f"live-{i}"),
-                        ),
-                        id=f"item-{i}",
-                    )
-                    for i, a in enumerate(self.agents)
-                ],
-                id="agents",
-            )
+            tree: Tree[dict] = Tree("fleet", id="fleet")
+            tree.show_root = False
+            tree.guide_depth = 2
+            yield tree
             yield VerticalScroll(id="detail")
         yield Static("", id="status")
         yield Footer()
@@ -302,17 +360,22 @@ class SettingsApp(App):
         self.title = "SQUAD BOARD"
         where = self.scoped_to.rsplit("/", 1)[-1] if self.scoped_to else "this machine"
         self.sub_title = f"{len(self.agents)} agent(s) · {where}"
+        self._rebuild_tree()
+        self.query_one("#fleet", Tree).focus()
         # Open on an agent that HAS settings: `squad add-folder` enrols plain
         # directories deliberately and those have no derived identity, so
         # opening on roster row 0 routinely showed an empty panel.
-        self.agent_ix = self._first_with_settings()
-        lv = self.query_one("#agents", ListView)
-        lv.index = self.agent_ix
-        lv.focus()
-        await self.refresh_detail()
+        #
+        # AFTER a refresh, not now: a Tree maps nodes to lines only once it has
+        # laid out, so move_cursor() during on_mount is silently a no-op and
+        # the panel opened on the machine heading instead.
+        self.call_after_refresh(self._initial_select)
         if self._board_for is not None:
             self._poll_board()                      # first paint: don't wait 3s
             self.set_interval(self._poll_seconds, self._poll_board)
+        if self._workspaces_for is not None:
+            self._poll_workspaces()
+            self.set_interval(self._workspaces_seconds, self._poll_workspaces)
         # Presence needs BOTH a reporter and a workspace to report. Unscoped
         # (`mcp-hub board` with no --workspace) there is genuinely nothing
         # open to name, and inventing one would put a phantom row in the
@@ -329,6 +392,332 @@ class SettingsApp(App):
             except Exception:  # noqa: BLE001
                 continue
         return 0
+
+    async def _initial_select(self) -> None:
+        self._select_first_with_settings()
+        await self.refresh_detail()
+
+    def _select_first_with_settings(self) -> None:
+        ix = self._first_with_settings()
+        want = self.agents[ix]["agent"] if ix < len(self.agents) else None
+        for node in self._agent_nodes():
+            if node.data and node.data.get("agent") == want:
+                self._move_to(node)
+                return
+        # No local seat at all (a board opened on a box with an empty roster):
+        # land on whatever the tree's first row is rather than nothing.
+        tree = self.query_one("#fleet", Tree)
+        if tree.root.children:
+            self.selected = tree.root.children[0].data
+
+    # ---- the tree ----
+
+    def _palette(self) -> dict[str, str]:
+        """Tree labels are rich markup, which cannot read `$success` — so the
+        active theme's colours are resolved to hex here and the whole tree is
+        relabelled when the theme flips. A hard-coded green would be the exact
+        defect the three custom themes exist to avoid."""
+        t = self.current_theme
+        return {
+            "primary": t.primary, "success": t.success, "warning": t.warning,
+            "error": t.error, "accent": t.accent or t.primary,
+            "secondary": t.secondary or t.primary,
+        }
+
+    def _machine_label(self, m: dict[str, Any], p: dict[str, str]) -> str:
+        if m["unknown"]:
+            head = "(machine unknown)"
+        else:
+            head = f"{m['machine']}  · {'this machine' if m['local'] else 'remote'}"
+        # Only the EXCEPTIONAL facts. Seat and open counts used to ride here
+        # too and pushed the label past the panel — where a Tree clips rather
+        # than wraps, so the overflow would have been silent. They are one
+        # keypress away in the detail pane, and the tree shows them by simply
+        # being expanded.
+        bits = []
+        if m["drift_count"]:
+            bits.append(f"⚠ {m['drift_count']} drift")
+        # A snapshot that stopped being written must not read as a quiet box.
+        if m["stale"]:
+            bits.append("not reporting")
+        colour = p["primary"] if m["local"] else p["secondary"]
+        return f"[b {colour}]{escape(head)}[/]  [dim]{escape(' · '.join(bits))}[/]"
+
+    def _workspace_label(self, w: dict[str, Any], p: dict[str, str]) -> str:
+        # Three states, not two: nobody has it open · someone does · YOU are
+        # looking at it right now. The board knows its own --workspace, so the
+        # third is free and is the one the operator is standing in.
+        glyph = "◉" if w["here"] else ("●" if w["open_now"] else " ")
+        # Drift says what it IS, in words — the same guarantee the `w` view
+        # made, moved to the surface that replaced it. The PATH is deliberately
+        # not here: it is what made the old rows wrap, and the detail pane has
+        # room for it.
+        if w["error"]:
+            tail, colour = f"⚠ {w['error']}", p["warning"]
+        elif not w["on_disk"]:
+            tail, colour = "ghost — registered, no file", p["warning"]
+        elif w["registered"] is False:
+            tail, colour = "not registered", p["warning"]
+        elif w["registered"] is None:
+            tail, colour = "registration unknown", p["warning"]
+        elif w["here"]:
+            tail, colour = "", p["accent"]
+        elif w["open_now"]:
+            tail, colour = "", p["success"]
+        else:
+            tail, colour = "", ""
+        if w["squad"]:
+            tail = f"{tail}  [{w['squad']}]" if tail else f"[{w['squad']}]"
+        name = f"{glyph} {w['name']}"
+        style = f"b {colour}" if (w["here"] and colour) else colour
+        head = f"[{style}]{escape(name)}[/]" if colour else escape(name)
+        return f"{head}  [dim]{escape(tail)}[/]" if tail else head
+
+    def _agent_label(self, a: dict[str, Any], p: dict[str, str]) -> str:
+        if a["local"]:
+            rec = a.get("rec") or {}
+            st = rec.get("state", "")
+            colour = {"waiting": p["error"], "working": p["success"],
+                      "down": p["warning"]}.get(st, "")
+            if st == "waiting":
+                tail = f"waiting {_hms(rec.get('waiting_seconds', 0))}"
+            elif st:
+                tail = st
+            else:
+                tail = a.get("klass", "")
+            # The raised hand rides the row even when the state glyph already
+            # says `waiting` — it is what `n` jumps between, and a marker you
+            # cannot see is not a marker.
+            hand = "🙋 " if a["hand"] else ""
+            glyph = _STATE_GLYPH.get(st, "·")
+            # Context percentage but NOT the model name: an agent name is
+            # already ~22 cells and `Sonnet` pushed the longest real seat past
+            # the panel. The model is one row down in the live section.
+            bits = [b for b in (rec.get("ctx", ""), tail) if b]
+        else:
+            # Presence and nothing else — there is no pane to scrape on
+            # another box, so the row is thinner ON PURPOSE.
+            colour, hand = "", ""
+            glyph = "⚡" if a.get("wakeable") else "·"
+            if a.get("stale"):
+                bits = ["not reporting"]
+            else:
+                # `hub only` stays on the row: a remote `idle` is a weaker
+                # claim than a local one (a snapshot, not a scraped pane), and
+                # the two must not read identically.
+                bits = [a.get("state", ""), "hub only"]
+        name = f"{glyph} {hand}{a['agent']}"
+        head = f"[{colour}]{escape(name)}[/]" if colour else escape(name)
+        tail = (" · " if not a["local"] else " ").join(b for b in bits if b)
+        return f"{head}  [dim]{escape(tail)}[/]" if tail else head
+
+    def _label_for(self, data: dict[str, Any], p: dict[str, str]) -> str:
+        kind = data.get("kind")
+        if kind == "machine":
+            return self._machine_label(data, p)
+        if kind == "workspace":
+            return self._workspace_label(data, p)
+        return self._agent_label(data, p)
+
+    @staticmethod
+    def _identity(data: dict[str, Any] | None) -> tuple | None:
+        """WHAT is selected, independent of where it currently hangs.
+
+        A node's key encodes its parent, so a seat moves key the moment it is
+        attributed to a workspace — which is exactly what happens ~a second
+        after launch, when the registry poll lands and the tree restructures.
+        Matching on the key alone dropped the selection there and the detail
+        pane went blank on every open (found by rendering the real board, not
+        by any unit test).
+        """
+        if not data:
+            return None
+        kind = data.get("kind")
+        if kind == "agent":
+            return ("agent", data.get("agent"))
+        if kind == "workspace":
+            return ("workspace", data.get("machine"), data.get("name"))
+        return ("machine", data.get("machine"))
+
+    def _all_nodes(self) -> list[TreeNode]:
+        try:
+            tree = self.query_one("#fleet", Tree)
+        except Exception:  # noqa: BLE001 — queried before mount or mid-teardown
+            return []
+        out: list[TreeNode] = []
+
+        def walk(node: TreeNode) -> None:
+            for child in node.children:
+                out.append(child)
+                walk(child)
+
+        walk(tree.root)
+        return out
+
+    def _agent_nodes(self) -> list[TreeNode]:
+        return [n for n in self._all_nodes()
+                if n.data and n.data.get("kind") == "agent"]
+
+    def _build_model(self) -> dict[str, Any]:
+        return build_tree(
+            roster=self.agents,
+            board=self.board,
+            workspaces=self.workspaces,
+            fleet=self.fleet,
+            this_machine=self.workspaces.get("this_machine")
+            or self._this_machine,
+            scoped_to=self.scoped_to,
+            listings_for=self._listings_for,
+            now=self._now(),
+        )
+
+    def _default_expansion(self, model: dict[str, Any]) -> set[str]:
+        """This machine open, its workspaces open, other boxes folded.
+
+        The operator acts on the box they are sitting at; a tree that opens
+        with forty remote leaves showing buries it.
+        """
+        keys: set[str] = set()
+        for m in model.get("machines", []):
+            if not m["local"]:
+                continue
+            keys.add(m["key"])
+            keys.update(w["key"] for w in m["workspaces"])
+        return keys
+
+    def _rebuild_tree(self) -> None:
+        """Rebuild structure. Only called when `structure_key` actually moved —
+        the poll relabels in place, because a rebuild collapses the operator's
+        expansions and drops their cursor."""
+        tree = self.query_one("#fleet", Tree)
+        model = self._build_model()
+        first_paint = self._structure is None
+        keep = {n.data["key"] for n in self._all_nodes()
+                if n.data and n.is_expanded}
+        cursor = (self.selected or {}).get("key")
+        cursor_ident = self._identity(self.selected)
+        self.tree_model = model
+        self._structure = structure_key(model)
+        tree.clear()
+        tree.root.expand()
+        by_key: dict[str, TreeNode] = {}
+        p = self._palette()
+        for m in model.get("machines", []):
+            mn = tree.root.add(self._machine_label(m, p), data=m, expand=False)
+            by_key[m["key"]] = mn
+            for w in m["workspaces"]:
+                wn = mn.add(self._workspace_label(w, p), data=w, expand=False)
+                by_key[w["key"]] = wn
+                for a in w["agents"]:
+                    by_key[a["key"]] = wn.add_leaf(
+                        self._agent_label(a, p), data=a)
+            for a in m["loose"]:
+                by_key[a["key"]] = mn.add_leaf(self._agent_label(a, p), data=a)
+        want = self._default_expansion(model) if first_paint else keep
+        for key in want:
+            node = by_key.get(key)
+            if node is not None and node.allow_expand:
+                node.expand()
+        node = by_key.get(cursor or "")
+        if node is None and cursor_ident is not None:
+            # Same thing, new position — follow it rather than lose it.
+            node = next((n for n in self._all_nodes()
+                         if self._identity(n.data) == cursor_ident), None)
+        if node is not None:
+            self._move_to(node)
+        elif cursor is not None:
+            # The selection is genuinely GONE — an agent retired, a workspace
+            # deleted. Say so rather than silently landing on a neighbour and
+            # letting the right-hand pane look like it is still about the old
+            # one.
+            self._set_status("previous selection is no longer in the tree")
+            self.selected = None
+
+    def _relabel_tree(self) -> None:
+        """Same nodes, new text. Keyed by the node's own data dict, which the
+        rebuilt model replaces wholesale — so the label and the data can never
+        disagree about which agent a row is."""
+        model = self._build_model()
+        self.tree_model = model
+        p = self._palette()
+        fresh: dict[str, dict[str, Any]] = {}
+        for m in model.get("machines", []):
+            fresh[m["key"]] = m
+            for w in m["workspaces"]:
+                fresh[w["key"]] = w
+                for a in w["agents"]:
+                    fresh[a["key"]] = a
+            for a in m["loose"]:
+                fresh[a["key"]] = a
+        for node in self._all_nodes():
+            data = node.data or {}
+            new = fresh.get(data.get("key", ""))
+            if new is None:
+                continue
+            node.data = new
+            node.set_label(self._label_for(new, p))
+            if self.selected and self.selected.get("key") == new["key"]:
+                self.selected = new
+
+    def _sync_tree(self) -> None:
+        """One entry point for every data change: rebuild if the SHAPE moved,
+        otherwise relabel."""
+        if self._structure is None:
+            self._rebuild_tree()
+            return
+        if structure_key(self._build_model()) != self._structure:
+            self._rebuild_tree()
+        else:
+            self._relabel_tree()
+
+    def _move_to(self, node: TreeNode) -> None:
+        """Put the cursor on a node, opening whatever hides it.
+
+        The cursor move is deferred a frame ON PURPOSE. A Tree maps nodes to
+        lines only when it lays out, so a node inside a just-expanded branch
+        still reports line -1 and `move_cursor` is silently a no-op — which is
+        how a jump to a remote seat moved nothing at all while reporting
+        success. The selection is set NOW so callers see it immediately; the
+        cursor catches up on the next refresh.
+        """
+        parent = node.parent
+        while parent is not None:
+            if parent.allow_expand:
+                parent.expand()
+            parent = parent.parent
+        self._pending_key = (node.data or {}).get("key")
+        self.selected = node.data
+        if node.data and node.data.get("roster_ix") is not None:
+            self.agent_ix = node.data["roster_ix"]
+        self.call_after_refresh(self._settle_cursor, node)
+
+    def _settle_cursor(self, node: TreeNode) -> None:
+        if node.line >= 0:
+            self.query_one("#fleet", Tree).move_cursor(node)
+        self._pending_key = None
+
+    # ---- the workspace registry ----
+
+    def _poll_workspaces(self) -> None:
+        self.run_worker(self._collect_workspaces, thread=True,
+                        group="workspace-poll", exclusive=True)
+
+    def _collect_workspaces(self) -> None:
+        try:
+            data = self._workspaces_for()
+        except Exception as exc:  # noqa: BLE001 — the tree must never crash
+            data = {"rows": [], "machines": [], "note": f"workspace data: {exc}"}
+        self.call_from_thread(self._apply_workspaces, data)
+
+    def _apply_workspaces(self, data: dict[str, Any]) -> None:
+        self.workspaces = data
+        if self._fleet_for is not None:
+            try:
+                self.fleet = self._fleet_for() or {"ts": 0, "agents": []}
+            except Exception:  # noqa: BLE001 — a missing cache is "not reporting"
+                self.fleet = {"ts": 0, "agents": []}
+        self._sync_tree()
+        self.call_later(self.refresh_detail)
 
     # ---- the live board ----
 
@@ -385,32 +774,10 @@ class SettingsApp(App):
             self.sub_title = " · ".join(bits)
         elif snap.get("error"):
             self.sub_title = "live data unavailable"
-        live = snap.get("agents") or {}
-        for i, a in enumerate(self.agents):
-            rec = live.get(a["agent"])
-            try:
-                item = self.query_one(f"#item-{i}", ListItem)
-                line = self.query_one(f"#live-{i}", Label)
-            except Exception:  # noqa: BLE001 — mid-teardown query, next poll repaints
-                return
-            item.remove_class("st-waiting", "st-working", "st-idle", "st-down")
-            if not rec:
-                line.update(a.get("klass", ""))
-                continue
-            item.add_class(f"st-{rec.get('state', 'idle')}")
-            hand = "🙋 " if (rec.get("next") or {}).get("hand") else ""
-            st = rec.get("state", "")
-            if st == "waiting":
-                tail = f"waiting {_hms(rec.get('waiting_seconds', 0))}"
-            elif st == "down":
-                tail = "down"
-            else:
-                tail = st
-            bits = [b for b in (
-                _STATE_GLYPH.get(st, ""), hand + rec.get("hub", ""),
-                rec.get("model", ""), rec.get("ctx", ""), tail,
-            ) if b]
-            line.update(" ".join(bits))
+        # A poll changes what rows SAY, almost never which rows exist — so the
+        # default path relabels and the tree keeps the operator's expansions
+        # and cursor exactly where they left them.
+        self._sync_tree()
         # the detail's live section follows the selected agent
         self.call_later(self._refresh_live_section)
 
@@ -435,6 +802,20 @@ class SettingsApp(App):
             Static(f"● {act}" if act else "", classes="source"),
             classes="row",
         ))
+
+        # Model and context left the tree label when it outgrew the panel, so
+        # they must land somewhere — an instrument that is merely moved is
+        # fine, one that is dropped is a regression nobody notices.
+        model, ctx = rec.get("model", ""), rec.get("ctx", "")
+        if model or ctx:
+            out.append(Vertical(
+                Horizontal(Label("Model", classes="label"),
+                           Static(" · ".join(b for b in (model, ctx) if b),
+                                  classes="value-ro"),
+                           classes="row-line"),
+                Static("model, and context used", classes="source"),
+                classes="row",
+            ))
 
         q = rec.get("question") or ""
         if st == "waiting":
@@ -515,6 +896,7 @@ class SettingsApp(App):
         return (
             rec.get("state"), _hms(rec.get("waiting_seconds", 0)),
             rec.get("action"), rec.get("question"),
+            rec.get("model"), rec.get("ctx"),
             nxt.get("source"), nxt.get("age"), nxt.get("hand"),
             nxt.get("text"), nxt.get("ask"), nxt.get("net"),
             rec.get("branch"), rec.get("dirty"), rec.get("unpushed"),
@@ -528,10 +910,11 @@ class SettingsApp(App):
         any fixed id collides — DuplicateIds took the whole app down the first
         time the operator selected a waiting agent (2026-07-29). Same defect,
         same cure as refresh_detail's, documented on _gen."""
-        if not self.agents:
+        sel = self.selected or {}
+        if sel.get("kind") != "agent" or not sel.get("local"):
             return
-        rec = (self.board.get("agents") or {}).get(self.agents[self.agent_ix]["agent"])
-        key = (self.agent_ix, self._live_render_key(rec), repr(self.board.get("error")))
+        rec = (self.board.get("agents") or {}).get(sel["agent"])
+        key = (sel["key"], self._live_render_key(rec), repr(self.board.get("error")))
         if key == self._live_key:
             return
         self._live_key = key
@@ -550,13 +933,23 @@ class SettingsApp(App):
         await detail.remove_children()      # AWAITED: mounts below raced it
         self._gen += 1
         self._live_key = None
-        if self.show_workspaces:
-            await detail.mount_all(self._workspace_widgets())
+        sel = self.selected or {}
+        kind = sel.get("kind")
+        if kind == "machine":
+            await detail.mount_all(self._machine_widgets(sel))
             return
-        if not self.agents:
-            await detail.mount(Static("no agents in this workspace", classes="note"))
+        if kind == "workspace":
+            await detail.mount_all(self._workspace_widgets(sel))
             return
-        agent = self.agents[self.agent_ix]
+        if kind == "agent" and not sel.get("local"):
+            await detail.mount_all(self._remote_agent_widgets(sel))
+            return
+        if kind != "agent" or not self.agents:
+            await detail.mount(Static(
+                "nothing selected — pick a machine, a workspace or a seat "
+                "on the left", classes="note"))
+            return
+        agent = self.agents[sel["roster_ix"]]
         # the live section mounts first (empty shell; _refresh_live_section
         # fills it) so the board's answer is always above the settings sheet
         widgets: list[Any] = [Vertical(id="live")]
@@ -616,22 +1009,50 @@ class SettingsApp(App):
 
     # ---- events ----
 
-    @on(ListView.Highlighted, "#agents")
-    async def _agent_changed(self, event: ListView.Highlighted) -> None:
-        if event.list_view.index is None or event.list_view.index == self.agent_ix:
+    @on(Tree.NodeHighlighted, "#fleet")
+    async def _node_changed(self, event: Tree.NodeHighlighted) -> None:
+        data = event.node.data
+        if not data:
             return
-        self.agent_ix = event.list_view.index
+        # Expanding a branch re-validates the cursor and fires a highlight for
+        # wherever it currently is — which, mid-jump, is the row we are leaving.
+        # Honouring it would land the detail pane on the wrong thing.
+        if self._pending_key and data.get("key") != self._pending_key:
+            return
+        # Key comparison, not identity: every poll replaces the data dicts
+        # wholesale, so `is` would repaint the detail pane three times a
+        # second for a selection that never moved.
+        if self.selected and self.selected.get("key") == data.get("key"):
+            self.selected = data
+            return
+        self.selected = data
+        if data.get("roster_ix") is not None:
+            self.agent_ix = data["roster_ix"]
         await self.refresh_detail()
 
     @on(Button.Pressed)
     def _answer_pressed(self, event: Button.Pressed) -> None:
         bid = event.button.id or ""
+        sel = self.selected or {}
+        if bid.startswith("wsreg-"):
+            path = sel.get("path", "")
+            if not path:
+                return
+            self._set_status(f"registering {sel.get('name', path)}…")
+            self.run_worker(
+                lambda: self._apply(self.hub_bin, ["workspaces", "register", path],
+                                    f"register {sel.get('name', '')}", "hub"),
+                thread=True, exclusive=True,
+            )
+            return
         if not bid.startswith("ans-"):
             return
         intent = bid.rsplit("-", 1)[-1]
         if intent not in {"yes", "no", "always"}:
             return
-        agent = self.agents[self.agent_ix]["agent"]
+        if sel.get("kind") != "agent" or not sel.get("local"):
+            return
+        agent = sel["agent"]
         self._set_status(f"answering {agent}: {intent}…")
         self.run_worker(
             lambda: self._apply(self.squad_bin, ["answer", agent, intent],
@@ -701,99 +1122,271 @@ class SettingsApp(App):
             return "~/" + parent[len(home) + 1:]
         return parent
 
-    def _workspace_widgets(self) -> list[Any]:
-        """The manager's view: every workspace, three truth columns, drift
-        loud. Rendered from collect_workspaces — no ids on rows, so this view
-        can never recreate the DuplicateIds crash."""
-        out: list[Any] = [Static(
-            "▌WORKSPACES   registered · on disk · open — drift shown, "
-            "nothing lost track of", classes="section section-live")]
-        if self._workspaces_for is None:
-            out.append(Static("workspace registry not wired on this build",
-                              classes="note"))
-            return out
-        try:
-            data = self._workspaces_for()
-        except Exception as exc:  # noqa: BLE001 — the view must never crash
-            out.append(Static(f"workspace data: {exc}", classes="note"))
-            return out
-        if data.get("note"):
-            out.append(Static(data["note"], classes="note"))
-        rows = data.get("rows", [])
-        # ONE Static per row, pre-formatted. The previous shape was a
-        # Horizontal of a fixed-width Label plus a 1fr Static, inherited from
-        # the settings rows — where the value is short. A workspace row
-        # carries an absolute path, and the value was sized to the FULL row
-        # width while starting after the 24-cell label, so it overflowed the
-        # row by exactly the label's width and the whole thing read as
-        # wrapped. Nothing here can overflow: the text is measured first.
-        name_w = max((len(r["name"]) for r in rows), default=8)
-        name_w = min(max(name_w, 8), 22)
-        here = data.get("this_machine")
-        machine = object()  # sentinel: never equal to a real machine name
-        for r in rows:
-            if r.get("machine") != machine:
-                machine = r.get("machine")
-                local = machine == here
-                # Which box a workspace lives on decides whether you can open
-                # it, so it should not have to be inferred from the name.
-                out.append(Static(
-                    f"{machine or '(machine unknown)'}"
-                    f"{'  · this machine' if local else '  · remote'}",
-                    classes="ws-machine" if local else "ws-machine-remote",
-                ))
-            reg = {True: "✔ hub", False: "✗ hub", None: "? hub"}[
-                r.get("registered")]
-            disk = "✔ disk" if r.get("on_disk") else "✗ disk"
-            # Three states, not two: nobody has it open · someone does · YOU
-            # are looking at it right now. The board knows its own --workspace,
-            # so the third is free and is the one the operator is standing in.
-            mine = bool(self.scoped_to) and r.get("path") == self.scoped_to
-            if mine:
-                open_now = "◉ here"
-            elif r.get("open_now"):
-                open_now = "● open"
-            else:
-                open_now = "      "
-            drift = (r.get("registered") is False) or not r.get("on_disk")
-            # Drift says what it IS, in words, at the end of the line — the
-            # short columns stay aligned and the reason still reads loudly.
-            if r.get("error"):
-                tail = f"⚠ {r['error']}"
-            elif not r.get("on_disk"):
-                tail = "ghost — registered, no file"
-            elif r.get("registered") is False:
-                tail = "not registered   " + self._short_dir(r.get("path"))
-            else:
-                tail = self._short_dir(r.get("path"))
-            if r.get("squad"):
-                tail = f"{tail}  [{r['squad']}]"
-            # Drift outranks both open states: attention beats status. A row
-            # that is open AND feral must read as feral.
-            if drift:
-                row_class = "ws-row-drift"
-            elif mine:
-                row_class = "ws-row-here"
-            elif r.get("open_now"):
-                row_class = "ws-row-open"
-            else:
-                row_class = "ws-row"
+    @staticmethod
+    def _fact(label: str, value: str, klass: str = "value-ro",
+              source: str = "") -> Vertical:
+        return Vertical(
+            Horizontal(Label(label, classes="label"),
+                       Static(value, classes=klass), classes="row-line"),
+            Static(source, classes="source"),
+            classes="row",
+        )
+
+    def _machine_widgets(self, m: dict[str, Any]) -> list[Any]:
+        head = "(machine unknown)" if m["unknown"] else m["machine"]
+        out: list[Any] = [
+            Static(f"▌MACHINE   {head}", classes="section section-live")]
+        if m["unknown"]:
             out.append(Static(
-                f"  {r['name']:<{name_w}}  {reg:<6} {disk:<7} {open_now}  {tail}",
-                classes=row_class,
-            ))
-        if not data.get("rows"):
-            out.append(Static("no workspaces found anywhere", classes="note"))
+                "Agents whose name matches no enrolled machine. Identity is "
+                "`<repo>-<hostname>`, so this is a box the hub has never been "
+                "told about — enrol it with `mcp-hub machines enrol`. They are "
+                "shown rather than dropped: nothing gets lost track of.",
+                classes="note"))
+        out.append(self._fact(
+            "Role", "this machine" if m["local"] else "remote",
+            "value-on" if m["local"] else "value-ro",
+            "local seats carry live pane data; remote seats carry presence only"))
+        out.append(self._fact("Seats", str(m["agent_count"])))
+        out.append(self._fact("Workspaces", str(len(m["workspaces"]))))
+        if m["open_count"]:
+            out.append(self._fact("Open now", str(m["open_count"]), "value-on",
+                                  "a board is running in front of a human"))
+        if m["drift_count"]:
+            out.append(self._fact(
+                "Drift", f"{m['drift_count']} workspace(s)", "value-warn",
+                "registered with no file, or a file nobody registered"))
+        if m["stale"]:
+            out.append(Static(
+                "The fleet snapshot (~/.mcp-hub/fleet-board.json) has not been "
+                "written recently, so this box is NOT REPORTING — which is not "
+                "the same as quiet. Every remote state here reads unknown "
+                "until a daemon writes it again.", classes="note"))
         return out
 
-    async def action_toggle_workspaces(self) -> None:
-        self.show_workspaces = not self.show_workspaces
-        await self.refresh_detail()
+    def _workspace_widgets(self, w: dict[str, Any]) -> list[Any]:
+        """One workspace, three truth columns, drift loud.
+
+        The columns are the `w` view's, kept verbatim when that view was
+        absorbed into the tree; what changed is that the PATH now has a pane
+        wide enough to hold it instead of overflowing a 46-cell row.
+        """
+        out: list[Any] = [
+            Static(f"▌WORKSPACE   {w['name']}", classes="section section-live")]
+        if w["error"]:
+            out.append(Static(f"⚠ this file will not parse: {w['error']}",
+                              classes="note"))
+        local = w["machine"] == self.tree_model.get("this_machine")
+        out.append(self._fact(
+            "Machine",
+            f"{w['machine'] or '(unknown)'}"
+            f"{'  · this machine' if local else '  · remote'}"))
+        reg = w["registered"]
+        out.append(self._fact(
+            "Registered",
+            {True: "yes", False: "no", None: "unknown"}[reg],
+            {True: "value-on", False: "value-warn", None: "value-warn"}[reg],
+            "the hub holds a definition for it" if reg is True
+            else ("nothing declared it — `mcp-hub workspaces register`"
+                  if reg is False else
+                  "the hub did not answer, so this is not an accusation"),
+        ))
+        out.append(self._fact(
+            "On disk", "yes" if w["on_disk"] else "no",
+            "value-on" if w["on_disk"] else "value-warn",
+            "" if w["on_disk"] else
+            "ghost — a definition nothing has materialized here"))
+        if w["here"]:
+            open_v, open_k, open_s = "you are here", "value-on", \
+                "this board is scoped to it"
+        elif w["open_now"]:
+            open_v, open_k, open_s = "yes", "value-on", \
+                "a board pinged within the hub's 180s window"
+        else:
+            open_v, open_k, open_s = "no", "value-off", \
+                "no board has claimed it recently"
+        out.append(self._fact("Open now", open_v, open_k, open_s))
+        if w["squad"]:
+            out.append(self._fact("Squad", w["squad"], "value-on",
+                                  "broadcasts scoped here reach these seats"))
+        out.append(self._fact(
+            "Folder", self._short_dir(w["path"]) if w["path"] else "—",
+            "value-ro", w["path"] or "no file on any machine that reported"))
+        out.append(self._fact(
+            "Seats", str(len(w["agents"])) if w["agents"] else "none attributed",
+            "value-ro" if w["agents"] else "value-off",
+            "" if w["agents"] else
+            "a remote workspace only lists its folders once REGISTERED, so its "
+            "seats sit under the machine instead"))
+        for a in w["agents"]:
+            out.append(Static(
+                f"  {a['agent']}" + ("" if a["local"] else "   (presence only)"),
+                classes="ws-row" if a["local"] else "ws-row-open"))
+        if reg is False and w["path"] and \
+                w["machine"] == self.tree_model.get("this_machine"):
+            # Offered only where it can actually be done: registering another
+            # machine's file would name a path this box cannot verify.
+            out.append(Horizontal(
+                Button("register this workspace", id=f"wsreg-{self._gen}",
+                       variant="warning", compact=True),
+                classes="answers"))
+        return out
+
+    def _remote_agent_widgets(self, a: dict[str, Any]) -> list[Any]:
+        out: list[Any] = [
+            Static(f"▌SEAT   {a['agent']}", classes="section section-live")]
+        out.append(Static(
+            "Presence only. This seat is on another machine, where there is no "
+            "pane to scrape — the hub knows it exists and whether it can be "
+            "woken, and claiming more than that is how 'delivered live' came "
+            "to be reported about an agent that could not receive.",
+            classes="note"))
+        out.append(self._fact("Machine", a["machine"] or "(unknown)"))
+        if a.get("project"):
+            out.append(self._fact("Project", a["project"]))
+        if a.get("stale"):
+            out.append(self._fact("State", "not reporting", "value-warn",
+                                  "the fleet snapshot has gone stale"))
+        else:
+            out.append(self._fact(
+                "State", a.get("state", "unknown"),
+                "value-on" if a.get("state") == "working" else "value-ro",
+                "from the daemons' fleet snapshot, not from a pane"))
+            out.append(self._fact(
+                "Wakeable", "yes" if a.get("wakeable") else "no",
+                "value-on" if a.get("wakeable") else "value-warn",
+                "bound for channel-push wake" if a.get("wakeable")
+                else "queued messages wait for its next turn boundary"))
+            out.append(self._fact("Sessions", str(a.get("sessions", 0))))
+        if a.get("next"):
+            out.append(Static(a["next"], classes="live-next"))
+            out.append(Static("its bio `next:`", classes="source"))
+        return out
+
+    # ---- the command palette ----
+
+    def run_verb(self, exe: str, argv: list[str], label: str,
+                 value: str = "") -> None:
+        """Run one squad/hub verb on a worker thread and report what it said.
+
+        Everything the palette does goes through here — the same path the
+        dropdowns use, so a palette command cannot do anything the panel's
+        own controls could not, and cannot freeze the UI doing it.
+        """
+        self._set_status(f"{label}…")
+        self.run_worker(
+            lambda: self._apply(exe, argv, label, value),
+            thread=True, exclusive=True,
+        )
+
+    def _goto(self, key: str):
+        def run() -> None:
+            for node in self._all_nodes():
+                if (node.data or {}).get("key") == key:
+                    self._move_to(node)
+                    self.call_later(self.refresh_detail)
+                    return
+        return run
+
+    def palette_commands(self) -> list[tuple[str, str, Any]]:
+        """(title, help, callback) for everything runnable right now.
+
+        Ordered by how close it is to hand: the selection's own actions first,
+        then navigation, then the app's. A command is only listed when the
+        current selection can actually perform it — offering `answer` for a
+        remote seat would be a button that lies.
+        """
+        out: list[tuple[str, str, Any]] = []
+        sel = self.selected or {}
+        agent = sel.get("agent") if sel.get("kind") == "agent" else None
+
+        if agent:
+            where = "this machine" if sel.get("local") else sel.get("machine", "")
+            for mins, word in ((30, "30m"), (60, "1h"), (120, "2h")):
+                out.append((
+                    f"Focus {word} — {agent}",
+                    f"do not disturb on {where}; urgent still gets through",
+                    (lambda m=mins: self.run_verb(
+                        self.hub_bin, ["focus", str(m), "--agent", agent],
+                        f"focus {agent}", f"{m}m")),
+                ))
+            out.append((
+                f"Focus off — {agent}", "start hearing normal messages again",
+                lambda: self.run_verb(
+                    self.hub_bin, ["focus", "--off", "--agent", agent],
+                    f"focus {agent}", "off"),
+            ))
+        if agent and sel.get("local"):
+            if sel.get("state") == "waiting":
+                for intent in ("yes", "no", "always"):
+                    out.append((
+                        f"Answer {intent} — {agent}",
+                        "fail-closed: presses nothing unless that option is "
+                        "on the agent's screen",
+                        (lambda i=intent: self.run_verb(
+                            self.squad_bin, ["answer", agent, i],
+                            f"answer {agent}", i)),
+                    ))
+            for verb, why in (("restart", "relaunch it, keeping its history"),
+                              ("stop", "close its pane"),
+                              ("start", "launch it")):
+                out.append((
+                    f"{verb.capitalize()} agent — {agent}", why,
+                    (lambda v=verb: self.run_verb(
+                        self.squad_bin, [v, agent], f"{v} {agent}", agent)),
+                ))
+
+        if sel.get("kind") == "workspace" and sel.get("registered") is False \
+                and sel.get("path") \
+                and sel.get("machine") == self.tree_model.get("this_machine"):
+            out.append((
+                f"Register workspace — {sel['name']}",
+                "declare it on the hub so it stops reading as drift",
+                lambda p=sel["path"]: self.run_verb(
+                    self.hub_bin, ["workspaces", "register", p],
+                    f"register {sel['name']}", "hub"),
+            ))
+        out.append((
+            "Register every unregistered workspace here",
+            "`mcp-hub workspaces register --all` for this machine",
+            lambda: self.run_verb(
+                self.hub_bin, ["workspaces", "register", "--all"],
+                "register all workspaces", "hub"),
+        ))
+
+        for node in self._agent_nodes():
+            data = node.data or {}
+            out.append((
+                f"Go to {data.get('agent', '')}",
+                f"{data.get('machine', '')}"
+                f"{'' if data.get('local') else ' · presence only'}",
+                self._goto(data.get("key", "")),
+            ))
+        for m in self.tree_model.get("machines", []):
+            for w in m["workspaces"]:
+                out.append((
+                    f"Go to workspace {w['name']}",
+                    f"{w['machine']}"
+                    f"{' · drift' if w['drift'] else ''}",
+                    self._goto(w["key"]),
+                ))
+
+        out.append(("Next needs-you", "jump to the next raised hand",
+                    self.action_next_hand))
+        out.append(("Expand or collapse the tree", "everything, or this box only",
+                    self.action_expand_all))
+        out.append(("Reload", "re-poll the board and the registry",
+                    lambda: self.run_worker(self.action_reload())))
+        out.append(("Light / dark", "override the terminal's answer",
+                    self.action_toggle_theme))
+        return out
 
     async def action_reload(self) -> None:
         await self.refresh_detail()
         if self._board_for is not None:
             self._poll_board()
+        if self._workspaces_for is not None:
+            self._poll_workspaces()
         self._set_status("reloaded")
 
     def action_toggle_theme(self) -> None:
@@ -802,20 +1395,50 @@ class SettingsApp(App):
         a wrong theme you cannot change is worse than no detection."""
         dark_now = self.theme == "claude-dark"
         self.theme = "squad-light" if dark_now else "claude-dark"
+        # Tree labels carry resolved hex, not CSS variables, so they do not
+        # follow a theme change on their own — they would keep the old theme's
+        # green until the next structural rebuild.
+        self._relabel_tree()
+
+    def action_expand_all(self) -> None:
+        """Everything open, or everything back to the default fold.
+
+        The default hides other machines, which is right for acting and wrong
+        for surveying; one key covers the second case.
+        """
+        nodes = [n for n in self._all_nodes() if n.allow_expand]
+        if any(not n.is_expanded for n in nodes):
+            for n in nodes:
+                n.expand()
+            self._set_status("expanded")
+            return
+        want = self._default_expansion(self.tree_model)
+        for n in nodes:
+            if n.data and n.data.get("key") in want:
+                n.expand()
+            else:
+                n.collapse()
+        self._set_status("collapsed to this machine")
 
     def action_next_hand(self) -> None:
-        """Jump the cursor to the next agent that needs the operator — the
-        roster keeps FILE ORDER (the cockpit's tab order; re-sorting would
-        disagree with it), so needs-you is a key, not a sort."""
-        live = self.board.get("agents") or {}
-        n = len(self.agents)
-        if not n:
+        """Jump the cursor to the next seat that needs the operator.
+
+        Tree ORDER, not roster order — the roster's file order is preserved
+        inside each workspace (it is the cockpit's tab order and re-sorting
+        would disagree with it), but the cursor now walks what is on screen.
+        A hand is a board fact, so only local seats can raise one.
+        """
+        nodes = self._agent_nodes()
+        if not nodes:
             return
-        for step in range(1, n + 1):
-            i = (self.agent_ix + step) % n
-            rec = live.get(self.agents[i]["agent"]) or {}
-            if rec.get("state") == "waiting" or (rec.get("next") or {}).get("hand"):
-                lv = self.query_one("#agents", ListView)
-                lv.index = i
+        keys = [n.data.get("key") for n in nodes]
+        try:
+            start = keys.index((self.selected or {}).get("key"))
+        except ValueError:
+            start = -1
+        for step in range(1, len(nodes) + 1):
+            node = nodes[(start + step) % len(nodes)]
+            if (node.data or {}).get("hand"):
+                self._move_to(node)
                 return
         self._set_status("nobody needs you 🎉")

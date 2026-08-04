@@ -2455,6 +2455,20 @@ def settings_command(args: argparse.Namespace) -> int:
                 host, {"workspace_open": workspace_path}
             )
 
+        def _fleet_snapshot() -> dict:
+            """The daemons' fleet snapshot — every agent the hub knows, not
+            just this box's roster. Read from the local cache rather than the
+            network: it is on the board's poll path, and a missing cache must
+            read as "not reporting", which `fleet_tree` decides from its `ts`.
+            """
+            try:
+                return json.loads(
+                    (pathlib.Path.home() / ".mcp-hub" / "fleet-board.json")
+                    .read_text(encoding="utf-8")
+                )
+            except Exception:  # noqa: BLE001 — absent or malformed: no claim
+                return {"ts": 0, "agents": []}
+
         SettingsApp(
             agents,
             scoped_to=getattr(args, "workspace", None),
@@ -2465,6 +2479,9 @@ def settings_command(args: argparse.Namespace) -> int:
             dark=dark,
             workspaces_for=_workspaces,
             presence_ping=_presence_ping,
+            fleet_for=_fleet_snapshot,
+            listings_for=lambda p: _workspace_listings(pathlib.Path(p)),
+            this_machine=_sanitize_ident(platform.node() or "unknown-host"),
         ).run()
         return 0
     cwd = args.cwd or os.getcwd()

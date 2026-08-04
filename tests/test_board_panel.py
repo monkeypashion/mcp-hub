@@ -63,7 +63,8 @@ def _snapshot(state_beta="waiting"):
 def _app(board=None, ran=None, dark=None):
     app = SettingsApp(AGENTS, scoped_to=None, model_for=_model_for,
                       squad_bin="/usr/bin/SQUAD", hub_bin="/usr/bin/HUB",
-                      board_for=board, dark=dark, poll_seconds=3600)
+                      board_for=board, dark=dark, poll_seconds=3600,
+                      this_machine="thisbox")
     if ran is not None:
         def apply(exe, argv, label, value):
             ran.append((exe, argv))
@@ -72,21 +73,45 @@ def _app(board=None, ran=None, dark=None):
     return app
 
 
+def _label(app, agent: str) -> str:
+    """One seat's rendered row in the tree, as the operator reads it."""
+    for node in app._agent_nodes():
+        if (node.data or {}).get("agent") == agent:
+            return node.label.plain
+    raise AssertionError(f"{agent} is not in the tree")
+
+
+async def _goto(app, pilot, agent: str) -> None:
+    from textual.widgets import Tree
+    for node in app._agent_nodes():
+        if (node.data or {}).get("agent") == agent:
+            app.query_one("#fleet", Tree).move_cursor(node)
+            await pilot.pause()
+            await pilot.pause()
+            return
+    raise AssertionError(f"{agent} is not in the tree")
+
+
 # ---- the live roster and detail ----
 
 @pytest.mark.asyncio
-async def test_the_roster_wears_the_board_state():
+async def test_the_tree_wears_the_board_state():
     app = _app(board=_snapshot)
     async with app.run_test(size=(120, 34)) as pilot:
         await pilot.pause()
         await pilot.pause()
-        line0 = app.query_one("#live-0").render()
-        line1 = app.query_one("#live-1").render()
-        assert "Fable" in str(line0) and "working" in str(line0)
-        assert "waiting" in str(line1) and "2m" in str(line1)
-        assert "🙋" in str(line1)                       # the hand rides the roster
-        # an agent the scan doesn't know keeps its class line, not garbage
-        assert str(app.query_one("#live-2").render()) == "faculty"
+        assert "19%" in _label(app, "alpha")
+        assert "working" in _label(app, "alpha")
+        # The model name left the label when it outgrew the panel — it must
+        # still be readable, one pane over.
+        detail = " ".join(str(w.render())
+                          for w in app.query_one("#detail").walk_children())
+        assert "Fable" in detail
+        assert "waiting" in _label(app, "beta") and "2m" in _label(app, "beta")
+        assert "🙋" in _label(app, "beta")           # the hand rides the row
+        # an agent the scan doesn't know keeps its class, not garbage
+        assert "faculty" in _label(app, "gamma")
+        assert "waiting" not in _label(app, "gamma")
         # the fleet summary took over the subtitle
         assert "need you" in app.sub_title
 
@@ -96,10 +121,7 @@ async def test_the_live_section_shows_the_blocking_question_with_answers():
     app = _app(board=_snapshot)
     async with app.run_test(size=(120, 34)) as pilot:
         await pilot.pause()
-        items = app.query("#agents > ListItem")
-        await pilot.click(items[1])                    # beta, the waiting one
-        await pilot.pause()
-        await pilot.pause()
+        await _goto(app, pilot, "beta")                # the waiting one
         texts = " ".join(str(w.render()) for w in app.query("#live Static"))
         assert "rm -rf" in texts                       # the question, verbatim
         assert "deploy?" in texts                      # the open card's ask
@@ -113,10 +135,7 @@ async def test_answer_buttons_run_squad_answer_fail_closed_verb():
     app = _app(board=_snapshot, ran=ran)
     async with app.run_test(size=(120, 34)) as pilot:
         await pilot.pause()
-        items = app.query("#agents > ListItem")
-        await pilot.click(items[1])
-        await pilot.pause()
-        await pilot.pause()
+        await _goto(app, pilot, "beta")
         await pilot.click(app.query("#live Button").first())
         await pilot.pause()
         await pilot.pause()
@@ -130,10 +149,7 @@ async def test_a_working_agent_gets_no_answer_buttons():
     app = _app(board=lambda: _snapshot(state_beta="working"))
     async with app.run_test(size=(120, 34)) as pilot:
         await pilot.pause()
-        items = app.query("#agents > ListItem")
-        await pilot.click(items[1])
-        await pilot.pause()
-        await pilot.pause()
+        await _goto(app, pilot, "beta")
         assert not list(app.query("#live Button"))
 
 
@@ -158,10 +174,10 @@ async def test_n_jumps_to_the_agent_that_needs_you():
     async with app.run_test(size=(120, 34)) as pilot:
         await pilot.pause()
         await pilot.pause()
-        assert app.agent_ix == 0
+        assert app.selected["agent"] == "alpha"
         await pilot.press("n")
         await pilot.pause()
-        assert app.agents[app.agent_ix]["agent"] == "beta"
+        assert app.selected["agent"] == "beta"
 
 
 # ---- theme ----
@@ -304,9 +320,7 @@ async def test_polling_a_waiting_agent_does_not_crash_or_churn_its_buttons():
     app._poll_seconds = 0.05
     async with app.run_test(size=(120, 34)) as pilot:
         await pilot.pause()
-        items = app.query("#agents > ListItem")
-        await pilot.click(items[1])                    # beta, the waiting one
-        await pilot.pause()
+        await _goto(app, pilot, "beta")                # the waiting one
         gen_after_select = app._gen
         for _ in range(6):                             # several poll applications
             app._apply_board(snapshot())
