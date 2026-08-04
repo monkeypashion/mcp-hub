@@ -213,3 +213,87 @@ def test_json_is_still_valid_after_a_rotation(client):
                     headers={"Authorization": f"Bearer {OP}"})
     body = json.loads(r.text)
     assert set(body) >= {"name", "os", "capabilities", "token"}
+
+
+# ---- the two halves must meet ----------------------------------------------
+
+def test_edge_reads_the_token_file_that_enrol_and_rotate_write(tmp_path,
+                                                               monkeypatch):
+    """The gap that made rotation pointless.
+
+    `edge apply` read only --token and $MCP_HUB_MACHINE_TOKEN, while enrol and
+    rotate wrote a FILE. A systemd timer passes no flag and inherits no
+    environment, so the timer would have logged "no machine token" every two
+    minutes while a perfectly good credential sat on disk.
+    """
+    import argparse
+
+    from mcp_hub import operator_api
+
+    dest = tmp_path / "machine.token"
+    dest.write_text("token-from-the-file")
+    monkeypatch.setattr(operator_api, "MACHINE_TOKEN_FILE", dest)
+    monkeypatch.delenv("MCP_HUB_MACHINE_TOKEN", raising=False)
+
+    seen = {}
+
+    class FakeHubAPI:
+        def __init__(self, base_url="", token="", client=None):
+            seen["token"] = token
+
+        def pull_placements(self, machine):
+            return []
+
+        def push_status(self, machine, payload):
+            pass
+
+    monkeypatch.setattr("mcp_hub.edge.HubAPI", FakeHubAPI)
+    args = argparse.Namespace(
+        action="apply", machine="box-1", token=None, dry_run=True,
+        scan_dir=[str(tmp_path)], hub_url="http://h/mcp")
+    cli.edge_command(args)
+    assert seen["token"] == "token-from-the-file"
+
+
+def test_an_explicit_token_still_beats_the_file(tmp_path, monkeypatch):
+    import argparse
+
+    from mcp_hub import operator_api
+
+    dest = tmp_path / "machine.token"
+    dest.write_text("file-token")
+    monkeypatch.setattr(operator_api, "MACHINE_TOKEN_FILE", dest)
+    seen = {}
+
+    class FakeHubAPI:
+        def __init__(self, base_url="", token="", client=None):
+            seen["token"] = token
+
+        def pull_placements(self, machine):
+            return []
+
+        def push_status(self, machine, payload):
+            pass
+
+    monkeypatch.setattr("mcp_hub.edge.HubAPI", FakeHubAPI)
+    args = argparse.Namespace(
+        action="apply", machine="box-1", token="explicit", dry_run=True,
+        scan_dir=[str(tmp_path)], hub_url="http://h/mcp")
+    cli.edge_command(args)
+    assert seen["token"] == "explicit"
+
+
+def test_no_token_anywhere_names_the_verb_that_makes_one(tmp_path, monkeypatch,
+                                                         capsys):
+    import argparse
+
+    from mcp_hub import operator_api
+
+    monkeypatch.setattr(operator_api, "MACHINE_TOKEN_FILE",
+                        tmp_path / "absent.token")
+    monkeypatch.delenv("MCP_HUB_MACHINE_TOKEN", raising=False)
+    args = argparse.Namespace(
+        action="apply", machine="box-1", token=None, dry_run=True,
+        scan_dir=[str(tmp_path)], hub_url="http://h/mcp")
+    assert cli.edge_command(args) == 2
+    assert "machines enrol" in capsys.readouterr().err
