@@ -330,3 +330,28 @@ def test_remove_dry_run_writes_nothing(capsys):
 def test_every_workspaces_action_parses(action):
     args = cli.build_parser().parse_args(["workspaces", action])
     assert args.action == action
+
+
+def test_an_image_unit_needs_no_repo_either(capsys):
+    """An nginx container has no git remote any more than it has a worktree.
+    Demanding one forces the operator to invent a field, and an invented
+    field is a lie the roster then carries forever. Measured: declaring the
+    first containerized claude seat required passing a repo the container
+    never clones."""
+    api = FakeApi()
+    rc = cli.seats_command(
+        _args(action="add", identity="web-1", machine="box",
+              image="nginx:alpine"),
+        api=api)
+    assert rc == 0
+    assert api.calls[0][7]["image"] == "nginx:alpine"
+
+
+def test_a_worktree_unit_still_demands_repo_AND_folder(capsys):
+    """The relaxation is for image units ONLY — a tmux seat with neither
+    cannot be materialized anywhere."""
+    api = FakeApi()
+    rc = cli.seats_command(_args(action="add", machine="box"), api=api)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "--repo" in err and "--folder" in err

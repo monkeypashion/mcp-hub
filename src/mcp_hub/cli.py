@@ -1871,10 +1871,12 @@ def seats_command(args: argparse.Namespace, api: Any = None) -> int:
 
         if args.action == "add":
             # A container is named by its IMAGE; only a worktree unit needs a
-            # folder on this host. Demanding one of nginx would be a lie.
-            need = [("--repo", args.repo)]
+            # folder on this host — or a repo. Demanding either of nginx would
+            # be a lie: an inference server or a web app has no git remote,
+            # and the image IS the thing that says what will run.
+            need = []
             if not args.image:
-                need.append(("--folder", args.folder))
+                need = [("--repo", args.repo), ("--folder", args.folder)]
             missing = [f for f, v in need if not v]
             if missing:
                 print(f"{' and '.join(missing)} required — a seat without them "
@@ -4621,7 +4623,7 @@ def build_parser() -> argparse.ArgumentParser:
     placements.add_argument("--machine", default=None, help="set: on this machine")
     placements.add_argument("--substrate", default="worktree",
                             choices=["worktree", "docker"],
-                            help="set: docker placements are skipped by the edge")
+                            help="set: worktree (tmux seat) or docker (container)")
     placements.add_argument(
         "--yes", action="store_true",
         help="reclaim: skip the confirmation — it DESTROYS the substrate",

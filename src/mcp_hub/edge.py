@@ -127,6 +127,18 @@ def observed_report(
             "report a state no evidence supports"
         )
     state = "running" if enumeration.get("alive") else "stopped"
+    # A container running the WRONG IMAGE is not converged, and "running"
+    # would be true-but-useless: `docker ps` cannot see the difference, so
+    # the drift would stay invisible forever (it bit this build for real —
+    # the edge recreated a seat from a stale `latest` 13 seconds before the
+    # new image finished building). The hub marks any observed != desired as
+    # diverged, so naming the state is the whole mechanism.
+    #
+    # Only when it is actually UP: drift is about what it runs, and a
+    # stopped container reporting stale-image would hide that it is down.
+    # `is False` deliberately — an ABSENT key is unknown, not a mismatch.
+    if state == "running" and enumeration.get("image_matches") is False:
+        state = "stale-image"
     return {"state": state, "enumeration": enumeration}
 
 
@@ -440,10 +452,56 @@ def enumerate_docker(runner: Any, seats: list[str]) -> dict[str, dict[str, Any]]
         parts = line.split("\t")
         if len(parts) >= 2 and parts[0].strip():
             found[parts[0].strip()] = parts[1].strip()
+
+    # WHICH IMAGE each container actually runs — a second call, deliberately.
+    # `docker ps --format {{.ImageID}}` does not exist (measured: template
+    # error), and `{{.Image}}` is the TAG, which reads identically for a
+    # container created from last month's `latest`. Only inspect exposes the
+    # image ID that would reveal drift.
+    #
+    # Skipped entirely when nothing is materialized: `docker inspect` with no
+    # arguments is an error, and a pointless call would fail the whole pass.
+    images: dict[str, str] = {}
+    present = [s for s in seats if s in found]
+    if present:
+        rc, iout = runner(
+            ["docker", "inspect", "--format", "{{.Name}} {{.Image}}", *present]
+        )
+        if rc != 0:
+            raise EnumerationFailed(
+                f"`docker inspect` failed (rc={rc}) — refusing to report an "
+                f"image identity this pass never observed. Output: "
+                f"{iout.strip()[:300]}"
+            )
+        for line in iout.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                images[parts[0].lstrip("/").strip()] = parts[1].strip()
+
     return {
-        s: {"materialized": s in found, "running": found.get(s) == "running"}
+        s: {
+            "materialized": s in found,
+            "running": found.get(s) == "running",
+            "image": images.get(s) if s in found else None,
+        }
         for s in seats
     }
+
+
+def resolve_image_id(runner: Any, image: str) -> str | None:
+    """Current image ID for a tag, or None when it cannot be resolved.
+
+    None means UNKNOWN, never "drift": an image that has not been pulled on
+    this box yields no comparison, and claiming divergence from an absent
+    fact would make every seat on a fresh machine look broken. Unknown is
+    the honest answer and it stays out of the report.
+    """
+    rc, out = runner(
+        ["docker", "image", "inspect", image, "--format", "{{.Id}}"]
+    )
+    if rc != 0:
+        return None
+    return out.strip().splitlines()[0].strip() if out.strip() else None
 
 
 class EnumerationFailed(RuntimeError):
@@ -539,6 +597,15 @@ def edge_apply(
         results.append(ex.execute(a, specs.get(a["seat"], {})))
 
     local = enumerate_now()
+    # Resolve each DISTINCT spec image once — a squad of ten seats off one
+    # image asks docker once, not ten times.
+    want_image_ids: dict[str, str | None] = {}
+    for p in placements:
+        if p.get("substrate") != "docker":
+            continue
+        img = (specs.get(p["seat"], {}).get("spec") or {}).get("image")
+        if img and img not in want_image_ids:
+            want_image_ids[img] = resolve_image_id(runner, img)
     reported = 0
     for p in placements:
         state = local[p["seat"]]
@@ -551,6 +618,16 @@ def edge_apply(
                 "alive": state["running"],
                 "exists": state["materialized"],
             }
+            # Image drift, reported only where BOTH sides are known: the
+            # image the container runs (enumerated) and the current ID of
+            # the tag its spec names (resolved). Either unknown -> the key
+            # is absent, and absent means unknown rather than agreement.
+            want = (specs.get(p["seat"], {}).get("spec") or {}).get("image")
+            want_id = want_image_ids.get(want) if want else None
+            if state.get("image") and want_id:
+                enumeration["image"] = state["image"]
+                enumeration["want_image"] = want_id
+                enumeration["image_matches"] = state["image"] == want_id
         else:
             enumeration = {
                 "tmux_session": p["seat"],

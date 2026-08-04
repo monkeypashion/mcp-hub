@@ -33,8 +33,11 @@ from mcp_hub.edge import (
 class Runner:
     """Records commands; answers `docker ps` from a scripted world."""
 
-    def __init__(self, world=None, fail=(), denied=False):
+    def __init__(self, world=None, fail=(), denied=False, images=None,
+                 tags=None):
         self.world = dict(world or {})       # name -> state
+        self.images = dict(images or {})     # name -> image id it RUNS
+        self.tags = dict(tags or {})         # image ref -> current id
         self.calls: list[list[str]] = []
         self.fail = set(fail)
         self.denied = denied
@@ -49,6 +52,19 @@ class Runner:
                 return 1, "Cannot connect to the Docker daemon"
             body = "\n".join(f"{n}\t{s}" for n, s in self.world.items())
             return 0, body
+        if cmd[:2] == ["docker", "inspect"]:
+            if "inspect" in self.fail:
+                return 1, "No such object"
+            names = [c for c in cmd[2:] if not c.startswith("--")
+                     and c not in ("{{.Name}} {{.Image}}",)]
+            return 0, "\n".join(
+                f"/{n} {self.images.get(n, 'sha256:unknown')}" for n in names
+            )
+        if cmd[:3] == ["docker", "image", "inspect"]:
+            ref = cmd[3]
+            if ref not in self.tags:
+                return 1, f"Error: No such image: {ref}"
+            return 0, self.tags[ref]
         if cmd[:2] == ["squad", "ls"]:
             return 0, ""
         return (1, "boom") if cmd[1] in self.fail else (0, "ok")
@@ -68,18 +84,21 @@ def test_a_stopped_container_still_counts_as_materialized():
     under a name already taken, and the run would fail every pass forever."""
     r = Runner({"web-box-1": "exited"})
     state = enumerate_docker(r, ["web-box-1"])
-    assert state["web-box-1"] == {"materialized": True, "running": False}
+    assert state["web-box-1"] == {"materialized": True, "running": False,
+                                  "image": "sha256:unknown"}
     assert r.calls[0][:3] == ["docker", "ps", "-a"]
 
 
 def test_a_running_container_is_both():
     state = enumerate_docker(Runner({"web-box-1": "running"}), ["web-box-1"])
-    assert state["web-box-1"] == {"materialized": True, "running": True}
+    assert state["web-box-1"] == {"materialized": True, "running": True,
+                                  "image": "sha256:unknown"}
 
 
 def test_an_absent_container_is_neither():
     state = enumerate_docker(Runner({}), ["web-box-1"])
-    assert state["web-box-1"] == {"materialized": False, "running": False}
+    assert state["web-box-1"] == {"materialized": False, "running": False,
+                                  "image": None}
 
 
 def test_a_docker_daemon_that_cannot_be_reached_is_a_HARD_error():
@@ -239,8 +258,13 @@ def test_a_container_placement_converges_and_is_reported_as_a_container(tmp_path
     summary = edge_apply(api, "box-1", r, [tmp_path], seeder=lambda f: True)
 
     assert summary["placements"] == 1
-    assert [c[:2] for c in r.calls if c[0] == "docker" and c[1] != "ps"] == \
-        [["docker", "create"], ["docker", "start"]]
+    # MUTATING calls, in order: create then start, never `docker run` (which
+    # would make a `desired: stopped` seat start anyway). Read-only calls
+    # (ps/inspect/image inspect) are enumeration and excluded by name — the
+    # assertion is about what this pass CHANGED, not how much it looked.
+    mutating = [c[:2] for c in r.calls
+                if c[0] == "docker" and c[1] not in ("ps", "inspect", "image")]
+    assert mutating == [["docker", "create"], ["docker", "start"]]
     report = api.observed["pl-1"]
     assert report["state"] == "running"
     assert report["enumeration"]["container"] == "web-box-1"
@@ -477,3 +501,150 @@ def test_create_argv_injects_seat_identity_last_so_it_wins():
 def test_create_argv_injects_seat_identity_when_spec_has_no_env():
     argv = DockerExecutor.create_argv("seat-b", {"image": "img"})
     assert "SEAT_IDENTITY=seat-b" in argv
+
+
+# ---- image drift -----------------------------------------------------------
+#
+# A container with the right NAME in the right STATE reads converged even
+# when it runs last month's build. That is a hole in observe-don't-guess:
+# `docker ps` cannot see it, and it bit this build for real (the edge
+# recreated a seat from a stale `latest` mid-rebuild, 13s before the new
+# image finished). The edge now compares the image the container ACTUALLY
+# runs against the one its spec names.
+
+
+def test_enumeration_reports_the_image_a_container_actually_runs():
+    r = Runner({"web-box-1": "running"}, images={"web-box-1": "sha256:aaa"})
+    state = enumerate_docker(r, ["web-box-1"])
+    assert state["web-box-1"]["image"] == "sha256:aaa"
+    # ps first (existence/state), inspect second (identity) — never one call
+    # pretending to be both: `docker ps --format {{.ImageID}}` DOES NOT EXIST
+    # (measured: template error), and .Image gives the tag, which is the same
+    # string for a stale container and so cannot detect drift.
+    assert r.calls[0][:3] == ["docker", "ps", "-a"]
+    assert r.calls[1][:2] == ["docker", "inspect"]
+
+
+def test_inspect_is_not_called_when_nothing_is_materialized():
+    """No containers found = nothing to inspect. `docker inspect` with no
+    arguments is an error, so a pointless call would fail the whole pass."""
+    r = Runner({})
+    enumerate_docker(r, ["web-box-1"])
+    assert not any(c[:2] == ["docker", "inspect"] for c in r.calls)
+
+
+def test_a_failing_inspect_is_a_HARD_error_like_a_failing_ps():
+    """Same rule, same reason: a state this pass never observed must not
+    reach a report."""
+    r = Runner({"web-box-1": "running"}, fail=("inspect",))
+    with pytest.raises(EnumerationFailed):
+        enumerate_docker(r, ["web-box-1"])
+
+
+def test_resolve_image_id_returns_the_current_id_of_a_tag():
+    from mcp_hub.edge import resolve_image_id
+
+    r = Runner({}, tags={"nginx:alpine": "sha256:bbb"})
+    assert resolve_image_id(r, "nginx:alpine") == "sha256:bbb"
+
+
+def test_an_unpullable_image_is_UNKNOWN_not_drift():
+    """An image absent locally means we cannot compare — and an unknown is
+    never evidence of drift. Claiming diverged here would make every seat
+    on a box that has not pulled yet look broken."""
+    from mcp_hub.edge import resolve_image_id
+
+    assert resolve_image_id(Runner({}), "never:pulled") is None
+
+
+def test_observed_report_says_stale_image_over_running():
+    """The honest word. `running` would be TRUE and useless — the container
+    is running the wrong thing, and the hub marks any observed != desired
+    as diverged, so this alone surfaces the drift."""
+    from mcp_hub.edge import observed_report
+
+    rep = observed_report(
+        {"id": "pl-1"},
+        {"container": "web-box-1", "alive": True, "exists": True,
+         "image": "sha256:old", "want_image": "sha256:new",
+         "image_matches": False},
+    )
+    assert rep["state"] == "stale-image"
+
+
+def test_matching_image_reports_running_as_before():
+    from mcp_hub.edge import observed_report
+
+    rep = observed_report(
+        {"id": "pl-1"},
+        {"container": "web-box-1", "alive": True, "exists": True,
+         "image": "sha256:new", "want_image": "sha256:new",
+         "image_matches": True},
+    )
+    assert rep["state"] == "running"
+
+
+def test_unknown_image_does_not_invent_drift():
+    from mcp_hub.edge import observed_report
+
+    rep = observed_report(
+        {"id": "pl-1"},
+        {"container": "web-box-1", "alive": True, "exists": True},
+    )
+    assert rep["state"] == "running"
+
+
+def test_a_stopped_container_is_stopped_even_with_a_stale_image():
+    """Drift is about WHAT it runs; stopped is about WHETHER it runs. A
+    stopped container reporting stale-image would hide that it is down."""
+    from mcp_hub.edge import observed_report
+
+    rep = observed_report(
+        {"id": "pl-1"},
+        {"container": "web-box-1", "alive": False, "exists": True,
+         "image": "sha256:old", "want_image": "sha256:new",
+         "image_matches": False},
+    )
+    assert rep["state"] == "stopped"
+
+
+def test_a_stale_image_makes_a_live_placement_report_stale_image(tmp_path):
+    """End to end: the container is up, docker is happy, and the edge says
+    stale-image — which the hub reads as diverged because observed != desired.
+    Without this the board shows green while a seat runs last month's build."""
+    class Live(Runner):
+        def __call__(self, cmd, cwd=None):
+            return super().__call__(cmd, cwd)
+
+    r = Live({"web-box-1": "running"},
+             images={"web-box-1": "sha256:OLD"},
+             tags={"nginx:alpine": "sha256:NEW"})
+    api = FakeApi([_placement()])
+    edge_apply(api, "box-1", r, [tmp_path], seeder=lambda f: True)
+
+    report = api.observed["pl-1"]
+    assert report["state"] == "stale-image"
+    assert report["enumeration"]["image"] == "sha256:OLD"
+    assert report["enumeration"]["want_image"] == "sha256:NEW"
+
+
+def test_a_current_image_still_reports_running(tmp_path):
+    r = Runner({"web-box-1": "running"},
+               images={"web-box-1": "sha256:SAME"},
+               tags={"nginx:alpine": "sha256:SAME"})
+    api = FakeApi([_placement()])
+    edge_apply(api, "box-1", r, [tmp_path], seeder=lambda f: True)
+    assert api.observed["pl-1"]["state"] == "running"
+
+
+def test_one_image_inspect_per_DISTINCT_image(tmp_path):
+    """A squad of N seats off one image asks docker once, not N times."""
+    p1 = {**_placement(), "id": "pl-1", "seat": "web-box-1"}
+    p2 = {**_placement(), "id": "pl-2", "seat": "web-box-2"}
+    p2 = {**p2, "seat_spec": dict(p2["seat_spec"], identity="web-box-2")}
+    r = Runner({"web-box-1": "running", "web-box-2": "running"},
+               images={"web-box-1": "sha256:S", "web-box-2": "sha256:S"},
+               tags={"nginx:alpine": "sha256:S"})
+    api = FakeApi([p1, p2])
+    edge_apply(api, "box-1", r, [tmp_path], seeder=lambda f: True)
+    assert len([c for c in r.calls if c[:3] == ["docker", "image", "inspect"]]) == 1
