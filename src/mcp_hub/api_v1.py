@@ -344,6 +344,42 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
         db().commit()
         return JSONResponse({"name": name, "archived": True})
 
+    @route("/api/v1/machines/{name}/rotate-token", methods=["POST"])
+    async def machine_rotate_token(request: Request) -> Response:
+        """Issue a NEW machine token, invalidating the old one.
+
+        Enrolment returns a token exactly once and the hub keeps only a hash,
+        so a caller that drops it has destroyed it — with no way back. Both
+        machines in this fleet lost theirs that way (2026-07-30), which left
+        `edge apply` authenticating with the OPERATOR token: one credential
+        that drives every machine, on every box, indefinitely.
+
+        Operator-only on purpose. A machine rotating its own credential is a
+        machine that can lock the operator out of it, and the recovery path
+        for that is the one that was already missing.
+        """
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        name = request.path_params["name"]
+        row = db().execute(
+            "SELECT * FROM api_machines WHERE name = ? AND archived = 0", (name,)
+        ).fetchone()
+        if not row:
+            return _err(404, f"no machine '{name}'")
+        token = secrets.token_hex(24)
+        db().execute(
+            "UPDATE api_machines SET token_hash = ? WHERE name = ?",
+            (_sha(token.encode()), name),
+        )
+        db().commit()
+        row = db().execute(
+            "SELECT * FROM api_machines WHERE name = ?", (name,)
+        ).fetchone()
+        # Same contract as enrolment: returned once, never retrievable. The
+        # client persists before printing.
+        return JSONResponse(machine_json(row, token=token))
+
     @route("/api/v1/machines/{name}/placements", methods=["GET"])
     async def machine_placements(request: Request) -> Response:
         got = auth(request)

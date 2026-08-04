@@ -1,0 +1,16 @@
+[Unit]
+Description=Run mcp-hub edge apply every 2 minutes
+
+[Timer]
+# Matches squad-heal's cadence: both are convergence loops and there is no
+# reason for the fleet to have two different notions of "soon". 2 minutes is
+# also the number the placements CLI quotes when it explains what happens
+# after you write desired state — change one, change the other.
+OnBootSec=2min
+OnUnitActiveSec=2min
+# Without this the whole fleet reconciles on the same second after a shared
+# outage, which is the one moment the hub is least able to serve it.
+RandomizedDelaySec=20
+
+[Install]
+WantedBy=timers.target
