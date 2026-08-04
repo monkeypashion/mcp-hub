@@ -339,6 +339,37 @@ class DockerExecutor:
         return {**base, "rc": rc, "output": out[-400:]}
 
 
+def _docker_permission_hint(output: str) -> str:
+    """Name the cause a docker permission error almost always has HERE.
+
+    Observed live on dev-vm-1, 2026-08-04: `docker ps` worked in an ssh
+    session and failed inside the edge's systemd unit, on the same box, as the
+    same user. The user was added to the `docker` group AFTER the systemd
+    --user manager started, and every service the manager spawns inherits its
+    supplementary groups as they were then. PAM builds fresh credentials for
+    each login, which is exactly why an interactive check says everything is
+    fine.
+
+    Diagnosing that from `permission denied` alone took twenty minutes. The
+    error is the right place to spend the sentence.
+    """
+    low = output.lower()
+    if "permission denied" not in low or "docker.sock" not in low:
+        return ""
+    return (
+        "\n  Likely cause: this runs as a systemd --user service, and the user "
+        "manager was started BEFORE the account joined the `docker` group — it "
+        "keeps the supplementary groups it had then, while an interactive shell "
+        "gets fresh ones and works fine."
+        "\n  Check:  grep ^Groups: /proc/$(pgrep -u $UID -f 'systemd --user' "
+        "| head -1)/status   against   getent group docker"
+        "\n  Fix:    log the user fully out and back in, or reboot. NOTE that "
+        "`loginctl terminate-user` restarts the manager and will kill any agent "
+        "panes and timers it owns — on a box running seats that is not a quiet "
+        "operation."
+    )
+
+
 def enumerate_docker(runner: Any, seats: list[str]) -> dict[str, dict[str, Any]]:
     """What docker ACTUALLY has, for the named seats.
 
@@ -353,6 +384,7 @@ def enumerate_docker(runner: Any, seats: list[str]) -> dict[str, dict[str, Any]]
         raise EnumerationFailed(
             f"`docker ps` failed (rc={rc}) — refusing to plan or report against "
             f"state this pass never observed. Output: {out.strip()[:300]}"
+            f"{_docker_permission_hint(out)}"
         )
     found: dict[str, str] = {}
     for line in out.splitlines():

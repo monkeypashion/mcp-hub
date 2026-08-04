@@ -31,15 +31,19 @@ from mcp_hub.edge import (
 class Runner:
     """Records commands; answers `docker ps` from a scripted world."""
 
-    def __init__(self, world=None, fail=()):
+    def __init__(self, world=None, fail=(), denied=False):
         self.world = dict(world or {})       # name -> state
         self.calls: list[list[str]] = []
         self.fail = set(fail)
+        self.denied = denied
 
     def __call__(self, cmd, cwd=None):
         self.calls.append(list(cmd))
         if cmd[:3] == ["docker", "ps", "-a"]:
             if "ps" in self.fail:
+                if self.denied:
+                    return 1, ("permission denied while trying to connect to "
+                               "the docker API at unix:///var/run/docker.sock")
                 return 1, "Cannot connect to the Docker daemon"
             body = "\n".join(f"{n}\t{s}" for n, s in self.world.items())
             return 0, body
@@ -387,3 +391,34 @@ class TestSeatsEndpointAcceptsContainers:
         cols = [x[1] for x in sqlite3.connect(dbp)
                 .execute("PRAGMA table_info(api_seats)")]
         assert "spec" in cols
+
+
+# ---- the error that costs twenty minutes -----------------------------------
+
+DENIED = ("permission denied while trying to connect to the docker API at "
+          "unix:///var/run/docker.sock")
+
+
+def test_a_socket_permission_error_names_the_stale_group_manager():
+    """Observed live: `docker ps` worked over ssh and failed in the systemd
+    unit, same box, same user. The user joined the `docker` group AFTER the
+    --user manager started, so every service it spawns keeps the old
+    supplementary groups while interactive logins get fresh ones."""
+    with pytest.raises(EnumerationFailed) as e:
+        enumerate_docker(Runner(fail=["ps"], denied=True), ["web-box-1"])
+    msg = str(e.value)
+    assert "systemd --user" in msg
+    assert "supplementary groups" in msg
+    assert "getent group docker" in msg          # the check, not just the cause
+    # …and it warns that the obvious fix is destructive on a box running seats
+    assert "terminate-user" in msg and "kill" in msg
+
+
+def test_an_unrelated_docker_failure_gets_no_group_lecture():
+    """A hint that fires for everything is noise, and would send someone
+    chasing groups when the daemon is simply not running."""
+    with pytest.raises(EnumerationFailed) as e:
+        enumerate_docker(Runner(fail=["ps"]), ["web-box-1"])
+    msg = str(e.value)
+    assert "supplementary groups" not in msg
+    assert "refusing to plan or report" in msg   # the refusal still stands
