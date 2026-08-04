@@ -417,12 +417,29 @@ and a separate `w` keystroke listing every workspace on every box.
 ```
 ▾ fireblade-wsl · this machine
   ▾ ◉ showcase
-      🔴 🙋 mcp-hub-fireblade-wsl   42% waiting 4m
-      ▶ dreamteam-fireblade         18% working
+      🔴 ⚡ 🙋 mcp-hub-fireblade-wsl    42% waiting 4m
+      ▶  ⚡ dreamteam-fireblade         18% working
+      ○     pc-cleanup-fireblade-wsl          ← enrolled, not running
   ▸ ● xport
-  ▸   feral            not registered      ← drift, in words
+  ▸ ○ feral            not registered         ← drift, in words
 ▸ dev-vm-1 · remote   ⚠ 1 drift
 ```
+
+**Two glyph columns, one vocabulary, and every row wears a mark.** State:
+`🔴` waiting · `▶` working · `💤` idle · `✖` down · `○` not running ·
+`⚠` not reporting. Wake: `⚡` or blank. `💤`/`⚡` are the hub's own
+`list_agents` vocabulary, so one thing looks the same wherever it appears.
+
+Narrow glyphs are padded to two cells (`_cell2`) — `🔴` and `💤` are
+double-width, `▶ ✖ ○` are not, and unpadded the name column shifts sideways
+as an agent changes state. Beware when testing this: a pair of *narrow*
+glyphs proves nothing, which is how the first version of that test passed
+with the padding removed entirely.
+
+The label is a summary, not the record. `faculty`/`squad`, the model name,
+and the board's full `hub` phrase (`✖ REGISTER` says what `⚡`-or-nothing
+cannot) all live in the detail pane — the tree lost each of them once by
+being trimmed to fit, so anything taken off a row has to land somewhere.
 
 Three levels, and the middle one carries the three truth columns below.
 This machine opens expanded, other boxes folded — you act on the box you are
