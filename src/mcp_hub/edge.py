@@ -29,6 +29,7 @@ injected — the brain never shells out, so no test of it can touch a roster.
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -294,11 +295,15 @@ class DockerExecutor:
     rather than inventing one.
     """
 
-    def __init__(self, runner: Any) -> None:
+    def __init__(self, runner: Any, environ: dict[str, str] | None = None) -> None:
         self._run = runner
+        # This machine's own environment, injected so tests never read the
+        # real one. It is the ONLY place a secret value comes from.
+        self._environ = environ if environ is not None else dict(os.environ)
 
     @staticmethod
-    def create_argv(seat: str, spec: dict[str, Any]) -> list[str]:
+    def create_argv(seat: str, spec: dict[str, Any],
+                    environ: dict[str, str] | None = None) -> list[str]:
         """`docker create` for one seat. Created, not run: materialize and
         start are separate ops because `desired: stopped` on a seat that does
         not exist yet must produce a container that is NOT running."""
@@ -309,6 +314,22 @@ class DockerExecutor:
         argv += ["--restart", "no"]
         for k, v in (spec.get("env") or {}).items():
             argv += ["-e", f"{k}={v}"]
+        # SECRETS: the hub stores the NAME, this machine supplies the VALUE.
+        #
+        # A seat spec lives in the hub's SQLite and anything holding the
+        # operator token can read it, so an API key passed through `env` would
+        # sit in plaintext in the control plane and in every backup of it.
+        # Naming the variable instead keeps the control plane free of secrets
+        # entirely — the hub can be fully compromised without leaking one.
+        #
+        # A name that is not set HERE is omitted rather than passed as empty:
+        # an empty ANTHROPIC_API_KEY authenticates as nothing and produces a
+        # confusing 401 inside the container, where a missing one fails at the
+        # door with an obvious message.
+        env = environ if environ is not None else {}
+        for name in spec.get("env_from_host") or []:
+            if env.get(name):
+                argv += ["-e", f"{name}={env[name]}"]
         for pub in spec.get("ports") or []:
             argv += ["-p", str(pub)]
         for vol in spec.get("volumes") or []:
@@ -347,7 +368,7 @@ class DockerExecutor:
                 # cannot detect — `docker ps` would report it healthy.
                 return {**base, "skipped": True,
                         "reason": "no image in seat spec — refusing to guess one"}
-            cmd = self.create_argv(seat, spec)
+            cmd = self.create_argv(seat, spec, self._environ)
         elif op == "start":
             cmd = ["docker", "start", seat]
         elif op == "stop":

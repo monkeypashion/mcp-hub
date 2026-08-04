@@ -16,6 +16,8 @@ The runner is injected everywhere, so nothing here can reach a real docker.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from mcp_hub.edge import (
@@ -422,3 +424,37 @@ def test_an_unrelated_docker_failure_gets_no_group_lecture():
     msg = str(e.value)
     assert "supplementary groups" not in msg
     assert "refusing to plan or report" in msg   # the refusal still stands
+
+
+# ---- secrets never enter the control plane ---------------------------------
+
+class TestSecretsStayOnTheMachine:
+    """A seat spec lives in the hub's SQLite, and anything holding the operator
+    token can read it. So the hub stores the NAME of a secret and the edge
+    supplies the VALUE from its own environment — the control plane can be
+    fully compromised without leaking a credential."""
+
+    SPEC = {"identity": "s", "spec": {"image": "mcp-hub-seat",
+                                      "env_from_host": ["ANTHROPIC_API_KEY"]}}
+
+    def test_the_value_comes_from_the_machine_not_the_spec(self):
+        argv = DockerExecutor.create_argv(
+            "s", self.SPEC["spec"], {"ANTHROPIC_API_KEY": "sk-live"})
+        assert "-e" in argv and "ANTHROPIC_API_KEY=sk-live" in argv
+
+    def test_the_spec_itself_carries_no_value_to_leak(self):
+        """The whole point: what the hub stores is a NAME."""
+        assert self.SPEC["spec"]["env_from_host"] == ["ANTHROPIC_API_KEY"]
+        assert "sk-" not in json.dumps(self.SPEC)
+
+    def test_an_unset_name_is_omitted_not_passed_empty(self):
+        """An empty ANTHROPIC_API_KEY authenticates as nothing and produces a
+        confusing 401 INSIDE the container; a missing one fails at the door."""
+        argv = DockerExecutor.create_argv("s", self.SPEC["spec"], {})
+        assert not any(a.startswith("ANTHROPIC_API_KEY") for a in argv)
+
+    def test_the_executor_reads_its_own_environment(self):
+        r = Runner()
+        DockerExecutor(r, {"ANTHROPIC_API_KEY": "sk-from-edge"}).execute(
+            {"op": "materialize", "seat": "s"}, self.SPEC)
+        assert "ANTHROPIC_API_KEY=sk-from-edge" in r.calls[-1]

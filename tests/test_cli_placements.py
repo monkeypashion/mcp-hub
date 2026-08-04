@@ -88,7 +88,7 @@ def _args(**kw):
                 target=None, desired=None, seat="", substrate="worktree",
                 paths=[], all=False, squad="", scan_dir=None,
                 image="", env=None, port=None, volume=None, network="",
-                memory_volume="", command="")
+                memory_volume="", command="", env_from_host=None)
     base.update(kw)
     return argparse.Namespace(**base)
 

@@ -1892,6 +1892,8 @@ def seats_command(args: argparse.Namespace, api: Any = None) -> int:
                     spec["volumes"] = list(args.volume)
                 if args.network:
                     spec["network"] = args.network
+                if args.env_from_host:
+                    spec["env_from_host"] = list(args.env_from_host)
                 if args.memory_volume:
                     spec["memory_volume"] = args.memory_volume
                 if args.command:
@@ -4372,6 +4374,12 @@ def build_parser() -> argparse.ArgumentParser:
     seats.add_argument("--volume", action="append", default=None, metavar="S:D",
                        help="add: bind mount or volume (repeatable)")
     seats.add_argument("--network", default="", help="add: docker network")
+    seats.add_argument(
+        "--env-from-host", action="append", default=None, metavar="NAME",
+        help="add: pass this variable through from the EDGE MACHINE's own "
+             "environment. The hub stores the NAME only, never the value — so "
+             "an API key never enters the control plane (repeatable)",
+    )
     seats.add_argument(
         "--memory-volume", default="",
         help="add: the volume holding this seat's Claude memory. Its PRESENCE "
