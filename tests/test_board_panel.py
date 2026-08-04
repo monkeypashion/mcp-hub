@@ -491,3 +491,36 @@ async def test_rebuilding_a_waiting_agents_live_section_repeatedly_does_not_cras
         buttons = [str(b.label) for b in app.query("Button")]
         assert buttons == ["yes", "no", "always"], \
             f"{buttons} — duplicate or lost mounts across rebuilds"
+
+
+@pytest.mark.asyncio
+async def test_jumping_repaints_the_detail_pane_not_just_the_cursor():
+    """A defect that shipped and was caught by a later test asserting on the
+    RENDERED pane instead of on `selected`.
+
+    `_move_to` sets the selection eagerly so callers see it at once, then
+    defers the cursor move a frame (a Tree maps nodes to lines only after
+    layout). When the deferred move finally fired its NodeHighlighted,
+    `_node_changed` saw a key that already matched and returned early — so `n`
+    and every "Go to" moved the cursor while the right-hand pane went on
+    describing the seat you had just left.
+    """
+    app = _app(board=_snapshot)
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        await _goto(app, pilot, "alpha")
+        assert "merging the branch" in _detail_text(app)
+
+        await pilot.press("n")                     # jumps to beta, the waiting one
+        await pilot.pause()
+        await pilot.pause()
+        assert app.selected["agent"] == "beta"
+        text = _detail_text(app)
+        assert "rm -rf" in text, "the pane still shows the seat we left"
+        assert "merging the branch" not in text
+
+
+def _detail_text(app) -> str:
+    return " ".join(str(w.render())
+                    for w in app.query_one("#detail").walk_children())
