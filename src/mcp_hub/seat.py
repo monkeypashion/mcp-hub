@@ -218,6 +218,12 @@ def hooks_settings_content() -> dict:
     (2026-08-04, 3 of 4 paths had lost it).
     """
     return {
+        # A THEME is not cosmetic here: it is the first step of claude's
+        # first-run wizard, and a fresh container HOME has none. Measured on
+        # the first live seat — container running, tmux alive, claude parked
+        # on the theme picker forever, never registering. Half the fix; the
+        # other half is onboarding_state() in ~/.claude.json.
+        "theme": "dark",
         "enabledMcpjsonServers": ["hub"],
         "hooks": {
             "Stop": [
@@ -268,3 +274,17 @@ def launch_argv(contract: SeatContract, workdir: str) -> list[str]:
         workdir,
         "claude --dangerously-load-development-channels server:hub",
     ]
+
+
+def onboarding_state(claude_version: str) -> dict:
+    """Keys that tell claude its first-run wizard is already done.
+
+    A container's HOME is fresh every time, so without these claude opens
+    the onboarding wizard and BLOCKS — a seat that looks perfectly healthy
+    to `docker ps` and never becomes an agent. Version-stamped because
+    claude re-onboards when its version outruns the recorded one.
+    """
+    return {
+        "hasCompletedOnboarding": True,
+        "lastOnboardingVersion": claude_version,
+    }

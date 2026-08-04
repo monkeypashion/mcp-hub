@@ -3990,6 +3990,30 @@ def seat_entry_command(args: argparse.Namespace) -> int:
 
     seed_first_launch(str(workdir))
 
+    # Onboarding: a container HOME is fresh, so claude would open its
+    # first-run wizard and BLOCK — healthy to `docker ps`, never an agent.
+    # Merged into the same file seed_first_launch just wrote (read-modify-
+    # write, never a fresh dict) so neither seed erases the other.
+    from mcp_hub.seat import onboarding_state
+
+    claude_json = pathlib.Path.home() / ".claude.json"
+    try:
+        state = json.loads(claude_json.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            raise ValueError("not an object")
+    except (OSError, ValueError):
+        state = {}
+    ver = subprocess.run(
+        ["claude", "--version"], capture_output=True, text=True
+    )
+    # "2.1.221 (Claude Code)" -> "2.1.221"; unknown version still marks
+    # onboarding done (a wrong-but-present version re-onboards once, an
+    # absent key blocks forever).
+    version = (ver.stdout.strip().split() or ["0.0.0"])[0]
+    state.update(onboarding_state(version))
+    claude_json.parent.mkdir(parents=True, exist_ok=True)
+    claude_json.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
     lane = {"oauth": "subscription OAuth", "api-key": "API key", "both": (
         "BOTH set — Claude Code's own hierarchy decides (unmeasured; "
         "see docs/seat-image.md)"

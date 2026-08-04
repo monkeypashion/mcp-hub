@@ -375,3 +375,46 @@ def test_entry_is_idempotent_and_preserves_existing_settings(
                   monkeypatch, tmp_path) == 0
     assert _json.loads(settings_path.read_text()) == {"custom": True}
     assert "left untouched" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------- onboarding --
+
+
+def test_onboarding_state_marks_the_wizard_done():
+    """A fresh container HOME makes claude open its first-run wizard (theme
+    picker) and wait forever — measured on the first live seat: container
+    running, tmux alive, claude never started a session, never registered.
+    'Running' meant nothing."""
+    from mcp_hub.seat import onboarding_state
+
+    s = onboarding_state("2.1.221")
+    assert s["hasCompletedOnboarding"] is True
+    # Version-stamped: claude re-onboards when its version outruns this.
+    assert s["lastOnboardingVersion"] == "2.1.221"
+
+
+def test_settings_carry_a_theme_so_the_picker_never_opens():
+    # The theme picker is the FIRST wizard step and lives in settings.json,
+    # not ~/.claude.json — both halves are needed or the seat still blocks.
+    assert hooks_settings_content()["theme"]
+
+
+def test_entry_seeds_onboarding_without_clobbering_trust(
+    monkeypatch, tmp_path
+):
+    import json as _json
+
+    work = tmp_path / "work"
+    rc = _entry(
+        ["--prepare-only", "--workdir", str(work)],
+        {"SEAT_IDENTITY": "s1", "MCP_HUB_URL": "http://hub/mcp",
+         "CLAUDE_CODE_OAUTH_TOKEN": GOOD_OAUTH},
+        monkeypatch,
+        tmp_path,
+    )
+    assert rc == 0
+    data = _json.loads((tmp_path / "home" / ".claude.json").read_text())
+    assert data["hasCompletedOnboarding"] is True
+    assert data.get("lastOnboardingVersion")
+    # The trust seed shares this file — one must not overwrite the other.
+    assert data["projects"][str(work)]["hasTrustDialogAccepted"] is True
