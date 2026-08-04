@@ -101,14 +101,26 @@ class TestPlan:
         )
         assert [a["op"] for a in actions] == ["harvest", "verify", "destroy"]
 
-    def test_docker_substrate_is_skipped_loudly_not_guessed(self):
+    def test_docker_is_planned_like_any_other_substrate(self):
+        """It used to be skipped loudly while the container story was
+        undesigned. Now the planner is genuinely substrate-agnostic — the
+        difference lives entirely in the executor and the enumeration."""
         actions = plan(
             placements=[_placement(substrate="docker")],
             local_seats={},
         )
-        assert len(actions) == 1
-        assert actions[0]["op"] == "skip"
-        assert "docker" in actions[0]["reason"]
+        assert [a["op"] for a in actions] == ["materialize", "start"]
+        # The substrate must ride the ACTION, or edge_apply cannot choose an
+        # executor and would run `squad start` at a container.
+        assert all(a["substrate"] == "docker" for a in actions)
+
+    def test_an_unknown_substrate_is_still_refused_rather_than_guessed(self):
+        actions = plan(
+            placements=[_placement(substrate="podman")],
+            local_seats={},
+        )
+        assert len(actions) == 1 and actions[0]["op"] == "skip"
+        assert "podman" in actions[0]["reason"]
 
     def test_converged_placement_produces_nothing(self):
         p = _placement()

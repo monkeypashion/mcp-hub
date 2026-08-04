@@ -78,7 +78,13 @@ def init_api_tables(conn: sqlite3.Connection) -> None:
             class       TEXT NOT NULL DEFAULT 'squad',
             cloned_from TEXT NOT NULL DEFAULT '',
             archived    INTEGER NOT NULL DEFAULT 0,
-            created     REAL NOT NULL
+            created     REAL NOT NULL,
+            -- Substrate-specific, as JSON: image/env/ports/volumes/command for
+            -- docker, nothing for worktree (which uses repo+folder). A column
+            -- per substrate would make every new substrate a migration; this
+            -- makes it a key. The unit being managed is a CONTAINER; an agent
+            -- seat is one that additionally has memory and a harvest step.
+            spec        TEXT NOT NULL DEFAULT '{}'
         );
         CREATE TABLE IF NOT EXISTS api_squads (
             name             TEXT PRIMARY KEY,
@@ -131,6 +137,15 @@ def init_api_tables(conn: sqlite3.Connection) -> None:
     try:
         conn.execute(
             "ALTER TABLE squad_members ADD COLUMN source TEXT NOT NULL DEFAULT ''"
+        )
+    except sqlite3.OperationalError:
+        pass
+    # Substrate-specific seat fields. The live hub's api_seats predates this,
+    # and CREATE TABLE IF NOT EXISTS silently does nothing for it — so the
+    # column has to arrive by ALTER or every deployed hub keeps the old shape.
+    try:
+        conn.execute(
+            "ALTER TABLE api_seats ADD COLUMN spec TEXT NOT NULL DEFAULT '{}'"
         )
     except sqlite3.OperationalError:
         pass
@@ -208,6 +223,7 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             "launch_args": row["launch_args"],
             "class": row["class"],
             "cloned_from": row["cloned_from"],
+            "spec": json.loads(row["spec"] or "{}"),
         }
         if presence:
             agent = db().execute(
@@ -530,7 +546,15 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             ).fetchall()
             return JSONResponse({"seats": [seat_json(r) for r in rows]})
         body = await body_of(request)
-        for field in ("repo", "machine", "folder"):
+        spec = body.get("spec") or {}
+        if not isinstance(spec, dict):
+            return _err(422, "spec must be an object")
+        # A docker unit is named by its IMAGE, not by a folder on a host — an
+        # nginx container has no worktree and never will. Requiring one would
+        # make every non-agent unit lie about itself.
+        required = ("repo", "machine") if spec.get("image") \
+            else ("repo", "machine", "folder")
+        for field in required:
             if not body.get(field):
                 return _err(422, f"{field} required")
         # Identity is ASSIGNED here, never derived downstream — a container's
@@ -544,7 +568,7 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             return _err(409, f"seat '{identity}' already exists")
         db().execute(
             "INSERT INTO api_seats (identity, repo, machine, folder, launch_args,"
-            " class, created) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            " class, created, spec) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 identity,
                 body["repo"],
@@ -553,6 +577,7 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
                 body.get("launch_args", ""),
                 body.get("class", "squad"),
                 _now(),
+                json.dumps(spec),
             ),
         )
         db().commit()
