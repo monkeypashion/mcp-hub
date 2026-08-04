@@ -1578,9 +1578,23 @@ def edge_command(args: argparse.Namespace) -> int:
     Path = pathlib.Path
 
     machine = args.machine or _sanitize_ident(platform.node() or "unknown-host")
+    # The FILE is the third source, and in practice the only one that matters:
+    # `machines enrol` and `machines rotate` both write it, and a systemd timer
+    # has no --token to pass and inherits no environment. Without this the two
+    # halves never met — rotating a token achieved nothing and the timer was a
+    # no-op that reported "no machine token" into the journal every 2 minutes.
     token = args.token or os.environ.get("MCP_HUB_MACHINE_TOKEN", "")
     if not token:
-        print("edge: no machine token (--token or $MCP_HUB_MACHINE_TOKEN)")
+        from mcp_hub.operator_api import MACHINE_TOKEN_FILE
+        try:
+            token = MACHINE_TOKEN_FILE.read_text(encoding="utf-8").strip()
+        except OSError:
+            token = ""
+    if not token:
+        from mcp_hub.operator_api import MACHINE_TOKEN_FILE
+        print(f"edge: no machine token — run `mcp-hub machines enrol` (writes "
+              f"{MACHINE_TOKEN_FILE}), or pass --token / "
+              "$MCP_HUB_MACHINE_TOKEN", file=sys.stderr)
         return 2
 
     # The hub URL points at /mcp for MCP clients; the API lives beside it.
