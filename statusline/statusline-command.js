@@ -27,10 +27,45 @@ process.stdin.on('end', () => {
   };
   const paint = (s, ...c) => `${c.join('')}${s}${C.reset}`;
 
-  // Default usage thresholds (5h / 7d): green < 50, yellow 50-79, red >= 80.
+  // Default usage thresholds (5h): green < 50, yellow 50-79, red >= 80.
   const usageColor = (p) => (p >= 80 ? C.red : p >= 50 ? C.yellow : C.green);
   // ctx is more aggressive by request: red once past 50%.
   const ctxColor = (p) => (p >= 50 ? C.red : C.green);
+
+  // 7d is coloured by PACE, not absolute usage (operator's ask): the question
+  // is "have I used more than I should have by this point in the week".
+  //
+  // The budget is CONTINUOUS (operator's choice, 2026-08-04): the target is
+  // exactly the fraction of the window elapsed, moving every refresh, with no
+  // daily steps. It renders in brackets after the usage — e.g. "9% (7%)" — and
+  // the colour is computed from the SAME number, so the display can never
+  // disagree with the colour.
+  //
+  // Chosen over a calendar-day or elapsed-day ceiling knowing the trade: this
+  // is the strictest of the three and reads harshly in the first hours of a
+  // window, when one ordinary session can exceed a budget of a few percent.
+  // That is tolerable now only because the target is VISIBLE — an unexplained
+  // red at 9% was the original complaint; "9% against 7%" is legible.
+  //
+  // There is no window-START field, so the start is DERIVED as resets_at minus
+  // seven days. If that assumption is wrong the whole segment is wrong — which
+  // is why the caller falls back to flat thresholds when resets_at is absent
+  // rather than guessing an elapsed time.
+  const WEEK_SECS = 7 * 24 * 3600;
+  // Absolute ceiling: near the cap is red even when inside the target. At the
+  // end of the window the target approaches 100%, so without this "nearly out"
+  // renders green on the day it matters most.
+  const PACE_HARD_RED_PCT = 90;
+  // Elapsed fraction of the window as a percentage. Clamped: clock skew or an
+  // unexpected window length must not yield a negative or >100 budget.
+  const paceTarget = (secsLeft) =>
+    Math.max(0, Math.min(100, ((WEEK_SECS - secsLeft) / WEEK_SECS) * 100));
+  const paceColor = (used, target) => {
+    if (used >= PACE_HARD_RED_PCT) return C.red;
+    if (used > target) return C.red;
+    if (used > target * 0.9) return C.yellow;  // close to the day's ceiling
+    return C.green;
+  };
 
   // Seconds → reset countdown: "3hr43" (hours + padded mins) / "45m" (last
   // hour) / "now". Rounds to the minute first so we never render "3hr60".
@@ -257,14 +292,25 @@ process.stdin.on('end', () => {
     segs.push(barMetric('5h', fh.used_percentage, usageColor, secondary));
   }
 
-  // 7d — reset time + usage %, e.g. "Mon 17hrs 41%" (date dim, % usage-
-  // coloured). Falls back to "7d 41%" if no reset timestamp is available.
+  // 7d — reset time + usage %, e.g. "Mon 17hrs 41%" (date dim, % pace-
+  // coloured). Falls back to "7d 41%" with FLAT thresholds if no reset
+  // timestamp is available — without resets_at there is no way to know how far
+  // into the window we are, and a pace colour computed from a guessed start
+  // would be a confident wrong answer rather than a missing one.
   const sd = rl.seven_day;
   if (sd && sd.used_percentage != null) {
     if (sd.resets_at) {
       const u = Math.round(sd.used_percentage);
+      const target = paceTarget(sd.resets_at - nowSec);
+      // Floored, not rounded: this is a ceiling you are measured against, and
+      // rounding up would overstate the allowance. The colour uses the
+      // unrounded value, so the displayed number is never more generous than
+      // the one being enforced.
+      const t = Math.floor(target);
       segs.push(
-        paint(`${fmtClock(sd.resets_at)} `, C.dim) + paint(u + '%', usageColor(u))
+        paint(`${fmtClock(sd.resets_at)} `, C.dim)
+        + paint(u + '%', paceColor(u, target))
+        + paint(` (${t}%)`, C.dim)
       );
     } else {
       segs.push(pct('7d', sd.used_percentage));
