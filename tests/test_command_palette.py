@@ -37,6 +37,16 @@ WS_ROWS = [
      "path": "/home/me/Projects/remote-feral.code-workspace", "folders": 1,
      "error": "", "on_disk": True, "open_now": False, "registered": False,
      "squad": "", "listings": []},
+    # A ghost: the definition outlived its file, on the OTHER machine.
+    {"name": "departed", "machine": "dev-vm-1", "path": "", "folders": 0,
+     "error": "", "on_disk": False, "open_now": False, "registered": True,
+     "squad": "", "listings": []},
+    # Healthy: registered AND on disk. The only thing separating it from the
+    # ghost is `on_disk`, which is what makes it the right control.
+    {"name": "healthy", "machine": "here",
+     "path": "/home/me/Projects/healthy.code-workspace", "folders": 2,
+     "error": "", "on_disk": True, "open_now": False, "registered": True,
+     "squad": "", "listings": []},
 ]
 
 
@@ -241,6 +251,45 @@ async def test_registering_shells_the_hub_verb_with_the_files_path():
         await pilot.pause()
     assert ran == [("/usr/bin/HUB", [
         "workspaces", "register", "/home/me/Projects/feral.code-workspace"])], ran
+
+
+@pytest.mark.asyncio
+async def test_a_ghost_can_be_deregistered_from_any_machine():
+    """Unlike `register`, dropping a definition is hub-side — and a ghost is
+    most likely to be looked at from a box that is NOT the one whose file went
+    away, so gating it on the local machine would hide it exactly when it is
+    needed."""
+    app = _app()
+    async with app.run_test(size=(120, 34)) as pilot:
+        await _ready(app, pilot)
+        await _select(app, pilot, "w:dev-vm-1/departed")
+        assert "Deregister workspace — departed" in _titles(app)
+        # …and NOT for a healthy one. `healthy` differs from `departed` in
+        # exactly one field — on_disk — so this is what makes that guard
+        # load-bearing rather than incidentally true. (`feral` would not do:
+        # it is already excluded by being unregistered, which is how the
+        # first version of this test passed with the guard removed.)
+        await _select(app, pilot, "w:here/healthy")
+        assert "Deregister workspace — healthy" not in _titles(app), \
+            "a workspace that still has a file must not be one keystroke " \
+            "from becoming feral"
+
+
+@pytest.mark.asyncio
+async def test_deregistering_names_the_machine_so_a_twin_is_not_hit(capsys):
+    """Two machines can define the same workspace name; the verb refuses an
+    ambiguous name, so the palette has to say which one it means."""
+    ran: list = []
+    app = _app(ran)
+    async with app.run_test(size=(120, 34)) as pilot:
+        await _ready(app, pilot)
+        await _select(app, pilot, "w:dev-vm-1/departed")
+        _run_named(app, "Deregister workspace — departed")
+        await pilot.pause()
+        await pilot.pause()
+    assert ran == [("/usr/bin/HUB", [
+        "workspaces", "remove", "departed", "--yes",
+        "--machine", "dev-vm-1"])], ran
 
 
 # ---- navigation ------------------------------------------------------------

@@ -1083,6 +1083,15 @@ class SettingsApp(App):
     def _answer_pressed(self, event: Button.Pressed) -> None:
         bid = event.button.id or ""
         sel = self.selected or {}
+        if bid.startswith("wsdel-"):
+            name = sel.get("name", "")
+            if not name:
+                return
+            argv = ["workspaces", "remove", name, "--yes"]
+            if sel.get("machine"):
+                argv += ["--machine", sel["machine"]]
+            self.run_verb(self.hub_bin, argv, f"deregister {name}", "hub")
+            return
         if bid.startswith("wsreg-"):
             path = sel.get("path", "")
             if not path:
@@ -1279,6 +1288,18 @@ class SettingsApp(App):
                 Button("register this workspace", id=f"wsreg-{self._gen}",
                        variant="warning", compact=True),
                 classes="answers"))
+        elif reg is True and not w["on_disk"]:
+            # A ghost: the definition outlived its file. Deregistering is a
+            # HUB-side act with no machine involved, so it is offered for any
+            # machine's ghost, unlike register.
+            out.append(Static(
+                "Nothing on any machine that reported has this file. "
+                "Deregistering drops the hub's definition and touches no disk.",
+                classes="note"))
+            out.append(Horizontal(
+                Button("deregister this workspace", id=f"wsdel-{self._gen}",
+                       variant="error", compact=True),
+                classes="answers"))
         return out
 
     def _remote_agent_widgets(self, a: dict[str, Any]) -> list[Any]:
@@ -1394,6 +1415,20 @@ class SettingsApp(App):
                 lambda p=sel["path"]: self.run_verb(
                     self.hub_bin, ["workspaces", "register", p],
                     f"register {sel['name']}", "hub"),
+            ))
+        if sel.get("kind") == "workspace" and sel.get("registered") is True \
+                and not sel.get("on_disk"):
+            # No machine gate: dropping a definition is hub-side, and a ghost
+            # is most likely to be looked at from a box that is NOT the one
+            # whose file went away.
+            out.append((
+                f"Deregister workspace — {sel['name']}",
+                "drop the hub's definition; no file is deleted",
+                lambda n=sel["name"], m=sel.get("machine", ""): self.run_verb(
+                    self.hub_bin,
+                    ["workspaces", "remove", n, "--yes"]
+                    + (["--machine", m] if m else []),
+                    f"deregister {n}", "hub"),
             ))
         out.append((
             "Register every unregistered workspace here",

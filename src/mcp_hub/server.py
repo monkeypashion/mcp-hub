@@ -3762,6 +3762,8 @@ _CLI_SUBCOMMANDS = {
     "rebind-url",
     "edge",
     "workspaces",
+    "seats",
+    "placements",
     "machines",
     "focus",
 }
