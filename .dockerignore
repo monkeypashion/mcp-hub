@@ -1,0 +1,11 @@
+# Shared by BOTH images (root Dockerfile = hub deploy, seat/Dockerfile =
+# seat image) — docker has one .dockerignore per context.
+#
+# ⚠️ .git is deliberately NOT ignored: the hub's /health falls back to
+# reading the shipped .git dir when GIT_SHA isn't passed at build.
+.venv
+**/__pycache__
+**/*.pyc
+node_modules
+.pytest_cache
+.ruff_cache
