@@ -288,3 +288,45 @@ def onboarding_state(claude_version: str) -> dict:
         "hasCompletedOnboarding": True,
         "lastOnboardingVersion": claude_version,
     }
+
+
+# ------------------------------------------------------------- launch dance
+
+# Flattened dialog tokens. Matching is on FLATTENED text (letters/digits
+# only, lowercased) because a narrow pane re-wraps dialog text mid-word —
+# squad learned this on a live wedge; a phrase with spaces silently stops
+# matching at 80 columns.
+_CHANNELS_TOKEN = "loadingdevelopmentchannels"
+# claude's own chrome: proof it is past the dialog phase and running.
+_CHROME_TOKENS = ("forshortcuts", "bypassingpermissions", "acceptedits")
+
+
+def _flatten(text: str) -> str:
+    return "".join(c for c in text.lower() if c.isalnum())
+
+
+def startup_dance_action(pane_text: str) -> str | None:
+    """Which key answers the dialog currently on the pane, if any.
+
+    The seat launches claude INSIDE the container, so squad's host-side
+    launch dance cannot reach it — this is the same idea, ported and
+    narrowed to the one dialog a seat can hit (no --continue, so no
+    resume dialog; trust is already seeded).
+
+    Option 1 ("I am using this for local development") is the default and
+    is correct here: `server:hub` IS our own hub.
+    """
+    flat = _flatten(pane_text)
+    if _CHANNELS_TOKEN in flat:
+        return "Enter"
+    return None
+
+
+def pane_is_settled(pane_text: str) -> bool:
+    """True once claude's chrome is visible — the dance loop's exit.
+
+    Without this the loop would burn its whole timeout on every healthy
+    start, delaying registration for no reason.
+    """
+    flat = _flatten(pane_text)
+    return any(t in flat for t in _CHROME_TOKENS)

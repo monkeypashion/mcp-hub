@@ -3911,13 +3911,13 @@ def seat_entry_command(args: argparse.Namespace) -> int:
 
     verdict = validate_seat_credentials(os.environ)
     if not verdict.ok:
-        print(f"seat-entry: REFUSED (auth): {verdict.error}", file=sys.stderr)
+        print(f"seat-entry: REFUSED (auth): {verdict.error}", file=sys.stderr, flush=True)
         return EXIT_AUTH
 
     try:
         contract = parse_seat_contract(os.environ)
     except SeatContractError as e:
-        print(f"seat-entry: REFUSED (contract): {e}", file=sys.stderr)
+        print(f"seat-entry: REFUSED (contract): {e}", file=sys.stderr, flush=True)
         return EXIT_CONTRACT
 
     if contract.mode == "headless":
@@ -3929,6 +3929,7 @@ def seat_entry_command(args: argparse.Namespace) -> int:
             "reserved but not yet shipped — run interactive, or build the "
             "headless leg first (docs/seat-image.md, Modes).",
             file=sys.stderr,
+            flush=True,
         )
         return EXIT_CONTRACT
 
@@ -3948,6 +3949,7 @@ def seat_entry_command(args: argparse.Namespace) -> int:
                 f"seat-entry: REFUSED (contract): clone of "
                 f"{contract.repo} failed: {clone.stderr.strip()}",
                 file=sys.stderr,
+                flush=True,
             )
             return EXIT_CONTRACT
 
@@ -3978,6 +3980,7 @@ def seat_entry_command(args: argparse.Namespace) -> int:
         print(
             f"seat-entry: {settings_path} exists — left untouched",
             file=sys.stderr,
+            flush=True,
         )
     else:
         settings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4020,11 +4023,12 @@ def seat_entry_command(args: argparse.Namespace) -> int:
     )}[verdict.lane]
     print(
         f"seat-entry: {contract.identity} (project {contract.project}) "
-        f"mode={contract.mode} credential={lane}"
+        f"mode={contract.mode} credential={lane}",
+        flush=True,
     )
 
     if args.prepare_only:
-        print("seat-entry: --prepare-only — not launching claude")
+        print("seat-entry: --prepare-only — not launching claude", flush=True)
         return 0
 
     argv = launch_argv(contract, str(workdir))
@@ -4033,8 +4037,30 @@ def seat_entry_command(args: argparse.Namespace) -> int:
         print(
             f"seat-entry: launch failed: {launched.stderr.strip()}",
             file=sys.stderr,
+            flush=True,
         )
         return 1
+
+    # Launch dance — claude stops on the development-channels dialog and
+    # WAITS (measured on the first live seat: container healthy, claude
+    # parked, never an agent). squad answers this on the host; a container
+    # has to answer it for itself.
+    from mcp_hub.seat import pane_is_settled, startup_dance_action
+
+    for _ in range(25):
+        time.sleep(1)
+        pane = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-t", "seat"],
+            capture_output=True,
+            text=True,
+        ).stdout
+        key = startup_dance_action(pane)
+        if key:
+            subprocess.run(["tmux", "send-keys", "-t", "seat", key])
+            continue
+        if pane_is_settled(pane):
+            break
+    print("seat-entry: claude is up", flush=True)
     # PID 1 must outlive the detached tmux session or docker reaps the
     # container while claude runs. Container stops when the session ends.
     while True:

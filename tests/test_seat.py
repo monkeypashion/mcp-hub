@@ -418,3 +418,70 @@ def test_entry_seeds_onboarding_without_clobbering_trust(
     assert data.get("lastOnboardingVersion")
     # The trust seed shares this file — one must not overwrite the other.
     assert data["projects"][str(work)]["hasTrustDialogAccepted"] is True
+
+
+# ------------------------------------------------------------- launch dance --
+
+# The real dialog, captured from the live seat 2026-08-04 — not paraphrased.
+# claude pops it for --dangerously-load-development-channels and WAITS.
+CHANNELS_DIALOG = """
+  WARNING: Loading development channels
+
+  --dangerously-load-development-channels is for local channel development
+  only. Do not use this option to run channels you have downloaded off the
+  internet.
+
+  Please use --channels to run a list of approved channels.
+
+  Channels: server:hub
+
+  > 1. I am using this for local development
+    2. Exit
+
+  Enter to confirm - Esc to cancel
+"""
+
+STARTED_PANE = """
+> Try "how does authentication work in this codebase?"
+
+  ? for shortcuts                                  Bypassing Permissions
+"""
+
+
+def test_dance_answers_the_channels_dialog():
+    """The seat launches claude itself, so it needs its own launch dance —
+    squad's lives on the host and cannot reach inside a container."""
+    from mcp_hub.seat import startup_dance_action
+
+    assert startup_dance_action(CHANNELS_DIALOG) == "Enter"
+
+
+def test_dance_is_wrap_tolerant():
+    """A narrow pane re-wraps dialog text mid-word, so matching must be on
+    flattened tokens — never on phrases with spaces (squad's rule, learned
+    on a live wedge)."""
+    from mcp_hub.seat import startup_dance_action
+
+    wrapped = CHANNELS_DIALOG.replace("development\n", "developme\nnt\n")
+    assert startup_dance_action(wrapped) == "Enter"
+
+
+def test_dance_does_nothing_once_claude_is_up():
+    from mcp_hub.seat import startup_dance_action
+
+    assert startup_dance_action(STARTED_PANE) is None
+
+
+def test_dance_does_not_match_an_empty_pane():
+    from mcp_hub.seat import startup_dance_action
+
+    assert startup_dance_action("") is None
+
+
+def test_pane_is_settled_only_when_chrome_shows():
+    """Exit condition for the dance loop: claude's own chrome. Without it
+    the loop would spin the full timeout on every healthy start."""
+    from mcp_hub.seat import pane_is_settled
+
+    assert pane_is_settled(STARTED_PANE)
+    assert not pane_is_settled(CHANNELS_DIALOG)
