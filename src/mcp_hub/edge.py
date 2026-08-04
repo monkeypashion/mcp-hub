@@ -1,12 +1,20 @@
-"""Edge realizer brain — `mcp-hub edge apply` (interim edge, worktree only).
+"""Edge realizer brain — `mcp-hub edge apply`.
 
 The hub stores desired state; this module decides what a machine should DO
-about it and what it may truthfully REPORT back. Three properties are
-load-bearing and tested:
+about it and what it may truthfully REPORT back.
+
+**The unit is a managed thing on a machine, not an agent.** Worktree seats
+(tmux + claude) and containers (a squad, a web app, an inference server) are
+the same shape to the planner; they differ only in their EXECUTOR and in how
+they are ENUMERATED. That is why `plan()` never mentions docker: adding a
+substrate is adding an executor, not editing the brain. An agent seat is
+simply a unit that additionally carries memory and a harvest step.
+
+Three properties are load-bearing and tested:
 
 - plan() diffs desired against ENUMERATED local state and emits ordered
-  actions; docker placements are skipped loudly, never guessed at (the
-  container credential story is undesigned — see the runtime doc).
+  actions, carrying the substrate so the caller can pick an executor. An
+  UNKNOWN substrate is still refused loudly rather than guessed at.
 - discover_workspaces() reports every .code-workspace it finds, including
   unparseable ones — the operator's "never lose track of workspaces"
   requirement means a broken file is reported-with-error, not dropped.
@@ -42,14 +50,14 @@ def plan(
     actions: list[dict[str, Any]] = []
     for p in placements:
         seat = p["seat"]
-        base = {"placement": p["id"], "seat": seat}
-        if p["substrate"] != "worktree":
+        substrate = p.get("substrate", "worktree")
+        base = {"placement": p["id"], "seat": seat, "substrate": substrate}
+        if substrate not in ("worktree", "docker"):
             actions.append(
                 {
                     **base,
                     "op": "skip",
-                    "reason": f"substrate '{p['substrate']}' not realizable by this "
-                    "edge (docker needs the container credential story)",
+                    "reason": f"substrate '{substrate}' not realizable by this edge",
                 }
             )
             continue
@@ -250,6 +258,113 @@ class SquadExecutor:
         return {**base, "rc": rc, "output": out[-400:]}
 
 
+class DockerExecutor:
+    """Realize a placement as a container, via an injected runner.
+
+    The unit this edge manages is a CONTAINER; an agent seat is one that
+    additionally carries memory and a harvest step. So nothing here knows what
+    is inside the image — nginx, an inference server and a squad seat are the
+    same shape to it, which is the point.
+
+    The container NAME is the seat identity. That is the whole enumeration
+    contract: `docker ps` is asked what exists, and the answer maps back to a
+    placement without a side table to drift out of step. It is also why
+    `--name` is not optional and why materialize refuses without an image
+    rather than inventing one.
+    """
+
+    def __init__(self, runner: Any) -> None:
+        self._run = runner
+
+    @staticmethod
+    def create_argv(seat: str, spec: dict[str, Any]) -> list[str]:
+        """`docker create` for one seat. Created, not run: materialize and
+        start are separate ops because `desired: stopped` on a seat that does
+        not exist yet must produce a container that is NOT running."""
+        argv = ["docker", "create", "--name", seat]
+        # Restart policy is deliberately NOT `always`: this edge is the thing
+        # that decides what runs. Docker restarting a container the hub asked
+        # to stop would make `observed` disagree with reality every 2 minutes.
+        argv += ["--restart", "no"]
+        for k, v in (spec.get("env") or {}).items():
+            argv += ["-e", f"{k}={v}"]
+        for pub in spec.get("ports") or []:
+            argv += ["-p", str(pub)]
+        for vol in spec.get("volumes") or []:
+            argv += ["-v", str(vol)]
+        if spec.get("network"):
+            argv += ["--network", str(spec["network"])]
+        argv.append(spec["image"])
+        cmd = spec.get("command")
+        if cmd:
+            argv += list(cmd) if isinstance(cmd, list) else [str(cmd)]
+        return argv
+
+    def execute(self, action: dict[str, Any],
+                seat_spec: dict[str, Any]) -> dict[str, Any]:
+        op = action["op"]
+        seat = action["seat"]
+        base = {"op": op, "seat": seat, "substrate": "docker"}
+        spec = (seat_spec or {}).get("spec") or {}
+        if op == "skip":
+            return {**base, "skipped": True, "reason": action.get("reason", "")}
+        if op == "verify":
+            return {**base, "deferred": "verified by re-enumeration"}
+        if op == "harvest":
+            # Not every container has learnings. A seat image that mounts a
+            # memory volume harvests through that volume; a web app has
+            # nothing to harvest and saying so beats running a no-op that
+            # LOOKS like it preserved something.
+            if not spec.get("memory_volume"):
+                return {**base, "skipped": True,
+                        "reason": "no memory_volume in spec — nothing to harvest"}
+            cmd = ["docker", "exec", seat, "mcp-hub", "memory-export"]
+        elif op == "materialize":
+            if not spec.get("image"):
+                # Refuse rather than guess: a wrong image would start the
+                # wrong software under the right name, which enumeration
+                # cannot detect — `docker ps` would report it healthy.
+                return {**base, "skipped": True,
+                        "reason": "no image in seat spec — refusing to guess one"}
+            cmd = self.create_argv(seat, spec)
+        elif op == "start":
+            cmd = ["docker", "start", seat]
+        elif op == "stop":
+            cmd = ["docker", "stop", seat]
+        elif op == "destroy":
+            cmd = ["docker", "rm", "-f", seat]
+        else:
+            return {**base, "skipped": True, "reason": f"unknown op '{op}'"}
+        rc, out = self._run(cmd)
+        return {**base, "rc": rc, "output": out[-400:]}
+
+
+def enumerate_docker(runner: Any, seats: list[str]) -> dict[str, dict[str, Any]]:
+    """What docker ACTUALLY has, for the named seats.
+
+    `-a` is load-bearing: a stopped container still exists, and calling it
+    unmaterialized would make the planner create a second one under a name
+    that is already taken — the run would fail every pass, forever.
+    """
+    rc, out = runner(
+        ["docker", "ps", "-a", "--format", "{{.Names}}\\t{{.State}}"]
+    )
+    if rc != 0:
+        raise EnumerationFailed(
+            f"`docker ps` failed (rc={rc}) — refusing to plan or report against "
+            f"state this pass never observed. Output: {out.strip()[:300]}"
+        )
+    found: dict[str, str] = {}
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[0].strip():
+            found[parts[0].strip()] = parts[1].strip()
+    return {
+        s: {"materialized": s in found, "running": found.get(s) == "running"}
+        for s in seats
+    }
+
+
 class EnumerationFailed(RuntimeError):
     """The substrate could not be enumerated, so nothing may be claimed.
 
@@ -271,8 +386,21 @@ def edge_apply(
     loop observes the effect of its own actions rather than assuming them.
     """
     placements = api.pull_placements(machine)
+    docker_seats = [p["seat"] for p in placements
+                    if p.get("substrate") == "docker"]
+    worktree_seats = [p["seat"] for p in placements
+                      if p.get("substrate", "worktree") == "worktree"]
 
     def enumerate_now() -> dict[str, dict[str, Any]]:
+        # Each substrate is enumerated by its OWN authority, and only when
+        # something needs it: a docker-only box may have no squad installed at
+        # all, and running `squad ls` there would turn a healthy machine into
+        # an EnumerationFailed every two minutes.
+        state: dict[str, dict[str, Any]] = {}
+        if docker_seats:
+            state.update(enumerate_docker(runner, docker_seats))
+        if not worktree_seats:
+            return state
         # One truthful source for both facts: `squad ls` rows carry roster
         # enrollment (the row exists) and tmux liveness (the up/down column).
         rc, out = runner(["squad", "ls"])
@@ -293,13 +421,12 @@ def edge_apply(
             parts = line.split()
             if len(parts) >= 2 and parts[1] in ("up", "down"):
                 enrolled[parts[0]] = parts[1] == "up"
-        return {
-            p["seat"]: {
-                "materialized": p["seat"] in enrolled,
-                "running": enrolled.get(p["seat"], False),
+        for seat in worktree_seats:
+            state[seat] = {
+                "materialized": seat in enrolled,
+                "running": enrolled.get(seat, False),
             }
-            for p in placements
-        }
+        return state
 
     actions = plan(placements, enumerate_now())
     # Injectable seeder: production seeds the real ~/.claude.json; tests
@@ -310,21 +437,45 @@ def edge_apply(
     if any(a["op"] == "materialize" for a in actions):
         for p in placements:
             spec = p.get("seat_spec") or {}
+            # Worktree only: folder-trust and the MCP approval are host
+            # Claude Code state. A container brings its own filesystem and
+            # never reads ~/.claude.json, so seeding for it would write an
+            # entry naming a path that does not exist on this box.
             if p["substrate"] == "worktree" and spec.get("folder"):
                 seed(spec["folder"])
-    executor = SquadExecutor(runner)
+    # One executor per substrate, chosen by the ACTION, not by the machine —
+    # a box can run agent seats in tmux and a web app in a container at the
+    # same time, and that is the ordinary case rather than the exotic one.
+    executors = {"worktree": SquadExecutor(runner), "docker": DockerExecutor(runner)}
     specs = {p["seat"]: (p.get("seat_spec") or {}) for p in placements}
-    results = [executor.execute(a, specs.get(a["seat"], {})) for a in actions]
+    results = []
+    for a in actions:
+        ex = executors.get(a.get("substrate", "worktree"))
+        if ex is None:
+            results.append({"op": a["op"], "seat": a["seat"], "skipped": True,
+                            "reason": f"no executor for '{a.get('substrate')}'"})
+            continue
+        results.append(ex.execute(a, specs.get(a["seat"], {})))
 
     local = enumerate_now()
     reported = 0
     for p in placements:
         state = local[p["seat"]]
-        enumeration = {
-            "tmux_session": p["seat"],
-            "alive": state["running"],
-            "enrolled": state["materialized"],
-        }
+        # Name the enumeration after what was actually asked: calling a
+        # container a `tmux_session` would put a false claim in the observed
+        # record, which is the one place the fleet trusts completely.
+        if p.get("substrate") == "docker":
+            enumeration = {
+                "container": p["seat"],
+                "alive": state["running"],
+                "exists": state["materialized"],
+            }
+        else:
+            enumeration = {
+                "tmux_session": p["seat"],
+                "alive": state["running"],
+                "enrolled": state["materialized"],
+            }
         api.push_observed(p["id"], observed_report(p, enumeration))
         reported += 1
 

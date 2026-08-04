@@ -31,6 +31,7 @@ import os
 import pathlib
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1869,15 +1870,38 @@ def seats_command(args: argparse.Namespace, api: Any = None) -> int:
             return 0
 
         if args.action == "add":
-            missing = [f for f, v in (("--repo", args.repo),
-                                      ("--folder", args.folder)) if not v]
+            # A container is named by its IMAGE; only a worktree unit needs a
+            # folder on this host. Demanding one of nginx would be a lie.
+            need = [("--repo", args.repo)]
+            if not args.image:
+                need.append(("--folder", args.folder))
+            missing = [f for f, v in need if not v]
             if missing:
                 print(f"{' and '.join(missing)} required — a seat without them "
                       "cannot be materialized anywhere", file=sys.stderr)
                 return 1
+            spec: dict[str, Any] = {}
+            if args.image:
+                spec["image"] = args.image
+                if args.env:
+                    spec["env"] = dict(
+                        kv.split("=", 1) for kv in args.env if "=" in kv)
+                if args.port:
+                    spec["ports"] = list(args.port)
+                if args.volume:
+                    spec["volumes"] = list(args.volume)
+                if args.network:
+                    spec["network"] = args.network
+                if args.memory_volume:
+                    spec["memory_volume"] = args.memory_volume
+                if args.command:
+                    spec["command"] = shlex.split(args.command)
             rec = api.create_seat(args.repo, machine, args.folder,
-                                  args.want_identity, args.launch_args, args.klass)
-            print(f"seat {rec['identity']} declared on {rec.get('machine', '')}")
+                                  args.want_identity, args.launch_args,
+                                  args.klass, spec)
+            what = f"docker ({args.image})" if args.image else "worktree"
+            print(f"seat {rec['identity']} declared on {rec.get('machine', '')}"
+                  f"  [{what}]")
             print("it will not run until it is PLACED: "
                   f"mcp-hub placements set --seat {rec['identity']} "
                   f"--machine {rec.get('machine', '')}")
@@ -4336,6 +4360,25 @@ def build_parser() -> argparse.ArgumentParser:
     seats.add_argument("--identity", dest="want_identity", default="",
                        help="add: override the assigned identity")
     seats.add_argument("--launch-args", default="", help="add: claude launch args")
+    seats.add_argument(
+        "--image", default="",
+        help="add: container image — makes this a DOCKER unit (a web app, an "
+             "inference server, a squad seat); --folder is then not required",
+    )
+    seats.add_argument("--env", action="append", default=None, metavar="K=V",
+                       help="add: container env (repeatable)")
+    seats.add_argument("--port", action="append", default=None, metavar="H:C",
+                       help="add: published port (repeatable)")
+    seats.add_argument("--volume", action="append", default=None, metavar="S:D",
+                       help="add: bind mount or volume (repeatable)")
+    seats.add_argument("--network", default="", help="add: docker network")
+    seats.add_argument(
+        "--memory-volume", default="",
+        help="add: the volume holding this seat's Claude memory. Its PRESENCE "
+             "is what makes reclaim harvest before destroying — a unit without "
+             "one is a service, and has nothing to preserve",
+    )
+    seats.add_argument("--command", default="", help="add: override the image CMD")
     seats.add_argument("--class", dest="klass", default="squad",
                        choices=["squad", "faculty"],
                        help="add: faculty seats are never auto-started by `up`")

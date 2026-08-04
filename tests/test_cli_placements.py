@@ -38,10 +38,10 @@ class FakeApi:
         return self._seats
 
     def create_seat(self, repo, machine, folder, identity="", launch_args="",
-                    klass="squad"):
+                    klass="squad", spec=None):
         self._maybe_fail()
         self.calls.append(("create_seat", repo, machine, folder, identity,
-                           launch_args, klass))
+                           launch_args, klass, spec or {}))
         return {"identity": identity or f"{repo.rsplit('/', 1)[-1]}-{machine}",
                 "machine": machine}
 
@@ -86,7 +86,9 @@ def _args(**kw):
                 machine=None, identity=None, repo="", folder="",
                 want_identity="", launch_args="", klass="squad",
                 target=None, desired=None, seat="", substrate="worktree",
-                paths=[], all=False, squad="", scan_dir=None)
+                paths=[], all=False, squad="", scan_dir=None,
+                image="", env=None, port=None, volume=None, network="",
+                memory_volume="", command="")
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -127,6 +129,38 @@ def test_a_declared_seat_says_it_is_not_yet_running_anywhere(capsys):
     assert "will not run until it is PLACED" in out
     assert "placements set --seat x-box" in out
     assert api.calls[0][:4] == ("create_seat", "org/x", "box", "/srv/x")
+
+
+def test_a_docker_unit_needs_no_folder_because_it_has_an_image(capsys):
+    """An nginx container has no worktree and never will. Demanding one would
+    make every non-agent unit lie about itself."""
+    api = FakeApi()
+    rc = cli.seats_command(
+        _args(action="add", repo="org/site", machine="box", image="nginx:alpine",
+              port=["8080:80"], env=["TZ=UTC"], volume=["/srv:/usr/share/nginx"]),
+        api=api)
+    assert rc == 0
+    spec = api.calls[0][7]
+    assert spec == {"image": "nginx:alpine", "env": {"TZ": "UTC"},
+                    "ports": ["8080:80"], "volumes": ["/srv:/usr/share/nginx"]}
+    assert "docker (nginx:alpine)" in capsys.readouterr().out
+
+
+def test_a_worktree_unit_still_demands_its_folder(capsys):
+    rc = cli.seats_command(_args(action="add", repo="org/x", machine="box"),
+                           api=FakeApi())
+    assert rc == 1
+    assert "--folder" in capsys.readouterr().err
+
+
+def test_memory_volume_is_what_separates_a_seat_from_a_service(capsys):
+    """Its presence is the whole agent-vs-service distinction: reclaim
+    harvests before destroying only when there is something to preserve."""
+    api = FakeApi()
+    cli.seats_command(
+        _args(action="add", repo="org/pm", machine="box", image="mcp-hub-seat",
+              memory_volume="pm-memory"), api=api)
+    assert api.calls[0][7]["memory_volume"] == "pm-memory"
 
 
 def test_archiving_a_seat_with_placements_explains_the_refusal(capsys):

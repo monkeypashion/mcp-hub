@@ -177,13 +177,20 @@ class OperatorApi:
         identity: str = "",
         launch_args: str = "",
         klass: str = "squad",
+        spec: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Declare a seat. Identity is ASSIGNED by the hub when not given —
         never derived at the far end, because a container's hostname must not
-        be allowed to name a seat."""
+        be allowed to name a seat.
+
+        `spec` carries substrate-specific fields (image/env/ports/volumes for
+        docker). Its presence is what makes a unit a container rather than a
+        worktree, so a service and an agent seat are declared the same way.
+        """
         body: dict[str, Any] = {
             "repo": repo, "machine": machine, "folder": folder,
             "launch_args": launch_args, "class": klass,
+            "spec": spec or {},
         }
         if identity:
             body["identity"] = identity
