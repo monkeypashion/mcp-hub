@@ -330,3 +330,24 @@ def pane_is_settled(pane_text: str) -> bool:
     """
     flat = _flatten(pane_text)
     return any(t in flat for t in _CHROME_TOKENS)
+
+
+def first_turn_prompt(contract: SeatContract) -> str:
+    """The message the seat types to itself to start its FIRST turn.
+
+    A container has no operator to type anything, and claude's
+    SessionStart `additionalContext` — which carries the register
+    instruction — is only consumed when a turn actually runs. Measured on
+    the first live seat: hooks fired, the heartbeat daemon ran, and
+    `~/.claude/projects/` was empty, so no turn had ever executed and the
+    seat never registered despite looking healthy at every other layer.
+
+    Single line by construction: `tmux send-keys -l` sends the buffer
+    verbatim, so an embedded newline would submit half a prompt.
+    """
+    return (
+        f"You are {contract.identity}, a containerized seat on project "
+        f"{contract.project}. Call register(name=\"{contract.identity}\", "
+        f"project=\"{contract.project}\") on the hub now to bind this "
+        f"session for wake, then stand by for instructions."
+    )

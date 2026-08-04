@@ -485,3 +485,36 @@ def test_pane_is_settled_only_when_chrome_shows():
 
     assert pane_is_settled(STARTED_PANE)
     assert not pane_is_settled(CHANNELS_DIALOG)
+
+
+# ------------------------------------------------------------- first turn --
+
+
+def test_first_turn_prompt_names_the_assigned_identity():
+    """MEASURED: hooks fire, the heartbeat daemon runs, and claude still
+    never registers — because ~/.claude/projects/ is empty, i.e. no turn
+    ever ran. The SessionStart register instruction rides in
+    additionalContext, which is only consumed BY a turn. A fleet agent gets
+    its first turn from the operator; a container has no operator, so the
+    seat must start its own."""
+    from mcp_hub.seat import first_turn_prompt
+
+    c = parse_seat_contract(BASE_ENV)
+    p = first_turn_prompt(c)
+    assert "probe-seat-1" in p
+    assert "register" in p.lower()
+
+
+def test_first_turn_prompt_is_single_line():
+    """tmux send-keys -l sends the buffer verbatim: an embedded newline
+    would submit a half-typed prompt and leave the rest as a second turn."""
+    from mcp_hub.seat import first_turn_prompt
+
+    assert "\n" not in first_turn_prompt(parse_seat_contract(BASE_ENV))
+
+
+def test_first_turn_prompt_carries_the_project_for_register():
+    from mcp_hub.seat import first_turn_prompt
+
+    c = parse_seat_contract({**BASE_ENV, "SEAT_PROJECT": "org/thing"})
+    assert "org/thing" in first_turn_prompt(c)

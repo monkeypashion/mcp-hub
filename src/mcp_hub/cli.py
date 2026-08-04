@@ -4061,6 +4061,23 @@ def seat_entry_command(args: argparse.Namespace) -> int:
         if pane_is_settled(pane):
             break
     print("seat-entry: claude is up", flush=True)
+
+    # First turn. The register instruction rides in SessionStart's
+    # additionalContext, which only a RUNNING TURN consumes — and a
+    # container has no operator to type one. Without this the seat idles
+    # forever: hooks fired, daemon alive, ~/.claude/projects/ empty,
+    # never an agent (measured 2026-08-04).
+    #
+    # -l (literal) so nothing in the text is read as a key name; Enter is
+    # a SEPARATE send-keys because -l would type the word "Enter".
+    from mcp_hub.seat import first_turn_prompt
+
+    subprocess.run(
+        ["tmux", "send-keys", "-t", "seat", "-l", first_turn_prompt(contract)]
+    )
+    time.sleep(1)  # let the TUI ingest the paste before submitting
+    subprocess.run(["tmux", "send-keys", "-t", "seat", "Enter"])
+    print("seat-entry: first turn sent — the seat registers itself", flush=True)
     # PID 1 must outlive the detached tmux session or docker reaps the
     # container while claude runs. Container stops when the session ends.
     while True:
