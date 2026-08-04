@@ -30,6 +30,11 @@ RUN curl -fsSL https://claude.ai/install.sh | bash \
 # WORKDIR is the seat workdir — LOAD-BEARING for harvest: the edge's
 # `docker exec` lands here, and memory-export resolves identity from cwd
 # (the marker seat-entry writes lives at ./.claude/hub-agent.json).
+# mkdir'd as the seat user FIRST: the WORKDIR directive creates missing
+# dirs as ROOT even after USER, leaving PID 1 unable to write its own
+# workdir (found by the first container smoke test, not by unit tests —
+# they run as one user on the host and cannot see ownership).
+RUN mkdir -p /home/seat/work
 WORKDIR /home/seat/work
 
 # The contract door: env in (SEAT_IDENTITY, MCP_HUB_URL, credential...),
