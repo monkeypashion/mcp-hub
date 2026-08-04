@@ -1802,6 +1802,147 @@ def machines_command(args: argparse.Namespace, api: Any = None) -> int:
     return 0
 
 
+def seats_command(args: argparse.Namespace, api: Any = None) -> int:
+    """Seats — WHAT may run. `mcp-hub seats list|add|rm`."""
+    from mcp_hub.operator_api import ApiUnavailable, OperatorApi, api_base
+
+    if api is None:
+        api = OperatorApi(api_base(args.hub_url))
+    machine = args.machine or _sanitize_ident(platform.node() or "unknown-host")
+
+    try:
+        if args.action == "list":
+            rows = api.list_seats()
+            if args.json:
+                print(json.dumps(rows, indent=2))
+                return 0
+            if not rows:
+                print("no seats declared — nothing can be placed until one is")
+                return 0
+            for s in rows:
+                print(f"{s['identity']:<34} {s.get('machine', ''):<16} "
+                      f"{s.get('class', ''):<8} {s.get('folder', '')}")
+            return 0
+
+        if args.action == "add":
+            missing = [f for f, v in (("--repo", args.repo),
+                                      ("--folder", args.folder)) if not v]
+            if missing:
+                print(f"{' and '.join(missing)} required — a seat without them "
+                      "cannot be materialized anywhere", file=sys.stderr)
+                return 1
+            rec = api.create_seat(args.repo, machine, args.folder,
+                                  args.want_identity, args.launch_args, args.klass)
+            print(f"seat {rec['identity']} declared on {rec.get('machine', '')}")
+            print("it will not run until it is PLACED: "
+                  f"mcp-hub placements set --seat {rec['identity']} "
+                  f"--machine {rec.get('machine', '')}")
+            return 0
+
+        if not args.identity:
+            print("name the seat to archive", file=sys.stderr)
+            return 1
+        api.delete_seat(args.identity)
+        print(f"seat {args.identity} archived (the worktree is untouched)")
+        return 0
+    except ApiUnavailable as e:
+        msg = str(e)
+        if "409" in msg and args.action == "rm":
+            print(f"{args.identity} still has active placements — reclaim them "
+                  "first, or the fleet keeps placements naming a seat that is "
+                  "gone", file=sys.stderr)
+            return 1
+        print(msg, file=sys.stderr)
+        return 1
+
+
+def placements_command(args: argparse.Namespace, api: Any = None) -> int:
+    """Placements — WHERE a seat runs. `mcp-hub placements list|set|reclaim`.
+
+    This is the verb that makes the fleet drivable from any node: it writes
+    DESIRED state to the hub and returns. The named machine's `edge apply`
+    is what makes it true, and `status` reports which of those has happened.
+    """
+    from mcp_hub.operator_api import ApiUnavailable, OperatorApi, api_base
+
+    if api is None:
+        api = OperatorApi(api_base(args.hub_url))
+
+    try:
+        if args.action == "list":
+            rows = api.list_placements()
+            if args.json:
+                print(json.dumps(rows, indent=2))
+                return 0
+            if not rows:
+                print("no placements — nothing is scheduled anywhere")
+                return 0
+            pending = 0
+            for p in rows:
+                obs = (p.get("observed") or {}).get("state") or "—"
+                status = p.get("status", "")
+                pending += status == "pending-edge"
+                print(f"{p['id']:<14} {p['seat']:<30} {p['machine']:<16} "
+                      f"want {p['desired']:<9} saw {obs:<9} {status}")
+            if pending:
+                # The single most likely cause, named rather than left to be
+                # rediscovered: `edge apply` is a one-shot and nothing runs it
+                # by default.
+                print(f"\n{pending} pending-edge — no edge pass has reported "
+                      "since these were written. Check that `mcp-hub edge "
+                      "apply` actually runs on those machines.")
+            return 0
+
+        if args.action == "reclaim":
+            if not args.target:
+                print("name the placement to reclaim", file=sys.stderr)
+                return 1
+            if args.dry_run:
+                print(f"would reclaim {args.target} "
+                      "(harvest memory, verify, then DESTROY the substrate)")
+                return 0
+            if not args.yes:
+                print("reclaim HARVESTS then DESTROYS the substrate; "
+                      "re-run with --yes", file=sys.stderr)
+                return 1
+            api.reclaim_placement(args.target)
+            print(f"{args.target}: reclaim requested — the machine's next edge "
+                  "pass harvests memory, verifies, then destroys")
+            return 0
+
+        # -- set --------------------------------------------------------
+        desired = args.desired or "running"
+        if desired not in ("running", "stopped"):
+            print("desired must be running or stopped (reclaim is its own verb, "
+                  "because it destroys)", file=sys.stderr)
+            return 1
+        if args.target:
+            if args.dry_run:
+                print(f"would set {args.target} -> {desired}")
+                return 0
+            rec = api.set_placement(args.target, desired)
+            print(f"{rec['id']}: {rec['seat']} on {rec['machine']} -> {desired}")
+        else:
+            if not args.seat:
+                print("pass a placement id, or --seat with --machine to create one",
+                      file=sys.stderr)
+                return 1
+            machine = args.machine or _sanitize_ident(
+                platform.node() or "unknown-host")
+            if args.dry_run:
+                print(f"would place {args.seat} on {machine} "
+                      f"({args.substrate}) -> {desired}")
+                return 0
+            rec = api.create_placement(args.seat, machine, args.substrate, desired)
+            print(f"{rec['id']}: {rec['seat']} placed on {rec['machine']} -> {desired}")
+        print("written to the hub. Nothing has happened yet — that machine's "
+              "`edge apply` realizes it and reports what it OBSERVED.")
+        return 0
+    except ApiUnavailable as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+
 def workspaces_command(args: argparse.Namespace, api: Any = None) -> int:
     """The workspace registry from the command line.
 
@@ -1811,11 +1952,15 @@ def workspaces_command(args: argparse.Namespace, api: Any = None) -> int:
     from mcp_hub.operator_api import ApiUnavailable, OperatorApi, api_base
     from mcp_hub.workspace_data import collect_workspaces
 
+    args.machine_given = args.machine is not None
     machine = args.machine or _sanitize_ident(platform.node() or "unknown-host")
     if api is None:
         api = OperatorApi(api_base(args.hub_url))
     scan_dirs = [pathlib.Path(d) for d in (getattr(args, "scan_dir", None) or [])] \
         or _workspace_scan_dirs()
+
+    if args.action == "remove":
+        return _workspaces_remove(args, api, machine)
 
     if args.action == "list":
         data = collect_workspaces(api, scan_dirs, machine)
@@ -1906,6 +2051,86 @@ def workspaces_command(args: argparse.Namespace, api: Any = None) -> int:
     for n in failed:
         print(f"FAILED {n}", file=sys.stderr)
     print(f"{len(created)} {verb}, {len(skipped)} already there, {len(failed)} failed")
+    return 1 if failed else 0
+
+
+def _workspaces_remove(args: argparse.Namespace, api: Any, machine: str) -> int:
+    """Drop DEFINITIONS. Deletes nothing on any disk.
+
+    Named rather than id'd, because the id is a database detail the operator
+    never sees — the board and `list` both speak names. A name that matches on
+    two machines is refused rather than resolved: deleting the wrong machine's
+    definition is silent, and the fix is one `--machine` away.
+    """
+    from mcp_hub.operator_api import ApiUnavailable
+
+    if not args.paths:
+        print("name the workspaces to remove (as `workspaces list` shows them)",
+              file=sys.stderr)
+        return 1
+    try:
+        known = api.list_workspaces()
+    except ApiUnavailable as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    targets, missing, ambiguous = [], [], []
+    for name in args.paths:
+        # Tolerate a path or a filename: the board shows names, but muscle
+        # memory from `register` will paste a path.
+        name = name.rsplit("/", 1)[-1].removesuffix(".code-workspace")
+        hits = [w for w in known if w.get("name") == name]
+        if args.machine_given:
+            hits = [w for w in hits if w.get("machine") == machine]
+        if not hits:
+            missing.append(name)
+        elif len(hits) > 1:
+            where = ", ".join(sorted(h.get("machine") or "(any)" for h in hits))
+            ambiguous.append(f"{name} — defined on {where}; "
+                             "name one with --machine")
+        else:
+            targets.append(hits[0])
+
+    for n in missing:
+        print(f"no definition named {n} — nothing to remove", file=sys.stderr)
+    for n in ambiguous:
+        print(f"AMBIGUOUS {n}", file=sys.stderr)
+    if ambiguous:
+        return 1
+    if not targets:
+        return 1 if missing else 0
+
+    # The tense has to follow what will ACTUALLY happen, not just --dry-run:
+    # without --yes this preview is followed by a refusal, and printing
+    # "removing:" above it describes an act that is about to not occur.
+    will_write = args.yes and not args.dry_run
+    for w in targets:
+        where = w.get("machine") or "(any machine)"
+        print(f"{'removing' if will_write else 'would remove'}: "
+              f"{w['name']}  [{where}]  {len(w.get('listings') or [])} folder(s)")
+    if args.dry_run:
+        return 0
+    if not args.yes:
+        # There is no archive for workspace definitions — DELETE is a real
+        # delete, unlike seats, which the hub only marks archived.
+        print("this cannot be undone (the hub archives seats, not workspaces); "
+              "re-run with --yes", file=sys.stderr)
+        return 1
+
+    removed, failed = [], []
+    for w in targets:
+        try:
+            api.delete_workspace(w["id"])
+            removed.append(w["name"])
+        except ApiUnavailable as e:
+            failed.append(f"{w['name']}: {e}")
+    for n in removed:
+        print(f"removed definition: {n}")
+    for n in failed:
+        print(f"FAILED {n}", file=sys.stderr)
+    if removed:
+        print("the FILES are untouched — `squad teardown workspace <file> "
+              "--remove-workspace` is the other half")
     return 1 if failed else 0
 
 
@@ -3987,16 +4212,20 @@ def build_parser() -> argparse.ArgumentParser:
             "`register` is the missing half: until a workspace is POSTed to "
             "/api/v1/workspaces it reads as an unregistered file, so a fresh "
             "hub makes every workspace you own look like drift. Registering "
-            "is what makes a MISSING one mean something."
+            "is what makes a MISSING one mean something. `remove` drops a "
+            "DEFINITION and touches no disk — the file is `squad teardown "
+            "workspace`'s job, and doing only one of the two is exactly how "
+            "you get a ghost row or a feral file."
         ),
     )
     workspaces.add_argument(
-        "action", choices=["list", "register"],
-        help="list: the merged view · register: define workspaces on the hub",
+        "action", choices=["list", "register", "remove"],
+        help="list: the merged view · register: define on the hub · "
+             "remove: drop the definition (no file is deleted)",
     )
     workspaces.add_argument(
         "paths", nargs="*",
-        help="Workspace files to register (default with --all: every one found here)",
+        help="register: workspace files · remove: workspace NAMES",
     )
     workspaces.add_argument(
         "--all", action="store_true",
@@ -4020,9 +4249,85 @@ def build_parser() -> argparse.ArgumentParser:
     )
     workspaces.add_argument(
         "--dry-run", action="store_true",
-        help="register: print what would be created; write nothing",
+        help="register/remove: print what would change; write nothing",
+    )
+    workspaces.add_argument(
+        "--yes", action="store_true",
+        help="remove: skip the confirmation (there is no undo — the hub has "
+             "no archive for workspace definitions)",
     )
     workspaces.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    seats = sub.add_parser(
+        "seats",
+        help="Seats — WHAT may run, independent of which machine runs it",
+        description=(
+            "A seat is a unit of work with an identity; a placement says "
+            "where it runs. Splitting them is what lets a seat move between "
+            "machines without changing what it IS. Identity is assigned by "
+            "the hub, never derived at the far end — a container's hostname "
+            "must not be able to name a seat."
+        ),
+    )
+    seats.add_argument(
+        "action", choices=["list", "add", "rm"],
+        help="list · add: declare a seat · rm: archive it (placements first)",
+    )
+    seats.add_argument("identity", nargs="?", default=None, help="rm: which seat")
+    seats.add_argument("--repo", default="", help="add: <org>/<repo>")
+    seats.add_argument("--machine", default=None,
+                       help="add: which machine (default: this one)")
+    seats.add_argument("--folder", default="", help="add: absolute path there")
+    seats.add_argument("--identity", dest="want_identity", default="",
+                       help="add: override the assigned identity")
+    seats.add_argument("--launch-args", default="", help="add: claude launch args")
+    seats.add_argument("--class", dest="klass", default="squad",
+                       choices=["squad", "faculty"],
+                       help="add: faculty seats are never auto-started by `up`")
+    seats.add_argument(
+        "--hub-url", default=DEFAULT_HUB_URL,
+        help="Hub base URL (default: $MCP_HUB_URL or built-in)",
+    )
+    seats.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    placements = sub.add_parser(
+        "placements",
+        help="Placements — WHERE a seat runs, and whether it should be running",
+        description=(
+            "Desired state, written from ANY node. Nothing happens at the "
+            "moment you write one: the named machine's `edge apply` pulls it, "
+            "acts, and reports what it OBSERVED. So `status` here is the "
+            "honest word — converged, diverged, or pending-edge, which means "
+            "no edge has run since you asked. If placements sit pending "
+            "forever, no edge is running on that box; that is the fact to "
+            "check first, not the hub."
+        ),
+    )
+    placements.add_argument(
+        "action", choices=["list", "set", "reclaim"],
+        help="list · set: running|stopped · reclaim: harvest then destroy",
+    )
+    placements.add_argument("target", nargs="?", default=None,
+                            help="set/reclaim: placement id")
+    placements.add_argument("desired", nargs="?", default=None,
+                            help="set: running|stopped")
+    placements.add_argument("--seat", default="", help="set: create for this seat")
+    placements.add_argument("--machine", default=None, help="set: on this machine")
+    placements.add_argument("--substrate", default="worktree",
+                            choices=["worktree", "docker"],
+                            help="set: docker placements are skipped by the edge")
+    placements.add_argument(
+        "--yes", action="store_true",
+        help="reclaim: skip the confirmation — it DESTROYS the substrate",
+    )
+    placements.add_argument("--dry-run", action="store_true",
+                            help="print what would change; write nothing")
+    placements.add_argument(
+        "--hub-url", default=DEFAULT_HUB_URL,
+        help="Hub base URL (default: $MCP_HUB_URL or built-in)",
+    )
+    placements.add_argument("--json", action="store_true",
+                            help="Machine-readable output")
 
     edge = sub.add_parser(
         "edge",
@@ -4120,6 +4425,10 @@ def main(argv: list[str] | None = None) -> int:
         return edge_command(args)
     if args.subcommand == "workspaces":
         return workspaces_command(args)
+    if args.subcommand == "seats":
+        return seats_command(args)
+    if args.subcommand == "placements":
+        return placements_command(args)
     if args.subcommand == "machines":
         return machines_command(args)
     if args.subcommand == "focus":

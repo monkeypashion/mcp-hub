@@ -522,6 +522,28 @@ mcp-hub workspaces register --all --squad dreamteam
 mcp-hub workspaces register ~/Projects/squad.code-workspace
 ```
 
+### Removing a workspace is TWO acts, so it is two verbs
+
+```bash
+squad teardown workspace ~/Projects/xport2.code-workspace --dry-run
+squad teardown workspace ~/Projects/xport2.code-workspace --remove-workspace --yes
+mcp-hub workspaces remove xport2 --dry-run          # then --yes
+```
+
+The first removes the **file**; the second removes the **hub's definition**.
+Do only the first and the definition survives as a ghost (`✗ disk`,
+"registered, no file"); do only the second and the file becomes feral
+(`✗ hub`). The manager shows both, in both directions, on purpose — so pick
+deliberately rather than assuming one verb did both.
+
+`remove` refuses without `--yes` (there is no archive for definitions — unlike
+seats, which the hub only marks archived) and **refuses a name defined on two
+machines** rather than resolving it, because deleting the wrong machine's
+definition is silent and `--machine` is one flag away. In the board, a ghost
+row offers **Deregister workspace** — hub-side, so it works from any machine,
+unlike register. A workspace that still has a file is deliberately NOT one
+keystroke from becoming feral.
+
 **Register before reading the drift column.** Until a workspace is POSTed to
 the hub, *every* workspace in the fleet is unregistered, so the column says
 the same thing about all of them and means nothing. Registering is what makes
@@ -537,6 +559,41 @@ machine that ever ran a bare `mcp-hub board`. The endpoint shipped before the
 sender did, which meant the column was blank fleet-wide while looking like a
 working feature; if you add a fourth column, add its producer in the same
 change.
+
+## Driving the fleet from any node — seats and placements
+
+The split that makes a fleet drivable from anywhere: a **seat** is WHAT may
+run (identity, repo, folder, launch args); a **placement** is WHERE it runs and
+whether it should be running. Separating them is what lets a seat move machines
+without changing what it is.
+
+```bash
+mcp-hub seats list
+mcp-hub seats add --repo org/x --folder /srv/x --machine dev-vm-1
+mcp-hub placements set --seat x-dev-vm-1 --machine dev-vm-1   # -> running
+mcp-hub placements set <id> stopped
+mcp-hub placements reclaim <id> --yes        # harvest memory, verify, DESTROY
+mcp-hub placements list
+```
+
+**Writing a placement schedules nothing.** It records desired state; the named
+machine's `mcp-hub edge apply` pulls it, acts, and reports what it OBSERVED.
+So `status` is the honest word — `converged`, `diverged`, or `pending-edge`,
+which means *no edge has run since you asked*. `placements list` says so
+explicitly when anything is pending, because the likeliest cause is the design's
+own gap: **`edge apply` is a one-shot and nothing schedules it by default.**
+
+`reclaim` is its own verb rather than a value of `desired`, because it harvests
+then DESTROYS — a destroy you can reach by typing a word into a state field is
+a destroy that happens by accident.
+
+Identity is **assigned by the hub** when a seat is created, never derived at the
+far end: a container's hostname must not be able to name a seat.
+
+⚠️ **`edge apply` currently authenticates with the OPERATOR token**, because both
+machine tokens were lost (the hub stores only a hash and has no rotation
+endpoint). That means anything holding the operator token can drive any machine.
+A `POST /api/v1/machines/{name}/rotate-token` is the fix and needs a deploy.
 
 ## Stop hook — auto-surface queued messages
 

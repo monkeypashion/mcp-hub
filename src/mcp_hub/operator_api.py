@@ -142,6 +142,85 @@ class OperatorApi:
             },
         ).json()
 
+    def delete_workspace(self, wid: Any) -> dict[str, Any]:
+        """Drop a DEFINITION. Deletes nothing on any disk.
+
+        The two halves of a workspace are cleaned by different tools and it
+        matters which you reach for: `squad teardown workspace` removes the
+        file, this removes the hub's record of it. Do only the first and the
+        definition survives as a ghost row; do only this and the file becomes
+        feral. The manager shows both, in both directions, on purpose.
+        """
+        return self._request("DELETE", f"/api/v1/workspaces/{wid}").json()
+
+    # -- seats: WHAT may run, independent of where ---------------------------
+
+    def list_seats(self) -> list[dict[str, Any]]:
+        return self._request("GET", "/api/v1/seats").json()["seats"]
+
+    def create_seat(
+        self,
+        repo: str,
+        machine: str,
+        folder: str,
+        identity: str = "",
+        launch_args: str = "",
+        klass: str = "squad",
+    ) -> dict[str, Any]:
+        """Declare a seat. Identity is ASSIGNED by the hub when not given —
+        never derived at the far end, because a container's hostname must not
+        be allowed to name a seat."""
+        body: dict[str, Any] = {
+            "repo": repo, "machine": machine, "folder": folder,
+            "launch_args": launch_args, "class": klass,
+        }
+        if identity:
+            body["identity"] = identity
+        return self._request("POST", "/api/v1/seats", json=body).json()
+
+    def delete_seat(self, identity: str) -> dict[str, Any]:
+        """Archive a seat. Refused by the hub while it still has active
+        placements — reclaim those first, or the fleet would be left with
+        placements naming a seat that no longer exists."""
+        return self._request("DELETE", f"/api/v1/seats/{identity}").json()
+
+    # -- placements: WHERE a seat runs, and whether it should ----------------
+
+    def list_placements(self) -> list[dict[str, Any]]:
+        return self._request("GET", "/api/v1/placements").json()["placements"]
+
+    def create_placement(
+        self,
+        seat: str,
+        machine: str,
+        substrate: str = "worktree",
+        desired: str = "running",
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/api/v1/placements",
+            json={"seat": seat, "machine": machine,
+                  "substrate": substrate, "desired": desired},
+        ).json()
+
+    def set_placement(self, pid: str, desired: str) -> dict[str, Any]:
+        """running | stopped. Reclaim is DELETE, deliberately — it harvests
+        memory before destroying, and a value in a dropdown should not be able
+        to trigger that."""
+        return self._request(
+            "PATCH", f"/api/v1/placements/{pid}", json={"desired": desired}
+        ).json()
+
+    def reclaim_placement(self, pid: str) -> dict[str, Any]:
+        """Ask for harvest-then-destroy. 202, not 200: the hub has recorded
+        the intent, and the machine's edge does the work on its next pass."""
+        return self._request("DELETE", f"/api/v1/placements/{pid}").json()
+
+    def machine_placements(self, machine: str) -> list[dict[str, Any]]:
+        return self._request(
+            "GET", f"/api/v1/machines/{machine}/placements"
+        ).json()["placements"]
+
     def push_status(self, machine: str, payload: dict[str, Any]) -> None:
         self._request("POST", f"/api/v1/machines/{machine}/status", json=payload)
 
