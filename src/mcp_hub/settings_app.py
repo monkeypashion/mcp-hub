@@ -306,7 +306,8 @@ class SettingsApp(App):
                  board_for=None, dark: bool | None = None,
                  poll_seconds: float = 3.0, workspaces_for=None,
                  presence_ping=None, presence_seconds: float = 60.0,
-                 fleet_for=None, listings_for=None, this_machine: str = "",
+                 fleet_for=None, listings_for=None, placements_for=None,
+                 this_machine: str = "",
                  workspaces_seconds: float = 30.0, now=None):
         super().__init__()
         self.agents = agents
@@ -318,6 +319,7 @@ class SettingsApp(App):
         self._workspaces_for = workspaces_for  # injected; None → local only
         self._fleet_for = fleet_for            # injected; None → no remote rows
         self._listings_for = listings_for      # injected; reads a local ws file
+        self._placements_for = placements_for  # injected; None hides placements
         self._presence_ping = presence_ping    # injected; None disables it
         # Well inside the hub's 180s open-now window, so a single dropped
         # ping never blinks the workspace out of the manager's view.
@@ -342,6 +344,7 @@ class SettingsApp(App):
         # which is an assertion nothing has made yet.
         self.workspaces: dict[str, Any] = {"rows": [], "machines": [], "note": ""}
         self.fleet: dict[str, Any] = {"ts": 0, "agents": []}
+        self.placements: list[dict[str, Any]] = []
         self.tree_model: dict[str, Any] = {"machines": []}
         self.selected: dict[str, Any] | None = None
         self._pending_key: str | None = None
@@ -534,8 +537,23 @@ class SettingsApp(App):
         # Two fixed columns, then a separator — without it a present ⚡ (already
         # two cells) ran straight into the name while an absent one left a gap,
         # so the name started in a different place depending on the wake state.
+        # A placement is what the HUB wants; everything else on this row is
+        # what the machine is doing. When they disagree — or when no edge has
+        # reported since it was asked — that is the whole point of showing it.
+        pl = a.get("placement")
+        if pl:
+            status = pl.get("status", "")
+            if status == "pending-edge":
+                bits = [f"want {pl.get('desired', '')} · no edge yet"]
+            elif status == "diverged":
+                bits = [f"want {pl.get('desired', '')} · DIVERGED"]
+            else:
+                bits = [f"placed · {pl.get('desired', '')}"] if not bits else bits
         name = f"{_cell2(glyph)}{_cell2(wake)} {hand}{a['agent']}"
         head = f"[{colour}]{escape(name)}[/]" if colour else escape(name)
+        if pl and pl.get("status") in ("pending-edge", "diverged"):
+            # Attention beats status, same rule the workspace rows follow.
+            head = f"[{p['warning']}]{escape(name)}[/]"
         tail = " ".join(b for b in bits if b)
         return f"{head}  [dim]{escape(tail)}[/]" if tail else head
 
@@ -596,6 +614,7 @@ class SettingsApp(App):
             or self._this_machine,
             scoped_to=self.scoped_to,
             listings_for=self._listings_for,
+            placements=self.placements,
             now=self._now(),
         )
 
@@ -723,6 +742,14 @@ class SettingsApp(App):
         if node.line >= 0:
             self.query_one("#fleet", Tree).move_cursor(node)
         self._pending_key = None
+        # The detail pane has to be repainted HERE, not left to the highlight
+        # event: `_move_to` already set `self.selected`, so by the time the
+        # deferred cursor move fires its NodeHighlighted, `_node_changed` sees
+        # a key that already matches and returns early. The result was `n` and
+        # every "Go to" moving the cursor while the right-hand pane kept
+        # showing the previous seat — caught by asserting on the RENDERED pane
+        # rather than on `selected`.
+        self.call_later(self.refresh_detail)
 
     # ---- the workspace registry ----
 
@@ -735,10 +762,21 @@ class SettingsApp(App):
             data = self._workspaces_for()
         except Exception as exc:  # noqa: BLE001 — the tree must never crash
             data = {"rows": [], "machines": [], "note": f"workspace data: {exc}"}
-        self.call_from_thread(self._apply_workspaces, data)
+        # Same worker, same round trip budget: placements are desired state
+        # for the SAME registry and go stale on the same clock.
+        placements: list[dict[str, Any]] = []
+        if self._placements_for is not None:
+            try:
+                placements = self._placements_for() or []
+            except Exception:  # noqa: BLE001 — a dashboard never dies of this
+                placements = []
+        self.call_from_thread(self._apply_workspaces, data, placements)
 
-    def _apply_workspaces(self, data: dict[str, Any]) -> None:
+    def _apply_workspaces(self, data: dict[str, Any],
+                          placements: list[dict[str, Any]] | None = None) -> None:
         self.workspaces = data
+        if placements is not None:
+            self.placements = placements
         if self._fleet_for is not None:
             try:
                 self.fleet = self._fleet_for() or {"ts": 0, "agents": []}
@@ -1331,6 +1369,56 @@ class SettingsApp(App):
         if a.get("next"):
             out.append(Static(a["next"], classes="live-next"))
             out.append(Static("its bio `next:`", classes="source"))
+        out.extend(self._placement_widgets(a))
+        return out
+
+    def _placement_widgets(self, a: dict[str, Any]) -> list[Any]:
+        """What the HUB wants for this seat, and whether anyone acted on it.
+
+        Absent a placement, the seat is not scheduled at all — which is not a
+        fault, and the pane says what it would take rather than implying
+        something is broken. The two-step is real: a placement needs a seat,
+        and a seat needs a FOLDER, which this machine cannot know for a box it
+        is not sitting at.
+        """
+        pl = a.get("placement")
+        if not pl:
+            return [
+                Static("▌PLACEMENT   not scheduled", classes="section"),
+                Static(
+                    "The hub has no placement for this seat, so nothing will "
+                    "start or stop it. Declaring one needs its folder on that "
+                    f"machine:\n  mcp-hub seats add --repo <org>/<repo> "
+                    f"--machine {a.get('machine', '')} --folder <path>\n"
+                    f"  mcp-hub placements set --seat {a['agent']} "
+                    f"--machine {a.get('machine', '')}",
+                    classes="note"),
+            ]
+        status = pl.get("status", "")
+        obs = (pl.get("observed") or {}).get("state") or "—"
+        out: list[Any] = [
+            Static(f"▌PLACEMENT   {pl.get('id', '')}",
+                   classes="section section-live"),
+            self._fact("Machine", pl.get("machine", "")),
+            self._fact("Substrate", pl.get("substrate", "")),
+            self._fact("Desired", pl.get("desired", ""), "value-on",
+                       "what the hub wants — written from any node"),
+            self._fact("Observed", obs,
+                       "value-on" if status == "converged" else "value-warn",
+                       "what that machine's edge actually enumerated"),
+        ]
+        if status == "pending-edge":
+            out.append(Static(
+                "PENDING — no edge pass has reported since this was written. "
+                "Desired state is inert until `mcp-hub edge apply` runs on "
+                f"{pl.get('machine', 'that machine')}; check its "
+                "mcp-hub-edge.timer before suspecting the hub.",
+                classes="note"))
+        elif status == "diverged":
+            out.append(Static(
+                "DIVERGED — the edge reported a state that is not what was "
+                "asked for. That is a real disagreement, not a delay.",
+                classes="note"))
         return out
 
     # ---- the command palette ----
@@ -1386,6 +1474,23 @@ class SettingsApp(App):
                     self.hub_bin, ["focus", "--off", "--agent", agent],
                     f"focus {agent}", "off"),
             ))
+        # Placement control works on ANY machine — it is a hub write, and the
+        # target's edge realizes it. This is the whole point of the split, so
+        # it is offered before the local-only verbs below.
+        pl = sel.get("placement") if agent else None
+        if pl:
+            where = pl.get("machine", "")
+            for want, verb in (("running", "Start"), ("stopped", "Stop")):
+                if pl.get("desired") == want:
+                    continue        # already asked for; offering it is noise
+                out.append((
+                    f"{verb} on {where} — {agent}",
+                    f"writes desired={want} to the hub; {where}'s edge "
+                    "realizes it on its next pass (~2 min)",
+                    (lambda w=want, pid=pl.get("id", ""): self.run_verb(
+                        self.hub_bin, ["placements", "set", pid, w],
+                        f"{agent} -> {w}", w)),
+                ))
         if agent and sel.get("local"):
             if sel.get("state") == "waiting":
                 for intent in ("yes", "no", "always"):

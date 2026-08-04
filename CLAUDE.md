@@ -587,6 +587,24 @@ own gap: **`edge apply` is a one-shot and nothing schedules it by default.**
 then DESTROYS — a destroy you can reach by typing a word into a state field is
 a destroy that happens by accident.
 
+**In the board**, a seat that has a placement offers `Start on <machine>` /
+`Stop on <machine>` in the palette — a HUB write, so it drives a box you are
+not sitting at. The state it is already in is not offered. The row itself
+carries the gap between asked and observed:
+
+```
+💤⚡ pm-dev-vm-1        want running · no edge yet     ← pending, in drift colour
+💤⚡ pm-dev-vm-1        want running · DIVERGED        ← a disagreement, not a delay
+```
+
+Both wear the warning colour, because attention beats status. The detail pane
+for a pending placement names the machine and tells you to check its
+`mcp-hub-edge.timer` **before suspecting the hub** — that is nearly always
+where the fault is. A seat with no placement reads *not scheduled* and prints
+the two-step needed to create one, rather than offering a button that would
+404: a placement needs a seat, and a seat needs a FOLDER, which this machine
+cannot know for a box it is not sitting at.
+
 Identity is **assigned by the hub** when a seat is created, never derived at the
 far end: a container's hostname must not be able to name a seat.
 

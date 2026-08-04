@@ -2710,6 +2710,15 @@ def settings_command(args: argparse.Namespace) -> int:
                 this_machine=host,
             )
 
+        def _placements() -> list:
+            """Desired state for the whole fleet, so the board can show which
+            seats are scheduled and which are waiting on an edge that is not
+            running. Failure is swallowed by the caller — this is a dashboard.
+            """
+            from mcp_hub.operator_api import OperatorApi, api_base
+
+            return OperatorApi(api_base(DEFAULT_HUB_URL)).list_placements()
+
         def _presence_ping(workspace_path: str) -> None:
             """Tell the hub this workspace is open in front of a human.
 
@@ -2750,6 +2759,7 @@ def settings_command(args: argparse.Namespace) -> int:
             presence_ping=_presence_ping,
             fleet_for=_fleet_snapshot,
             listings_for=lambda p: _workspace_listings(pathlib.Path(p)),
+            placements_for=_placements,
             this_machine=_sanitize_ident(platform.node() or "unknown-host"),
         ).run()
         return 0
