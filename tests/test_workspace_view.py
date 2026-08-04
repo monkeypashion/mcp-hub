@@ -192,10 +192,10 @@ async def test_the_workspace_this_board_is_looking_at_is_marked_HERE():
     async with app.run_test(size=(120, 30)) as pilot:
         await _ready(app, pilot)
         mine, other = _ws(app, "mine"), _ws(app, "other")
-        assert "◉ mine" in mine.label.plain
+        assert mine.label.plain.startswith("◉ mine")
         assert app._palette()["accent"] in " ".join(_styles(mine))
         # The other open workspace is still marked open, just not as yours.
-        assert "● other" in other.label.plain
+        assert other.label.plain.startswith("● other")
         assert app._palette()["success"] in " ".join(_styles(other))
 
 
@@ -207,7 +207,7 @@ async def test_an_unscoped_board_marks_nothing_as_here():
         await _ready(app, pilot)
         node = _ws(app, "a")
         assert "◉" not in node.label.plain
-        assert "● a" in node.label.plain
+        assert node.label.plain.startswith("● a")
 
 
 @pytest.mark.asyncio
@@ -225,7 +225,7 @@ async def test_drift_outranks_both_open_states():
         assert app._palette()["warning"] in styles
         assert app._palette()["success"] not in styles
         assert app._palette()["accent"] not in styles
-        assert "◉ mine" in node.label.plain   # still marked, just not coloured ok
+        assert node.label.plain.startswith("◉ mine")   # still marked, just not coloured ok
         assert "not registered" in node.label.plain
 
 

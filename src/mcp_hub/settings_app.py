@@ -46,6 +46,7 @@ import subprocess
 import time
 from typing import Any
 
+from rich.cells import cell_len
 from rich.markup import escape
 from textual import on
 from textual.app import App, ComposeResult
@@ -216,7 +217,26 @@ def _value_class(value: str) -> str:
     return "value-ro"
 
 
-_STATE_GLYPH = {"waiting": "🔴", "working": "▶", "idle": "·", "down": "✖"}
+# ONE glyph vocabulary, and every row wears one. `idle` used to be a bare `·`
+# and a seat with no board record got the same — so six of eight local seats
+# rendered as a faint dot while every remote seat showed ⚡, and the panel read
+# as "remote agents are instrumented, local ones aren't" (operator, 2026-08-04).
+# 💤 and ⚡ are the hub's own vocabulary from list_agents; using them here means
+# one thing looks the same everywhere it appears.
+_STATE_GLYPH = {"waiting": "🔴", "working": "▶", "idle": "💤", "down": "✖"}
+_GLYPH_STOPPED = "○"        # enrolled, no pane — a fact, not a fault
+_GLYPH_NOT_REPORTING = "⚠"  # the instrument is silent; nothing is claimed
+_GLYPH_WAKEABLE = "⚡"
+
+
+def _cell2(glyph: str) -> str:
+    """Exactly two cells, whatever the glyph.
+
+    🔴 and 💤 are double-width, ▶ ✖ ○ are single. Mixed, the name column shifts
+    by one between states and the tree reads as jitter — so the narrow ones are
+    padded rather than the set being restricted to emoji.
+    """
+    return glyph + " " * max(0, 2 - cell_len(glyph)) if glyph else "  "
 
 
 def _hms(s: int) -> str:
@@ -441,13 +461,16 @@ class SettingsApp(App):
         if m["stale"]:
             bits.append("not reporting")
         colour = p["primary"] if m["local"] else p["secondary"]
-        return f"[b {colour}]{escape(head)}[/]  [dim]{escape(' · '.join(bits))}[/]"
+        label = f"[b {colour}]{escape(head)}[/]"
+        return f"{label}  [dim]{escape(' · '.join(bits))}[/]" if bits else label
 
     def _workspace_label(self, w: dict[str, Any], p: dict[str, str]) -> str:
         # Three states, not two: nobody has it open · someone does · YOU are
         # looking at it right now. The board knows its own --workspace, so the
         # third is free and is the one the operator is standing in.
-        glyph = "◉" if w["here"] else ("●" if w["open_now"] else " ")
+        # ○ rather than a blank: every row in the tree wears a mark, or the
+        # ones that do read as the only real entries.
+        glyph = "◉" if w["here"] else ("●" if w["open_now"] else "○")
         # Drift says what it IS, in words — the same guarantee the `w` view
         # made, moved to the surface that replaced it. The PATH is deliberately
         # not here: it is what made the old rows wrap, and the detail pane has
@@ -481,15 +504,16 @@ class SettingsApp(App):
                       "down": p["warning"]}.get(st, "")
             if st == "waiting":
                 tail = f"waiting {_hms(rec.get('waiting_seconds', 0))}"
-            elif st:
-                tail = st
             else:
-                tail = a.get("klass", "")
+                # A stopped seat says so with its glyph; `faculty`/`squad` moved
+                # to the detail pane rather than costing two cells on every row.
+                tail = st
             # The raised hand rides the row even when the state glyph already
             # says `waiting` — it is what `n` jumps between, and a marker you
             # cannot see is not a marker.
             hand = "🙋 " if a["hand"] else ""
-            glyph = _STATE_GLYPH.get(st, "·")
+            glyph = _STATE_GLYPH.get(st, _GLYPH_STOPPED)
+            wake = _GLYPH_WAKEABLE if rec.get("wakeable") else ""
             # Context percentage but NOT the model name: an agent name is
             # already ~22 cells and `Sonnet` pushed the longest real seat past
             # the panel. The model is one row down in the live section.
@@ -498,17 +522,21 @@ class SettingsApp(App):
             # Presence and nothing else — there is no pane to scrape on
             # another box, so the row is thinner ON PURPOSE.
             colour, hand = "", ""
-            glyph = "⚡" if a.get("wakeable") else "·"
+            wake = _GLYPH_WAKEABLE if a.get("wakeable") else ""
             if a.get("stale"):
-                bits = ["not reporting"]
+                glyph, bits = _GLYPH_NOT_REPORTING, ["not reporting"]
             else:
                 # `hub only` stays on the row: a remote `idle` is a weaker
                 # claim than a local one (a snapshot, not a scraped pane), and
                 # the two must not read identically.
-                bits = [a.get("state", ""), "hub only"]
-        name = f"{glyph} {hand}{a['agent']}"
+                glyph = _STATE_GLYPH.get(a.get("state", ""), _GLYPH_STOPPED)
+                bits = ["hub only"]
+        # Two fixed columns, then a separator — without it a present ⚡ (already
+        # two cells) ran straight into the name while an absent one left a gap,
+        # so the name started in a different place depending on the wake state.
+        name = f"{_cell2(glyph)}{_cell2(wake)} {hand}{a['agent']}"
         head = f"[{colour}]{escape(name)}[/]" if colour else escape(name)
-        tail = (" · " if not a["local"] else " ").join(b for b in bits if b)
+        tail = " ".join(b for b in bits if b)
         return f"{head}  [dim]{escape(tail)}[/]" if tail else head
 
     def _label_for(self, data: dict[str, Any], p: dict[str, str]) -> str:
@@ -781,12 +809,26 @@ class SettingsApp(App):
         # the detail's live section follows the selected agent
         self.call_later(self._refresh_live_section)
 
-    def _live_widgets(self, rec: dict[str, Any] | None) -> list[Any]:
+    def _live_widgets(self, rec: dict[str, Any] | None,
+                      seat: dict[str, Any] | None = None) -> list[Any]:
         """The board's view of ONE agent, as widgets. Everything here is a
         rendering of collect()'s record — no scraping, no second source."""
         if rec is None:
             err = (self.board or {}).get("error")
-            return [Static(f"live data: {err}", classes="note")] if err else []
+            if err:
+                return [Static(f"live data: {err}", classes="note")]
+            if seat and seat.get("klass"):
+                # No pane, so nothing to report — but the row's ○ should not be
+                # the only place this is said, and the seat's CLASS moved here
+                # when it left the label.
+                return [
+                    Static("▌LIVE   not running", classes="section section-live"),
+                    self._fact("Class", seat["klass"], "value-off",
+                               "faculty seats are on-demand — `up` never starts them"
+                               if seat["klass"] == "faculty"
+                               else "started by `squad up`"),
+                ]
+            return []
         g = self._gen
         out: list[Any] = [Static("▌LIVE   the board's answer: what is it doing, what does it need",
                                  classes="section section-live")]
@@ -816,6 +858,13 @@ class SettingsApp(App):
                 Static("model, and context used", classes="source"),
                 classes="row",
             ))
+        # The tree's wake column is one glyph; this is the board's own phrase,
+        # verbatim — `✖ REGISTER` says something ⚡-or-nothing cannot.
+        if rec.get("hub"):
+            out.append(self._fact(
+                "Hub", str(rec["hub"]),
+                "value-on" if str(rec["hub"]).startswith("⚡") else "value-warn",
+                "as the statusline reports it"))
 
         q = rec.get("question") or ""
         if st == "waiting":
@@ -896,7 +945,7 @@ class SettingsApp(App):
         return (
             rec.get("state"), _hms(rec.get("waiting_seconds", 0)),
             rec.get("action"), rec.get("question"),
-            rec.get("model"), rec.get("ctx"),
+            rec.get("model"), rec.get("ctx"), rec.get("hub"),
             nxt.get("source"), nxt.get("age"), nxt.get("hand"),
             nxt.get("text"), nxt.get("ask"), nxt.get("net"),
             rec.get("branch"), rec.get("dirty"), rec.get("unpushed"),
@@ -924,7 +973,7 @@ class SettingsApp(App):
             return
         self._gen += 1
         await live.remove_children()
-        await live.mount_all(self._live_widgets(rec))
+        await live.mount_all(self._live_widgets(rec, sel))
 
     # ---- rendering the selected agent ----
 

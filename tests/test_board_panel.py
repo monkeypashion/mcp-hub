@@ -109,9 +109,101 @@ async def test_the_tree_wears_the_board_state():
         assert "Fable" in detail
         assert "waiting" in _label(app, "beta") and "2m" in _label(app, "beta")
         assert "🙋" in _label(app, "beta")           # the hand rides the row
-        # an agent the scan doesn't know keeps its class, not garbage
-        assert "faculty" in _label(app, "gamma")
+        # an agent the scan doesn't know says so; it does not borrow a state
+        assert "○" in _label(app, "gamma")
         assert "waiting" not in _label(app, "gamma")
+
+
+@pytest.mark.asyncio
+async def test_a_local_seat_shows_its_wake_marker_like_a_remote_one_does():
+    """The regression the operator caught: `hub` was dropped from the label
+    when it was trimmed to fit the panel, so remote seats kept their ⚡ and
+    local ones lost it — the tree read as "remote agents are instrumented,
+    local ones aren't"."""
+    app = _app(board=_snapshot)
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        assert "⚡" in _label(app, "alpha"), _label(app, "alpha")
+        # …and an agent with no pane claims no wake state at all
+        assert "⚡" not in _label(app, "gamma")
+
+
+@pytest.mark.asyncio
+async def test_every_seat_wears_a_state_glyph_none_are_bare():
+    """`idle` and `no record` both used to render as a bare `·`, which is not
+    a mark. Six of eight real local seats looked like nothing at all."""
+    app = _app(board=_snapshot)
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        marks = {"🔴", "▶", "💤", "✖", "○", "⚠"}
+        for agent in ("alpha", "beta", "gamma"):
+            label = _label(app, agent)
+            assert label[0] in marks, f"{agent} starts bare: {label!r}"
+
+
+@pytest.mark.asyncio
+async def test_the_name_column_does_not_jitter_between_states():
+    """🔴 and 💤 are two cells wide, ▶ and ○ are one. Unpadded, the name
+    shifts sideways as an agent changes state.
+
+    The pair here is chosen to make padding LOAD-BEARING: one wide glyph, one
+    narrow, everything else identical. An earlier version of this test compared
+    ▶ against ○ — both narrow — so it passed with the padding removed entirely
+    (caught by mutating `_cell2` to a no-op; it survived).
+    """
+    from rich.cells import cell_len
+
+    def snap():
+        s = _snapshot()
+        # alpha: idle → 💤 (TWO cells).  beta: down → ✖ (ONE cell).
+        # Both wakeable, and NEITHER raises a hand — `waiting` always does, by
+        # construction, so a waiting agent can never be half of this pair.
+        s["agents"]["alpha"]["state"] = "idle"
+        s["agents"]["beta"].update(state="down", next=None)
+        return s
+
+    app = _app(board=snap)
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        wide, narrow = _label(app, "alpha"), _label(app, "beta")
+        assert wide.startswith("💤") and narrow.startswith("✖"), (wide, narrow)
+        assert "🙋" not in wide and "🙋" not in narrow, "a hand skews the prefix"
+        assert cell_len(wide.split("alpha")[0]) \
+            == cell_len(narrow.split("beta")[0]), (wide, narrow)
+
+
+@pytest.mark.asyncio
+async def test_the_boards_own_hub_phrase_survives_in_the_detail_pane():
+    """A ⚡-or-nothing column cannot say `✖ REGISTER`."""
+    def snap():
+        s = _snapshot()
+        s["agents"]["alpha"]["hub"] = "✖ REGISTER"
+        return s
+    app = _app(board=snap)
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        await _goto(app, pilot, "alpha")
+        detail = " ".join(str(w.render())
+                          for w in app.query_one("#detail").walk_children())
+        assert "✖ REGISTER" in detail
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_seat_says_so_and_names_its_class():
+    """`faculty` left the label; it must land somewhere, or the tree simply
+    lost the fact that some seats are deliberately never auto-started."""
+    app = _app(board=_snapshot)
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await _goto(app, pilot, "gamma")
+        detail = " ".join(str(w.render())
+                          for w in app.query_one("#detail").walk_children())
+        assert "not running" in detail
+        assert "faculty" in detail
         # the fleet summary took over the subtitle
         assert "need you" in app.sub_title
 
