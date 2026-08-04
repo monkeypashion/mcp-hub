@@ -119,6 +119,7 @@ def build_tree(
     this_machine: str,
     scoped_to: str | None = None,
     listings_for: Callable[[str], list[str]] | None = None,
+    placements: list[dict[str, Any]] | None = None,
     now: float,
 ) -> dict[str, Any]:
     """Merge roster + board + workspace registry + fleet snapshot into a tree.
@@ -133,6 +134,11 @@ def build_tree(
     """
     live = board.get("agents") or {}
     rows = workspaces.get("rows") or []
+    # Seat identity IS the agent name, by construction — the hub assigns it as
+    # `<repo>-<machine>`, the same rule the derived identity uses. So a
+    # placement attaches to a row by name and needs no second mapping to drift
+    # out of step.
+    by_seat = {p["seat"]: p for p in (placements or []) if p.get("seat")}
     machines = list(workspaces.get("machines") or [])
     for r in rows:
         if r.get("machine") and r["machine"] not in machines:
@@ -200,6 +206,7 @@ def build_tree(
             "hand": bool((rec.get("next") or {}).get("hand"))
             or rec.get("state") == "waiting",
             "rec": rec or None,
+            "placement": by_seat.get(name),
         }
         # A folder listed by three workspaces belongs to three workspaces —
         # that is exactly where multi-squad membership comes from, so the seat
@@ -236,6 +243,7 @@ def build_tree(
             "stale": stale,
             "hand": False,     # a hand is a board fact; no pane, no claim
             "rec": None,
+            "placement": by_seat.get(name),
         }
         repo = _repo_of(entry.get("project", ""), name, m)
         homes = [
