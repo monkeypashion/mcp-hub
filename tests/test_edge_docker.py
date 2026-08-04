@@ -295,3 +295,95 @@ def test_the_hub_api_client_targets_the_machine_placement_route():
 
     HubAPI(client=C(), token="t").pull_placements("box-9")
     assert seen["path"] == "/api/v1/machines/box-9/placements"
+
+
+# ---- the API endpoint, not a fake ------------------------------------------
+
+class TestSeatsEndpointAcceptsContainers:
+    """These go through the REAL route. The CLI tests above use a fake API and
+    could not see that the INSERT still demanded `folder` after validation had
+    stopped requiring it — a 500 on every container seat, found by curl."""
+
+    @staticmethod
+    def _client(tmp_path, monkeypatch):
+        monkeypatch.setenv("MCP_HUB_API_TOKEN", "t")
+        from starlette.testclient import TestClient
+
+        from mcp_hub.server import create_server
+        c = TestClient(create_server(db_path=tmp_path / "hub.db")
+                       .streamable_http_app())
+        c.__enter__()
+        c.post("/api/v1/machines", headers={"Authorization": "Bearer t"},
+               json={"name": "box", "os": "linux"})
+        return c
+
+    def test_a_container_seat_needs_no_folder(self, tmp_path, monkeypatch):
+        c = self._client(tmp_path, monkeypatch)
+        r = c.post("/api/v1/seats", headers={"Authorization": "Bearer t"},
+                   json={"repo": "o/x", "machine": "box", "identity": "web-box",
+                         "spec": {"image": "nginx:alpine"}})
+        assert r.status_code == 201, r.text
+        assert r.json()["spec"]["image"] == "nginx:alpine"
+
+    def test_a_worktree_seat_still_needs_one(self, tmp_path, monkeypatch):
+        c = self._client(tmp_path, monkeypatch)
+        r = c.post("/api/v1/seats", headers={"Authorization": "Bearer t"},
+                   json={"repo": "o/x", "machine": "box"})
+        assert r.status_code == 422 and "folder" in r.text
+
+    def test_the_spec_survives_the_round_trip_to_the_edge(self, tmp_path,
+                                                          monkeypatch):
+        """The edge reads seat_spec from the placement pull; a spec that does
+        not survive that trip means the executor has no image to run."""
+        c = self._client(tmp_path, monkeypatch)
+        h = {"Authorization": "Bearer t"}
+        c.post("/api/v1/seats", headers=h,
+               json={"repo": "o/x", "machine": "box", "identity": "web-box",
+                     "spec": {"image": "nginx:alpine", "ports": ["80:80"]}})
+        c.post("/api/v1/placements", headers=h,
+               json={"seat": "web-box", "machine": "box", "substrate": "docker"})
+        pulled = c.get("/api/v1/machines/box/placements", headers=h).json()
+        spec = pulled["placements"][0]["seat_spec"]["spec"]
+        assert spec == {"image": "nginx:alpine", "ports": ["80:80"]}
+
+    def test_a_non_object_spec_is_refused_not_stored(self, tmp_path, monkeypatch):
+        c = self._client(tmp_path, monkeypatch)
+        r = c.post("/api/v1/seats", headers={"Authorization": "Bearer t"},
+                   json={"repo": "o/x", "machine": "box", "spec": "nginx"})
+        assert r.status_code == 422
+
+    def test_an_old_database_gains_the_column_by_migration(self, tmp_path,
+                                                           monkeypatch):
+        """CREATE TABLE IF NOT EXISTS does nothing for a deployed hub, so the
+        column has to arrive by ALTER or every live hub keeps the old shape —
+        which is a 500 on read, not a graceful degrade."""
+        import sqlite3
+
+        dbp = tmp_path / "old.db"
+        conn = sqlite3.connect(dbp)
+        conn.executescript(
+            "CREATE TABLE api_seats (identity TEXT PRIMARY KEY, repo TEXT NOT"
+            " NULL, machine TEXT NOT NULL, folder TEXT NOT NULL, launch_args"
+            " TEXT NOT NULL DEFAULT '', class TEXT NOT NULL DEFAULT 'squad',"
+            " cloned_from TEXT NOT NULL DEFAULT '', archived INTEGER NOT NULL"
+            " DEFAULT 0, created REAL NOT NULL);"
+        )
+        conn.commit()
+        conn.close()
+
+        monkeypatch.setenv("MCP_HUB_API_TOKEN", "t")
+        from starlette.testclient import TestClient
+
+        from mcp_hub.server import create_server
+        with TestClient(create_server(db_path=dbp).streamable_http_app()) as c:
+            h = {"Authorization": "Bearer t"}
+            c.post("/api/v1/machines", headers=h,
+                   json={"name": "box", "os": "linux"})
+            r = c.post("/api/v1/seats", headers=h,
+                       json={"repo": "o/x", "machine": "box",
+                             "identity": "web-box",
+                             "spec": {"image": "busybox"}})
+            assert r.status_code == 201, r.text
+        cols = [x[1] for x in sqlite3.connect(dbp)
+                .execute("PRAGMA table_info(api_seats)")]
+        assert "spec" in cols

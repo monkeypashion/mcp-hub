@@ -573,7 +573,11 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
                 identity,
                 body["repo"],
                 body["machine"],
-                body["folder"],
+                # .get, not []: `folder` stopped being required for docker
+                # units above, and the INSERT kept demanding it — a 500 on
+                # every container seat, which the CLI-level tests could not
+                # see because they ran against a fake API.
+                body.get("folder", ""),
                 body.get("launch_args", ""),
                 body.get("class", "squad"),
                 _now(),
