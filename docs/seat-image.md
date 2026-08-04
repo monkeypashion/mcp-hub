@@ -84,6 +84,31 @@ Zero cli changes needed: hooks and statusline already resolve the marker.
   seat is containerized — placement state lives in the edge, presence lives
   in the registry, same as every other seat.
 
+## Permissions — the container is the sandbox
+
+Operator decision 2026-08-05 (card #360): a seat runs with
+`permissions.defaultMode: bypassPermissions`, so it can actually work.
+The first live seat proved the alternative is useless — it woke, went to
+work, and stopped on `git status` waiting for an approval nobody inside a
+container can give. Docker already bounds the blast radius; a second
+bound that no one can clear just means nothing happens.
+
+🔴 **THE RULE THAT KEEPS THIS SOUND — a seat must stay genuinely
+contained:**
+
+- **NO DOCKER SOCKET, ever.** `-v /var/run/docker.sock:...` in a seat spec
+  turns bypass mode from "sandboxed" into "root on the host". If a seat
+  ever needs to manage containers, that is the EDGE's job, from outside.
+- **Non-root user** (`seat`), as the image already does.
+- **No host mounts beyond its own `memory_volume`.** A seat with the
+  host's home mounted is not sandboxed by anything.
+- The comms allowlist stays alongside the mode, so a seat can still
+  register and report if the mode is ever disabled by policy.
+
+A seat that needs to violate any of these is not a seat — it is a
+privileged tool, and it should be an explicit operator act rather than a
+placement.
+
 ## Modes
 
 - **`interactive`** (v1): long-running claude session under tmux, registered

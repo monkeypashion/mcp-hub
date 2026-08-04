@@ -260,7 +260,25 @@ def hooks_settings_content() -> dict:
         # agents' state). No Bash/Edit/Write here: joining a hub is not a
         # licence to run commands — those grants are the operator's to
         # make, per repo.
-        "permissions": {"allow": list(SEAT_ALLOWED_TOOLS)},
+        "permissions": {
+            # THE CONTAINER IS THE SANDBOX (operator decision 2026-08-05,
+            # card #360). A seat that cannot run a command is an observer,
+            # not a worker — the first live seat woke, went to work, and
+            # stopped on `git status` with nobody inside to approve it.
+            # Docker already bounds the blast radius; bounding it a second
+            # time with a dialog nobody can answer only means no work
+            # happens.
+            #
+            # ⚠️ This is sound ONLY while the seat is genuinely contained:
+            # non-root user, no host mounts beyond its own memory volume,
+            # and NO DOCKER SOCKET. A spec that mounts the socket turns
+            # this from a sandbox into root on the host — see
+            # docs/seat-image.md.
+            "defaultMode": "bypassPermissions",
+            # Kept alongside the mode on purpose: if a policy ever disables
+            # it, the seat can still reach the hub to say it is stuck.
+            "allow": list(SEAT_ALLOWED_TOOLS),
+        },
         "hooks": {
             "Stop": [
                 {

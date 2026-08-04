@@ -544,8 +544,35 @@ def test_permissions_are_enumerated_not_server_wide():
     assert all(t.startswith("mcp__hub__") for t in allow)
 
 
-def test_no_bash_or_edit_permissions_are_granted():
-    # Registering on a hub is not a licence to run commands. Anything the
-    # seat's own work needs is the operator's grant to make, per repo.
+def test_the_allowlist_itself_names_no_bash_or_edit_rules():
+    # The allowlist stays the COMMS grant: hub tools only. What the seat may
+    # RUN is decided by the mode below, not by accreting Bash( rules here —
+    # that list would be endless to maintain and would drift per seat.
     allow = hooks_settings_content()["permissions"]["allow"]
     assert not any(t.startswith(("Bash(", "Edit", "Write")) for t in allow)
+
+
+def test_the_container_is_the_sandbox_so_the_seat_may_act():
+    """Operator decision 2026-08-05 (card #360, option A).
+
+    A seat that cannot run a command is an observer, not a worker: the
+    first live seat woke, went to work and stopped dead on `git status`
+    with nobody inside to approve it. Docker exists to bound the blast
+    radius; bounding it TWICE — once by the container, once by a dialog
+    nobody can answer — just means no work ever happens.
+
+    ⚠️ Only sound while the seat is GENUINELY contained: non-root user, no
+    host mounts beyond its own memory volume, and above all NO DOCKER
+    SOCKET. Mount the socket into a seat and this stops being a sandbox
+    and becomes root on the host.
+    """
+    mode = hooks_settings_content()["permissions"]["defaultMode"]
+    assert mode == "bypassPermissions"
+
+
+def test_the_comms_allowlist_survives_the_mode():
+    """Belt and braces, deliberately: if a policy ever disables that mode,
+    the seat must still be able to REGISTER — an agent that cannot reach
+    the hub cannot even report that it is stuck."""
+    perms = hooks_settings_content()["permissions"]
+    assert "mcp__hub__register" in perms["allow"]
