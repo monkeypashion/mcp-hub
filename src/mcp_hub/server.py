@@ -3766,6 +3766,7 @@ _CLI_SUBCOMMANDS = {
     "placements",
     "machines",
     "focus",
+    "seat-entry",
 }
 
 

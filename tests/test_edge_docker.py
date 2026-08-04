@@ -458,3 +458,22 @@ class TestSecretsStayOnTheMachine:
         DockerExecutor(r, {"ANTHROPIC_API_KEY": "sk-from-edge"}).execute(
             {"op": "materialize", "seat": "s"}, self.SPEC)
         assert "ANTHROPIC_API_KEY=sk-from-edge" in r.calls[-1]
+
+
+def test_create_argv_injects_seat_identity_last_so_it_wins():
+    """The container name IS the seat identity — a spec that claims a
+    different SEAT_IDENTITY must lose to the placement (docker: last -e
+    wins). Drift here = a container reporting one name to docker and
+    another to the hub."""
+    argv = DockerExecutor.create_argv(
+        "seat-a", {"image": "img", "env": {"SEAT_IDENTITY": "impostor"}}
+    )
+    pairs = [argv[i + 1] for i, a in enumerate(argv) if a == "-e"]
+    identity_values = [p for p in pairs if p.startswith("SEAT_IDENTITY=")]
+    # both present, ours LAST (docker applies later -e over earlier)
+    assert identity_values[-1] == "SEAT_IDENTITY=seat-a"
+
+
+def test_create_argv_injects_seat_identity_when_spec_has_no_env():
+    argv = DockerExecutor.create_argv("seat-b", {"image": "img"})
+    assert "SEAT_IDENTITY=seat-b" in argv

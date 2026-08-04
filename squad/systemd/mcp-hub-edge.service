@@ -11,6 +11,13 @@ Description=mcp-hub edge — reconcile this machine toward the hub's desired sta
 
 [Service]
 Type=oneshot
+# Seat credentials for `--env-from-host` (e.g. CLAUDE_CODE_OAUTH_TOKEN from
+# `claude setup-token`). A systemd user unit sees NO shell environment, so
+# without this file the edge can never inject a credential the hub named —
+# the seat would die at its door (exit 42) every pass. Optional (-) and
+# chmod 600: the file holds VALUES, which is exactly why they never go in
+# the unit file itself (unit files are world-readable and end up in git).
+EnvironmentFile=-%h/.mcp-hub/edge-env
 # Absolute path: systemd user units get a bare PATH with no ~/.local/bin, which
 # is the same gap that made `edge apply` die on a raw FileNotFoundError when it
 # was first run over ssh.

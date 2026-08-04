@@ -3889,6 +3889,139 @@ def heartbeat_daemon_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def seat_entry_command(args: argparse.Namespace) -> int:
+    """PID 1 of mcp-hub-seat — validate, prepare, launch (docs/seat-image.md).
+
+    Refusals are LOUD and coded: 42 credential (the factory's auth-death
+    code — never misread as a build failure), 43 any other contract
+    violation. Everything before launch is idempotent so a container
+    restart re-runs it safely.
+    """
+    from mcp_hub.seat import (
+        EXIT_AUTH,
+        EXIT_CONTRACT,
+        SeatContractError,
+        hooks_settings_content,
+        launch_argv,
+        marker_content,
+        mcp_json_content,
+        parse_seat_contract,
+        validate_seat_credentials,
+    )
+
+    verdict = validate_seat_credentials(os.environ)
+    if not verdict.ok:
+        print(f"seat-entry: REFUSED (auth): {verdict.error}", file=sys.stderr)
+        return EXIT_AUTH
+
+    try:
+        contract = parse_seat_contract(os.environ)
+    except SeatContractError as e:
+        print(f"seat-entry: REFUSED (contract): {e}", file=sys.stderr)
+        return EXIT_CONTRACT
+
+    if contract.mode == "headless":
+        # Reserved, deliberately unshipped: the structure exists so the
+        # factory merge is a flag not a fork, but shipping it untested
+        # would let a placement claim a mode nothing has ever run.
+        print(
+            "seat-entry: REFUSED (contract): SEAT_MODE=headless is "
+            "reserved but not yet shipped — run interactive, or build the "
+            "headless leg first (docs/seat-image.md, Modes).",
+            file=sys.stderr,
+        )
+        return EXIT_CONTRACT
+
+    workdir = pathlib.Path(
+        args.workdir or (pathlib.Path.home() / "work")
+    ).expanduser()
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    if contract.repo and not any(workdir.iterdir()):
+        clone = subprocess.run(
+            ["git", "clone", contract.repo, str(workdir)],
+            capture_output=True,
+            text=True,
+        )
+        if clone.returncode != 0:
+            print(
+                f"seat-entry: REFUSED (contract): clone of "
+                f"{contract.repo} failed: {clone.stderr.strip()}",
+                file=sys.stderr,
+            )
+            return EXIT_CONTRACT
+
+    # Re-parse with the (possibly just-cloned) repo's origin so the
+    # project derives exactly the way the cli derives it everywhere else.
+    contract = parse_seat_contract(
+        os.environ, origin_url=_git_remote_url(str(workdir))
+    )
+
+    # Identity marker — ASSIGNED identity wins because the repo is NOT
+    # opted into ~/.mcp-hub/config.json (derivation never applies).
+    marker = workdir / AGENT_MARKER_PATH
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(
+        json.dumps(marker_content(contract), indent=2), encoding="utf-8"
+    )
+
+    # .mcp.json generated from MCP_HUB_URL — never baked into the image.
+    (workdir / ".mcp.json").write_text(
+        json.dumps(mcp_json_content(contract), indent=2), encoding="utf-8"
+    )
+
+    # Hook settings: write only if absent. A memory_volume mounted at
+    # ~/.claude may carry a previous seat's (identical) settings — or an
+    # operator's deliberate ones, which are not ours to clobber.
+    settings_path = pathlib.Path.home() / ".claude" / "settings.json"
+    if settings_path.exists():
+        print(
+            f"seat-entry: {settings_path} exists — left untouched",
+            file=sys.stderr,
+        )
+    else:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(
+            json.dumps(hooks_settings_content(), indent=2), encoding="utf-8"
+        )
+
+    # Folder trust — the placement is the operator's explicit trust act.
+    from mcp_hub.edge import seed_first_launch
+
+    seed_first_launch(str(workdir))
+
+    lane = {"oauth": "subscription OAuth", "api-key": "API key", "both": (
+        "BOTH set — Claude Code's own hierarchy decides (unmeasured; "
+        "see docs/seat-image.md)"
+    )}[verdict.lane]
+    print(
+        f"seat-entry: {contract.identity} (project {contract.project}) "
+        f"mode={contract.mode} credential={lane}"
+    )
+
+    if args.prepare_only:
+        print("seat-entry: --prepare-only — not launching claude")
+        return 0
+
+    argv = launch_argv(contract, str(workdir))
+    launched = subprocess.run(argv, capture_output=True, text=True)
+    if launched.returncode != 0:
+        print(
+            f"seat-entry: launch failed: {launched.stderr.strip()}",
+            file=sys.stderr,
+        )
+        return 1
+    # PID 1 must outlive the detached tmux session or docker reaps the
+    # container while claude runs. Container stops when the session ends.
+    while True:
+        alive = subprocess.run(
+            ["tmux", "has-session", "-t", "seat"], capture_output=True
+        )
+        if alive.returncode != 0:
+            return 0
+        time.sleep(5)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mcp-hub",
@@ -4443,9 +4576,11 @@ def build_parser() -> argparse.ArgumentParser:
             "placements (machine token), realize worktree-substrate ones via "
             "the squad verbs, then report observed state BY ENUMERATION plus "
             "every .code-workspace file discovered — the workspace registry's "
-            "never-lose-track leg. Docker-substrate placements are skipped "
-            "loudly (the container credential story is undesigned). Run it "
-            "from the heal timer for continuous reconciliation."
+            "never-lose-track leg. Docker-substrate placements are realized "
+            "via the DockerExecutor (observed by `docker ps -a` enumeration; "
+            "an unreachable docker daemon refuses the pass rather than "
+            "guessing). Run it from the edge timer for continuous "
+            "reconciliation."
         ),
     )
     edge.add_argument("action", choices=["apply"], help="apply: one reconcile pass")
@@ -4474,6 +4609,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Pull, plan and print actions; execute nothing, report nothing",
+    )
+
+    seat_entry = sub.add_parser(
+        "seat-entry",
+        help="Container entrypoint: validate the seat contract, prepare, launch claude",
+        description=(
+            "PID 1 of mcp-hub-seat. Validates the env against "
+            "docs/seat-image.md (exit 42 = credential missing/implausible, "
+            "43 = contract violation), clones SEAT_REPO into the workdir "
+            "when empty, writes the identity marker + .mcp.json + hook "
+            "settings, then runs claude under tmux (session 'seat'). "
+            "Idempotent: a container restart re-runs it safely."
+        ),
+    )
+    seat_entry.add_argument(
+        "--workdir",
+        default=None,
+        help="Seat working directory (default: ~/work)",
+    )
+    seat_entry.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="Validate + write files, but do not launch claude (tests/debug)",
     )
 
     return parser
@@ -4539,6 +4697,8 @@ def main(argv: list[str] | None = None) -> int:
         return machines_command(args)
     if args.subcommand == "focus":
         return focus_command(args)
+    if args.subcommand == "seat-entry":
+        return seat_entry_command(args)
 
     parser.print_help()
     return 0

@@ -314,6 +314,13 @@ class DockerExecutor:
         argv += ["--restart", "no"]
         for k, v in (spec.get("env") or {}).items():
             argv += ["-e", f"{k}={v}"]
+        # The container name IS the seat identity, so SEAT_IDENTITY is
+        # injected from the placement rather than trusted from the spec —
+        # and injected AFTER spec env (docker: last -e wins) so a stale or
+        # hand-edited spec cannot make a container report one name to
+        # docker and another to the hub. Name/identity agreement is true
+        # by construction, not by convention.
+        argv += ["-e", f"SEAT_IDENTITY={seat}"]
         # SECRETS: the hub stores the NAME, this machine supplies the VALUE.
         #
         # A seat spec lives in the hub's SQLite and anything holding the
