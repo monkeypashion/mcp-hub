@@ -52,6 +52,11 @@ def collect_workspaces(
             "open_now": False,
             "registered": None,  # unknown until the hub answers
             "squad": "",
+            # The folder paths a workspace lists. Only DEFINITIONS carry them
+            # (edge reports a count, not a manifest), so a remote workspace
+            # nobody registered has none — which is why the tree attributes a
+            # remote agent to a machine but not always to a workspace.
+            "listings": [],
         }
 
     hub_reachable = True
@@ -90,6 +95,7 @@ def collect_workspaces(
                 "open_now": d.get("open_now", False),
                 "registered": d.get("registered", False),
                 "squad": "",
+                "listings": [],
             }
 
     for w in registry["definitions"]:
@@ -102,6 +108,7 @@ def collect_workspaces(
         if matched:
             rows[matched]["registered"] = True
             rows[matched]["squad"] = w.get("squad", "")
+            rows[matched]["listings"] = list(w.get("listings", []))
         else:
             rows[key] = {
                 "name": w["name"],
@@ -113,6 +120,7 @@ def collect_workspaces(
                 "open_now": False,
                 "registered": True,
                 "squad": w.get("squad", ""),
+                "listings": list(w.get("listings", [])),
             }
 
     # A hub that ANSWERED has told us everything it knows. Anything still
@@ -124,9 +132,24 @@ def collect_workspaces(
             if r["registered"] is None:
                 r["registered"] = False
 
+    # Every machine the fleet is known to have, so an agent named after a box
+    # that owns no workspace can still be PLACED on it. Derived from the rows
+    # alone, a machine with nothing on disk simply would not exist, and its
+    # agents would fall into "(machine unknown)" — visible, but wrong.
+    machines = {r["machine"] for r in rows.values() if r["machine"]}
+    machines.add(this_machine)
+    if hub_reachable:
+        try:
+            machines.update(
+                m["name"] for m in api.list_machines() if m.get("name")
+            )
+        except Exception:  # noqa: BLE001 — enrolment is a bonus source, not a gate
+            pass
+
     return {
         "hub_reachable": hub_reachable,
         "note": note,
+        "machines": sorted(machines),
         # Returned rather than re-derived by the view: the caller already
         # resolved it, and a second derivation is a second chance to disagree
         # (squad deriving from basename while the cli derives from the git
