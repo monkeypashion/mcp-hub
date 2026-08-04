@@ -4,10 +4,14 @@ Every previous presentation was "tested" by rendering it and looking, which is
 how six of them shipped defects the first click found. Textual's Pilot sends
 real clicks and key presses through the real app, so these fail for the same
 reasons the operator's session fails.
+
+The left panel is now a tree, so navigation here is arrow keys through the real
+widget rather than clicks on list rows — still real input, still the same app.
 """
 from __future__ import annotations
 
 import pytest
+from textual.widgets import Tree
 
 from mcp_hub.settings_app import SettingsApp
 
@@ -50,7 +54,7 @@ def _app(ran=None, fail=False):
                       # assertion here can tell which one the model asked for,
                       # and a mutant hardcoding one of them passes.
                       model_for=_model_for, squad_bin="/usr/bin/SQUAD",
-                      hub_bin="/usr/bin/HUB")
+                      hub_bin="/usr/bin/HUB", this_machine="thisbox")
     if ran is not None:
         def apply(exe, argv, label, value):
             ran.append((exe, argv))
@@ -60,21 +64,38 @@ def _app(ran=None, fail=False):
     return app
 
 
+async def _goto(app, pilot, agent: str) -> None:
+    """Move the cursor onto one seat through the real widget."""
+    for node in app._agent_nodes():
+        if (node.data or {}).get("agent") == agent:
+            app.query_one("#fleet", Tree).move_cursor(node)
+            await pilot.pause()
+            await pilot.pause()
+            return
+    raise AssertionError(f"{agent} is not in the tree")
+
+
+def _detail_text(app) -> str:
+    pane = app.query_one("#detail")
+    return " ".join(str(w.render()) for w in pane.walk_children())
+
+
 @pytest.mark.asyncio
-async def test_clicking_every_agent_does_not_crash():
-    """THE crash the operator hit: clicking one no-settings agent after another
+async def test_walking_the_whole_tree_does_not_crash():
+    """THE crash the operator hit: moving from one no-settings agent to another
     mounted a second widget with the same id, and DuplicateIds took the whole
     app down. remove_children() is asynchronous — the mounts were racing it.
     """
     app = _app()
     async with app.run_test(size=(110, 30)) as pilot:
         await pilot.pause()
-        items = app.query("#agents > ListItem")
-        for i in range(len(AGENTS)):
-            await pilot.click(items[i])
+        for _ in range(12):                      # to the very top
+            await pilot.press("up")
             await pilot.pause()
+        for _ in range(12):                      # and all the way back down
+            await pilot.press("down")
             await pilot.pause()
-        assert app.agent_ix == len(AGENTS) - 1
+        assert app.selected["agent"] == "real-two", app.selected
 
 
 @pytest.mark.asyncio
@@ -90,12 +111,10 @@ async def test_widget_ids_are_never_reused_between_renders():
     app = _app()
     async with app.run_test(size=(110, 30)) as pilot:
         await pilot.pause()
-        items = app.query("#agents > ListItem")
         seen: set[str] = set()
         for _ in range(3):
-            for ix in (2, 3):
-                await pilot.click(items[ix])
-                await pilot.pause()
+            for name in ("real", "real-two"):
+                await _goto(app, pilot, name)
                 ids = {s.id for s in app.query("Select")}
                 assert ids, "controls vanished after switching agents"
                 assert not (ids & seen), f"id reused across renders: {ids & seen}"
@@ -109,7 +128,7 @@ async def test_it_opens_on_an_agent_that_has_settings():
     app = _app()
     async with app.run_test(size=(110, 30)) as pilot:
         await pilot.pause()
-        assert app.agents[app.agent_ix]["agent"] == "real"
+        assert app.selected["agent"] == "real", app.selected
         assert app.query("Select"), "opened on an agent with nothing to change"
 
 
@@ -118,13 +137,10 @@ async def test_a_folder_with_no_identity_explains_itself():
     app = _app()
     async with app.run_test(size=(110, 30)) as pilot:
         await pilot.pause()
-        await pilot.click(app.query("#agents > ListItem")[0])
-        await pilot.pause()
+        await _goto(app, pilot, "scratch-one")
         # Assert on the RENDERED pane, not a widget internal: what matters is
         # that the operator can read it.
-        pane = app.query_one("#detail")
-        text = " ".join(str(w.render()) for w in pane.children).lower()
-        assert "no hub identity" in text, text[:200]
+        assert "no hub identity" in _detail_text(app).lower()
         assert not app.query("Select"), "offered controls for a folder with none"
 
 
@@ -181,65 +197,3 @@ async def test_every_editable_row_shows_its_current_value_as_selected():
         await pilot.pause()
         values = sorted(str(s.value) for s in app.query("Select"))
         assert values == ["hearing", "off"], values
-
-
-WS_ROWS = {
-    "hub_reachable": True,
-    "note": "",
-    "rows": [
-        {"name": "runtime", "machine": "dev-vm-1", "path": "/p/runtime.code-workspace",
-         "folders": 4, "error": "", "on_disk": True, "open_now": True,
-         "registered": True, "squad": "runtime"},
-        {"name": "feral", "machine": "dev-vm-1", "path": "/p/feral.code-workspace",
-         "folders": 1, "error": "", "on_disk": True, "open_now": False,
-         "registered": False, "squad": ""},
-        {"name": "ghost", "machine": "dev-vm-1", "path": "",
-         "folders": 0, "error": "", "on_disk": False, "open_now": False,
-         "registered": True, "squad": ""},
-    ],
-}
-
-
-@pytest.mark.asyncio
-async def test_workspaces_view_toggles_and_shows_drift():
-    """'w' swaps the detail pane to the manager view: every workspace with its
-    three truth columns, drift loud (feral = not registered, ghost = no file),
-    and 'w' again returns to the agent detail."""
-    app = _app()
-    app._workspaces_for = lambda: WS_ROWS
-    async with app.run_test(size=(110, 30)) as pilot:
-        await pilot.pause()
-        await pilot.press("w")
-        await pilot.pause()
-        text = "\n".join(
-            str(w.render()) for w in app.query("Static")
-        )
-        assert "WORKSPACES" in text
-        assert "runtime" in text and "● open" in text
-        # Drift is still named in WORDS, not left to a glyph — the columns
-        # went short (✗ hub / ✗ disk) so rows stay aligned, and the reason
-        # moved to the end of the line where it still reads loudly.
-        assert "not registered" in text          # feral, loud
-        # NOT "ghost": the fixture has a row NAMED ghost, so that assertion
-        # passed while the drift text was empty (caught by mutating the tail
-        # away — it survived). Assert the wording only the tail can produce.
-        assert "registered, no file" in text     # ghost, loud
-        assert "✗ hub" in text and "✗ disk" in text
-        await pilot.press("w")
-        await pilot.pause()
-        text = "\n".join(str(w.render()) for w in app.query("Static"))
-        assert "not registered" not in text      # back on agent detail
-
-
-@pytest.mark.asyncio
-async def test_workspaces_view_survives_collector_failure():
-    app = _app()
-    def boom():
-        raise RuntimeError("registry exploded")
-    app._workspaces_for = boom
-    async with app.run_test(size=(110, 30)) as pilot:
-        await pilot.pause()
-        await pilot.press("w")
-        await pilot.pause()
-        text = "\n".join(str(w.render()) for w in app.query("Static"))
-        assert "registry exploded" in text       # named, not crashed

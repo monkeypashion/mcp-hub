@@ -63,7 +63,8 @@ def _snapshot(state_beta="waiting"):
 def _app(board=None, ran=None, dark=None):
     app = SettingsApp(AGENTS, scoped_to=None, model_for=_model_for,
                       squad_bin="/usr/bin/SQUAD", hub_bin="/usr/bin/HUB",
-                      board_for=board, dark=dark, poll_seconds=3600)
+                      board_for=board, dark=dark, poll_seconds=3600,
+                      this_machine="thisbox")
     if ran is not None:
         def apply(exe, argv, label, value):
             ran.append((exe, argv))
@@ -72,21 +73,137 @@ def _app(board=None, ran=None, dark=None):
     return app
 
 
+def _label(app, agent: str) -> str:
+    """One seat's rendered row in the tree, as the operator reads it."""
+    for node in app._agent_nodes():
+        if (node.data or {}).get("agent") == agent:
+            return node.label.plain
+    raise AssertionError(f"{agent} is not in the tree")
+
+
+async def _goto(app, pilot, agent: str) -> None:
+    from textual.widgets import Tree
+    for node in app._agent_nodes():
+        if (node.data or {}).get("agent") == agent:
+            app.query_one("#fleet", Tree).move_cursor(node)
+            await pilot.pause()
+            await pilot.pause()
+            return
+    raise AssertionError(f"{agent} is not in the tree")
+
+
 # ---- the live roster and detail ----
 
 @pytest.mark.asyncio
-async def test_the_roster_wears_the_board_state():
+async def test_the_tree_wears_the_board_state():
     app = _app(board=_snapshot)
     async with app.run_test(size=(120, 34)) as pilot:
         await pilot.pause()
         await pilot.pause()
-        line0 = app.query_one("#live-0").render()
-        line1 = app.query_one("#live-1").render()
-        assert "Fable" in str(line0) and "working" in str(line0)
-        assert "waiting" in str(line1) and "2m" in str(line1)
-        assert "🙋" in str(line1)                       # the hand rides the roster
-        # an agent the scan doesn't know keeps its class line, not garbage
-        assert str(app.query_one("#live-2").render()) == "faculty"
+        assert "19%" in _label(app, "alpha")
+        assert "working" in _label(app, "alpha")
+        # The model name left the label when it outgrew the panel — it must
+        # still be readable, one pane over.
+        detail = " ".join(str(w.render())
+                          for w in app.query_one("#detail").walk_children())
+        assert "Fable" in detail
+        assert "waiting" in _label(app, "beta") and "2m" in _label(app, "beta")
+        assert "🙋" in _label(app, "beta")           # the hand rides the row
+        # an agent the scan doesn't know says so; it does not borrow a state
+        assert "○" in _label(app, "gamma")
+        assert "waiting" not in _label(app, "gamma")
+
+
+@pytest.mark.asyncio
+async def test_a_local_seat_shows_its_wake_marker_like_a_remote_one_does():
+    """The regression the operator caught: `hub` was dropped from the label
+    when it was trimmed to fit the panel, so remote seats kept their ⚡ and
+    local ones lost it — the tree read as "remote agents are instrumented,
+    local ones aren't"."""
+    app = _app(board=_snapshot)
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        assert "⚡" in _label(app, "alpha"), _label(app, "alpha")
+        # …and an agent with no pane claims no wake state at all
+        assert "⚡" not in _label(app, "gamma")
+
+
+@pytest.mark.asyncio
+async def test_every_seat_wears_a_state_glyph_none_are_bare():
+    """`idle` and `no record` both used to render as a bare `·`, which is not
+    a mark. Six of eight real local seats looked like nothing at all."""
+    app = _app(board=_snapshot)
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        marks = {"🔴", "▶", "💤", "✖", "○", "⚠"}
+        for agent in ("alpha", "beta", "gamma"):
+            label = _label(app, agent)
+            assert label[0] in marks, f"{agent} starts bare: {label!r}"
+
+
+@pytest.mark.asyncio
+async def test_the_name_column_does_not_jitter_between_states():
+    """🔴 and 💤 are two cells wide, ▶ and ○ are one. Unpadded, the name
+    shifts sideways as an agent changes state.
+
+    The pair here is chosen to make padding LOAD-BEARING: one wide glyph, one
+    narrow, everything else identical. An earlier version of this test compared
+    ▶ against ○ — both narrow — so it passed with the padding removed entirely
+    (caught by mutating `_cell2` to a no-op; it survived).
+    """
+    from rich.cells import cell_len
+
+    def snap():
+        s = _snapshot()
+        # alpha: idle → 💤 (TWO cells).  beta: down → ✖ (ONE cell).
+        # Both wakeable, and NEITHER raises a hand — `waiting` always does, by
+        # construction, so a waiting agent can never be half of this pair.
+        s["agents"]["alpha"]["state"] = "idle"
+        s["agents"]["beta"].update(state="down", next=None)
+        return s
+
+    app = _app(board=snap)
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        wide, narrow = _label(app, "alpha"), _label(app, "beta")
+        assert wide.startswith("💤") and narrow.startswith("✖"), (wide, narrow)
+        assert "🙋" not in wide and "🙋" not in narrow, "a hand skews the prefix"
+        assert cell_len(wide.split("alpha")[0]) \
+            == cell_len(narrow.split("beta")[0]), (wide, narrow)
+
+
+@pytest.mark.asyncio
+async def test_the_boards_own_hub_phrase_survives_in_the_detail_pane():
+    """A ⚡-or-nothing column cannot say `✖ REGISTER`."""
+    def snap():
+        s = _snapshot()
+        s["agents"]["alpha"]["hub"] = "✖ REGISTER"
+        return s
+    app = _app(board=snap)
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        await _goto(app, pilot, "alpha")
+        detail = " ".join(str(w.render())
+                          for w in app.query_one("#detail").walk_children())
+        assert "✖ REGISTER" in detail
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_seat_says_so_and_names_its_class():
+    """`faculty` left the label; it must land somewhere, or the tree simply
+    lost the fact that some seats are deliberately never auto-started."""
+    app = _app(board=_snapshot)
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await _goto(app, pilot, "gamma")
+        detail = " ".join(str(w.render())
+                          for w in app.query_one("#detail").walk_children())
+        assert "not running" in detail
+        assert "faculty" in detail
         # the fleet summary took over the subtitle
         assert "need you" in app.sub_title
 
@@ -96,10 +213,7 @@ async def test_the_live_section_shows_the_blocking_question_with_answers():
     app = _app(board=_snapshot)
     async with app.run_test(size=(120, 34)) as pilot:
         await pilot.pause()
-        items = app.query("#agents > ListItem")
-        await pilot.click(items[1])                    # beta, the waiting one
-        await pilot.pause()
-        await pilot.pause()
+        await _goto(app, pilot, "beta")                # the waiting one
         texts = " ".join(str(w.render()) for w in app.query("#live Static"))
         assert "rm -rf" in texts                       # the question, verbatim
         assert "deploy?" in texts                      # the open card's ask
@@ -113,10 +227,7 @@ async def test_answer_buttons_run_squad_answer_fail_closed_verb():
     app = _app(board=_snapshot, ran=ran)
     async with app.run_test(size=(120, 34)) as pilot:
         await pilot.pause()
-        items = app.query("#agents > ListItem")
-        await pilot.click(items[1])
-        await pilot.pause()
-        await pilot.pause()
+        await _goto(app, pilot, "beta")
         await pilot.click(app.query("#live Button").first())
         await pilot.pause()
         await pilot.pause()
@@ -130,10 +241,7 @@ async def test_a_working_agent_gets_no_answer_buttons():
     app = _app(board=lambda: _snapshot(state_beta="working"))
     async with app.run_test(size=(120, 34)) as pilot:
         await pilot.pause()
-        items = app.query("#agents > ListItem")
-        await pilot.click(items[1])
-        await pilot.pause()
-        await pilot.pause()
+        await _goto(app, pilot, "beta")
         assert not list(app.query("#live Button"))
 
 
@@ -158,10 +266,10 @@ async def test_n_jumps_to_the_agent_that_needs_you():
     async with app.run_test(size=(120, 34)) as pilot:
         await pilot.pause()
         await pilot.pause()
-        assert app.agent_ix == 0
+        assert app.selected["agent"] == "alpha"
         await pilot.press("n")
         await pilot.pause()
-        assert app.agents[app.agent_ix]["agent"] == "beta"
+        assert app.selected["agent"] == "beta"
 
 
 # ---- theme ----
@@ -312,36 +420,38 @@ async def test_polling_a_waiting_agent_does_not_crash_or_churn_its_buttons():
     async with app.run_test(size=(120, 34)) as pilot:
         # WAIT for the mount-time poll to be APPLIED before touching anything.
         # It runs on a worker thread, so whether it lands before or after the
-        # click is pure scheduling — and it is the difference between the live
-        # section rendering None and rendering beta, i.e. a legitimately
+        # selection is pure scheduling — and it is the difference between the
+        # live section rendering None and rendering beta, i.e. a legitimately
         # different render key. Racing it made this test fail ~50% of runs.
         for _ in range(50):
             await pilot.pause()
             if "beta" in (app.board.get("agents") or {}):
                 break
         assert "beta" in (app.board.get("agents") or {}), "board data never arrived"
-        items = app.query("#agents > ListItem")
-        await pilot.click(items[1])                    # beta, the waiting one
-        await pilot.pause()
-        await pilot.pause()
+        await _goto(app, pilot, "beta")                # the waiting one
         key_after_select = app._live_key
         assert key_after_select is not None, "live section never rendered beta"
+        gen_after_select = app._gen
         for _ in range(6):                             # several poll applications
             app._apply_board(snapshot())
             await pilot.pause()
         assert app.is_running                          # the crash, pinned
         buttons = list(app.query("Button"))
         assert len(buttons) == 3, f"{len(buttons)} buttons — duplicate mounts survived"
-        # The RENDER KEY, not the _gen counter. _gen is bumped by every
-        # rebuild from any source, including the mount-time poll whose worker
-        # lands at a nondeterministic point relative to the click — keying the
-        # assertion on it made this test fail ~50% of runs on the very commit
-        # it protects, and I nearly blamed an innocent merge for it
-        # (2026-07-29 night). The invariant that actually matters is that a
-        # sub-minute tick does not CHANGE WHAT WOULD BE RENDERED, so nothing
-        # under the operator's pointer is torn down.
+        # BOTH the render key AND the rebuild counter, because each is blind
+        # where the other sees. The key alone cannot detect a lost dedup — a
+        # rebuild with an unchanged key leaves _live_key equal, so deleting
+        # the early-out sailed through a key-only assertion (measured
+        # 2026-08-04). _gen alone was flaky when the mount-time poll's worker
+        # raced the selection and bumped it legitimately (2026-07-29 night —
+        # ~50% failures on the very commit it protects). The wait-for-data
+        # loop above ends that race: after selection, a sub-minute tick must
+        # neither change what would be rendered nor rebuild the section that
+        # renders it.
         assert app._live_key == key_after_select, \
             "sub-minute timer ticks changed the live render key"
+        assert app._gen == gen_after_select, \
+            "sub-minute timer ticks rebuilt the live section under the pointer"
 
 
 @pytest.mark.asyncio
@@ -371,7 +481,7 @@ async def test_rebuilding_a_waiting_agents_live_section_repeatedly_does_not_cras
             await pilot.pause()
             if "beta" in (app.board.get("agents") or {}):
                 break
-        await pilot.click(app.query("#agents > ListItem")[1])   # beta, waiting
+        await _goto(app, pilot, "beta")                # beta, waiting
         await pilot.pause()
         for _ in range(8):
             app._apply_board(snapshot())

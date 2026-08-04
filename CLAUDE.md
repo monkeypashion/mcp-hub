@@ -86,6 +86,43 @@ When in doubt: `send` for one agent, `post` for a topic, `broadcast` for your sq
 
 For low-prio DMs, the registry binding is the liveness gate — if the agent's session crashes, the heartbeat daemon dies and the activity-based reaper drops the binding. So `is_idle=1` on a bound agent is meaningful indefinitely; long-idle bound agents still receive Case 1 wakes correctly.
 
+## Focus mode — the third state
+
+`focus(agent_name, minutes=60, reason="")` — suppress your own wakes for a
+bounded time. `minutes=0` ends it. Also `mcp-hub focus [minutes] [--off]
+[--reason ...]`.
+
+The hub knows two states, **in a turn** and **idle**, and treats idle as safe
+to interrupt. But an agent babysitting a deploy or tailing a log is
+idle-at-the-keyboard and *operationally* busy, and the hub cannot see that kind
+of busy — the only defence used to be a convention asking senders to hold off,
+which fails exactly when the fleet is busy enough to need it.
+
+- **Nothing is dropped.** Messages queue as normal and surface at the next
+  Stop-hook boundary. Focus decides whether they *interrupt*, never whether
+  they arrive.
+- **`urgent` pierces it**, deliberately. A focus that swallowed "production
+  incident" is one nobody would dare switch on, and an unusable silencer just
+  returns everyone to the convention it replaced.
+- **It expires on its own** (default 60 min, hard cap 480). The stored value is
+  an EXPIRY, not a flag — that is the safety design, not a convenience. A
+  silencer that can be left on forever is a silent-drop bug waiting to happen,
+  and this codebase has shipped enough of those.
+- **It is visible**: `list_agents()` shows `🔕` with the time remaining, and a
+  sender who is queued behind it is told *"focus mode, 20m left — NOT
+  offline"*. A silencer nobody can see turns a delayed message into an
+  apparently-ignored one, and sends the sender hunting for a relaunch.
+
+The gate lives in `push_channel`, the single function every wake funnels
+through — DMs, channel posts and broadcasts alike. That is deliberate: a
+silencer covering four of five routes is worse than none, because it gets
+trusted. Priority rides in the notification `meta`, which every call site
+already populates.
+
+Focus is **attention**, not membership or subscription: `mute_squad` silences
+one squad permanently, `subscribe_channel` decides which channels can wake you
+at all, and focus silences *everything except urgent*, briefly.
+
 ## Channels-based idle-wake
 
 If you launch your Claude Code session with `--dangerously-load-development-channels server:hub` (or `--channels plugin:hub@...` once the marketplace plugin lands), incoming DMs and broadcasts wake your session from idle — no polling needed. After launch, call `register()` so the hub binds your session for push.
@@ -371,10 +408,88 @@ The launch dance is deliberately **not** taught to click these: auto-trusting
 arbitrary repo content defeats the point of the prompt. Seeding makes it an
 explicit act by whoever authorised the transport.
 
+## The fleet tree — one left panel, machines → workspaces → seats
+
+The board's left panel is a **tree**, and it replaced two surfaces that were
+always projections of one structure: a flat roster of this machine's agents,
+and a separate `w` keystroke listing every workspace on every box.
+
+```
+▾ fireblade-wsl · this machine
+  ▾ ◉ showcase
+      🔴 ⚡ 🙋 mcp-hub-fireblade-wsl    42% waiting 4m
+      ▶  ⚡ dreamteam-fireblade         18% working
+      ○     pc-cleanup-fireblade-wsl          ← enrolled, not running
+  ▸ ● xport
+  ▸ ○ feral            not registered         ← drift, in words
+▸ dev-vm-1 · remote   ⚠ 1 drift
+```
+
+**Two glyph columns, one vocabulary, and every row wears a mark.** State:
+`🔴` waiting · `▶` working · `💤` idle · `✖` down · `○` not running ·
+`⚠` not reporting. Wake: `⚡` or blank. `💤`/`⚡` are the hub's own
+`list_agents` vocabulary, so one thing looks the same wherever it appears.
+
+Narrow glyphs are padded to two cells (`_cell2`) — `🔴` and `💤` are
+double-width, `▶ ✖ ○` are not, and unpadded the name column shifts sideways
+as an agent changes state. Beware when testing this: a pair of *narrow*
+glyphs proves nothing, which is how the first version of that test passed
+with the padding removed entirely.
+
+The label is a summary, not the record. `faculty`/`squad`, the model name,
+and the board's full `hub` phrase (`✖ REGISTER` says what `⚡`-or-nothing
+cannot) all live in the detail pane — the tree lost each of them once by
+being trimmed to fit, so anything taken off a row has to land somewhere.
+
+Three levels, and the middle one carries the three truth columns below.
+This machine opens expanded, other boxes folded — you act on the box you are
+sitting at. `e` expands everything; `n` still jumps to the next raised hand,
+now in tree order.
+
+**A remote seat is visibly thinner than a local one, on purpose.** Local seats
+come from `squad board --json`, which scraped their panes — state, context,
+waiting time are real. Remote seats come from `~/.mcp-hub/fleet-board.json`,
+the daemons' fleet snapshot, which carries presence and *nothing else*. There
+is no pane to scrape on another machine, and smoothing that over is the
+"delivered live" mistake in a new costume.
+
+**A stale snapshot reads as `not reporting`, never as a quiet fleet.** Past 5
+minutes (`fleet_tree.FLEET_STALE_SECONDS`) every remote state becomes
+`unknown` and the machine node says so — an instrument that stopped being
+written must not be read as a measurement. `ts: 0` (no file at all) is stale
+too, or an absent instrument would read as a perfect one.
+
+**Nothing is dropped.** A seat whose name matches no enrolled machine lands
+under `(machine unknown)` rather than vanishing. Machine attribution is
+`-<machine>` *containment*, longest match wins — not `endswith`, because
+`mcp-hub-fireblade-wsl-xport` is a real transport-suffixed name that would
+otherwise be homeless.
+
+The join is `fleet_tree.build_tree` — pure data, tested without a terminal.
+The widget only renders it. Note that **tree labels carry resolved hex, not
+CSS variables**, so `action_toggle_theme` has to relabel; and a **Tree clips
+rather than wraps**, so a label that outgrows the panel fails silently — the
+width is measured in `test_workspace_view.py`, which is what caught the
+machine label overflowing when it carried seat counts.
+
+### Ctrl+P — the command palette
+
+Every verb, by typing instead of by keystroke. Focus (30m/1h/2h/off) for the
+selected seat, `answer yes|no|always`, restart/stop/start, register a
+workspace, and *go to* any seat or workspace by name.
+
+The list is built by `SettingsApp.palette_commands()`, not by the provider, so
+it is testable without opening a palette and there is only one list to keep
+current. **A command is only offered where it can actually be performed**:
+`focus` is a hub fact and works by name from anywhere, but `answer` and
+`restart` are tmux on *this* box, so they never appear for a remote seat.
+Same rule as the settings rows — the panel cannot offer an edit the underlying
+verb cannot make.
+
 ## Workspace manager — three truth columns
 
-The board's **`w`** view (and `mcp-hub workspaces list`, the same data as text)
-answers one question per workspace, from three independent sources:
+The tree's workspace level (and `mcp-hub workspaces list`, the same data as
+text) answers one question per workspace, from three independent sources:
 
 ```
 registered   the hub's /api/v1 registry — a DEFINITION someone made
@@ -407,6 +522,28 @@ mcp-hub workspaces register --all --squad dreamteam
 mcp-hub workspaces register ~/Projects/squad.code-workspace
 ```
 
+### Removing a workspace is TWO acts, so it is two verbs
+
+```bash
+squad teardown workspace ~/Projects/xport2.code-workspace --dry-run
+squad teardown workspace ~/Projects/xport2.code-workspace --remove-workspace --yes
+mcp-hub workspaces remove xport2 --dry-run          # then --yes
+```
+
+The first removes the **file**; the second removes the **hub's definition**.
+Do only the first and the definition survives as a ghost (`✗ disk`,
+"registered, no file"); do only the second and the file becomes feral
+(`✗ hub`). The manager shows both, in both directions, on purpose — so pick
+deliberately rather than assuming one verb did both.
+
+`remove` refuses without `--yes` (there is no archive for definitions — unlike
+seats, which the hub only marks archived) and **refuses a name defined on two
+machines** rather than resolving it, because deleting the wrong machine's
+definition is silent and `--machine` is one flag away. In the board, a ghost
+row offers **Deregister workspace** — hub-side, so it works from any machine,
+unlike register. A workspace that still has a file is deliberately NOT one
+keystroke from becoming feral.
+
 **Register before reading the drift column.** Until a workspace is POSTed to
 the hub, *every* workspace in the fleet is unregistered, so the column says
 the same thing about all of them and means nothing. Registering is what makes
@@ -422,6 +559,77 @@ machine that ever ran a bare `mcp-hub board`. The endpoint shipped before the
 sender did, which meant the column was blank fleet-wide while looking like a
 working feature; if you add a fourth column, add its producer in the same
 change.
+
+## Driving the fleet from any node — seats and placements
+
+The split that makes a fleet drivable from anywhere: a **seat** is WHAT may
+run (identity, repo, folder, launch args); a **placement** is WHERE it runs and
+whether it should be running. Separating them is what lets a seat move machines
+without changing what it is.
+
+```bash
+mcp-hub seats list
+mcp-hub seats add --repo org/x --folder /srv/x --machine dev-vm-1
+mcp-hub placements set --seat x-dev-vm-1 --machine dev-vm-1   # -> running
+mcp-hub placements set <id> stopped
+mcp-hub placements reclaim <id> --yes        # harvest memory, verify, DESTROY
+mcp-hub placements list
+```
+
+**Writing a placement schedules nothing.** It records desired state; the named
+machine's `mcp-hub edge apply` pulls it, acts, and reports what it OBSERVED.
+So `status` is the honest word — `converged`, `diverged`, or `pending-edge`,
+which means *no edge has run since you asked*. `placements list` says so
+explicitly when anything is pending, because the likeliest cause is the design's
+own gap: **`edge apply` is a one-shot and nothing schedules it by default.**
+
+`reclaim` is its own verb rather than a value of `desired`, because it harvests
+then DESTROYS — a destroy you can reach by typing a word into a state field is
+a destroy that happens by accident.
+
+Identity is **assigned by the hub** when a seat is created, never derived at the
+far end: a container's hostname must not be able to name a seat.
+
+### Making it actually converge — the edge timer
+
+Desired state is inert until something reconciles it. Install the units once
+per machine:
+
+```bash
+ln -sfn ~/Projects/code/monkeypashion/mcp-hub/squad/systemd/mcp-hub-edge.service ~/.config/systemd/user/
+ln -sfn ~/Projects/code/monkeypashion/mcp-hub/squad/systemd/mcp-hub-edge.timer   ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now mcp-hub-edge.timer
+```
+
+Every 2 minutes, matching `squad-heal`'s cadence — and **its own unit**, not
+folded into `squad-heal.service`: heal keeps live agents reachable and must not
+stop doing that because a reconcile pass failed (a `oneshot` that fails takes
+its whole ExecStart chain with it). `RandomizedDelaySec=20` so the fleet does
+not reconcile on the same second after a shared outage, which is the one moment
+the hub is least able to serve it. `ExecStart` names the venv binary
+absolutely — systemd user units get a bare PATH with no `~/.local/bin`, the
+same gap that made `edge apply` die on a raw `FileNotFoundError` over ssh.
+
+### Machine tokens — and how to recover one
+
+Each machine authenticates its edge passes with its own token:
+
+```bash
+mcp-hub machines enrol            # first time; writes ~/.mcp-hub/machine.token
+mcp-hub machines rotate           # recovery: new token, old one dies
+```
+
+Both are returned **exactly once** — the hub stores only a hash — so the client
+**persists before it prints**. That order is the whole lesson: both machines in
+this fleet lost their original tokens on 2026-07-30 to a shell pipeline that
+printed and never saved, which left `edge apply` running on the OPERATOR token,
+i.e. one credential that drives every machine.
+
+`rotate` overwrites the file without `--force`, deliberately — the situation it
+exists for is a file that is stale or missing. It is **operator-only**: a
+machine that can rotate its own credential is a machine that can lock the
+operator out of it, and the recovery path for *that* is the one that was
+already missing.
 
 ## Stop hook — auto-surface queued messages
 

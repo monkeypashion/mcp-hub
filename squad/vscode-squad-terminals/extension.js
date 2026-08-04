@@ -298,6 +298,18 @@ function squadExec(args, agent) {
   });
 }
 
+// Same shape for the hub CLI. Separate binary, so a caller cannot accidentally
+// pass a hub verb to `squad` and get a confusing "unknown command" toast.
+function hubExec(args, agent) {
+  cp.execFile(MCP_HUB, args, { timeout: 30000 }, (err, _out, stderr) => {
+    if (err) {
+      vscode.window.showErrorMessage(
+        `mcp-hub ${args[0]} ${agent}: ${stderr || err.message}`
+      );
+    }
+  });
+}
+
 // Context-menu commands may be invoked as (clickedTerminal) or — when tabs
 // are multi-selected — as (clickedTerminal, selectedTerminals[]). Resolve
 // every selected agent so actions apply to the whole selection.
@@ -822,6 +834,39 @@ function activate(context) {
       )
     );
   }
+
+  // ---- focus (do not disturb) ----
+  // Talks to the HUB, not the roster: focus is per-agent attention state held
+  // server-side, so unlike model/effort there is nothing local to write and
+  // nothing to apply on next launch — it takes effect immediately.
+  //
+  // Durations rather than a toggle because focus is bounded BY DESIGN: the
+  // hub stores an expiry, not a flag, so "on" without a length is not a state
+  // it can represent. Offering a bare toggle here would invite exactly the
+  // forever-silenced agent the expiry exists to prevent.
+  for (const mins of [30, 60, 120]) {
+    context.subscriptions.push(
+      vscode.commands.registerCommand(`squad.focus.${mins}`, (...args) =>
+        withAgents(args, (agents) => {
+          agents.forEach((a) => hubExec(["focus", String(mins), "--agent", a], a));
+          vscode.window.showInformationMessage(
+            `Squad: focus ${mins}m for ${agents.map(shortLabel).join(", ")} — ` +
+            "normal messages queue, urgent still gets through, expires on its own."
+          );
+        })
+      )
+    );
+  }
+  context.subscriptions.push(
+    vscode.commands.registerCommand("squad.focus.off", (...args) =>
+      withAgents(args, (agents) => {
+        agents.forEach((a) => hubExec(["focus", "--off", "--agent", a], a));
+        vscode.window.showInformationMessage(
+          `Squad: focus off for ${agents.map(shortLabel).join(", ")} — wakes resume now.`
+        );
+      })
+    )
+  );
 
   // Launch-settings state -> context keys, so the menu can show ONLY the action
   // that would change something. Without this the submenu offers on AND off
