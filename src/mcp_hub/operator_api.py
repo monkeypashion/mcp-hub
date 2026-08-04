@@ -142,6 +142,17 @@ class OperatorApi:
             },
         ).json()
 
+    def rotate_machine_token(self, name: str) -> dict[str, Any]:
+        """A NEW machine token, invalidating the old one. Returned once.
+
+        This is the recovery path that did not exist: without it, a lost
+        machine token was unrecoverable and the fleet had to fall back to the
+        operator token for every edge pass.
+        """
+        return self._request(
+            "POST", f"/api/v1/machines/{name}/rotate-token"
+        ).json()
+
     def delete_workspace(self, wid: Any) -> dict[str, Any]:
         """Drop a DEFINITION. Deletes nothing on any disk.
 
@@ -252,6 +263,21 @@ class OperatorApi:
                 "capabilities": capabilities or {"worktree": True},
             },
         ).json()
+
+
+def write_machine_token(token: str, dest: pathlib.Path | None = None) -> str:
+    """Persist a machine token and return where it went.
+
+    A separate function because the ORDER is the whole lesson: enrolment and
+    rotation both return the token exactly once, and the hub keeps only a
+    hash. Both machines in this fleet lost theirs to a shell pipeline that
+    printed before saving. Persist first, print second — always.
+    """
+    dest = dest or MACHINE_TOKEN_FILE
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(token, encoding="utf-8")
+    dest.chmod(0o600)
+    return str(dest)
 
 
 def _body_snippet(r: Any) -> str:

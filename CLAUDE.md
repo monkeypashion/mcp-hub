@@ -590,10 +590,46 @@ a destroy that happens by accident.
 Identity is **assigned by the hub** when a seat is created, never derived at the
 far end: a container's hostname must not be able to name a seat.
 
-⚠️ **`edge apply` currently authenticates with the OPERATOR token**, because both
-machine tokens were lost (the hub stores only a hash and has no rotation
-endpoint). That means anything holding the operator token can drive any machine.
-A `POST /api/v1/machines/{name}/rotate-token` is the fix and needs a deploy.
+### Making it actually converge — the edge timer
+
+Desired state is inert until something reconciles it. Install the units once
+per machine:
+
+```bash
+ln -sfn ~/Projects/code/monkeypashion/mcp-hub/squad/systemd/mcp-hub-edge.service ~/.config/systemd/user/
+ln -sfn ~/Projects/code/monkeypashion/mcp-hub/squad/systemd/mcp-hub-edge.timer   ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now mcp-hub-edge.timer
+```
+
+Every 2 minutes, matching `squad-heal`'s cadence — and **its own unit**, not
+folded into `squad-heal.service`: heal keeps live agents reachable and must not
+stop doing that because a reconcile pass failed (a `oneshot` that fails takes
+its whole ExecStart chain with it). `RandomizedDelaySec=20` so the fleet does
+not reconcile on the same second after a shared outage, which is the one moment
+the hub is least able to serve it. `ExecStart` names the venv binary
+absolutely — systemd user units get a bare PATH with no `~/.local/bin`, the
+same gap that made `edge apply` die on a raw `FileNotFoundError` over ssh.
+
+### Machine tokens — and how to recover one
+
+Each machine authenticates its edge passes with its own token:
+
+```bash
+mcp-hub machines enrol            # first time; writes ~/.mcp-hub/machine.token
+mcp-hub machines rotate           # recovery: new token, old one dies
+```
+
+Both are returned **exactly once** — the hub stores only a hash — so the client
+**persists before it prints**. That order is the whole lesson: both machines in
+this fleet lost their original tokens on 2026-07-30 to a shell pipeline that
+printed and never saved, which left `edge apply` running on the OPERATOR token,
+i.e. one credential that drives every machine.
+
+`rotate` overwrites the file without `--force`, deliberately — the situation it
+exists for is a file that is stale or missing. It is **operator-only**: a
+machine that can rotate its own credential is a machine that can lock the
+operator out of it, and the recovery path for *that* is the one that was
+already missing.
 
 ## Stop hook — auto-surface queued messages
 

@@ -1,0 +1,21 @@
+[Unit]
+# The edge realizer: pull this machine's placements from the hub, act, and
+# report what was OBSERVED. Without this running, every placement written from
+# any node sits at `pending-edge` forever — the write side is bookkeeping until
+# something reconciles it.
+#
+# A UNIT OF ITS OWN, deliberately not folded into squad-heal.service. heal
+# keeps live agents reachable and must not stop doing that because a reconcile
+# pass failed; a oneshot that fails takes its whole ExecStart chain with it.
+Description=mcp-hub edge — reconcile this machine toward the hub's desired state
+
+[Service]
+Type=oneshot
+# Absolute path: systemd user units get a bare PATH with no ~/.local/bin, which
+# is the same gap that made `edge apply` die on a raw FileNotFoundError when it
+# was first run over ssh.
+ExecStart=%h/Projects/code/monkeypashion/mcp-hub/.venv/bin/mcp-hub edge apply
+# A reconcile pass that cannot reach the hub is a non-event, not an incident:
+# the next tick tries again. Failing loudly here would fill the journal on
+# every network blip.
+SuccessExitStatus=0 1

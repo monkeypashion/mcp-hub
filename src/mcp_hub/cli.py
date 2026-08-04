@@ -1740,6 +1740,7 @@ def machines_command(args: argparse.Namespace, api: Any = None) -> int:
         ApiUnavailable,
         OperatorApi,
         api_base,
+        write_machine_token,
     )
 
     if api is None:
@@ -1762,6 +1763,37 @@ def machines_command(args: argparse.Namespace, api: Any = None) -> int:
             seen = m.get("last_seen")
             when = f"last seen {int(time.time() - seen)}s ago" if seen else "never seen"
             print(f"{m['name']:<20} {m.get('os', ''):<8} {when}")
+        return 0
+
+    if args.action == "rotate":
+        # The recovery path for a token that was never saved. Overwrites by
+        # design — the whole point is that the file on disk is stale or
+        # missing — so it does NOT honour the enrol-time --force guard.
+        dest = pathlib.Path(args.token_file) if args.token_file \
+            else MACHINE_TOKEN_FILE
+        try:
+            rec = api.rotate_machine_token(name)
+        except ApiUnavailable as e:
+            msg = str(e)
+            if "404" in msg:
+                print(f"machine '{name}' is not enrolled — `mcp-hub machines "
+                      "enrol` first (rotate replaces a credential, it does not "
+                      "create one)", file=sys.stderr)
+                return 1
+            print(msg, file=sys.stderr)
+            return 1
+        token = rec.get("token", "")
+        if not token:
+            print(f"the hub rotated '{name}' but returned no token — the old "
+                  "one is now INVALID and the new one is unrecoverable",
+                  file=sys.stderr)
+            return 1
+        where = write_machine_token(token, dest)   # persist BEFORE printing
+        digest = hashlib.sha256(token.encode()).hexdigest()[:12]
+        print(f"rotated '{name}' — the previous token is now invalid")
+        print(f"machine token written to {where} (mode 0600, sha256 {digest})")
+        if args.print_token:
+            print(f"token: {token}")
         return 0
 
     # -- enrol ------------------------------------------------------------
@@ -1789,12 +1821,10 @@ def machines_command(args: argparse.Namespace, api: Any = None) -> int:
         print(f"enrolled '{name}' but the hub returned no token — nothing to "
               "save, and it cannot be requested again", file=sys.stderr)
         return 1
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(token, encoding="utf-8")
-    dest.chmod(0o600)
+    where = write_machine_token(token, dest)      # persist BEFORE printing
     digest = hashlib.sha256(token.encode()).hexdigest()[:12]
     print(f"enrolled '{name}' ({rec.get('os', '')})")
-    print(f"machine token written to {dest} (mode 0600, sha256 {digest})")
+    print(f"machine token written to {where} (mode 0600, sha256 {digest})")
     if args.print_token:
         print(f"token: {token}")
     else:
@@ -4172,13 +4202,14 @@ def build_parser() -> argparse.ArgumentParser:
             "A machine must have a row on the hub before it can report "
             "anything: both the board's presence ping and `edge apply` 404 "
             "without one. `enrol` returns a machine token EXACTLY ONCE — the "
-            "hub keeps only a hash and has no rotation endpoint — so this "
+            "hub keeps only a hash — so this "
             "writes it to disk before printing anything."
         ),
     )
     machines.add_argument(
-        "action", choices=["list", "enrol"],
-        help="list: enrolled machines · enrol: add this machine",
+        "action", choices=["list", "enrol", "rotate"],
+        help="list: enrolled machines · enrol: add this machine · "
+             "rotate: issue a new token, invalidating the old one",
     )
     machines.add_argument(
         "name", nargs="?", default=None,
