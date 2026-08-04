@@ -33,6 +33,30 @@ API_KEY_MIN_LEN = 20
 _OAUTH = "CLAUDE_CODE_OAUTH_TOKEN"
 _API_KEY = "ANTHROPIC_API_KEY"
 
+# The comms a seat needs to BE an agent — read and write messages, be
+# discoverable, keep its binding alive. Deliberately excludes the hub's
+# authority-shaped tools (decision_*, memory_put, set_squads, unregister):
+# a seat that can silently leave its squad or answer decisions on the
+# operator's behalf is a different kind of thing, and that is a grant to
+# make deliberately rather than to inherit from an image.
+SEAT_ALLOWED_TOOLS = (
+    "mcp__hub__register",
+    "mcp__hub__ping",
+    "mcp__hub__list_agents",
+    "mcp__hub__list_squads",
+    "mcp__hub__list_channels",
+    "mcp__hub__get_messages",
+    "mcp__hub__get_broadcasts",
+    "mcp__hub__get_broadcasts_for_agent",
+    "mcp__hub__get_channel_messages",
+    "mcp__hub__get_history",
+    "mcp__hub__send",
+    "mcp__hub__post",
+    "mcp__hub__broadcast",
+    "mcp__hub__update_bio",
+    "mcp__hub__hub_status",
+)
+
 
 @dataclass(frozen=True)
 class CredentialVerdict:
@@ -225,6 +249,18 @@ def hooks_settings_content() -> dict:
         # other half is onboarding_state() in ~/.claude.json.
         "theme": "dark",
         "enabledMcpjsonServers": ["hub"],
+        # Pre-granted COMMS, nothing else. Measured: the seat called
+        # register() on its first turn and stopped on the tool-permission
+        # dialog — a container has nobody to click Yes, so the capability
+        # that makes it an agent has to be config, the way the fleet's own
+        # repos already do it in .claude/settings.local.json.
+        #
+        # Enumerated rather than server-wide (`mcp__hub` would allow every
+        # tool, including ones added later and ones that mutate OTHER
+        # agents' state). No Bash/Edit/Write here: joining a hub is not a
+        # licence to run commands — those grants are the operator's to
+        # make, per repo.
+        "permissions": {"allow": list(SEAT_ALLOWED_TOOLS)},
         "hooks": {
             "Stop": [
                 {

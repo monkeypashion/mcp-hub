@@ -518,3 +518,34 @@ def test_first_turn_prompt_carries_the_project_for_register():
 
     c = parse_seat_contract({**BASE_ENV, "SEAT_PROJECT": "org/thing"})
     assert "org/thing" in first_turn_prompt(c)
+
+
+# ------------------------------------------------------------- permissions --
+
+
+def test_settings_pre_allow_the_comms_tools_a_seat_needs():
+    """MEASURED: the seat typed its first turn, claude CALLED register — and
+    stopped on the MCP tool-permission dialog. A container has nobody to
+    click Yes, so the capability that makes it an agent must be granted in
+    config, exactly as the fleet's own repos do it."""
+    allow = hooks_settings_content()["permissions"]["allow"]
+    for tool in ("mcp__hub__register", "mcp__hub__send",
+                 "mcp__hub__get_messages"):
+        assert tool in allow
+
+
+def test_permissions_are_enumerated_not_server_wide():
+    """`mcp__hub` alone would allow EVERY hub tool, including ones added
+    later and ones that mutate other agents' state (decision_*, memory_put).
+    A seat needs comms, not authority — so the list is explicit and each
+    entry is a tool name."""
+    allow = hooks_settings_content()["permissions"]["allow"]
+    assert "mcp__hub" not in allow
+    assert all(t.startswith("mcp__hub__") for t in allow)
+
+
+def test_no_bash_or_edit_permissions_are_granted():
+    # Registering on a hub is not a licence to run commands. Anything the
+    # seat's own work needs is the operator's grant to make, per repo.
+    allow = hooks_settings_content()["permissions"]["allow"]
+    assert not any(t.startswith(("Bash(", "Edit", "Write")) for t in allow)
