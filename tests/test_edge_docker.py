@@ -648,3 +648,78 @@ def test_one_image_inspect_per_DISTINCT_image(tmp_path):
     api = FakeApi([p1, p2])
     edge_apply(api, "box-1", r, [tmp_path], seeder=lambda f: True)
     assert len([c for c in r.calls if c[:3] == ["docker", "image", "inspect"]]) == 1
+
+
+# ---- a completed reclaim ---------------------------------------------------
+
+def test_a_destroyed_substrate_reports_RECLAIMED_not_stopped():
+    """Measured on the live probe: after the edge harvested and destroyed
+    it, the placement read `want reclaimed · saw stopped · diverged` —
+    a SUCCESSFUL reclaim reporting as a failure forever, because "stopped"
+    never equals "reclaimed".
+
+    Absence is the evidence: we enumerated and the container was not there.
+    """
+    from mcp_hub.edge import observed_report
+
+    rep = observed_report(
+        {"id": "pl-1", "desired": "reclaimed"},
+        {"container": "web-box-1", "alive": False, "exists": False},
+    )
+    assert rep["state"] == "reclaimed"
+
+
+def test_a_reclaim_still_pending_does_NOT_claim_reclaimed():
+    """The container is still there, so the work has not happened. Claiming
+    otherwise would mark the placement converged and stop the edge from
+    ever finishing the job."""
+    from mcp_hub.edge import observed_report
+
+    rep = observed_report(
+        {"id": "pl-1", "desired": "reclaimed"},
+        {"container": "web-box-1", "alive": False, "exists": True},
+    )
+    assert rep["state"] == "stopped"
+
+
+def test_absence_without_a_reclaim_request_is_still_stopped():
+    """A container that vanished on its own is NOT a completed reclaim —
+    that would silently absolve whatever destroyed it."""
+    from mcp_hub.edge import observed_report
+
+    rep = observed_report(
+        {"id": "pl-1", "desired": "running"},
+        {"container": "web-box-1", "alive": False, "exists": False},
+    )
+    assert rep["state"] == "stopped"
+
+
+def test_a_reclaimed_worktree_seat_uses_its_own_absence_key():
+    """Worktree enumeration says `enrolled`, docker says `exists` — the
+    same rule must read both, or reclaim looks complete for containers and
+    permanently diverged for tmux seats."""
+    from mcp_hub.edge import observed_report
+
+    rep = observed_report(
+        {"id": "pl-1", "desired": "reclaimed"},
+        {"tmux_session": "seat-1", "alive": False, "enrolled": False},
+    )
+    assert rep["state"] == "reclaimed"
+
+
+def test_an_enumeration_with_NO_absence_key_never_claims_reclaimed():
+    """UNKNOWN is not ABSENCE — the evidence contract's first rule.
+
+    An enumeration carrying neither `exists` nor `enrolled` told us nothing
+    about whether the substrate is there, and a truthiness check would read
+    that silence as "gone" and mark a destroy complete that may never have
+    happened. Found by mutation: `is False` -> `not present` survived every
+    other test in this file.
+    """
+    from mcp_hub.edge import observed_report
+
+    rep = observed_report(
+        {"id": "pl-1", "desired": "reclaimed"},
+        {"container": "web-box-1", "alive": False},
+    )
+    assert rep["state"] == "stopped"

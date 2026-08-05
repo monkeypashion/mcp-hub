@@ -127,6 +127,20 @@ def observed_report(
             "report a state no evidence supports"
         )
     state = "running" if enumeration.get("alive") else "stopped"
+    # A COMPLETED reclaim. Without this a successful harvest-then-destroy
+    # reports `saw stopped` against `want reclaimed` — diverged forever,
+    # a finished job that looks like a failed one (measured on the live
+    # busybox probe). Absence is the evidence: we enumerated and it was
+    # not there. Absence WITHOUT a reclaim request stays `stopped`, or a
+    # container something else destroyed would be quietly absolved.
+    #
+    # Both substrates' absence keys are read — docker says `exists`,
+    # worktree says `enrolled` — or reclaim would look complete for
+    # containers and permanently diverged for tmux seats.
+    if placement.get("desired") == "reclaimed":
+        present = enumeration.get("exists", enumeration.get("enrolled"))
+        if present is False:
+            state = "reclaimed"
     # A container running the WRONG IMAGE is not converged, and "running"
     # would be true-but-useless: `docker ps` cannot see the difference, so
     # the drift would stay invisible forever (it bit this build for real —
