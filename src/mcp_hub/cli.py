@@ -4047,8 +4047,13 @@ def seat_entry_command(args: argparse.Namespace) -> int:
     # WAITS (measured on the first live seat: container healthy, claude
     # parked, never an agent). squad answers this on the host; a container
     # has to answer it for itself.
-    from mcp_hub.seat import pane_is_settled, startup_dance_action
+    from mcp_hub.seat import (
+        first_turn_is_safe,
+        pane_is_settled,
+        startup_dance_action,
+    )
 
+    pane = ""
     for _ in range(25):
         time.sleep(1)
         pane = subprocess.run(
@@ -4062,6 +4067,23 @@ def seat_entry_command(args: argparse.Namespace) -> int:
             continue
         if pane_is_settled(pane):
             break
+
+    # Never type into a dialog. The bypass-mode acceptance screen defaults
+    # to "No, exit", so the first-turn Enter confirmed the seat's own death
+    # — cleanly, exit 0, with nothing anywhere that looked wrong. A future
+    # unknown dialog gets the same treatment: refuse LOUDLY with a code
+    # `docker ps` can show, and print the pane so the screen that stopped
+    # us is in the log rather than in a tmux buffer that dies with it.
+    if not first_turn_is_safe(pane):
+        print(
+            "seat-entry: REFUSED (contract): claude is showing a dialog "
+            "this seat does not know how to answer, and a blind keypress "
+            "would confirm whatever its default row is. Pane follows:\n"
+            f"{pane}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return EXIT_CONTRACT
     print("seat-entry: claude is up", flush=True)
 
     # First turn. The register instruction rides in SessionStart's

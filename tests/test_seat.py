@@ -24,7 +24,9 @@ from mcp_hub.seat import (
     launch_argv,
     marker_content,
     mcp_json_content,
+    pane_is_settled,
     parse_seat_contract,
+    startup_dance_action,
     validate_seat_credentials,
 )
 
@@ -576,3 +578,59 @@ def test_the_comms_allowlist_survives_the_mode():
     the hub cannot even report that it is stuck."""
     perms = hooks_settings_content()["permissions"]
     assert "mcp__hub__register" in perms["allow"]
+
+
+# ------------------------------------------------- the bypass-mode dialog --
+
+# Captured from the live seat by mcp-hub-dev-vm-1, 2026-08-05 — the screen
+# that held 12 consecutive 2s pane captures of a 32-second container life.
+BYPASS_DIALOG = """
+  WARNING: Claude Code running in Bypass Permissions mode
+
+  In Bypass Permissions mode, Claude Code will not ask for your approval
+  before running potentially dangerous commands.
+
+  ❯ 1. No, exit
+    2. Yes, I accept
+
+  Enter to confirm - Esc to cancel
+"""
+
+
+def test_the_bypass_mode_acceptance_is_pre_ACCEPTED_in_settings():
+    """FIFTH gate, and the fix for the fourth minted it: bypass mode has its
+    own one-time acceptance dialog whose DEFAULT IS "No, exit". The seat's
+    own first-turn Enter therefore confirmed its own exit — cleanly, code 0,
+    which is why nothing looked wrong anywhere.
+
+    Key verified against the claude binary's settings schema, not assumed:
+    "Whether the user has accepted the bypass permissions mode dialog".
+    Card #360 is what makes seeding it legitimate — the operator accepted
+    this posture explicitly, so the image records THEIR decision rather
+    than sneaking one in.
+    """
+    assert hooks_settings_content()["skipDangerousModePermissionPrompt"] is True
+
+
+def test_the_bypass_dialog_is_never_treated_as_a_settled_pane():
+    """The load-bearing guard: `pane_is_settled` deciding True here is
+    exactly how a blind Enter reaches a dialog whose default is exit."""
+    assert not pane_is_settled(BYPASS_DIALOG)
+
+
+def test_the_dance_does_not_blind_enter_the_bypass_dialog():
+    """`Enter` on this screen selects "No, exit". The dance must NOT answer
+    it — acceptance belongs in settings (a recorded operator decision), not
+    in a keystroke that happens to land on the right row today."""
+    assert startup_dance_action(BYPASS_DIALOG) != "Enter"
+
+
+def test_an_unsettled_pane_refuses_to_send_the_first_turn():
+    """Refuse loudly instead of typing into an unknown dialog. Exit 43 is
+    diagnosable from `docker ps` alone; the silent exit 0 cost a whole
+    night of looking in the wrong place."""
+    from mcp_hub.seat import first_turn_is_safe
+
+    assert first_turn_is_safe(STARTED_PANE)
+    assert not first_turn_is_safe(BYPASS_DIALOG)
+    assert not first_turn_is_safe(CHANNELS_DIALOG)
