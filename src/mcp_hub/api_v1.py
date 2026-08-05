@@ -552,8 +552,14 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
         # A docker unit is named by its IMAGE, not by a folder on a host — an
         # nginx container has no worktree and never will. Requiring one would
         # make every non-agent unit lie about itself.
-        required = ("repo", "machine") if spec.get("image") \
-            else ("repo", "machine", "folder")
+        # ...and it has no git remote either, for the same reason. An image
+        # unit needs only a machine and, when its identity is not given, a
+        # repo to build a name from. Demanding a repo of nginx forces an
+        # operator to invent a field the roster then carries forever.
+        required = ["machine"] if spec.get("image") \
+            else ["repo", "machine", "folder"]
+        if spec.get("image") and not body.get("identity"):
+            required.append("repo")  # only as the source of a derived name
         for field in required:
             if not body.get(field):
                 return _err(422, f"{field} required")
@@ -571,12 +577,15 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             " class, created, spec) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 identity,
-                body["repo"],
+                # .get for BOTH, and for the same reason twice over: each
+                # time a field stops being required above, an INSERT that
+                # still subscripts it turns a relaxed rule into a 500.
+                # `folder` did it once (container seats), `repo` did it
+                # again the moment an image unit could be named explicitly.
+                # The validation block above is the only place that decides
+                # what is mandatory; this one must never re-assert it.
+                body.get("repo", ""),
                 body["machine"],
-                # .get, not []: `folder` stopped being required for docker
-                # units above, and the INSERT kept demanding it — a 500 on
-                # every container seat, which the CLI-level tests could not
-                # see because they ran against a fake API.
                 body.get("folder", ""),
                 body.get("launch_args", ""),
                 body.get("class", "squad"),

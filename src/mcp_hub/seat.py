@@ -444,3 +444,37 @@ def first_turn_prompt(contract: SeatContract) -> str:
         f"project=\"{contract.project}\") on the hub now to bind this "
         f"session for wake, then stand by for instructions."
     )
+
+
+# -------------------------------------------------------------- supervisor
+
+# How old the daemon's status cache may be and still count as evidence.
+# The daemon writes every 60s, so two missed writes means something is
+# wrong with the DAEMON, not with the binding.
+STATUS_STALE_SECONDS = 150.0
+
+
+def needs_reregister(status: dict | None, now: float,
+                     stale_after: float = STATUS_STALE_SECONDS) -> bool:
+    """Whether this seat has fallen off the hub and should nudge itself.
+
+    Every hub deploy drops all bindings. A human-driven agent re-registers
+    at its next turn boundary, because someone types something; an IDLE
+    container has no turn boundary and stays silently offline forever —
+    measured 2026-08-05, a seat up 5 hours, healthy, and absent from
+    `list_agents`.
+
+    The evidence rule decides everything else here: only a FRESH status
+    file saying `online: false` is grounds to act. A missing, stale, or
+    undated file says nothing about presence, and treating that silence as
+    "offline" would nudge a healthy seat on every cycle exactly when the
+    daemon is the thing that broke.
+    """
+    if not status:
+        return False
+    ts = status.get("ts")
+    if not isinstance(ts, (int, float)):
+        return False
+    if now - ts > stale_after:
+        return False
+    return status.get("online") is False

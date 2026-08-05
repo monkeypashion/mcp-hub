@@ -65,6 +65,12 @@ _NO_WINDOW_FLAG = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" 
 # uses the values it finds. Projects without this file silently no-op.
 AGENT_MARKER_PATH = pathlib.Path(".claude") / "hub-agent.json"
 
+# Seat supervisor: at most one re-register nudge per this many seconds. A
+# nudge needs a turn to run and a further daemon cycle (60s) to show up in
+# the status cache, so anything faster types into the pane while the last
+# one is still in flight.
+SUPERVISOR_COOLDOWN = 180.0
+
 
 # ---------------------------------------------------------------------------
 # Hub interaction (thin wrapper over the MCP client)
@@ -4213,6 +4219,19 @@ def seat_entry_command(args: argparse.Namespace) -> int:
     print("seat-entry: first turn sent — the seat registers itself", flush=True)
     # PID 1 must outlive the detached tmux session or docker reaps the
     # container while claude runs. Container stops when the session ends.
+    #
+    # It also SUPERVISES: every hub deploy drops all bindings, and a
+    # human-driven agent re-registers at its next turn boundary because
+    # someone types. An idle container has no turn boundary, so it stays
+    # silently offline forever (measured: up 5 hours, healthy, absent from
+    # the hub). PID 1 is the container's substitute for an operator
+    # noticing.
+    from mcp_hub.seat import needs_reregister
+
+    status_path = (
+        pathlib.Path.home() / ".mcp-hub" / f"status-{contract.identity}.json"
+    )
+    last_nudge = 0.0
     while True:
         alive = subprocess.run(
             ["tmux", "has-session", "-t", "seat"], capture_output=True
@@ -4220,6 +4239,38 @@ def seat_entry_command(args: argparse.Namespace) -> int:
         if alive.returncode != 0:
             return 0
         time.sleep(5)
+
+        # Rate-limited: one nudge per SUPERVISOR_COOLDOWN at most. A
+        # re-register takes a turn to happen and a further daemon cycle to
+        # show up in the status cache, so a faster loop would type into the
+        # pane repeatedly while the first nudge was still working.
+        if time.time() - last_nudge < SUPERVISOR_COOLDOWN:
+            continue
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            status = None
+        if not needs_reregister(status, time.time()):
+            continue
+        pane = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-t", "seat"],
+            capture_output=True, text=True,
+        ).stdout
+        # Same rule as the first turn: never type into a dialog, and never
+        # interrupt a turn in progress — a nudge mid-work would be worse
+        # than the offline state it is fixing.
+        if not first_turn_is_safe(pane):
+            continue
+        subprocess.run(
+            ["tmux", "send-keys", "-t", "seat", "-l", first_turn_prompt(contract)]
+        )
+        time.sleep(1)
+        subprocess.run(["tmux", "send-keys", "-t", "seat", "Enter"])
+        last_nudge = time.time()
+        print(
+            "seat-entry: seat was offline on the hub — re-register nudge sent",
+            flush=True,
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:

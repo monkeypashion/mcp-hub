@@ -649,3 +649,60 @@ def test_an_unsettled_pane_refuses_to_send_the_first_turn():
     assert first_turn_is_safe(STARTED_PANE)
     assert not first_turn_is_safe(BYPASS_DIALOG)
     assert not first_turn_is_safe(CHANNELS_DIALOG)
+
+
+# -------------------------------------------------------------- supervisor --
+
+
+def test_an_offline_seat_needs_a_nudge():
+    """Every hub deploy drops all bindings. A human-driven agent
+    re-registers at its next turn boundary because someone types; an idle
+    container has no turn boundary and stays silently offline forever.
+    MEASURED: the seat was up 5 hours, healthy, and absent from the hub.
+    """
+    from mcp_hub.seat import needs_reregister
+
+    assert needs_reregister({"online": False, "ts": 1000}, now=1030)
+
+
+def test_an_online_seat_is_left_alone():
+    from mcp_hub.seat import needs_reregister
+
+    assert not needs_reregister({"online": True, "ts": 1000}, now=1030)
+
+
+def test_a_STALE_status_file_is_unknown_not_offline():
+    """The evidence rule again: a status file nobody has refreshed says
+    nothing about presence. Treating silence as offline would nudge a
+    healthy seat every cycle when the daemon dies — noise that looks like
+    the thing it is supposed to fix."""
+    from mcp_hub.seat import needs_reregister
+
+    assert not needs_reregister({"online": False, "ts": 1000}, now=99999)
+
+
+def test_a_MISSING_status_file_is_unknown_not_offline():
+    from mcp_hub.seat import needs_reregister
+
+    assert not needs_reregister(None, now=1030)
+    assert not needs_reregister({}, now=1030)
+
+
+def test_a_status_file_without_a_timestamp_is_not_trusted():
+    """No ts means no way to judge freshness — and an undated claim of
+    'offline' could be from last week."""
+    from mcp_hub.seat import needs_reregister
+
+    assert not needs_reregister({"online": False}, now=1030)
+
+
+def test_a_status_file_with_NO_online_key_is_unknown_not_offline():
+    """Third time this exact gap has appeared today: `is False` vs
+    truthiness. A fresh status file that simply does not carry `online`
+    knows nothing about presence — reading its silence as "offline" would
+    nudge a healthy seat every cooldown. Found by mutation, not by review.
+    """
+    from mcp_hub.seat import needs_reregister
+
+    assert not needs_reregister({"ts": 1000}, now=1030)
+    assert not needs_reregister({"ts": 1000, "online": None}, now=1030)

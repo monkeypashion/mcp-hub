@@ -787,3 +787,52 @@ class TestPlacements:
             headers={"Authorization": f"Bearer {foreign}"},
         )
         assert denied.status_code == 403
+
+
+class TestImageUnitValidation:
+    """An image unit has no worktree and no git remote — demanding either
+    forces an operator to invent a field the roster then carries forever.
+
+    ⚠️ This is the seats-500 lesson repeating and being closed properly: the
+    CLI's relaxation shipped first, every CLI test passed against a FakeApi,
+    and the LIVE call still 422'd because the SERVER kept the old rule.
+    A fake at the client boundary tests the client.
+    """
+
+    def test_an_image_unit_with_an_identity_needs_no_repo(self, client):
+        r = client.post(
+            "/api/v1/seats",
+            json={"identity": "web-1", "machine": "box-i1",
+                  "spec": {"image": "nginx:alpine"}},
+            headers=H,
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["identity"] == "web-1"
+
+    def test_an_image_unit_without_an_identity_still_needs_a_repo(self, client):
+        """Not pedantry: the identity is DERIVED from the repo name when it
+        is not given, so with neither there is nothing to call the seat."""
+        r = client.post(
+            "/api/v1/seats",
+            json={"machine": "box-i2", "spec": {"image": "nginx:alpine"}},
+            headers=H,
+        )
+        assert r.status_code == 422
+        assert "repo" in r.json()["detail"]
+
+    def test_a_worktree_unit_still_needs_repo_and_folder(self, client):
+        r = client.post(
+            "/api/v1/seats",
+            json={"identity": "w-1", "machine": "box-i3"},
+            headers=H,
+        )
+        assert r.status_code == 422
+
+    def test_an_image_unit_never_needs_a_folder(self, client):
+        r = client.post(
+            "/api/v1/seats",
+            json={"identity": "web-2", "machine": "box-i4",
+                  "spec": {"image": "redis:7"}},
+            headers=H,
+        )
+        assert r.status_code == 201, r.text

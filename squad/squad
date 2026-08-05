@@ -481,7 +481,17 @@ strip_continue() { printf '%s\n' "$1" | sed -E 's/(^|[[:space:]])--continue([[:s
 # in place). An optional 2nd arg overrides the roster's claude_args for THIS
 # launch only (restart --fresh/--resume); the roster is never touched.
 launch_agent_cmd() {
-  local a="$1" ghdir args
+  local a="$1" ghdir args container
+  # CONTAINER SEATS RETURN FIRST, before anything can touch the roster. The
+  # args field holds the marker, not claude args, so arm_comms appending the
+  # channels flag would name a container that does not exist and break every
+  # future attach. Ordering makes that impossible rather than merely guarded;
+  # the guard inside arm_comms stays as belt and braces for any future caller.
+  if container="$(container_of "$a")"; then
+    type_line "$a" "$(launch_line "$a")"
+    echo "attached $a  (container $container)"
+    return 0
+  fi
   ghdir="$(untilde "$(field "$a" 3)")"
   # Arm comms before args are read, so an opted-in agent gains the channels flag
   # on THIS launch rather than the one after it.
@@ -502,7 +512,7 @@ launch_agent_cmd() {
     args="$(field "$a" 4)"
   fi
   [ -n "$ghdir" ] && type_line "$a" "export GH_CONFIG_DIR=\"$ghdir\""
-  type_line "$a" "claude $args"
+  type_line "$a" "$(launch_line "$a" "$args")"
   echo "started $a  ($args)"
   # Startup-dialog dance — auto-answer the two dialogs claude can pop at
   # launch, in one loop because they STACK (channels first, resume-size
@@ -691,8 +701,35 @@ PYEOF
 # a launch-time flag, so "enable it live" would mean killing a running agent's
 # conversation to apply it; doing it pre-launch costs nothing and no session is
 # ever disturbed. Idempotent, and silent when there's nothing to do.
+# A container seat: the roster ARGS field is `@docker:<container>` rather
+# than claude args. The marker lives there, not in a new column, because the
+# roster is a 5-field pipe format with several readers — a sixth column would
+# silently shift every field after it for all of them.
+container_of() {
+  local args
+  args="$(field "$1" 4)"
+  case "$args" in @docker:*) printf '%s\n' "${args#@docker:}" ;; *) return 1 ;; esac
+}
+
+# The exact line an agent's pane runs. ONE builder, so `launch-cmd` prints
+# what `up` would actually type — two builders drift, and the drift only
+# shows at launch time on a machine you are not looking at.
+launch_line() {
+  local a="$1" override="${2:-}" container args
+  if container="$(container_of "$a")"; then
+    printf 'docker exec -it %s tmux attach -t seat\n' "$container"
+    return 0
+  fi
+  args="${override:-$(field "$a" 4)}"
+  printf 'claude %s\n' "$args"
+}
+
 arm_comms() {
   local a="$1" cur new
+  # NEVER touch a container row: field 4 is the marker, and appending the
+  # channels flag to it would name a container that does not exist. The
+  # container arms its own comms from inside, where the flag belongs.
+  container_of "$a" >/dev/null && return 0
   has_comms "$a" && return 0
   hub_optedin "$a" || return 0
   cur="$(field "$a" 4)"
@@ -3424,6 +3461,34 @@ print("\n".join(r[2] for r in rows))
             ws_del_folder "$ws_arg" "$(untilde "$(field "$a" 2)")"
             echo "  '$a' is still enrolled (roster, hub opt-in and worktree untouched)."
             echo "  To retire it everywhere instead: $CMD rm $a" ;;
+  add-container) # squad add-container <name> <dir> <container> [--to <ws>]
+            # Enrol a CONTAINER seat: the folder is a real directory on this
+            # machine (bind-mounted into the container), which is what lets the
+            # workspace file list it and the extension give it a tab. The tab
+            # attaches to the container instead of running claude here.
+            shift; c_name="${1:-}"; c_dir="${2:-}"; c_cont="${3:-}"; ws_arg=""
+            shift 3 2>/dev/null || true
+            while [ $# -gt 0 ]; do case "$1" in
+              --to) ws_arg="${2:-}"; shift 2 ;;
+              -*)   echo "!! unknown add-container flag '$1' (valid: --to)" >&2; exit 1 ;;
+              *)    shift ;;
+            esac; done
+            [ -n "$c_name" ] && [ -n "$c_dir" ] && [ -n "$c_cont" ] || {
+              echo "usage: $CMD add-container <name> <dir> <container> [--to <ws>]" >&2; exit 1; }
+            c_dir="$(untilde "$c_dir")"
+            [ -d "$c_dir" ] || { echo "!! no such folder: $c_dir" >&2; exit 1; }
+            if field "$c_name" 1 >/dev/null 2>&1 && grep -q "^$c_name|" "$CONF" 2>/dev/null; then
+              echo "!! '$c_name' is already enrolled" >&2; exit 1; fi
+            # faculty: the EDGE owns a container's lifecycle. `up` starting one
+            # would race the placement that is realizing it.
+            printf '%s|%s||@docker:%s|faculty\n' "$c_name" "$c_dir" "$c_cont" >> "$CONF"
+            echo "enrolled $c_name -> container $c_cont (folder $c_dir)"
+            [ -n "$ws_arg" ] && ws_add_folder "$(untilde "$ws_arg")" "$c_dir" "$(basename "$c_dir")"
+            echo "  its tab attaches to the container; the EDGE starts and stops it." ;;
+  launch-cmd) # squad launch-cmd <agent> — print the line its pane would run
+            # Diagnostic, and the only way to test the launch path without a
+            # tmux server: it prints EXACTLY what up/restart would type.
+            a="$(need_agent "${2:-}")" || exit 1; launch_line "$a" ;;
   add-folder) # squad add-folder <dir> [--to <file.code-workspace>]
             shift; d_arg="${1:-}"; ws_arg=""
             while [ $# -gt 0 ]; do case "$1" in
