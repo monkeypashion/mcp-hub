@@ -2334,8 +2334,26 @@ case "${1:-help}" in
             fi ;;
   ls)       # tmux liveness + hub presence (from the daemon's status snapshot)
             hub_state() {
-              local safe sf
+              local safe sf c body
               safe="$(printf '%s' "$1" | sed 's/[^A-Za-z0-9_-]/_/g')"; sf="$HOME/.mcp-hub/status-$safe.json"
+              # A CONTAINER seat's daemon writes its status cache INSIDE the
+              # container, so the host copy does not exist and every seat read
+              # `-`. Ask the substrate that holds it — the same rule as
+              # liveness. One `docker exec` per container row, and only for
+              # rows that have one.
+              if c="$(container_of "$1")"; then
+                body="$(docker exec "$c" cat "/home/seat/.mcp-hub/status-$safe.json" 2>/dev/null)"
+                [ -n "$body" ] || { printf -- '-'; return; }
+                case "$body" in
+                  *'"online"'*': true'*|*'"online": true'*)
+                    case "$body" in
+                      *'"wakeable"'*': true'*|*'"wakeable": true'*) printf '⚡ online' ;;
+                      *) printf 'online' ;;
+                    esac ;;
+                  *) printf '✖ offline' ;;
+                esac
+                return
+              fi
               [ -f "$sf" ] || { printf -- '-'; return; }
               [ -n "$(find "$sf" -mmin -3 2>/dev/null)" ] || { printf 'hub?'; return; }
               if grep -q '"online"[[:space:]]*:[[:space:]]*true' "$sf"; then
