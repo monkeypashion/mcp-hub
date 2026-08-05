@@ -4231,7 +4231,11 @@ def seat_entry_command(args: argparse.Namespace) -> int:
     status_path = (
         pathlib.Path.home() / ".mcp-hub" / f"status-{contract.identity}.json"
     )
-    last_nudge = 0.0
+    # The FIRST TURN counts as the first nudge: it is a registration attempt,
+    # so both the cooldown and the evidence gate run from it. Measured
+    # otherwise — the supervisor fired 6s later on a status cache written
+    # before the seat had registered, typing into a pane mid-registration.
+    last_nudge = time.time()
     while True:
         alive = subprocess.run(
             ["tmux", "has-session", "-t", "seat"], capture_output=True
@@ -4250,7 +4254,7 @@ def seat_entry_command(args: argparse.Namespace) -> int:
             status = json.loads(status_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             status = None
-        if not needs_reregister(status, time.time()):
+        if not needs_reregister(status, time.time(), after=last_nudge):
             continue
         pane = subprocess.run(
             ["tmux", "capture-pane", "-p", "-t", "seat"],

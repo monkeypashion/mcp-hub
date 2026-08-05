@@ -455,7 +455,8 @@ STATUS_STALE_SECONDS = 150.0
 
 
 def needs_reregister(status: dict | None, now: float,
-                     stale_after: float = STATUS_STALE_SECONDS) -> bool:
+                     stale_after: float = STATUS_STALE_SECONDS,
+                     after: float = 0.0) -> bool:
     """Whether this seat has fallen off the hub and should nudge itself.
 
     Every hub deploy drops all bindings. A human-driven agent re-registers
@@ -476,5 +477,11 @@ def needs_reregister(status: dict | None, now: float,
     if not isinstance(ts, (int, float)):
         return False
     if now - ts > stale_after:
+        return False
+    # Evidence must postdate our last action. A cache written before we
+    # nudged (or before the first turn ran) describes the world we were
+    # trying to change, and acting on it types into a pane that is already
+    # mid-registration — measured: a nudge 6s after the first turn.
+    if ts <= after:
         return False
     return status.get("online") is False

@@ -706,3 +706,34 @@ def test_a_status_file_with_NO_online_key_is_unknown_not_offline():
 
     assert not needs_reregister({"ts": 1000}, now=1030)
     assert not needs_reregister({"ts": 1000, "online": None}, now=1030)
+
+
+def test_evidence_older_than_our_last_action_is_not_grounds_to_act():
+    """MEASURED live: the supervisor nudged 6 SECONDS after the first turn,
+    because the status cache had been written at daemon start — before the
+    seat registered — and was still fresh. Fresh is not the same as
+    RELEVANT: a report describing the world before you acted cannot tell
+    you whether your action worked.
+
+    So the rule is evidence observed AFTER the last thing we did. Without
+    it the supervisor types into a pane that is mid-registration, which is
+    the exact "nudged a busy seat" failure the design set out to avoid.
+    """
+    from mcp_hub.seat import needs_reregister
+
+    # Fresh, says offline — but written before our last action.
+    assert not needs_reregister(
+        {"online": False, "ts": 1000}, now=1030, after=1010
+    )
+    # Same file, observed after the action: now it counts.
+    assert needs_reregister(
+        {"online": False, "ts": 1020}, now=1030, after=1010
+    )
+
+
+def test_the_after_gate_defaults_to_off():
+    """A caller that passes no `after` gets the old behaviour — the gate is
+    opt-in, so nothing else that reads this function silently changes."""
+    from mcp_hub.seat import needs_reregister
+
+    assert needs_reregister({"online": False, "ts": 1000}, now=1030)
