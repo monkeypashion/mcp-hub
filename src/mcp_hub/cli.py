@@ -2221,6 +2221,13 @@ def identity_command(args: argparse.Namespace) -> int:
     """
     cwd = args.cwd or os.getcwd()
     name, project = _derive_agent_identity(cwd)
+    if name is None:
+        # The marker, same order the hooks use (derived wins, marker
+        # fallback). A CONTAINER has no git remote and is deliberately not
+        # opted in, so its ASSIGNED marker is the only identity it has —
+        # and this command is what CLAUDE.md tells everything to ask.
+        # Without this it answered "nothing" for every containerized seat.
+        name, project = _discover_agent_from_marker(cwd)
     if name is None and args.any:
         url = _git_remote_url(cwd)
         parsed = _parse_org_repo(url) if url else None
@@ -2232,7 +2239,20 @@ def identity_command(args: argparse.Namespace) -> int:
             raw = f"{repo}-{host}-{suffix}" if suffix else f"{repo}-{host}"
             name = _sanitize_ident(raw) or None
     if name is None:
-        print("", end="")
+        # Say WHY, on stderr. Silence here is indistinguishable from a
+        # missing subcommand — the first containerized seat ran this, saw
+        # exit 1 with no output, and reported that the CLI has no identity
+        # verb at all. stdout stays empty (callers capture it as the name)
+        # and the exit code stays 1 (callers branch on it); only the
+        # explanation is new, and squad's single call site already
+        # discards stderr.
+        print(
+            f"no identity for {cwd} — not a git repo with an origin, or its "
+            f"org/repo is not in ~/.mcp-hub/config.json 'projects', and no "
+            f".claude/hub-agent.json marker is present. Use --any to derive "
+            f"a name for a repo that is not opted in yet.",
+            file=sys.stderr,
+        )
         return 1
     if args.json:
         print(json.dumps({"name": name, "project": project, "cwd": cwd}))
