@@ -443,10 +443,25 @@ CHANNELS_DIALOG = """
   Enter to confirm - Esc to cancel
 """
 
+# CAPTURED from the live seat (claude 2.1.222, 2026-08-05), not composed.
+# The invented version of this fixture said "Bypassing Permissions" and made
+# `pane_is_settled` reject a healthy pane — the seat refused its own first
+# turn and exited 43. A fixture written from memory tests the memory.
 STARTED_PANE = """
-> Try "how does authentication work in this codebase?"
+╭─── Claude Code v2.1.222 ─────────────────────────────────────────────────────╮
+│                           │ Tips for getting started                         │
+│       Welcome back!       │ Run /init to create a CLAUDE.md file with instr… │
+│   Sonnet 5 · Claude API   │ /release-notes for more                          │
+│          ~/work           │                                                  │
+╰──────────────────────────────────────────────────────────────────────────────╯
 
-  ? for shortcuts                                  Bypassing Permissions
+ ▎ Channels (experimental) messages from server:hub inject directly in this
+ ▎ session · restart without --dangerously-load-development-channels to stop
+
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
 """
 
 

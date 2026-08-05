@@ -363,7 +363,23 @@ def onboarding_state(claude_version: str) -> dict:
 # matching at 80 columns.
 _CHANNELS_TOKEN = "loadingdevelopmentchannels"
 # claude's own chrome: proof it is past the dialog phase and running.
-_CHROME_TOKENS = ("forshortcuts", "bypassingpermissions", "acceptedits")
+#
+# CAPTURED from a live seat (2.1.222), not composed. The first version of
+# this list was written from an INVENTED fixture ("Bypassing Permissions")
+# and rejected a perfectly healthy pane whose footer actually reads
+# "⏵⏵ bypass permissions on (shift+tab to cycle)" — the same
+# paraphrase-instead-of-capture mistake this module warns about elsewhere.
+#
+# `bypasspermissionson` deliberately, NOT `bypasspermissions`: the bypass
+# ACCEPTANCE DIALOG says "Bypass Permissions mode", and a token matching
+# both would call that dialog settled — the exact confusion that let a
+# blind Enter confirm "No, exit".
+_CHROME_TOKENS = (
+    "forshortcuts",
+    "shifttabtocycle",
+    "bypasspermissionson",
+    "acceptedits",
+)
 
 
 def _flatten(text: str) -> str:
