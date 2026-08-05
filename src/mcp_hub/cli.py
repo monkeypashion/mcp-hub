@@ -2221,6 +2221,13 @@ def identity_command(args: argparse.Namespace) -> int:
     """
     cwd = args.cwd or os.getcwd()
     name, project = _derive_agent_identity(cwd)
+    if name is None:
+        # The marker, same order the hooks use (derived wins, marker
+        # fallback). A CONTAINER has no git remote and is deliberately not
+        # opted in, so its ASSIGNED marker is the only identity it has —
+        # and this command is what CLAUDE.md tells everything to ask.
+        # Without this it answered "nothing" for every containerized seat.
+        name, project = _discover_agent_from_marker(cwd)
     if name is None and args.any:
         url = _git_remote_url(cwd)
         parsed = _parse_org_repo(url) if url else None
@@ -2232,7 +2239,20 @@ def identity_command(args: argparse.Namespace) -> int:
             raw = f"{repo}-{host}-{suffix}" if suffix else f"{repo}-{host}"
             name = _sanitize_ident(raw) or None
     if name is None:
-        print("", end="")
+        # Say WHY, on stderr. Silence here is indistinguishable from a
+        # missing subcommand — the first containerized seat ran this, saw
+        # exit 1 with no output, and reported that the CLI has no identity
+        # verb at all. stdout stays empty (callers capture it as the name)
+        # and the exit code stays 1 (callers branch on it); only the
+        # explanation is new, and squad's single call site already
+        # discards stderr.
+        print(
+            f"no identity for {cwd} — not a git repo with an origin, or its "
+            f"org/repo is not in ~/.mcp-hub/config.json 'projects', and no "
+            f".claude/hub-agent.json marker is present. Use --any to derive "
+            f"a name for a repo that is not opted in yet.",
+            file=sys.stderr,
+        )
         return 1
     if args.json:
         print(json.dumps({"name": name, "project": project, "cwd": cwd}))
@@ -4047,8 +4067,13 @@ def seat_entry_command(args: argparse.Namespace) -> int:
     # WAITS (measured on the first live seat: container healthy, claude
     # parked, never an agent). squad answers this on the host; a container
     # has to answer it for itself.
-    from mcp_hub.seat import pane_is_settled, startup_dance_action
+    from mcp_hub.seat import (
+        first_turn_is_safe,
+        pane_is_settled,
+        startup_dance_action,
+    )
 
+    pane = ""
     for _ in range(25):
         time.sleep(1)
         pane = subprocess.run(
@@ -4062,6 +4087,23 @@ def seat_entry_command(args: argparse.Namespace) -> int:
             continue
         if pane_is_settled(pane):
             break
+
+    # Never type into a dialog. The bypass-mode acceptance screen defaults
+    # to "No, exit", so the first-turn Enter confirmed the seat's own death
+    # — cleanly, exit 0, with nothing anywhere that looked wrong. A future
+    # unknown dialog gets the same treatment: refuse LOUDLY with a code
+    # `docker ps` can show, and print the pane so the screen that stopped
+    # us is in the log rather than in a tmux buffer that dies with it.
+    if not first_turn_is_safe(pane):
+        print(
+            "seat-entry: REFUSED (contract): claude is showing a dialog "
+            "this seat does not know how to answer, and a blind keypress "
+            "would confirm whatever its default row is. Pane follows:\n"
+            f"{pane}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return EXIT_CONTRACT
     print("seat-entry: claude is up", flush=True)
 
     # First turn. The register instruction rides in SessionStart's

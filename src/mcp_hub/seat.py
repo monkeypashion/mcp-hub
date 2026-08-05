@@ -248,6 +248,17 @@ def hooks_settings_content() -> dict:
         # on the theme picker forever, never registering. Half the fix; the
         # other half is onboarding_state() in ~/.claude.json.
         "theme": "dark",
+        # Bypass mode has its OWN one-time acceptance dialog, and its
+        # default row is "No, exit" — so the seat's first-turn Enter landed
+        # on it and confirmed its own exit, cleanly, code 0. Key taken from
+        # the claude binary's settings schema ("Whether the user has
+        # accepted the bypass permissions mode dialog"), not guessed.
+        #
+        # Seeding it is legitimate ONLY because card #360 exists: the
+        # operator accepted this posture explicitly, so the image records
+        # THEIR decision. An image that pre-accepted a dangerous-mode
+        # dialog nobody had agreed to would be smuggling one.
+        "skipDangerousModePermissionPrompt": True,
         "enabledMcpjsonServers": ["hub"],
         # Pre-granted COMMS, nothing else. Measured: the seat called
         # register() on its first turn and stopped on the tool-permission
@@ -352,7 +363,23 @@ def onboarding_state(claude_version: str) -> dict:
 # matching at 80 columns.
 _CHANNELS_TOKEN = "loadingdevelopmentchannels"
 # claude's own chrome: proof it is past the dialog phase and running.
-_CHROME_TOKENS = ("forshortcuts", "bypassingpermissions", "acceptedits")
+#
+# CAPTURED from a live seat (2.1.222), not composed. The first version of
+# this list was written from an INVENTED fixture ("Bypassing Permissions")
+# and rejected a perfectly healthy pane whose footer actually reads
+# "⏵⏵ bypass permissions on (shift+tab to cycle)" — the same
+# paraphrase-instead-of-capture mistake this module warns about elsewhere.
+#
+# `bypasspermissionson` deliberately, NOT `bypasspermissions`: the bypass
+# ACCEPTANCE DIALOG says "Bypass Permissions mode", and a token matching
+# both would call that dialog settled — the exact confusion that let a
+# blind Enter confirm "No, exit".
+_CHROME_TOKENS = (
+    "forshortcuts",
+    "shifttabtocycle",
+    "bypasspermissionson",
+    "acceptedits",
+)
 
 
 def _flatten(text: str) -> str:
@@ -374,6 +401,18 @@ def startup_dance_action(pane_text: str) -> str | None:
     if _CHANNELS_TOKEN in flat:
         return "Enter"
     return None
+
+
+def first_turn_is_safe(pane_text: str) -> bool:
+    """Whether typing into this pane can only reach a PROMPT.
+
+    The rule bought by the fifth gate: a blind Enter is safe only when
+    claude's own chrome is visible. Any dialog — known or unknown, present
+    or future — must stop the first turn rather than receive a keystroke
+    that happens to land on whatever row is default today. The bypass
+    dialog's default was "No, exit", so the seat confirmed its own death.
+    """
+    return pane_is_settled(pane_text)
 
 
 def pane_is_settled(pane_text: str) -> bool:
