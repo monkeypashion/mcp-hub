@@ -75,6 +75,11 @@ squad_agents() { rows | awk -F'|' '{gsub(/[[:space:]]/,"",$5)} $5!="faculty" {pr
 # agent can go deaf, or have meaningful hub state to judge. Matches both the
 # development flag and the eventual plugin form, each with a hub target.
 has_comms() {
+  # A CONTAINER seat always has comms: the channels flag is applied inside
+  # the container by seat-entry, so the roster's args field (which holds the
+  # marker) can never show it. Answering "no comms" for an agent that is
+  # demonstrably ⚡ on the hub makes the instrument wrong about its subject.
+  container_of "$1" >/dev/null && return 0
   case "$(field "$1" 4)" in
     *--dangerously-load-development-channels*hub*|*--channels*hub*) return 0 ;;
     *) return 1 ;;

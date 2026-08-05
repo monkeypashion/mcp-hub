@@ -184,3 +184,32 @@ def test_a_stopped_container_seat_IS_reported_down(env, tmp_path):
     )
     line = [ln for ln in r.stdout.splitlines() if "s1" in ln]
     assert line and "down" in line[0], r.stdout
+
+
+def test_a_container_seat_counts_as_having_comms(env, tmp_path):
+    """The last visible difference in `squad ls`: the HUB column showed `·`
+    (no comms) for a seat that was ⚡ on the hub, because has_comms greps the
+    ARGS field for the channels flag and a container row's args field holds
+    the marker instead.
+
+    The flag lives inside the container — seat-entry launches claude with
+    it. Reporting "no comms" for an agent that is demonstrably on the hub is
+    the instrument being wrong about the thing it is pointed at.
+    """
+    work = tmp_path / "w"
+    work.mkdir()
+    _run(env, "add-container", "s1", str(work), "c1")
+    r = subprocess.run(
+        ["bash", "-c",
+         f'. {SQUAD} 2>/dev/null; has_comms s1 && echo YES || echo NO'],
+        capture_output=True, text=True, timeout=60, env=env[0],
+    )
+    # Sourcing squad runs its dispatch; fall back to the observable surface.
+    if "YES" not in r.stdout and "NO" not in r.stdout:
+        r = subprocess.run(["bash", str(SQUAD), "ls"], capture_output=True,
+                           text=True, timeout=60, env=env[0])
+        line = [ln for ln in r.stdout.splitlines() if "s1" in ln][0]
+        # `·` is the "no comms, nothing to say" marker.
+        assert " · " not in line, line
+    else:
+        assert "YES" in r.stdout
