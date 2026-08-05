@@ -293,3 +293,75 @@ def test_a_STOPPED_container_seat_stays_hidden_like_other_faculty(env, tmp_path)
                        capture_output=True, text=True, timeout=60, env=e)
     names = [a["agent"] for a in json.loads(r.stdout).get("agents", [])]
     assert "s1" not in names, names
+
+
+def test_the_board_shows_a_container_seats_REAL_hub_glyph(env, tmp_path):
+    """`hub: '?'` on a seat that is ⚡ — because hub_glyph read the HOST
+    status cache and the daemon writes its cache inside the container.
+
+    Same fact, two readers (ls used hub_state, the board uses hub_glyph):
+    exactly the duplication that drifts, so both now consume one
+    substrate-aware source.
+    """
+    import json
+
+    work = tmp_path / "w"
+    work.mkdir()
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "docker").write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        "  *ps*) echo c1 ;;\n"
+        "  *capture-pane*) echo 'esc to interrupt' ;;\n"
+        "  *find*) echo fresh ;;\n"
+        '  *cat*) echo \'{"online": true, "wakeable": true}\' ;;\n'
+        "esac\nexit 0\n",
+        encoding="utf-8",
+    )
+    (bindir / "docker").chmod(0o755)
+    e, conf = env
+    e = dict(e, PATH=f"{bindir}:{e['PATH']}")
+    _run((e, conf), "add-container", "s1", str(work), "c1")
+
+    r = subprocess.run(["bash", str(SQUAD), "board", "--json"],
+                       capture_output=True, text=True, timeout=60, env=e)
+    row = [a for a in json.loads(r.stdout)["agents"] if a["agent"] == "s1"][0]
+    assert row["hub"] == "⚡", row
+
+
+def test_a_STALE_container_status_reads_UNKNOWN_not_online(env, tmp_path):
+    """The evidence rule, inside a container: a cache nobody has refreshed
+    says nothing about presence. It must read `?`, never the last thing it
+    happened to contain — a seat whose daemon died would otherwise look ⚡
+    forever.
+
+    Found by mutation: removing the freshness check changed nothing,
+    because the first fake docker always reported the file as fresh. A
+    guard the fixture cannot violate is a guard the test never checks.
+    """
+    import json
+
+    work = tmp_path / "w"
+    work.mkdir()
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "docker").write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        "  *ps*) echo c1 ;;\n"
+        "  *capture-pane*) echo 'esc to interrupt' ;;\n"
+        "  *find*) : ;;\n"                      # NOT fresh — nothing returned
+        '  *cat*) echo \'{"online": true, "wakeable": true}\' ;;\n'
+        "esac\nexit 0\n",
+        encoding="utf-8",
+    )
+    (bindir / "docker").chmod(0o755)
+    e, conf = env
+    e = dict(e, PATH=f"{bindir}:{e['PATH']}")
+    _run((e, conf), "add-container", "s1", str(work), "c1")
+
+    r = subprocess.run(["bash", str(SQUAD), "board", "--json"],
+                       capture_output=True, text=True, timeout=60, env=e)
+    row = [a for a in json.loads(r.stdout)["agents"] if a["agent"] == "s1"][0]
+    assert row["hub"] == "?", row
