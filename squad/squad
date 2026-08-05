@@ -179,7 +179,20 @@ need_agent() {
 # prefix on tmux 3.4 — only session-target commands (has-session / kill-session / attach) do. So we
 # use the bare name here (exact-match still wins: tmux tries exact before fnmatch/prefix).
 pane_cmd()   { tm display-message -p -t "$1" '#{pane_current_command}' 2>/dev/null || true; }
-pane_alive() { local c; c="$(pane_cmd "$1")"; [ -n "$c" ] && [ "$c" != bash ] && [ "$c" != sh ] && [ "$c" != zsh ]; }
+# Liveness. For a CONTAINER seat the process lives in docker, not in a host
+# pane: asking tmux here reported a running, ⚡-on-the-hub seat as `down`
+# (measured 2026-08-05) — a status line asserting something it never checked.
+# Ask the substrate that actually holds the process.
+container_alive() {
+  local c="$1"
+  command -v docker >/dev/null 2>&1 || return 1
+  docker ps --filter "name=^${c}$" --format '{{.Names}}' 2>/dev/null | grep -q .
+}
+
+pane_alive() {
+  local c
+  if c="$(container_of "$1")"; then container_alive "$c"; return $?; fi
+  c="$(pane_cmd "$1")"; [ -n "$c" ] && [ "$c" != bash ] && [ "$c" != sh ] && [ "$c" != zsh ]; }
 
 type_line() { local t="$1"; shift; tmt send-keys -t "$t" -l "$*" || return 1; sleep 0.2; tmt send-keys -t "$t" Enter; }
 
@@ -2327,6 +2340,18 @@ case "${1:-help}" in
             printf '%-26s %-10s %-11s %s\n' 'AGENT' 'TMUX' 'HUB' ''
             for a in $(agents); do
               hs="$(hub_state "$a")"; has_comms "$a" || hs="·"   # no comms flag: no hub state to show
+              # A container seat has no HOST tmux session by construction, and
+              # this gate ran before pane_alive ever did — so a running,
+              # ⚡-on-the-hub seat printed `down`. Ask docker instead, and say
+              # which substrate the answer came from rather than implying tmux.
+              if cseat="$(container_of "$a")"; then
+                if container_alive "$cseat"; then
+                  printf '%-26s %-10s %-11s (container %s)\n' "$a" up "$hs" "$cseat"
+                else
+                  printf '%-26s %-10s %-11s container not running — the EDGE starts it\n' "$a" down "$hs"
+                fi
+                continue
+              fi
               if tm has-session -t "=$a" 2>/dev/null; then
                 if pane_alive "$a"; then printf '%-26s %-10s %-11s (%s)\n' "$a" up "$hs" "$(pane_cmd "$a")"
                 else printf '%-26s %-10s %-11s session up, claude not running — try: %s restart %s\n' "$a" DEGRADED "$hs" "$CMD" "$a"; fi

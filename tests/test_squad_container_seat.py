@@ -127,3 +127,60 @@ def test_a_diagnostic_never_mutates_the_roster(env, tmp_path):
     before = env[1].read_text(encoding="utf-8")
     _run(env, "launch-cmd", "s1")
     assert env[1].read_text(encoding="utf-8") == before
+
+
+def test_a_running_container_seat_is_not_reported_DOWN(env, tmp_path):
+    """MEASURED: `squad ls` said `down` for a seat that was running and ⚡ on
+    the hub — because squad looked for a tmux session on the HOST while the
+    session lives inside the container.
+
+    That is the "delivered live" class of falsehood: a status line asserting
+    something it never checked. Liveness for a container row must ask
+    DOCKER, which is where the process actually is.
+    """
+    work = tmp_path / "w"
+    work.mkdir()
+    # A fake docker on PATH that reports the container as running — the real
+    # one is never invoked, so this can run anywhere.
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "docker").write_text(
+        "#!/bin/sh\n"
+        'case "$*" in *"ps"*) echo up-container ;; esac\nexit 0\n',
+        encoding="utf-8",
+    )
+    (bindir / "docker").chmod(0o755)
+
+    e, conf = env
+    e = dict(e, PATH=f"{bindir}:{e['PATH']}")
+    _run((e, conf), "add-container", "s1", str(work), "up-container")
+    r = subprocess.run(
+        ["bash", str(SQUAD), "ls"],
+        capture_output=True, text=True, timeout=60, env=e,
+    )
+    assert r.returncode == 0, r.stderr
+    line = [ln for ln in r.stdout.splitlines() if "s1" in ln]
+    assert line, r.stdout
+    assert "down" not in line[0], line[0]
+
+
+def test_a_stopped_container_seat_IS_reported_down(env, tmp_path):
+    """The other half: if the container is not running, saying so is the
+    whole point. A check that always says 'up' is not a check."""
+    work = tmp_path / "w"
+    work.mkdir()
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    # `docker ps` lists nothing — the container is absent.
+    (bindir / "docker").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (bindir / "docker").chmod(0o755)
+
+    e, conf = env
+    e = dict(e, PATH=f"{bindir}:{e['PATH']}")
+    _run((e, conf), "add-container", "s1", str(work), "gone-container")
+    r = subprocess.run(
+        ["bash", str(SQUAD), "ls"],
+        capture_output=True, text=True, timeout=60, env=e,
+    )
+    line = [ln for ln in r.stdout.splitlines() if "s1" in ln]
+    assert line and "down" in line[0], r.stdout
