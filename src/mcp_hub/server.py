@@ -3764,6 +3764,7 @@ _CLI_SUBCOMMANDS = {
     "workspaces",
     "seats",
     "placements",
+    "capsules",
     "machines",
     "focus",
     "seat-entry",

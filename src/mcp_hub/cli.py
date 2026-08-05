@@ -2015,6 +2015,95 @@ def placements_command(args: argparse.Namespace, api: Any = None) -> int:
         return 1
 
 
+def capsules_command(args: argparse.Namespace, api: Any = None) -> int:
+    """Capsules — a whole SQUAD on docker. `mcp-hub capsules list|compose|place`.
+
+    The machinery has been on the hub since the runtime shipped; what was
+    missing was a verb, so the only way to start a squad on containers was
+    curl with the operator token. A capability reachable only by curl is
+    half-delivered.
+
+    compose FREEZES a squad (every member's seat spec as it is now) and
+    place writes one docker placement PER SEAT. Both are bookkeeping: the
+    named machine's edge is what makes any of it true.
+    """
+    from mcp_hub.operator_api import ApiUnavailable, OperatorApi, api_base
+
+    if api is None:
+        api = OperatorApi(api_base(args.hub_url))
+
+    try:
+        if args.action == "list":
+            rows = api.list_capsules()
+            if args.json:
+                print(json.dumps(rows, indent=2))
+                return 0
+            if not rows:
+                print("no capsules — compose one to freeze a squad you can "
+                      "place on any machine")
+                return 0
+            for c in rows:
+                seats = len((c.get("manifest") or {}).get("seats") or [])
+                print(f"{c['id']:<16} {c['squad']:<20} {seats:>2} seat(s)  "
+                      f"{c.get('created', '')}")
+            return 0
+
+        if args.action == "compose":
+            if not args.squad:
+                print("--squad required — a capsule freezes ONE squad",
+                      file=sys.stderr)
+                return 1
+            if args.register:
+                # Explicit, never silent: a squad can exist for MESSAGING
+                # (squad_members, who hears a broadcast) and be unknown to
+                # the MANAGEMENT registry (api_squads, what the runtime can
+                # place). Composing then 404s with the members sitting right
+                # there. Registering is a real act, so it is a real flag.
+                try:
+                    api.create_api_squad(args.squad)
+                    print(f"registered squad '{args.squad}' for management")
+                except ApiUnavailable as e:
+                    # 409 = already registered, which is success for our
+                    # purposes; anything else is a real failure.
+                    if "409" not in str(e):
+                        raise
+            rec = api.create_capsule(args.squad)
+            seats = (rec.get("manifest") or {}).get("seats") or []
+            print(f"{rec['id']}: froze squad '{rec['squad']}' — "
+                  f"{len(seats)} seat(s)")
+            for s in seats:
+                image = (s.get("spec") or {}).get("image") or "—"
+                print(f"  {s['identity']:<30} {image}")
+            # Same trap as `seats add`: "composed" reads as "started".
+            print("\nnothing is running — a capsule is INERT. Place it:\n"
+                  f"  mcp-hub capsules place {rec['id']} --machine <machine>")
+            return 0
+
+        # -- place ------------------------------------------------------
+        if not args.target:
+            print("name the capsule to place (see `mcp-hub capsules list`)",
+                  file=sys.stderr)
+            return 1
+        if not args.machine:
+            # No default: placing a whole squad on the wrong box because a
+            # hostname was assumed is not a mistake worth making convenient.
+            print("--machine required — placing a squad is not a guess",
+                  file=sys.stderr)
+            return 1
+        rec = api.place_capsule(args.target, args.machine)
+        ids = rec.get("placements") or []
+        print(f"{args.target}: {len(ids)} placement(s) written on "
+              f"{args.machine}")
+        for pid in ids:
+            print(f"  {pid}")
+        print("\nnothing has happened yet — that machine's `edge apply` "
+              "realizes them and reports what it OBSERVED.")
+        return 0
+    except ApiUnavailable as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+
 def workspaces_command(args: argparse.Namespace, api: Any = None) -> int:
     """The workspace registry from the command line.
 
@@ -4722,6 +4811,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="Pull, plan and print actions; execute nothing, report nothing",
     )
 
+    capsules = sub.add_parser(
+        "capsules",
+        help="A whole SQUAD on docker: freeze it, then place it on a machine",
+        description=(
+            "A capsule is a squad FROZEN — every member's seat spec as it is "
+            "at compose time, so placing the same capsule twice puts up the "
+            "same squad rather than whatever the roster says at the second "
+            "moment. `place` writes one docker placement PER SEAT; nothing "
+            "runs until that machine's edge pass realizes them."
+        ),
+    )
+    capsules.add_argument(
+        "action", choices=["list", "compose", "place"],
+        help="list · compose: freeze a squad · place: one placement per seat",
+    )
+    capsules.add_argument("target", nargs="?", help="place: which capsule")
+    capsules.add_argument("--squad", default=None, help="compose: which squad")
+    capsules.add_argument(
+        "--machine", default=None,
+        help="place: which machine (no default — placing a squad is not a guess)",
+    )
+    capsules.add_argument(
+        "--hub-url", default=DEFAULT_HUB_URL,
+        help="Hub base URL (default: $MCP_HUB_URL or built-in)",
+    )
+    capsules.add_argument(
+        "--register", action="store_true",
+        help=("compose: register the squad for management first — a squad "
+              "can exist for messaging and be unknown to the runtime"),
+    )
+    capsules.add_argument("--json", action="store_true",
+                          help="Machine-readable output")
+
     seat_entry = sub.add_parser(
         "seat-entry",
         help="Container entrypoint: validate the seat contract, prepare, launch claude",
@@ -4804,6 +4926,8 @@ def main(argv: list[str] | None = None) -> int:
         return seats_command(args)
     if args.subcommand == "placements":
         return placements_command(args)
+    if args.subcommand == "capsules":
+        return capsules_command(args)
     if args.subcommand == "machines":
         return machines_command(args)
     if args.subcommand == "focus":

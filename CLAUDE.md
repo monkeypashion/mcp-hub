@@ -649,6 +649,93 @@ machine that can rotate its own credential is a machine that can lock the
 operator out of it, and the recovery path for *that* is the one that was
 already missing.
 
+## Seats in containers — `mcp-hub-seat:latest`
+
+A claude seat that runs in docker. One container = one agent: a repo, an
+**assigned** identity, a hub connection, a credential. Full contract in
+`docs/seat-image.md`; build it from the repo root, never with the root
+Dockerfile (that one is the hub's own deploy):
+
+```bash
+docker build -f seat/Dockerfile -t mcp-hub-seat:latest .
+
+mcp-hub seats add --identity claude-seat-dev-vm-1 --machine dev-vm-1 \
+  --image mcp-hub-seat:latest \
+  --env MCP_HUB_URL=http://100.109.6.114:8090/mcp \
+  --env-from-host CLAUDE_CODE_OAUTH_TOKEN
+mcp-hub placements set "" running --seat claude-seat-dev-vm-1 \
+  --machine dev-vm-1 --substrate docker
+```
+
+The credential is named, never carried: `--env-from-host` means the hub
+stores the NAME and the edge injects the VALUE from its own environment
+(`~/.mcp-hub/edge-env`, `chmod 600`, read by the edge timer through
+`EnvironmentFile=`). A compromised control plane leaks nothing.
+
+**`docker ps` is not the acceptance test — hub presence is.** Six gates
+stood between "container running" and "agent on the hub", every one of
+them invisible to docker, and five of them a dialog with nobody there to
+answer it:
+
+1. **Root-owned WORKDIR** — docker's `WORKDIR` mkdirs as root even after
+   `USER`, so PID 1 could not write its own directory.
+2. **Onboarding wizard** — a fresh HOME opens the theme picker and waits.
+   Needs BOTH halves: `theme` in settings and `hasCompletedOnboarding` in
+   `~/.claude.json`, merged read-modify-write so it cannot erase the
+   folder-trust seed written a moment earlier.
+3. **Development-channels dialog** — `squad` answers this on the host; a
+   container has to answer it for itself.
+4. **No first turn** — hooks fired, daemon ran, `~/.claude/projects/` was
+   empty. The register instruction rides in SessionStart's
+   `additionalContext`, which only a RUNNING TURN consumes. A fleet agent
+   gets that turn from the operator; a container has nobody, so the seat
+   types its own.
+5. **MCP tool permission** — claude called `register()` and stopped on
+   "Do you want to proceed?".
+6. **Bypass-mode acceptance** — minted by the fix for (5), and its default
+   row is **"No, exit"**, so the seat's own first-turn Enter confirmed its
+   own death. Cleanly, exit 0, with nothing anywhere that looked wrong.
+
+⇒ **seat-entry never types into a dialog it does not recognise.** It
+refuses with exit 43 and prints the pane, because the silent exit 0 cost a
+night of looking in the wrong place. Any future dialog fails loudly rather
+than being answered by a keystroke that lands on whatever row is default.
+
+**The container is the sandbox** (operator, card #360): seats run with
+`permissions.defaultMode: bypassPermissions`, because a seat that cannot
+run a command is an observer, not a worker. 🔴 That is sound ONLY while the
+seat is genuinely contained — **no docker socket, ever** (container
+management is the edge's job, from outside), non-root user, no host mounts
+beyond its own `memory_volume`.
+
+**The edge observes WHICH IMAGE a container runs**, not merely that one
+runs: `docker inspect` compares the container's image ID against the
+spec's, and a mismatch reports `stale-image`, which the hub reads as
+diverged. `docker ps --format {{.ImageID}}` does not exist, and `{{.Image}}`
+is the tag — identical for a container built from last month's `latest`.
+
+## Squads on docker — capsules
+
+A capsule is a squad **frozen**: every member's seat spec as it is at
+compose time, so placing the same capsule twice puts up the same squad
+rather than whatever the roster says at the second moment.
+
+```bash
+mcp-hub capsules compose --squad runtime --register
+mcp-hub capsules place cap-<id> --machine dev-vm-1   # one placement PER SEAT
+mcp-hub capsules list
+```
+
+`--register` is explicit because there are **two squad registries and they
+are not the same thing**: `squad_members` decides who hears a broadcast,
+`api_squads` decides what the runtime may place. A squad can exist for
+comms and be unknown to the runtime, which is exactly how composing a live
+squad 404s with its members sitting right there.
+
+A member with **no seat spec** composes with no image — and the edge then
+**refuses to materialize it** rather than guessing one. That refusal is
+visible in the compose output (image column `—`) before anything runs.
+
 ## Stop hook — auto-surface queued messages
 
 Channels-based wake fires for `priority="normal"` and `"urgent"` messages, but `"low"` messages are deliberately queue-only (no wake). Without a Stop hook, agents only see queued items when they happen to call `get_messages()` — which often means never. The Stop hook closes that gap by auto-checking the inbox at every turn boundary. It also self-heals the keep-alive daemon: if no live daemon owns the agent's pidfile at a turn boundary, one is spawned detached (singleton-capped, fail-open).

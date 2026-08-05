@@ -234,6 +234,46 @@ class OperatorApi:
         the intent, and the machine's edge does the work on its next pass."""
         return self._request("DELETE", f"/api/v1/placements/{pid}").json()
 
+    # -- capsules: a whole SQUAD, frozen and placeable ------------------------
+
+    def list_api_squads(self) -> list[dict[str, Any]]:
+        return self._request("GET", "/api/v1/squads").json()["squads"]
+
+    def create_api_squad(self, name: str, description: str = "") -> dict[str, Any]:
+        """Register a squad in the MANAGEMENT registry.
+
+        Deliberately separate from messaging squads: `squad_members` decides
+        who hears a broadcast, `api_squads` decides what the runtime can
+        manage. A squad can exist for comms and be unknown here, which is
+        why composing a capsule for a live squad can 404 — the members are
+        there, the management row is not.
+        """
+        return self._request(
+            "POST", "/api/v1/squads",
+            json={"name": name, "description": description},
+        ).json()
+
+    def list_capsules(self) -> list[dict[str, Any]]:
+        return self._request("GET", "/api/v1/capsules").json()["capsules"]
+
+    def create_capsule(self, squad: str) -> dict[str, Any]:
+        """Freeze a squad into a capsule: every seat's spec as it is NOW.
+
+        Composition is a snapshot on purpose — placing the same capsule
+        twice puts the same squad up twice, rather than whatever the roster
+        happens to say at the second moment.
+        """
+        return self._request(
+            "POST", "/api/v1/capsules", json={"squad": squad}
+        ).json()
+
+    def place_capsule(self, cid: str, machine: str) -> dict[str, Any]:
+        """One docker placement PER SEAT on `machine`. Nothing runs yet —
+        that machine's edge realizes them on its next pass."""
+        return self._request(
+            "POST", f"/api/v1/capsules/{cid}/place", json={"machine": machine}
+        ).json()
+
     def machine_placements(self, machine: str) -> list[dict[str, Any]]:
         return self._request(
             "GET", f"/api/v1/machines/{machine}/placements"
