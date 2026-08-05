@@ -199,6 +199,19 @@ pane_alive() {
   if c="$(container_of "$1")"; then container_alive "$c"; return $?; fi
   c="$(pane_cmd "$1")"; [ -n "$c" ] && [ "$c" != bash ] && [ "$c" != sh ] && [ "$c" != zsh ]; }
 
+# The visible pane text for an agent, from whichever substrate holds it. A
+# container seat's tmux lives INSIDE the container, so capturing on the host
+# returned nothing and the board dropped the row entirely — the seat was
+# running, ⚡, and invisible (operator report, 2026-08-05).
+capture_for() {
+  local a="$1" c
+  if c="$(container_of "$a")"; then
+    docker exec "$c" tmux capture-pane -p -t seat 2>/dev/null
+  else
+    tm capture-pane -p -t "$a" 2>/dev/null
+  fi
+}
+
 type_line() { local t="$1"; shift; tmt send-keys -t "$t" -l "$*" || return 1; sleep 0.2; tmt send-keys -t "$t" Enter; }
 
 # What is this agent's claude doing RIGHT NOW? Reads the pane's visible text —
@@ -2644,7 +2657,7 @@ case "${1:-help}" in
                   # one capture, three harvests: waiting/working state, the
                   # ctx % AND the model — all already rendered by the agent's
                   # own statusline ("⚡ 9/9 · Fable5 high · ctx [..] 14% · …")
-                  tail="$(tm capture-pane -p -t "$a" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -20)"
+                  tail="$(capture_for "$a" | grep -v '^[[:space:]]*$' | tail -20)"
                   st="$(classify_text "$tail")"   # shared patterns — never re-implement here
                   ctx="$(printf '%s\n' "$tail" | grep -oE '[c]tx \[[^]]*\][[:space:]]*[0-9]+%' | tail -1 | grep -oE '[0-9]+%' || true)"
                   # first letter only — tab space is precious: O/F/S/H
@@ -2912,12 +2925,13 @@ except Exception:
               local a tail st ctx mod g q act el gi
               git_refresh; usage_refresh
               for a in $(agents); do
-                if ! tm has-session -t "=$a" 2>/dev/null || ! pane_alive "$a"; then
+                if ! pane_alive "$a" || { ! container_of "$a" >/dev/null &&
+                     ! tm has-session -t "=$a" 2>/dev/null; }; then
                   # down faculty is invisible on the board too — same rule as who
                   is_faculty "$a" && continue
                   printf '%s\037%s\037\037\037\0370\037\037\037%s\037%s\n' "$a" "down" "$(git_for "$a")" "$(usage_for "$a")"; continue
                 fi
-                tail="$(tm capture-pane -p -t "$a" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -20)"
+                tail="$(capture_for "$a" | grep -v '^[[:space:]]*$' | tail -20)"
                 st="$(classify_text "$tail")"      # shared patterns — never re-implement
                 ctx="$(printf '%s\n' "$tail" | grep -oE '[c]tx \[[^]]*\][[:space:]]*[0-9]+%' | tail -1 | grep -oE '[0-9]+%' || true)"
                 mod="$(printf '%s\n' "$tail" | grep -oE '[O]pus|[F]able|[S]onnet|[H]aiku' | tail -1 || true)"

@@ -213,3 +213,83 @@ def test_a_container_seat_counts_as_having_comms(env, tmp_path):
         assert " · " not in line, line
     else:
         assert "YES" in r.stdout
+
+
+def _fake_docker(bindir, container, pane_text):
+    """A docker that reports `container` running and serves a pane capture."""
+    bindir.mkdir(exist_ok=True)
+    (bindir / "docker").write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        f'  *ps*) echo {container} ;;\n'
+        f'  *capture-pane*) printf "%s\\n" "{pane_text}" ;;\n'
+        "esac\nexit 0\n",
+        encoding="utf-8",
+    )
+    (bindir / "docker").chmod(0o755)
+
+
+def test_a_running_container_seat_APPEARS_on_the_board(env, tmp_path):
+    """The operator's report: it was not on the squad board at all.
+
+    board_scan gates on a HOST tmux session, and a container seat has none —
+    so it fell into the `down` branch and, being faculty, was dropped
+    entirely. Invisible, while running and ⚡. The board must read a
+    container row's state from the container.
+    """
+    import json
+
+    work = tmp_path / "w"
+    work.mkdir()
+    _fake_docker(tmp_path / "bin", "c1", "esc to interrupt")
+    e, conf = env
+    e = dict(e, PATH=f"{tmp_path / 'bin'}:{e['PATH']}")
+    _run((e, conf), "add-container", "s1", str(work), "c1")
+
+    r = subprocess.run(["bash", str(SQUAD), "board", "--json"],
+                       capture_output=True, text=True, timeout=60, env=e)
+    assert r.returncode == 0, r.stderr
+    names = [a["agent"] for a in json.loads(r.stdout).get("agents", [])]
+    assert "s1" in names, names
+
+
+def test_the_board_reads_a_container_seats_REAL_state(env, tmp_path):
+    """Not merely present — present with a state derived from its own pane,
+    like any other agent. A row that is always 'idle' would be decoration."""
+    import json
+
+    work = tmp_path / "w"
+    work.mkdir()
+    # "esc to interrupt" is claude's mid-turn chrome — classify_text calls
+    # that WORKING, and the text comes from inside the container.
+    _fake_docker(tmp_path / "bin", "c1", "esc to interrupt")
+    e, conf = env
+    e = dict(e, PATH=f"{tmp_path / 'bin'}:{e['PATH']}")
+    _run((e, conf), "add-container", "s1", str(work), "c1")
+
+    r = subprocess.run(["bash", str(SQUAD), "board", "--json"],
+                       capture_output=True, text=True, timeout=60, env=e)
+    row = [a for a in json.loads(r.stdout)["agents"] if a["agent"] == "s1"][0]
+    assert row["state"] == "working", row
+
+
+def test_a_STOPPED_container_seat_stays_hidden_like_other_faculty(env, tmp_path):
+    """The existing rule is kept deliberately: permanent grey `down` rows
+    bury the squad signal, which is why faculty is hidden when not running.
+    A container seat is on-demand by nature, so it follows that rule."""
+    import json
+
+    work = tmp_path / "w"
+    work.mkdir()
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "docker").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (bindir / "docker").chmod(0o755)
+    e, conf = env
+    e = dict(e, PATH=f"{bindir}:{e['PATH']}")
+    _run((e, conf), "add-container", "s1", str(work), "c1")
+
+    r = subprocess.run(["bash", str(SQUAD), "board", "--json"],
+                       capture_output=True, text=True, timeout=60, env=e)
+    names = [a["agent"] for a in json.loads(r.stdout).get("agents", [])]
+    assert "s1" not in names, names
