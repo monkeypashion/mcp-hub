@@ -63,3 +63,42 @@ def test_the_roster_order_is_preserved(tmp_path, monkeypatch):
     conf.write_text(f"zeta|{tmp_path}/z|||\nalpha|{tmp_path}/a|||\n", encoding="utf-8")
     monkeypatch.setattr(cli, "SQUAD_CONF", conf)
     assert [r["agent"] for r in cli._roster_all()] == ["zeta", "alpha"]
+
+
+def test_the_panel_is_handed_a_roster_READER_not_a_snapshot(tmp_path, monkeypatch):
+    """The board polls; the roster has to ride that poll.
+
+    A list captured at launch cannot see `squad add-container` enrol a seat
+    from another pane, which is exactly how a container seat stayed invisible
+    on a board that was already open. So the assertion is not "the right agents
+    were passed" — it is that what was passed still ANSWERS after the file
+    changes underneath it.
+    """
+    import argparse
+
+    from mcp_hub import board_data, settings_app
+
+    conf = tmp_path / "squad.conf"
+    conf.write_text(f"a1|{tmp_path}/one|||\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "SQUAD_CONF", conf)
+    monkeypatch.setattr(board_data, "terminal_prefers_dark", lambda: None)
+
+    seen = {}
+
+    class Stub:
+        def __init__(self, agents, **kw):
+            seen["agents"] = agents
+            seen.update(kw)
+
+        def run(self):
+            return None
+
+    monkeypatch.setattr(settings_app, "SettingsApp", Stub)
+    rc = cli.settings_command(argparse.Namespace(tui=True, workspace=None,
+                                                 cwd=None, json=False))
+    assert rc == 0
+    assert [r["agent"] for r in seen["agents"]] == ["a1"]
+
+    conf.write_text(f"a1|{tmp_path}/one|||\na2|{tmp_path}/two|||\n",
+                    encoding="utf-8")
+    assert [r["agent"] for r in seen["roster_for"]()] == ["a1", "a2"]

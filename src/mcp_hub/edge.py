@@ -89,6 +89,26 @@ def plan(
     return actions
 
 
+def local_roster() -> list[dict[str, str]]:
+    """This machine's roster as {agent, worktree} — the fact only it holds.
+
+    Imported lazily: `edge` is the realizer and `cli` is the command surface,
+    and importing the latter at module scope makes a cycle. Failure is an
+    EMPTY list rather than a raise, because a machine that cannot read its own
+    roster must still report its workspaces and observations — but note that
+    the caller sends the key regardless, so an unreadable roster is reported as
+    "no agents", not as "no roster reported". That is the honest way round: an
+    edge that IS reporting should not be treated as one that cannot.
+    """
+    try:
+        from mcp_hub.cli import _roster_all
+
+        return [{"agent": r["agent"], "worktree": r.get("worktree", "")}
+                for r in _roster_all() if r.get("agent")]
+    except Exception:  # noqa: BLE001 — the edge never dies of a bad roster
+        return []
+
+
 def discover_workspaces(scan_dirs: list[Path]) -> list[dict[str, Any]]:
     """Enumerate .code-workspace files under the given directories (flat).
 
@@ -652,10 +672,18 @@ def edge_apply(
         reported += 1
 
     workspaces = discover_workspaces([Path(d) for d in scan_dirs])
+    # The roster, agent → worktree. Only this machine can say which folder an
+    # agent sits in: a remote row in the board carries no worktree, so without
+    # this the board matches by repo BASENAME and a box with several clones of
+    # one repo has every clone claimed by every workspace listing any of them.
+    # Reported even when empty — an empty LIST is "no agents here", while the
+    # key being ABSENT is "this edge does not report rosters", and the board
+    # falls back to basename matching only for the second.
     api.push_status(
         machine,
         {
             "workspaces": workspaces,
+            "agents": local_roster(),
             "seats": [
                 {"seat": s, **v} for s, v in sorted(local.items())
             ],

@@ -38,7 +38,7 @@ def _ws(name, machine, listings, **kw):
 
 def _tree(*, roster=(), rows=(), fleet_agents=(), fleet_ts=NOW,
           machines=("here",), this_machine="here", board=None, scoped_to=None,
-          listings_for=None):
+          listings_for=None, seats=(), machine_agents=None):
     return build_tree(
         roster=list(roster),
         board=board or {"agents": {}},
@@ -48,6 +48,8 @@ def _tree(*, roster=(), rows=(), fleet_agents=(), fleet_ts=NOW,
         this_machine=this_machine,
         scoped_to=scoped_to,
         listings_for=listings_for,
+        seats=list(seats),
+        machine_agents=machine_agents,
         now=NOW,
     )
 
@@ -306,3 +308,345 @@ def test_structure_key_ignores_a_state_tick_but_notices_a_new_seat():
     grown = _tree(roster=[*roster,
                           {"agent": "beta", "worktree": "/b", "klass": "squad"}])
     assert structure_key(grown) != structure_key(idle)
+
+
+# ---- containers: a substrate BETWEEN the machine and its agents -------------
+#
+# The operator's own words: "I expected a container alongside the other
+# machines, or underneath — underneath dev-vm-1 makes sense — and underneath
+# the container the workspace and under that the agents." Underneath is right,
+# and the reason it is not a MACHINE is load-bearing: no token, no edge, no
+# ssh. The docker that runs it belongs to the box above.
+
+def _seat(identity, machine, image="mcp-hub-seat:latest", **kw):
+    s = {"identity": identity, "machine": machine, "repo": "", "folder": "",
+         "launch_args": "", "class": "squad", "cloned_from": "",
+         "spec": {"image": image} if image else {}}
+    s.update(kw)
+    return s
+
+
+def test_a_container_seat_hangs_under_its_host_not_beside_it():
+    t = _tree(seats=[_seat("seat-here", "here")])
+    machines = [m["machine"] for m in t["machines"]]
+    assert machines == ["here"], f"a container became its own machine: {machines}"
+    box = t["machines"][0]["containers"][0]
+    assert box["kind"] == "container"
+    assert box["identity"] == "seat-here"
+    assert box["image"] == "mcp-hub-seat:latest"
+
+
+def test_a_worktree_seat_grows_no_container_node():
+    """A seat with no image is not containerized. Inventing a node for it
+    would put a substrate on a machine that does not have one."""
+    t = _tree(seats=[_seat("plain-here", "here", image="")])
+    assert t["machines"][0]["containers"] == []
+
+
+def test_the_agent_inside_a_container_hangs_under_the_container():
+    t = _tree(
+        roster=[{"agent": "seat-here", "worktree": "/work/seat", "klass": "squad"}],
+        seats=[_seat("seat-here", "here")],
+    )
+    box = t["machines"][0]["containers"][0]
+    assert [a["agent"] for a in box["agents"]] == ["seat-here"]
+
+
+def test_a_containerized_agent_is_not_ALSO_listed_under_a_host_workspace():
+    """The duplicate rows the operator saw. Its mount point is listed by a host
+    workspace, which is true and irrelevant: the agent runs in the container,
+    and showing it in both says it is in two places."""
+    t = _tree(
+        roster=[{"agent": "seat-here", "worktree": "/work/seat", "klass": "squad"}],
+        rows=[_ws("squad", "here", ["/work"])],       # /work CONTAINS /work/seat
+        seats=[_seat("seat-here", "here")],
+    )
+    ws = t["machines"][0]["workspaces"][0]
+    assert [a["agent"] for a in ws["agents"]] == [], \
+        "the seat is claimed by a host workspace as well as its container"
+    assert len(list(walk_agents(t))) == 1, "shown twice"
+
+
+def test_a_REMOTE_containerized_agent_stops_guessing_by_repo_name():
+    """Remote rows have no worktree, so they are matched by repo BASENAME —
+    and a box with three clones of one repo attributes all of them to every
+    workspace listing any of them (dev-vm-1 has three `mcp-hub` folders). The
+    seat record carries the real substrate, so a containerized agent opts out
+    of the guess entirely.
+    """
+    t = _tree(
+        machines=["here", "box"], this_machine="here",
+        rows=[_ws("one", "box", ["/a/mcp-hub"]), _ws("two", "box", ["/b/mcp-hub"])],
+        fleet_agents=[{"name": "mcp-hub-seat-box", "project": "org/mcp-hub",
+                       "wakeable": True, "idle": True, "sessions": 1, "next": ""}],
+        seats=[_seat("mcp-hub-seat-box", "box")],
+    )
+    box = [m for m in t["machines"] if m["machine"] == "box"][0]
+    assert [w["agents"] for w in box["workspaces"]] == [[], []], \
+        "the guess still claimed it"
+    assert [a["agent"] for a in box["containers"][0]["agents"]] \
+        == ["mcp-hub-seat-box"]
+
+
+def test_a_container_the_hub_knows_with_nobody_in_it_still_shows():
+    """Zero agents is a fact worth seeing — a placement that never came up
+    looks exactly like a container that was never declared, otherwise."""
+    t = _tree(seats=[_seat("empty-here", "here")])
+    box = t["machines"][0]["containers"][0]
+    assert box["agents"] == []
+
+
+def test_a_container_puts_its_host_on_the_map_even_with_no_workspaces():
+    """A box known ONLY for running a container must not be dropped by the
+    'enrolled box with nothing on it' rule."""
+    t = _tree(machines=["here"], this_machine="here",
+              seats=[_seat("seat-box", "box")])
+    assert "box" in [m["machine"] for m in t["machines"]]
+
+
+def test_containers_are_STRUCTURE_so_a_new_one_forces_a_rebuild():
+    """The poll relabels in place and only restructures when structure_key
+    moves. Omit containers from it and a seat that comes up never gets a node,
+    because the tree relabels forever."""
+    before = structure_key(_tree())
+    after = structure_key(_tree(seats=[_seat("seat-here", "here")]))
+    assert before != after
+
+
+def test_the_agent_inside_a_container_is_structure_too():
+    empty = structure_key(_tree(seats=[_seat("seat-here", "here")]))
+    filled = structure_key(_tree(
+        roster=[{"agent": "seat-here", "worktree": "/w", "klass": "squad"}],
+        seats=[_seat("seat-here", "here")]))
+    assert empty != filled
+
+
+# ---- where a container's work actually lives -------------------------------
+
+def test_seat_folder_prefers_what_the_hub_was_told():
+    from mcp_hub.fleet_tree import seat_folder
+    assert seat_folder(_seat("s", "here", folder="/declared",
+                             spec={"image": "i", "volumes": ["/mounted:/w"]})) \
+        == "/declared"
+
+
+def test_seat_folder_falls_back_to_the_bind_mount():
+    from mcp_hub.fleet_tree import seat_folder
+    assert seat_folder(_seat("s", "here",
+                             spec={"image": "i", "volumes": ["/mounted:/w"]})) \
+        == "/mounted"
+
+
+def test_seat_folder_ignores_a_NAMED_volume():
+    """`seat-memory-dev-vm-1:/home/seat/.claude` is a name, not a path. Read as
+    a worktree it would attribute the seat to any workspace listing a folder
+    of that name."""
+    from mcp_hub.fleet_tree import seat_folder
+    assert seat_folder(_seat("s", "here",
+                             spec={"image": "i",
+                                   "volumes": ["seat-memory:/home/seat/.claude"]})) \
+        == ""
+
+
+# ---- a scoped board cannot claim other workspaces are empty -----------------
+
+def test_other_local_workspaces_are_marked_OUT_OF_SCOPE_not_empty():
+    """A scoped board is handed a roster filtered to its own workspace, so
+    every other local workspace draws with no children. That is not a
+    measurement of emptiness and must not be presented as one — `xport` and
+    `xport2` each hold a real agent and rendered as bare rows.
+    """
+    here = _ws("windows", "here", ["/w/windows"])
+    other = _ws("xport", "here", ["/w/xport"])
+    t = _tree(rows=[here, other], scoped_to=here["path"],
+              roster=[{"agent": "a-here", "worktree": "/w/windows",
+                       "klass": "squad"}])
+    by_name = {w["name"]: w for w in t["machines"][0]["workspaces"]}
+    assert by_name["windows"]["in_scope"] is True
+    assert by_name["xport"]["in_scope"] is False
+
+
+def test_an_unscoped_board_measures_every_local_workspace():
+    """No --workspace means the whole roster, so every row IS a measurement."""
+    t = _tree(rows=[_ws("windows", "here", ["/w/windows"]),
+                    _ws("xport", "here", ["/w/xport"])], scoped_to=None)
+    assert all(w["in_scope"] is True for w in t["machines"][0]["workspaces"])
+
+
+def test_a_REMOTE_workspace_is_never_out_of_scope():
+    """Remote agents come from the fleet snapshot, which no scope filters.
+    Marking them out-of-scope would be a warning about nothing."""
+    here = _ws("windows", "here", ["/w/windows"])
+    t = _tree(machines=["here", "box"], this_machine="here",
+              rows=[here, _ws("squad", "box", ["/b/repo"])],
+              scoped_to=here["path"])
+    box = [m for m in t["machines"] if m["machine"] == "box"][0]
+    assert box["workspaces"][0]["in_scope"] is True
+
+
+# ---- clones of one repo on one box: refuse to guess -------------------------
+
+def _remote(name, project):
+    return {"name": name, "project": project, "wakeable": True, "idle": True,
+            "sessions": 1, "next": ""}
+
+
+def test_two_clones_of_one_repo_make_the_workspace_UNKNOWABLE():
+    """dev-vm-1 has three `mcp-hub` folders. A remote row has no worktree, so
+    the basename matched all of them and the agent appeared under every
+    workspace listing any clone — one of which belonged to a DIFFERENT agent.
+    Two distinct paths means we cannot tell which clone this is."""
+    t = _tree(
+        machines=["here", "box"], this_machine="here",
+        rows=[_ws("squad", "box", ["/code/org/mcp-hub"]),
+              _ws("general", "box", ["/general/mcp-hub"])],
+        fleet_agents=[_remote("mcp-hub-box", "org/mcp-hub")],
+    )
+    box = [m for m in t["machines"] if m["machine"] == "box"][0]
+    assert [w["agents"] for w in box["workspaces"]] == [[], []], \
+        "still claimed by a workspace it may not be in"
+    assert [a["agent"] for a in box["loose"]] == ["mcp-hub-box"]
+    assert box["loose"][0]["ambiguous"] == ["/code/org/mcp-hub",
+                                            "/general/mcp-hub"]
+
+
+def test_the_SAME_path_in_several_workspaces_is_membership_not_ambiguity():
+    """`squad` and `runtime` both list `code/monkeypashion/mcp-hub`. That is
+    the multi-membership local rows already show, and refusing it would lose a
+    true fact to avoid a false one."""
+    t = _tree(
+        machines=["here", "box"], this_machine="here",
+        rows=[_ws("squad", "box", ["/code/org/mcp-hub"]),
+              _ws("runtime", "box", ["/code/org/mcp-hub"])],
+        fleet_agents=[_remote("mcp-hub-box", "org/mcp-hub")],
+    )
+    box = [m for m in t["machines"] if m["machine"] == "box"][0]
+    assert [[a["agent"] for a in w["agents"]] for w in box["workspaces"]] \
+        == [["mcp-hub-box"], ["mcp-hub-box"]]
+    assert box["loose"] == []
+    assert box["workspaces"][0]["agents"][0]["ambiguous"] == []
+
+
+def test_one_matching_workspace_still_resolves():
+    t = _tree(
+        machines=["here", "box"], this_machine="here",
+        rows=[_ws("squad", "box", ["/code/org/pm"])],
+        fleet_agents=[_remote("pm-box", "org/pm")],
+    )
+    box = [m for m in t["machines"] if m["machine"] == "box"][0]
+    assert [a["agent"] for a in box["workspaces"][0]["agents"]] == ["pm-box"]
+
+
+# ---- never written is not gone stale ---------------------------------------
+
+def test_a_snapshot_never_written_is_not_reported_as_one_that_stopped():
+    """After a reboot the daemon that writes the snapshot does not exist until
+    an agent session starts. A board opened before that read `not reporting`
+    across the fleet, when the truth was that nothing had looked yet."""
+    t = _tree(machines=["here", "box"], this_machine="here", fleet_ts=0,
+              fleet_agents=[_remote("pm-box", "org/pm")])
+    assert t["fleet_never"] is True
+    box = [m for m in t["machines"] if m["machine"] == "box"][0]
+    assert box["never"] is True
+
+
+def test_a_snapshot_that_went_stale_is_not_called_never_written():
+    t = _tree(machines=["here", "box"], this_machine="here",
+              fleet_ts=NOW - FLEET_STALE_SECONDS - 1,
+              fleet_agents=[_remote("pm-box", "org/pm")])
+    assert t["fleet_never"] is False
+    box = [m for m in t["machines"] if m["machine"] == "box"][0]
+    assert box["stale"] is True and box["never"] is False
+
+
+# ---- exact remote attribution: the machine reports where its agents live ----
+
+def test_a_reported_worktree_places_a_remote_agent_EXACTLY():
+    """Two clones of one repo, and the machine has said which folder this
+    agent is in. The basename guess would claim both workspaces; the reported
+    worktree claims only the one that contains it."""
+    t = _tree(
+        machines=["here", "box"], this_machine="here",
+        rows=[_ws("squad", "box", ["/code/org/mcp-hub"]),
+              _ws("general", "box", ["/general/mcp-hub"])],
+        fleet_agents=[_remote("mcp-hub-box", "org/mcp-hub")],
+        machine_agents={"box": [{"agent": "mcp-hub-box",
+                                 "worktree": "/code/org/mcp-hub"}]},
+    )
+    box = [m for m in t["machines"] if m["machine"] == "box"][0]
+    by_name = {w["name"]: [a["agent"] for a in w["agents"]]
+               for w in box["workspaces"]}
+    assert by_name == {"squad": ["mcp-hub-box"], "general": []}
+    assert box["loose"] == []
+
+
+def test_a_reported_worktree_still_gives_MULTI_membership():
+    """The exact path listed by two workspaces is in both — the same rule
+    local rows follow. Exactness must not cost the true fact."""
+    t = _tree(
+        machines=["here", "box"], this_machine="here",
+        rows=[_ws("squad", "box", ["/code/org/mcp-hub"]),
+              _ws("runtime", "box", ["/code/org/mcp-hub"])],
+        fleet_agents=[_remote("mcp-hub-box", "org/mcp-hub")],
+        machine_agents={"box": [{"agent": "mcp-hub-box",
+                                 "worktree": "/code/org/mcp-hub"}]},
+    )
+    box = [m for m in t["machines"] if m["machine"] == "box"][0]
+    assert [[a["agent"] for a in w["agents"]] for w in box["workspaces"]] \
+        == [["mcp-hub-box"], ["mcp-hub-box"]]
+
+
+def test_a_machine_that_reported_NO_roster_keeps_the_old_behaviour():
+    """The degrade path. An edge that has not been upgraded reports nothing,
+    and that machine must keep matching by repo name — not empty out."""
+    t = _tree(
+        machines=["here", "box"], this_machine="here",
+        rows=[_ws("squad", "box", ["/code/org/pm"])],
+        fleet_agents=[_remote("pm-box", "org/pm")],
+        machine_agents={},           # nobody has reported
+    )
+    box = [m for m in t["machines"] if m["machine"] == "box"][0]
+    assert [a["agent"] for a in box["workspaces"][0]["agents"]] == ["pm-box"]
+
+
+def test_one_machine_reporting_does_not_change_another():
+    """Per-machine fallback: an upgraded edge on one box must not switch the
+    other box to exact matching it cannot supply."""
+    t = _tree(
+        machines=["here", "new", "old"], this_machine="here",
+        rows=[_ws("a", "new", ["/code/org/pm"]), _ws("b", "old", ["/code/org/pm"])],
+        fleet_agents=[_remote("pm-new", "org/pm"), _remote("pm-old", "org/pm")],
+        machine_agents={"new": [{"agent": "pm-new", "worktree": "/elsewhere"}]},
+    )
+    by_machine = {m["machine"]: m for m in t["machines"]}
+    # `new` reported /elsewhere, which workspace `a` does not list → loose
+    assert [a["agent"] for a in by_machine["new"]["loose"]] == ["pm-new"]
+    # `old` reported nothing → basename match, unchanged
+    assert [a["agent"] for a in by_machine["old"]["workspaces"][0]["agents"]] \
+        == ["pm-old"]
+
+
+def test_an_agent_missing_from_a_reported_roster_falls_back_not_vanishes():
+    """Online but not in squad.conf — registered by hand, say. It must not be
+    dropped, and it must not borrow another agent's worktree."""
+    t = _tree(
+        machines=["here", "box"], this_machine="here",
+        rows=[_ws("squad", "box", ["/code/org/pm"])],
+        fleet_agents=[_remote("pm-box", "org/pm")],
+        machine_agents={"box": [{"agent": "someone-else", "worktree": "/x"}]},
+    )
+    box = [m for m in t["machines"] if m["machine"] == "box"][0]
+    assert [a["agent"] for a in box["workspaces"][0]["agents"]] == ["pm-box"]
+
+
+def test_a_reported_worktree_in_no_workspace_goes_loose_without_ambiguity():
+    t = _tree(
+        machines=["here", "box"], this_machine="here",
+        rows=[_ws("squad", "box", ["/code/org/pm"])],
+        fleet_agents=[_remote("pm-box", "org/pm")],
+        machine_agents={"box": [{"agent": "pm-box", "worktree": "/somewhere/else"}]},
+    )
+    box = [m for m in t["machines"] if m["machine"] == "box"][0]
+    assert [a["agent"] for a in box["loose"]] == ["pm-box"]
+    assert box["loose"][0]["ambiguous"] == [], \
+        "it is not ambiguous — we know exactly where it is, and it is nowhere"

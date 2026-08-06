@@ -2827,9 +2827,10 @@ def _resolve_tool(name: str) -> str | None:
 def settings_command(args: argparse.Namespace) -> int:
     """One agent's settings, or an interactive panel over a workspace's agents."""
     if getattr(args, "tui", False):
-        agents = _agents_in_workspace(getattr(args, "workspace", None))
+        workspace = getattr(args, "workspace", None)
+        agents = _agents_in_workspace(workspace)
         if not agents:
-            where = getattr(args, "workspace", None) or "this machine"
+            where = workspace or "this machine"
             print(f"no roster agents in {where}", file=sys.stderr)
             return 1
         try:
@@ -2862,6 +2863,24 @@ def settings_command(args: argparse.Namespace) -> int:
 
             return OperatorApi(api_base(DEFAULT_HUB_URL)).list_placements()
 
+        def _seats() -> list:
+            """What may run, fleet-wide. The board needs it to draw containers:
+            a seat with an image IS a container, and its record carries the
+            host folder that a remote agent's presence row does not.
+            """
+            from mcp_hub.operator_api import OperatorApi, api_base
+
+            return OperatorApi(api_base(DEFAULT_HUB_URL)).list_seats()
+
+        def _machine_agents() -> dict:
+            """Each machine's roster, so a REMOTE row is attributed by its real
+            worktree instead of by repo name. A machine missing from this map
+            has not reported one; the tree falls back for that machine alone.
+            """
+            from mcp_hub.operator_api import OperatorApi, api_base
+
+            return OperatorApi(api_base(DEFAULT_HUB_URL)).machine_agents()
+
         def _presence_ping(workspace_path: str) -> None:
             """Tell the hub this workspace is open in front of a human.
 
@@ -2892,17 +2911,23 @@ def settings_command(args: argparse.Namespace) -> int:
 
         SettingsApp(
             agents,
-            scoped_to=getattr(args, "workspace", None),
+            scoped_to=workspace,
             model_for=_settings_model,
             squad_bin=SQUAD_BIN,
             hub_bin=MCP_HUB_BIN,
             board_for=lambda: collect(SQUAD_BIN),
+            # Same call that produced the opening roster, on the board's own
+            # tick: squad.conf is a file another pane writes, so enrolment has
+            # to reach a board that is already open.
+            roster_for=lambda: _agents_in_workspace(workspace),
             dark=dark,
             workspaces_for=_workspaces,
             presence_ping=_presence_ping,
             fleet_for=_fleet_snapshot,
             listings_for=lambda p: _workspace_listings(pathlib.Path(p)),
             placements_for=_placements,
+            seats_for=_seats,
+            machine_agents_for=_machine_agents,
             this_machine=_sanitize_ident(platform.node() or "unknown-host"),
         ).run()
         return 0
