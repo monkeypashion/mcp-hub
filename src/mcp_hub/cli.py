@@ -1580,9 +1580,28 @@ def _dig(data: Any, path: list[str]) -> Any:
 
 def edge_command(args: argparse.Namespace) -> int:
     """One edge reconcile pass — `mcp-hub edge apply`."""
-    from mcp_hub.edge import HubAPI, edge_apply, plan
+    from mcp_hub.edge import (
+        EDGE_ENV_FILE,
+        HubAPI,
+        apply_env_file,
+        edge_apply,
+        load_env_file,
+        plan,
+    )
 
     Path = pathlib.Path
+
+    # Seat credentials, the same file the systemd unit loads via
+    # `EnvironmentFile=-%h/.mcp-hub/edge-env`. A shell inherits nothing from
+    # that unit, so before this the SAME command built a live seat from the
+    # timer and an auth-dead one from a terminal — the container came up,
+    # `docker ps` showed it, and it had exited 42 at its own door. A pass
+    # whose result depends on how it was invoked is not a reconcile.
+    supplied = apply_env_file(os.environ, load_env_file(EDGE_ENV_FILE))
+    if supplied:
+        # Names only. The values are the one thing on this box that must
+        # never reach a log, a journal or a transcript.
+        print(f"edge: loaded {', '.join(supplied)} from {EDGE_ENV_FILE}")
 
     machine = args.machine or _sanitize_ident(platform.node() or "unknown-host")
     # The FILE is the third source, and in practice the only one that matters:

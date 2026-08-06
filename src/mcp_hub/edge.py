@@ -34,6 +34,69 @@ import re
 from pathlib import Path
 from typing import Any
 
+# Where the seat credentials live on an edge host. The systemd unit reads it
+# via `EnvironmentFile=-%h/.mcp-hub/edge-env`; the CLI reads it through
+# load_env_file so a hand-run behaves the same way. chmod 600, VALUES inside —
+# which is why the hub only ever stores the NAMES.
+EDGE_ENV_FILE = Path.home() / ".mcp-hub" / "edge-env"
+
+# Where a seat's claude state lives INSIDE the container — memory,
+# transcripts, credentials cache. The image's user is `seat` (seat/Dockerfile),
+# so this is that user's ~/.claude and nothing here may derive it from the
+# EDGE host's HOME. Destination for a `memory_volume` given as a bare name.
+SEAT_STATE_DIR = "/home/seat/.claude"
+
+
+def load_env_file(path: Path) -> dict[str, str]:
+    """Parse systemd's EnvironmentFile dialect. Missing file → {}.
+
+    Narrow on purpose: `KEY=VALUE` per line, `#` comments, one optional layer
+    of surrounding quotes. systemd supports more (line continuations, `$`
+    expansion) and this does not — an edge-env that needs those is better
+    simplified than half-understood, because a MISREAD credential is worse
+    than an absent one: it produces a container that starts and fails
+    somewhere else.
+
+    A malformed line is skipped, not fatal. This runs on the path that keeps
+    seats alive, and refusing the whole file over one bad line would take the
+    good credentials down with it.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    out: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition("=")
+        key = key.strip()
+        if not sep or not key or not key.replace("_", "").isalnum():
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        out[key] = value
+    return out
+
+
+def apply_env_file(environ: dict[str, str], loaded: dict[str, str]) -> list[str]:
+    """Fill in names the environment doesn't already have. Returns the names
+    it supplied (never the values — this list gets printed).
+
+    An ambient NON-EMPTY value wins: an operator who exported something did so
+    deliberately. An ambient EMPTY one does not, because an empty export
+    clobbering a good credential is a real incident shape (docs/seat-image.md)
+    and a var that is present-but-empty is indistinguishable from that.
+    """
+    supplied = []
+    for key, value in loaded.items():
+        if not environ.get(key) and value:
+            environ[key] = value
+            supplied.append(key)
+    return sorted(supplied)
+
 
 def plan(
     placements: list[dict[str, Any]],
@@ -387,6 +450,24 @@ class DockerExecutor:
             argv += ["-p", str(pub)]
         for vol in spec.get("volumes") or []:
             argv += ["-v", str(vol)]
+        # THE MEMORY VOLUME IS A MOUNT, not just a flag.
+        #
+        # It was declared on every seat and read in exactly one place — the
+        # harvest branch, to decide whether a seat "has learnings" — and
+        # never mounted. So ~/.claude was container-local: reclaim would
+        # `memory-export` from a directory that only ever existed inside the
+        # container it was about to destroy, and the edge would report a
+        # successful harvest of nothing. Measured 2026-08-06 by destroying
+        # three live seats on a stated belief that their memory was durable;
+        # `docker inspect` showed one mount, the worktree.
+        #
+        # A bare name gets the documented destination rather than being
+        # guessed at or silently ignored (docs/seat-image.md: the whole claude
+        # state dir — memory, transcripts, credentials cache).
+        memvol = str(spec.get("memory_volume") or "")
+        if memvol:
+            argv += ["-v", memvol if ":" in memvol
+                     else f"{memvol}:{SEAT_STATE_DIR}"]
         if spec.get("network"):
             argv += ["--network", str(spec["network"])]
         argv.append(spec["image"])
@@ -421,6 +502,29 @@ class DockerExecutor:
                 # cannot detect — `docker ps` would report it healthy.
                 return {**base, "skipped": True,
                         "reason": "no image in seat spec — refusing to guess one"}
+            wanted = list(spec.get("env_from_host") or [])
+            if wanted and not any(self._environ.get(n) for n in wanted):
+                # NONE of the named credentials is set here, so this container
+                # is guaranteed to die at its own door (exit 42) the moment it
+                # starts. Creating it anyway produces a seat that exists, is
+                # observed, and can never be an agent.
+                #
+                # The precise condition is "not one of them" rather than "any
+                # missing": a spec naming both lanes with only one set is the
+                # NORMAL healthy case, and refusing that would break every
+                # seat on the fleet.
+                #
+                # Measured cause, every time: a hand-run `edge apply`. The
+                # systemd unit loads ~/.mcp-hub/edge-env via EnvironmentFile
+                # and a shell does not, so the same command builds a live seat
+                # from the timer and a dead one from a terminal.
+                return {**base, "skipped": True, "reason": (
+                    f"none of the credentials this spec names is set in the "
+                    f"edge's environment ({', '.join(wanted)}) — refusing to "
+                    f"create a container that would exit 42 at its door. If "
+                    f"this is a hand-run, load the same file the timer does: "
+                    f"`set -a; . ~/.mcp-hub/edge-env; set +a`"
+                )}
             cmd = self.create_argv(seat, spec, self._environ)
         elif op == "start":
             cmd = ["docker", "start", seat]
