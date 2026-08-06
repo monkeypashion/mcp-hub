@@ -128,6 +128,26 @@ def plan(
         local = local_seats.get(seat, {"materialized": False, "running": False})
         desired = p["desired"]
         if desired == "reclaimed":
+            if not local["materialized"]:
+                # ALREADY GONE — the reclaim finished, possibly passes ago.
+                # Without this the three steps below were re-planned on every
+                # single pass forever: `edge-probe-dev-vm-1` and
+                # `claude-seat-dev-vm-1` were still being harvested, verified
+                # and destroyed every two minutes on 2026-08-06, long after
+                # their containers ceased to exist.
+                #
+                # Absence is sound evidence HERE and only here: enumeration
+                # RAISES when it cannot see the substrate, so "not
+                # materialized" means we looked and it was not there — never
+                # "we could not look". A reclaim is also the one desired state
+                # whose completion IS an absence, so there is nothing else to
+                # wait for.
+                #
+                # Skipping harvest with it is right too: `docker exec` into a
+                # container that does not exist cannot preserve anything, so
+                # the alternative is three commands that all fail while
+                # claiming to protect memory.
+                continue
             # Harvest before destroy, always: the memory delta is work
             # product, and a clone whose learnings die with the substrate is
             # the vacuous green of scheduling.

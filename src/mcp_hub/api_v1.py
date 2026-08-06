@@ -1312,16 +1312,32 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
         if principal == "machine" and mname != row["machine"]:
             return _err(403, "machine token may only report its own placements")
         body = await body_of(request)
+        state = body.get("state", "")
         db().execute(
             "UPDATE api_placements SET observed_state = ?, observed_at = ?,"
             " observed_enum = ? WHERE id = ?",
             (
-                body.get("state", ""),
+                state,
                 _now(),
                 json.dumps(body.get("enumeration", {})),
                 pid,
             ),
         )
+        # A reclaim REPORTED COMPLETE is complete. The three steps were written
+        # `pending` when the DELETE arrived and nothing ever wrote them again,
+        # so a finished reclaim went on describing itself as unstarted forever
+        # — `mcp-hub placements list` showed two seats mid-harvest whose
+        # containers had not existed for a day (2026-08-06).
+        #
+        # Only the edge's own `reclaimed` verdict flips them, and that verdict
+        # is built from ABSENCE it actually enumerated (edge.observed_report) —
+        # never from `desired`, so this cannot mark itself done by wanting to.
+        if state == "reclaimed" and row["reclaim"]:
+            db().execute(
+                "UPDATE api_placements SET reclaim = ? WHERE id = ?",
+                (json.dumps({"harvest": "done", "verify": "done",
+                             "destroy": "done"}), pid),
+            )
         db().commit()
         row = db().execute(
             "SELECT * FROM api_placements WHERE id = ?", (pid,)

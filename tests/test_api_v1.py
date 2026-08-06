@@ -896,3 +896,51 @@ def test_a_machine_may_not_report_another_machines_roster(client):
                     json={"agents": [{"agent": "x", "worktree": "/x"}]},
                     headers=_tok(client, "box-r5"))
     assert r.status_code == 403
+
+
+def test_a_reported_reclaim_stops_saying_pending(client):
+    """The three steps were written `pending` on DELETE and never written
+    again, so a finished reclaim described itself as unstarted forever — two
+    seats showed mid-harvest a day after their containers were gone."""
+    client.post("/api/v1/machines", json={"name": "boxr"}, headers=H)
+    client.post("/api/v1/seats", json={"identity": "s-boxr", "repo": "r",
+                                       "machine": "boxr", "folder": "/f"},
+                headers=H)
+    pid = client.post("/api/v1/placements",
+                      json={"seat": "s-boxr", "machine": "boxr",
+                            "substrate": "docker"},
+                      headers=H).json()["id"]
+    client.delete(f"/api/v1/placements/{pid}", headers=H)
+    before = client.get("/api/v1/placements", headers=H).json()
+    mine = [p for p in before["placements"] if p["id"] == pid][0]
+    assert mine["reclaim"]["destroy"] == "pending"
+
+    client.post(f"/api/v1/placements/{pid}/observed",
+                json={"state": "reclaimed",
+                      "enumeration": {"container": "s-boxr", "exists": False}},
+                headers=H)
+    after = client.get("/api/v1/placements", headers=H).json()
+    mine = [p for p in after["placements"] if p["id"] == pid][0]
+    assert mine["reclaim"] == {"harvest": "done", "verify": "done",
+                               "destroy": "done"}
+
+
+def test_a_reclaim_is_not_marked_done_by_a_lesser_observation(client):
+    """`stopped` is not `reclaimed`. Only the edge's absence-derived verdict
+    closes a reclaim; anything weaker would let a container that merely went
+    down be recorded as harvested and destroyed."""
+    client.post("/api/v1/machines", json={"name": "boxs"}, headers=H)
+    client.post("/api/v1/seats", json={"identity": "s-boxs", "repo": "r",
+                                       "machine": "boxs", "folder": "/f"},
+                headers=H)
+    pid = client.post("/api/v1/placements",
+                      json={"seat": "s-boxs", "machine": "boxs",
+                            "substrate": "docker"},
+                      headers=H).json()["id"]
+    client.delete(f"/api/v1/placements/{pid}", headers=H)
+    client.post(f"/api/v1/placements/{pid}/observed",
+                json={"state": "stopped", "enumeration": {"exists": True}},
+                headers=H)
+    got = client.get("/api/v1/placements", headers=H).json()
+    mine = [p for p in got["placements"] if p["id"] == pid][0]
+    assert mine["reclaim"]["harvest"] == "pending"

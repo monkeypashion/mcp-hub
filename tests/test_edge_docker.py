@@ -309,9 +309,35 @@ def test_a_stopped_container_asked_to_stop_produces_no_action(tmp_path):
 
 def test_reclaim_harvests_before_it_destroys():
     """Ordering, not presence: destroying first would make the harvest a
-    report about something that no longer exists."""
-    actions = plan([_placement(desired="reclaimed")], {})
+    report about something that no longer exists.
+
+    The seat is explicitly MATERIALIZED here. This test passed `{}` when it
+    was written — an absent seat — which read as "reclaim always plans three
+    steps" and was the assumption behind the loop below: two placements were
+    still being harvested, verified and destroyed every two minutes long after
+    their containers were gone. The subject was always the ORDER, so the
+    fixture now says so instead of relying on a state it did not mean.
+    """
+    actions = plan([_placement(desired="reclaimed")],
+                   {"web-box-1": {"materialized": True, "running": True}})
     assert [a["op"] for a in actions] == ["harvest", "verify", "destroy"]
+
+
+def test_a_FINISHED_reclaim_plans_nothing():
+    """The completion of a reclaim IS an absence, so a seat that is already
+    gone needs no work. Enumeration RAISES when it cannot see the substrate,
+    so "not materialized" means we looked and it was not there."""
+    assert plan([_placement(desired="reclaimed")], {}) == []
+
+
+def test_a_finished_reclaim_does_not_pretend_to_harvest():
+    """`docker exec` into a container that does not exist preserves nothing.
+    Planning a harvest anyway is three failing commands wearing the costume of
+    protecting memory."""
+    ops = [a["op"] for a in plan([_placement(desired="reclaimed")],
+                                 {"web-box-1": {"materialized": False,
+                                                "running": False}})]
+    assert "harvest" not in ops and ops == []
 
 
 def test_the_hub_api_client_targets_the_machine_placement_route():
