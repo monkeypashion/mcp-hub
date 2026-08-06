@@ -1202,3 +1202,74 @@ async def test_an_ambiguous_remote_row_says_WHY_it_has_no_workspace():
         row = _label(app, "mcp-hub-farbox")
         assert "workspace unknown" in row, row
         assert "hub only" not in row, "the reason was overwritten by the state"
+
+
+# ---- off-hub rows: which of them actually MATTER --------------------------
+#
+# Making a roster-only agent visible turned every enrolled folder on a box into
+# a warning: dev-vm-1 raised twenty, of which exactly one was actionable. A
+# warning on twenty rows is a warning on none — the same defect as the row
+# being invisible, only louder.
+
+def _offhub_app(agents):
+    return SettingsApp(
+        [], scoped_to=None, model_for=_model_for,
+        squad_bin="/usr/bin/SQUAD", hub_bin="/usr/bin/HUB",
+        board_for=None, dark=None, poll_seconds=3600, this_machine="thisbox",
+        workspaces_for=lambda: {
+            "machines": ["thisbox", "farbox"], "this_machine": "thisbox",
+            "note": "", "rows": []},
+        fleet_for=lambda: {"ts": time.time(), "agents": []},
+        machine_agents_for=lambda: {"farbox": agents},
+    )
+
+
+async def test_a_comms_agent_that_is_UP_but_off_the_hub_warns():
+    """The one actionable shape: launched to reach the hub, no longer reaching
+    it. That is what a redeploy leaves behind."""
+    app = _offhub_app([{"agent": "armed-farbox", "worktree": "/w/a",
+                        "comms": True, "running": True}])
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        row = _label(app, "armed-farbox")
+        assert "running, not on hub" in row, row
+        assert "⚠" in row, row
+
+
+async def test_a_STOPPED_comms_agent_does_not_warn():
+    """Stopped is not a fault. It is the ordinary state of most of a box."""
+    app = _offhub_app([{"agent": "down-farbox", "worktree": "/w/d",
+                        "comms": True, "running": False}])
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        row = _label(app, "down-farbox")
+        assert "stopped" in row, row
+        assert "⚠" not in row, row
+
+
+async def test_a_SCRATCH_folder_never_warns_even_while_running():
+    """No comms flag means it was never going to be on the hub — `squad
+    add-folder` omits the flag deliberately, because it is inert without a hub
+    identity. Warning about its absence would be warning about a decision."""
+    app = _offhub_app([{"agent": "scratch-farbox", "worktree": "/w/s",
+                        "comms": False, "running": True}])
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        row = _label(app, "scratch-farbox")
+        assert "⚠" not in row, row
+        assert "not on hub" not in row, row
+
+
+async def test_an_edge_that_never_reported_liveness_keeps_the_weaker_line():
+    """Absent `running` is UNKNOWN. Reading it as either state would be a
+    claim about a box whose edge has not answered yet."""
+    app = _offhub_app([{"agent": "old-farbox", "worktree": "/w/o",
+                        "comms": True}])
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        row = _label(app, "old-farbox")
+        assert "not on hub" in row and "running," not in row, row

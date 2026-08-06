@@ -850,7 +850,40 @@ def test_a_machine_reports_its_roster_and_it_comes_back(client):
                 json={"agents": [{"agent": "pm-box", "worktree": "/code/pm"}]},
                 headers=h)
     got = client.get("/api/v1/machines", headers=H).json()
-    assert got["agents"]["box-r1"] == [{"agent": "pm-box", "worktree": "/code/pm"}]
+    # Exact shape on purpose — this is a wire contract, and a field appearing
+    # here unannounced is how a board starts reading something nobody sent.
+    # `comms` defaults false for an edge that does not send it; `running` is
+    # ABSENT rather than false, because unreadable liveness is not "down".
+    assert got["agents"]["box-r1"] == [
+        {"agent": "pm-box", "worktree": "/code/pm", "comms": False}
+    ]
+
+
+def test_liveness_and_comms_survive_the_round_trip(client):
+    h = _tok(client, "box-r1b")
+    client.post("/api/v1/machines/box-r1b/status",
+                json={"agents": [
+                    {"agent": "up-box", "worktree": "/u",
+                     "comms": True, "running": True},
+                    {"agent": "down-box", "worktree": "/d",
+                     "comms": True, "running": False},
+                ]}, headers=h)
+    got = client.get("/api/v1/machines", headers=H).json()["agents"]["box-r1b"]
+    by = {a["agent"]: a for a in got}
+    assert by["up-box"]["running"] is True and by["up-box"]["comms"] is True
+    assert by["down-box"]["running"] is False
+
+
+def test_unreadable_liveness_comes_back_ABSENT_not_false(client):
+    """NULL means the edge could not read tmux. Returning `false` would let a
+    board draw a whole box as stopped and clear every warning on it — the
+    false calm the tri-state exists to prevent."""
+    h = _tok(client, "box-r1c")
+    client.post("/api/v1/machines/box-r1c/status",
+                json={"agents": [{"agent": "unknown-box", "worktree": "/x",
+                                  "comms": True}]}, headers=h)
+    got = client.get("/api/v1/machines", headers=H).json()["agents"]["box-r1c"]
+    assert "running" not in got[0], got[0]
 
 
 def test_the_roster_is_a_SNAPSHOT_so_a_retired_agent_leaves(client):

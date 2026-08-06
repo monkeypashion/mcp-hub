@@ -172,8 +172,28 @@ def plan(
     return actions
 
 
-def local_roster() -> list[dict[str, str]]:
-    """This machine's roster as {agent, worktree} — the fact only it holds.
+def live_sessions(runner: Any) -> set[str] | None:
+    """Agent names with a live pane, or None when we could not look.
+
+    squad runs its panes on a DEDICATED tmux socket (`-L squad`) with the
+    session named for the agent, so this is a structured question with a
+    structured answer — no parsing of `squad ls`'s rendered table, which is
+    the habit that put repo basenames in the board.
+
+    None, not the empty set, on failure. `tmux ls` also exits non-zero when
+    there is genuinely no server, so the two cases are indistinguishable from
+    the exit code — and guessing "nothing is running" is the dangerous half:
+    it would quietly clear every warning on the board. Unknown keeps the
+    weaker claim.
+    """
+    rc, out = runner(["tmux", "-L", "squad", "ls", "-F", "#{session_name}"])
+    if rc != 0:
+        return None
+    return {ln.strip() for ln in out.splitlines() if ln.strip()}
+
+
+def local_roster(runner: Any = None) -> list[dict[str, Any]]:
+    """This machine's roster — {agent, worktree, comms, running?}.
 
     Imported lazily: `edge` is the realizer and `cli` is the command surface,
     and importing the latter at module scope makes a cycle. Failure is an
@@ -182,12 +202,38 @@ def local_roster() -> list[dict[str, str]]:
     the caller sends the key regardless, so an unreadable roster is reported as
     "no agents", not as "no roster reported". That is the honest way round: an
     edge that IS reporting should not be treated as one that cannot.
+
+    `comms` and `running` are what let the board tell an agent that SHOULD be
+    on the hub and isn't from one that was never going to be. Without them
+    every enrolled folder on a box became a warning the moment off-hub rows
+    started rendering — dev-vm-1 raised twenty, of which exactly one was
+    actionable, and a warning on twenty rows is a warning on none.
+
+    - `comms`: its launch args carry the hub channels flag. A plain scratch
+      folder has none and is never expected on the hub, so it must never
+      warn (`squad add-folder` omits the flag deliberately — it is inert
+      without a hub identity).
+    - `running`: OMITTED when liveness could not be read, never defaulted.
+      An absent key is unknown; `False` would be a claim that the agent is
+      down, which is exactly the false calm this is meant to avoid.
     """
     try:
         from mcp_hub.cli import _roster_all
 
-        return [{"agent": r["agent"], "worktree": r.get("worktree", "")}
-                for r in _roster_all() if r.get("agent")]
+        live = live_sessions(runner) if runner is not None else None
+        out: list[dict[str, Any]] = []
+        for r in _roster_all():
+            if not r.get("agent"):
+                continue
+            row: dict[str, Any] = {
+                "agent": r["agent"],
+                "worktree": r.get("worktree", ""),
+                "comms": "server:hub" in (r.get("args") or ""),
+            }
+            if live is not None:
+                row["running"] = r["agent"] in live
+            out.append(row)
+        return out
     except Exception:  # noqa: BLE001 — the edge never dies of a bad roster
         return []
 
@@ -807,7 +853,9 @@ def edge_apply(
         machine,
         {
             "workspaces": workspaces,
-            "agents": local_roster(),
+            # The runner is what lets it read tmux liveness; without one the
+            # `running` key is omitted rather than guessed.
+            "agents": local_roster(runner),
             "seats": [
                 {"seat": s, **v} for s, v in sorted(local.items())
             ],

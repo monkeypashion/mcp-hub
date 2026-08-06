@@ -128,6 +128,13 @@ def init_api_tables(conn: sqlite3.Connection) -> None:
             machine     TEXT NOT NULL,
             agent       TEXT NOT NULL,
             worktree    TEXT NOT NULL DEFAULT '',
+            -- Whether its launch args carry the hub channels flag, and whether
+            -- it has a live pane. Together they separate "should be on the hub
+            -- and isn't" from "was never going to be" — without them, every
+            -- enrolled scratch folder on a box became a warning.
+            comms       INTEGER NOT NULL DEFAULT 0,
+            -- TRI-STATE: NULL is "liveness unreadable", NOT "down".
+            running     INTEGER,
             reported_at REAL NOT NULL,
             PRIMARY KEY (machine, agent)
         );
@@ -154,6 +161,21 @@ def init_api_tables(conn: sqlite3.Connection) -> None:
         )
     except sqlite3.OperationalError:
         pass
+    # Roster rows gained two fields after the table shipped, and the live hub
+    # already holds the old shape — CREATE TABLE IF NOT EXISTS silently does
+    # nothing for it, so they arrive by ALTER or not at all.
+    #
+    # `running` has NO DEFAULT on purpose: NULL is "the edge could not read
+    # tmux", which every pre-existing row honestly is. Defaulting it to 0
+    # would mark the whole fleet down on the deploy that adds the column.
+    for _sql in (
+        "ALTER TABLE api_machine_agents ADD COLUMN comms INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE api_machine_agents ADD COLUMN running INTEGER",
+    ):
+        try:
+            conn.execute(_sql)
+        except sqlite3.OperationalError:
+            pass
     # Substrate-specific seat fields. The live hub's api_seats predates this,
     # and CREATE TABLE IF NOT EXISTS silently does nothing for it — so the
     # column has to arrive by ALTER or every deployed hub keeps the old shape.
@@ -320,14 +342,21 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             # the tree. A machine whose edge has not reported one is ABSENT
             # here rather than present-and-empty, so the board can tell "no
             # roster reported" from "no agents" and fall back accordingly.
-            reported: dict[str, list[dict[str, str]]] = {}
+            reported: dict[str, list[dict[str, Any]]] = {}
             for a in db().execute(
-                "SELECT machine, agent, worktree FROM api_machine_agents"
-                " ORDER BY machine, agent"
+                "SELECT machine, agent, worktree, comms, running"
+                " FROM api_machine_agents ORDER BY machine, agent"
             ).fetchall():
-                reported.setdefault(a["machine"], []).append(
-                    {"agent": a["agent"], "worktree": a["worktree"]}
-                )
+                row: dict[str, Any] = {
+                    "agent": a["agent"],
+                    "worktree": a["worktree"],
+                    "comms": bool(a["comms"]),
+                }
+                # Omitted when NULL, so the wire shape says "unknown" the same
+                # way the edge said it — a `false` here would be a claim.
+                if a["running"] is not None:
+                    row["running"] = bool(a["running"])
+                reported.setdefault(a["machine"], []).append(row)
             return JSONResponse({
                 "machines": [machine_json(r) for r in rows],
                 "agents": reported,
@@ -509,11 +538,21 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             for a in body["agents"]:
                 if not isinstance(a, dict) or not a.get("agent"):
                     continue
+                # `running` is TRI-STATE and stays that way through the
+                # column: NULL means the edge could not read tmux, which is
+                # not the same as "down". Storing 0 for unknown would let a
+                # board draw every agent on a box as stopped and clear every
+                # warning on it — the false calm this whole field exists to
+                # prevent.
+                running = a.get("running")
                 db().execute(
                     "INSERT INTO api_machine_agents"
-                    " (machine, agent, worktree, reported_at)"
-                    " VALUES (?, ?, ?, ?)",
-                    (name, a["agent"], a.get("worktree", ""), now),
+                    " (machine, agent, worktree, comms, running, reported_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (name, a["agent"], a.get("worktree", ""),
+                     1 if a.get("comms") else 0,
+                     None if running is None else (1 if running else 0),
+                     now),
                 )
         # Board presence: "this workspace is open, operator eyes on" — a fact
         # only the board can know. Upserts, because the board may report a

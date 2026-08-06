@@ -189,11 +189,15 @@ def build_tree(
     # {machine: {agent: worktree}} — the API hands back a LIST per machine so
     # the wire format stays additive; the lookup is built once here rather than
     # scanned per agent.
-    worktree_of: dict[str, dict[str, str]] = {
-        mach: {a["agent"]: a.get("worktree", "")
+    pushed_of: dict[str, dict[str, dict[str, Any]]] = {
+        mach: {a["agent"]: a
                for a in rows if isinstance(a, dict) and a.get("agent")}
         for mach, rows in (machine_agents or {}).items()
         if isinstance(rows, list)
+    }
+    worktree_of: dict[str, dict[str, str]] = {
+        mach: {name: (a.get("worktree") or "") for name, a in rows.items()}
+        for mach, rows in pushed_of.items()
     }
 
     fleet_ts = float(fleet.get("ts") or 0)
@@ -451,6 +455,11 @@ def build_tree(
                 # and this row does not come from it.
                 "stale": False,
                 "off_hub": True,
+                # What separates an agent that SHOULD be on the hub from one
+                # that never would be. `running` may be absent entirely —
+                # that is UNKNOWN and must not be read as False.
+                "comms": bool(pushed_of[m][name].get("comms")),
+                "running": pushed_of[m][name].get("running"),
                 "ambiguous": [],
                 "hand": False,
                 "rec": None,

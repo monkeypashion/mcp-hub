@@ -713,3 +713,27 @@ def test_an_off_hub_agent_lands_in_its_workspace_by_REAL_path():
     )
     ws = [w for m in t["machines"] for w in m["workspaces"] if w["name"] == "ws"][0]
     assert [a["agent"] for a in ws["agents"]] == ["ghost-far"]
+
+
+def test_the_push_carries_comms_and_liveness_through():
+    """Which off-hub rows MATTER depends on these two, so they must survive
+    the join rather than being re-derived from a name."""
+    t = _tree(machines=("here", "far"),
+              machine_agents={"far": [
+                  {"agent": "armed-far", "worktree": "/w/a",
+                   "comms": True, "running": True},
+                  {"agent": "scratch-far", "worktree": "/w/s", "comms": False},
+              ]})
+    got = _by_name(t)
+    assert got["armed-far"]["comms"] is True
+    assert got["armed-far"]["running"] is True
+    assert got["scratch-far"]["comms"] is False
+
+
+def test_absent_liveness_stays_UNKNOWN_not_false():
+    """An older edge sends no `running`. Reading that as `down` would mark a
+    whole box stopped and clear every warning on it."""
+    t = _tree(machines=("here", "far"),
+              machine_agents={"far": [{"agent": "old-far", "worktree": "/w/o",
+                                       "comms": True}]})
+    assert _by_name(t)["old-far"]["running"] is None

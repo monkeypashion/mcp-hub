@@ -576,13 +576,30 @@ class SettingsApp(App):
             colour, hand = "", ""
             wake = _GLYPH_WAKEABLE if a.get("wakeable") else ""
             if a.get("off_hub"):
-                # Its machine's roster lists it; the hub has no presence for
-                # it. That is ALL this row knows — the roster push carries no
-                # pane state — so it must not read as `stopped`, which is a
-                # liveness claim nobody measured. Before this the row did not
-                # exist at all, which read as `nothing to see here` for the
-                # one condition that needs an operator.
-                glyph, bits, wake = _GLYPH_NOT_REPORTING, ["not on hub"], ""
+                # Its machine's roster lists it; the hub has no presence.
+                # WHICH of those matters depends on two more facts, or the
+                # row shouts on every enrolled folder a box owns — dev-vm-1
+                # raised twenty warnings of which exactly one was actionable,
+                # and a warning on twenty rows is a warning on none.
+                #
+                # Only a comms-armed agent with a LIVE pane is a fault: it was
+                # launched to reach the hub and has stopped reaching it, which
+                # is what a redeploy leaves behind. A scratch folder with no
+                # comms flag was never going to be there, and a stopped agent
+                # is simply stopped — neither is news.
+                #
+                # `running` absent is UNKNOWN, and unknown keeps the older,
+                # weaker line rather than being read as either state.
+                wake = ""
+                running = a.get("running")
+                if not a.get("comms"):
+                    glyph, bits = _GLYPH_STOPPED, []
+                elif running is True:
+                    glyph, bits = _GLYPH_NOT_REPORTING, ["running, not on hub"]
+                elif running is False:
+                    glyph, bits = _GLYPH_STOPPED, ["stopped"]
+                else:
+                    glyph, bits = _GLYPH_NOT_REPORTING, ["not on hub"]
             elif a.get("stale"):
                 # The wake flag is read from the SAME snapshot this row has
                 # just called not-reporting, so keeping ⚡ lets a dead cache go
