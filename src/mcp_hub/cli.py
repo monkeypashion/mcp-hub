@@ -2084,24 +2084,54 @@ def _capsule_attach(args: argparse.Namespace, api: Any) -> int:
     squad_bin = _resolve_tool("squad") or "squad"
     refused = [p for p in plan if p[1] == ATTACH_REFUSE]
     todo = [p for p in plan if p[1] == ATTACH_ENROL]
-    for ident, action, detail in plan:
-        mark = {ATTACH_ENROL: "enrol ", ATTACH_PRESENT: "have  ",
-                ATTACH_REFUSE: "REFUSE"}.get(action, "skip  ")
-        print(f"  {mark} {ident:<28} {detail}")
+
+    # ONE execution path, two RENDERINGS. The cockpit needs the plan as data —
+    # a UI parsing rendered lines is how the board came to attribute agents by
+    # repo basename — but a json branch that also re-implemented the enrol loop
+    # would be a second path free to drift from the guarded one, which is
+    # exactly how merging a safe and an unsafe variant drops the guard.
+    as_json = getattr(args, "json", False)
+    if as_json:
+        print(json.dumps({
+            "capsule": args.target,
+            "machine": machine,
+            "workspace": ws,
+            "dry_run": bool(args.dry_run),
+            "plan": [{"identity": i, "action": a, "folder": d}
+                     for i, a, d in plan],
+            # Named separately because "nothing to enrol" and "refused, so
+            # nothing was written" are opposite outcomes that both leave the
+            # enrol list empty.
+            "refused": [{"identity": i, "reason": d} for i, a, d in refused],
+            "enrol": [{"identity": i, "folder": d} for i, _a, d in todo],
+        }, indent=2))
+    else:
+        for ident, action, detail in plan:
+            mark = {ATTACH_ENROL: "enrol ", ATTACH_PRESENT: "have  ",
+                    ATTACH_REFUSE: "REFUSE"}.get(action, "skip  ")
+            print(f"  {mark} {ident:<28} {detail}")
     if refused:
         # A missing bind-mount source is the FIRST of the six gates between a
         # running container and an agent on the hub, and docker hides it by
         # creating the directory as root. Refusing the whole attach keeps the
         # capsule all-or-nothing rather than half-wired.
+        #
+        # Shared by BOTH renderings on purpose: this goes to stderr, so stdout
+        # stays pure JSON for the cockpit while the operator running it by hand
+        # still gets the sentence. An `if as_json: return 1` short-circuit here
+        # was measured to change nothing — a mutation test kept passing with it
+        # gutted, which is the definition of a line that isn't doing work.
         print(f"\n{len(refused)} seat(s) refused — nothing was written. Their "
               "work folders must exist first (docker would create them as "
               "root and the seat runs as uid 1000).", file=sys.stderr)
         return 1
     if args.dry_run:
-        print(f"\ndry run — {len(todo)} seat(s) would be enrolled")
+        if not as_json:
+            print(f"\ndry run — {len(todo)} seat(s) would be enrolled")
         return 0
     if not todo:
-        print("\nnothing to do — every seat is already enrolled")
+        if not as_json:
+            print("\nnothing to do — every seat is already enrolled")
         return 0
     if ws:
         ws = str(pathlib.Path(ws).expanduser())
@@ -2113,9 +2143,11 @@ def _capsule_attach(args: argparse.Namespace, api: Any) -> int:
             argv += ["--to", ws]
         r = subprocess.run(argv, capture_output=True, text=True)
         out = (r.stdout or r.stderr).strip().splitlines()
-        print(f"  {ident}: {out[0] if out else 'enrolled'}")
-    print(f"\n{len(todo)} seat(s) enrolled. Open {ws or 'the workspace'} on "
-          "this machine and each tab attaches to its container.")
+        if not as_json:
+            print(f"  {ident}: {out[0] if out else 'enrolled'}")
+    if not as_json:
+        print(f"\n{len(todo)} seat(s) enrolled. Open {ws or 'the workspace'} "
+              "on this machine and each tab attaches to its container.")
     return 0
 
 

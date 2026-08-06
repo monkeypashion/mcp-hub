@@ -146,5 +146,11 @@ placement.
   contract already carries arbitrary env, so nothing here changes shape.
 - **No credential storage.** Not in the image, not in the hub. The token
   lives in the edge host's environment; `--env-from-host` is the only door.
-- **No subscription-concurrency claims.** N seats on one subscription
-  identity is unmeasured fleet-wide. Start at one; measure before scaling.
+- ~~**No subscription-concurrency claims.**~~ **MEASURED 2026-08-06:** three
+  seats (`mcp-hub-seat-dev-vm-1`, `mcp-hub-cap-dev-vm-1`,
+  `vps-hetzner-cap-dev-vm-1`) ran concurrently on ONE `CLAUDE_CODE_OAUTH_TOKEN`
+  on dev-vm-1, all registered and ⚡ at once. The "start at one" caution is
+  discharged for three; nothing above three has been tried, and the number
+  that matters is per-account concurrency, not per-container — so N seats in
+  ONE container (docs/n-seats-per-container.md) asks the same question, not a
+  new one.

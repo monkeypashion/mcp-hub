@@ -2,7 +2,7 @@
   "name": "squad-terminals",
   "displayName": "Squad Terminals",
   "description": "Auto-opens one plain terminal per squad agent (squad attach) with icon+color, and adds per-agent squad actions to the terminal tab context menu.",
-  "version": "0.31.0",
+  "version": "0.32.0",
   "publisher": "monkeypashion",
   "engines": {
     "vscode": "^1.90.0"
@@ -181,6 +181,11 @@
       {
         "command": "squad.addFolder",
         "title": "Add existing folder as agent\u2026",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.capsuleAttach",
+        "title": "Attach placed capsule as agents\u2026",
         "category": "Squad"
       },
       {
@@ -509,6 +514,10 @@
         {
           "command": "squad.addFromGitHub",
           "group": "1_add@2"
+        },
+        {
+          "command": "squad.capsuleAttach",
+          "group": "1_add@3"
         },
         {
           "command": "squad.wsRemove",

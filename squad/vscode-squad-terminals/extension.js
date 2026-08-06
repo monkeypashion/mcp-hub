@@ -1310,6 +1310,157 @@ function activate(context) {
     })
   );
 
+  // ---- attach a placed capsule ----
+  // `capsules place` writes desired state and the edge makes containers exist;
+  // NEITHER gives the operator a way in. That gap was closed in the CLI and
+  // nowhere else, so standing up a container squad meant a terminal — which by
+  // the standing rule makes the whole capsule half-delivered.
+  //
+  // Two things this deliberately cannot do, both because they are destination
+  // facts (the same reason `transport-recv` exists rather than the source
+  // doing the wiring):
+  //
+  //   - It only ever enrols seats belonging to THIS machine. Under Remote-SSH
+  //     "this machine" is the remote host, which is exactly the case that
+  //     matters; a capsule spanning two boxes is attached once per box.
+  //   - It cannot run before the edge has realized the containers. The work
+  //     folders must already exist, and the CLI REFUSES the whole capsule when
+  //     one is missing rather than letting docker create it as root under a
+  //     seat that runs as uid 1000.
+  //
+  // The plan is read as JSON, never parsed from the rendered lines: a UI
+  // reading a human format is how the board came to attribute agents by repo
+  // basename, and every later wording change becomes a silent behaviour change.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("squad.capsuleAttach", async () => {
+      const wf = vscode.workspace.workspaceFile;
+      if (!wf) {
+        vscode.window.showWarningMessage(
+          "Squad: open a .code-workspace first — agent tabs only appear in one."
+        );
+        return;
+      }
+
+      const listed = cp.spawnSync(MCP_HUB, ["capsules", "list", "--json"], {
+        timeout: 30000, encoding: "utf8",
+      });
+      if (listed.status !== 0) {
+        vscode.window.showErrorMessage(
+          `Squad: capsules list — ${(listed.stderr || "failed").trim()}`
+        );
+        return;
+      }
+      let capsules = [];
+      try {
+        capsules = JSON.parse(listed.stdout || "[]");
+      } catch (e) {
+        vscode.window.showErrorMessage(`Squad: unreadable capsule list — ${e}`);
+        return;
+      }
+      if (!capsules.length) {
+        vscode.window.showInformationMessage(
+          "Squad: no capsules — freeze one with `mcp-hub capsules compose`, " +
+            "then place it on a machine."
+        );
+        return;
+      }
+
+      const pick = await vscode.window.showQuickPick(
+        capsules.map((c) => ({
+          label: c.squad || c.id,
+          description: c.id,
+          // `created` is an epoch FLOAT (seconds). Rendering it raw puts
+          // "composed 1785934605.87" in front of the operator, which is a
+          // number pretending to be information.
+          detail: c.created
+            ? `composed ${new Date(c.created * 1000).toISOString().slice(0, 16).replace("T", " ")}` +
+              ` · ${((c.manifest || {}).seats || []).length} seat(s)`
+            : undefined,
+          id: c.id,
+        })),
+        { title: "Attach which capsule?", placeHolder: "Its seats gain a tab here" }
+      );
+      if (!pick) return;
+
+      // Dry run FIRST, always. The confirmation names what will happen to each
+      // seat, so a refusal is read before anything is written rather than
+      // discovered halfway through.
+      const dry = cp.spawnSync(
+        MCP_HUB, ["capsules", "attach", pick.id, "--dry-run", "--json"],
+        { timeout: 60000, encoding: "utf8" }
+      );
+      let plan;
+      try {
+        plan = JSON.parse(dry.stdout || "{}");
+      } catch (e) {
+        vscode.window.showErrorMessage(
+          `Squad: unreadable attach plan — ${(dry.stderr || e).toString().trim()}`
+        );
+        return;
+      }
+      if ((plan.refused || []).length) {
+        vscode.window.showErrorMessage(
+          `Squad: ${plan.refused.length} seat(s) refused, nothing written — ` +
+            plan.refused.map((r) => `${r.identity}: ${r.reason}`).join("; ") +
+            ". Has the edge realized this capsule on this machine yet?"
+        );
+        return;
+      }
+      const enrol = plan.enrol || [];
+      if (!enrol.length) {
+        // Distinguish the two empty cases — "already done" is success and
+        // "nothing here belongs to this box" is a different machine's job.
+        const mine = (plan.plan || []).filter((p) => p.action !== "skip");
+        vscode.window.showInformationMessage(
+          mine.length
+            ? "Squad: every seat in that capsule is already enrolled here."
+            : `Squad: none of that capsule's seats belong to ${plan.machine} — ` +
+                "attach it on the machine hosting them."
+        );
+        return;
+      }
+
+      const go = await vscode.window.showInformationMessage(
+        `Attach ${enrol.length} seat(s) to this workspace?`,
+        { modal: true, detail: enrol.map((s) => `${s.identity}\n  ${s.folder}`).join("\n") },
+        "Attach"
+      );
+      if (go !== "Attach") return;
+
+      const out = cp.spawnSync(MCP_HUB, ["capsules", "attach", pick.id, "--json"], {
+        timeout: 120000, encoding: "utf8",
+      });
+      if (out.status !== 0) {
+        vscode.window.showErrorMessage(
+          `Squad: attach failed — ${(out.stderr || "").trim() || "see terminal"}`
+        );
+        return;
+      }
+
+      // Folders go in via the API, not by writing the workspace file: VSCode
+      // owns the formatting and this fires onDidChangeWorkspaceFolders, which
+      // the cockpit builder already listens for — so tabs appear without a
+      // reload. (`--workspace` is deliberately NOT passed for the same reason:
+      // two writers of one hand-formatted JSONC file is how comments die.)
+      const existing = vscode.workspace.workspaceFolders || [];
+      const fresh = enrol.filter(
+        (s) => !existing.some((f) => canon(f.uri.fsPath) === canon(s.folder))
+      );
+      if (fresh.length) {
+        vscode.workspace.updateWorkspaceFolders(
+          existing.length, 0,
+          ...fresh.map((s) => ({
+            uri: vscode.Uri.file(s.folder), name: shortLabel(s.identity),
+          }))
+        );
+      }
+      vscode.window.showInformationMessage(
+        `Squad: ${enrol.length} seat(s) attached — each tab runs ` +
+          "`docker exec` into its container. Right-click → Start & attach."
+      );
+    })
+  );
+
   // ---- workspace-scoped actions ----
   // The workspace is the unit the operator works in, and folder membership is
   // already how the cockpit decides which tabs to show — so these reuse that

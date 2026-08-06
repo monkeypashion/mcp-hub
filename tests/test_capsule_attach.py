@@ -188,3 +188,91 @@ def test_an_unknown_capsule_is_named_not_guessed(monkeypatch, capsys):
     rc = cli.capsules_command(_args(target="cap-nope"), api=_Api(_capsule([])))
     assert rc == 1
     assert "no capsule cap-nope" in capsys.readouterr().err
+
+
+# ---- the structured plan the cockpit reads ---------------------------------
+#
+# The extension must never parse the rendered lines: a UI reading a human
+# format is how the board came to attribute agents by repo basename, and every
+# later wording change would silently become a behaviour change.
+
+class _Done:
+    """What subprocess.run returns for a successful `squad add-container`."""
+    stdout = "enrolled"
+    stderr = ""
+    returncode = 0
+
+
+def _plan_json(capsys):
+    import json as _json
+    return _json.loads(capsys.readouterr().out)
+
+
+def test_json_plan_names_each_seat_and_its_folder(monkeypatch, capsys):
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "_roster_all", lambda: [])
+    monkeypatch.setattr(cli.platform, "node", lambda: "box")
+    monkeypatch.setattr(cli.os.path, "isdir", lambda p: True)
+    rc = cli.capsules_command(_args(dry_run=True, json=True),
+                              api=_Api(_capsule([_seat("a"), _seat("b")])))
+    out = _plan_json(capsys)
+    assert rc == 0
+    assert [e["identity"] for e in out["enrol"]] == ["a", "b"]
+    assert out["enrol"][0]["folder"] == "/w/a"      # the cockpit adds THIS
+    assert out["dry_run"] is True and out["machine"] == "box"
+
+
+def test_json_dry_run_still_writes_nothing(monkeypatch, capsys):
+    """The RENDERING must not decide whether the guard runs."""
+    ran = []
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: ran.append(a))
+    monkeypatch.setattr(cli, "_roster_all", lambda: [])
+    monkeypatch.setattr(cli.platform, "node", lambda: "box")
+    monkeypatch.setattr(cli.os.path, "isdir", lambda p: True)
+    rc = cli.capsules_command(_args(dry_run=True, json=True),
+                              api=_Api(_capsule([_seat("a")])))
+    assert rc == 0 and ran == []
+
+
+def test_json_refusal_is_a_NAMED_list_not_an_empty_enrol(monkeypatch, capsys):
+    """`nothing to enrol` and `refused, so nothing was written` are opposite
+    outcomes that both leave `enrol` empty — the cockpit must tell them apart
+    or it reports a blocked capsule as an already-done one."""
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "_roster_all", lambda: [])
+    monkeypatch.setattr(cli.platform, "node", lambda: "box")
+    monkeypatch.setattr(cli.os.path, "isdir", lambda p: False)
+    rc = cli.capsules_command(_args(json=True),
+                              api=_Api(_capsule([_seat("a")])))
+    out = _plan_json(capsys)
+    assert rc == 1
+    assert out["enrol"] == []
+    assert [r["identity"] for r in out["refused"]] == ["a"]
+
+
+def test_json_run_still_enrols_through_squad(monkeypatch, capsys):
+    """One execution path, two renderings — the json branch must not be a
+    second implementation free to drift from the guarded one."""
+    calls = []
+    monkeypatch.setattr(
+        cli.subprocess, "run",
+        lambda argv, *a, **k: calls.append(argv) or _Done())
+    monkeypatch.setattr(cli, "_roster_all", lambda: [])
+    monkeypatch.setattr(cli.platform, "node", lambda: "box")
+    monkeypatch.setattr(cli.os.path, "isdir", lambda p: True)
+    rc = cli.capsules_command(_args(json=True),
+                              api=_Api(_capsule([_seat("a")])))
+    assert rc == 0
+    assert any("add-container" in c for c in calls)
+
+
+def test_json_output_is_ONLY_json(monkeypatch, capsys):
+    """A stray human line makes JSON.parse throw in the cockpit."""
+    import json as _json
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: _Done())
+    monkeypatch.setattr(cli, "_roster_all", lambda: [])
+    monkeypatch.setattr(cli.platform, "node", lambda: "box")
+    monkeypatch.setattr(cli.os.path, "isdir", lambda p: True)
+    cli.capsules_command(_args(json=True), api=_Api(_capsule([_seat("a")])))
+    _json.loads(capsys.readouterr().out)     # throws if anything else printed
+
