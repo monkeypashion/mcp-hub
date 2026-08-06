@@ -17,7 +17,7 @@ error itself.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Any, Mapping
 
 # The factory's auth-death exit code. Shared dialect with codespace-runner —
 # an auth failure must never be misread as a build failure in either estate.
@@ -438,10 +438,18 @@ def first_turn_prompt(contract: SeatContract) -> str:
     Single line by construction: `tmux send-keys -l` sends the buffer
     verbatim, so an embedded newline would submit half a prompt.
     """
+    # SEAT_SQUADS was parsed into the contract and then dropped here, while
+    # docs/seat-image.md said it was "passed to register()". A seat placed as
+    # part of a squad came up squadless, so `capsules compose` — which reads
+    # squad_members — froze a squad with no members in it. Empty is omitted
+    # rather than sent as "": register treats empty as NO OPINION (so a
+    # reconnect cannot drop an agent out of its squads), which means an empty
+    # string would be indistinguishable from not asking.
+    squads = (f", squads=\"{contract.squads}\"" if contract.squads else "")
     return (
         f"You are {contract.identity}, a containerized seat on project "
         f"{contract.project}. Call register(name=\"{contract.identity}\", "
-        f"project=\"{contract.project}\") on the hub now to bind this "
+        f"project=\"{contract.project}\"{squads}) on the hub now to bind this "
         f"session for wake, then stand by for instructions."
     )
 
@@ -485,3 +493,67 @@ def needs_reregister(status: dict | None, now: float,
     if ts <= after:
         return False
     return status.get("online") is False
+
+
+# ---- making a placed capsule OPENABLE --------------------------------------
+#
+# `compose` freezes a squad and `place` writes one placement per seat; the edge
+# then makes containers exist. None of that gives the operator a way IN. The
+# capsule's own `bootstrap.sh` was meant to close the gap and is a stub — four
+# lines of comment, no logic — so standing up a squad meant running
+# `squad add-container` by hand once per seat and hand-editing a workspace file.
+#
+# This decides what to do; the caller does it. Nothing here touches the disk,
+# so the whole policy is testable without a machine, and `--dry-run` prints
+# exactly what a real run would perform rather than a second description of it.
+
+ATTACH_SKIP = "skip"
+ATTACH_ENROL = "enrol"
+ATTACH_PRESENT = "already"
+ATTACH_REFUSE = "refuse"
+
+
+def capsule_attach_plan(
+    seats: list[dict[str, Any]],
+    this_machine: str,
+    enrolled: set[str],
+    dir_exists,
+) -> list[tuple[str, str, str]]:
+    """[(identity, action, detail)] for one capsule on THIS machine.
+
+    A missing work directory is REFUSED, never created. Docker would happily
+    create a missing bind-mount source — owned by root — and the seat runs as
+    uid 1000, so it would come up unable to write its own worktree. That was
+    the first of the six gates between "container running" and "agent on hub",
+    and it is invisible to `docker ps`. A directory that is supposed to hold a
+    repo is not something to conjure silently.
+    """
+    from mcp_hub.fleet_tree import container_image, seat_folder
+
+    out: list[tuple[str, str, str]] = []
+    for s in seats:
+        ident = str(s.get("identity") or "")
+        if not ident:
+            continue
+        if not container_image(s):
+            # A worktree seat is a normal agent; it has a tab already.
+            out.append((ident, ATTACH_SKIP, "not a container seat"))
+            continue
+        machine = str(s.get("machine") or "")
+        if machine and this_machine and machine != this_machine:
+            # Paths and the roster are per-machine. Enrolling another box's
+            # seat here would add a row whose folder does not exist.
+            out.append((ident, ATTACH_SKIP, f"belongs to {machine}"))
+            continue
+        folder = seat_folder(s)
+        if not folder:
+            out.append((ident, ATTACH_REFUSE, "no work mount in its spec"))
+            continue
+        if not dir_exists(folder):
+            out.append((ident, ATTACH_REFUSE, f"no such folder: {folder}"))
+            continue
+        if ident in enrolled:
+            out.append((ident, ATTACH_PRESENT, folder))
+            continue
+        out.append((ident, ATTACH_ENROL, folder))
+    return out

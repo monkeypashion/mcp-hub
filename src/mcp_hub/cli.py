@@ -2021,6 +2021,85 @@ def placements_command(args: argparse.Namespace, api: Any = None) -> int:
         return 1
 
 
+def _capsule_attach(args: argparse.Namespace, api: Any) -> int:
+    """Make a placed capsule OPENABLE on this machine.
+
+    `place` writes desired state and the edge makes containers exist; neither
+    gives the operator a way in. This adds the roster row and the workspace
+    folder entry per seat, so the cockpit shows a tab that attaches to the
+    container — the same tab any other agent gets.
+
+    It must run ON the machine hosting the seats: the folders, the roster and
+    the hostname are all destination facts, which is the same reason
+    `transport-recv` exists rather than the source doing the wiring.
+
+    `squad` stays the only writer of the roster and of workspace files. A
+    second writer of a hand-formatted JSONC file is how comments get destroyed,
+    and a second writer of squad.conf is how two views of the fleet come to
+    disagree.
+    """
+    from mcp_hub.seat import (
+        ATTACH_ENROL,
+        ATTACH_PRESENT,
+        ATTACH_REFUSE,
+        capsule_attach_plan,
+    )
+
+    if not args.target:
+        print("name the capsule to attach (see `mcp-hub capsules list`)",
+              file=sys.stderr)
+        return 1
+    rec = next((c for c in api.list_capsules() if c["id"] == args.target), None)
+    if rec is None:
+        print(f"no capsule {args.target}", file=sys.stderr)
+        return 1
+    seats = (rec.get("manifest") or {}).get("seats") or []
+    machine = _sanitize_ident(platform.node() or "unknown-host")
+    enrolled = {r["agent"] for r in _roster_all()}
+    plan = capsule_attach_plan(seats, machine, enrolled, os.path.isdir)
+    if not plan:
+        print(f"{args.target}: the capsule froze no seats")
+        return 0
+
+    ws = getattr(args, "workspace", None)
+    squad_bin = _resolve_tool("squad") or "squad"
+    refused = [p for p in plan if p[1] == ATTACH_REFUSE]
+    todo = [p for p in plan if p[1] == ATTACH_ENROL]
+    for ident, action, detail in plan:
+        mark = {ATTACH_ENROL: "enrol ", ATTACH_PRESENT: "have  ",
+                ATTACH_REFUSE: "REFUSE"}.get(action, "skip  ")
+        print(f"  {mark} {ident:<28} {detail}")
+    if refused:
+        # A missing bind-mount source is the FIRST of the six gates between a
+        # running container and an agent on the hub, and docker hides it by
+        # creating the directory as root. Refusing the whole attach keeps the
+        # capsule all-or-nothing rather than half-wired.
+        print(f"\n{len(refused)} seat(s) refused — nothing was written. Their "
+              "work folders must exist first (docker would create them as "
+              "root and the seat runs as uid 1000).", file=sys.stderr)
+        return 1
+    if args.dry_run:
+        print(f"\ndry run — {len(todo)} seat(s) would be enrolled")
+        return 0
+    if not todo:
+        print("\nnothing to do — every seat is already enrolled")
+        return 0
+    if ws:
+        ws = str(pathlib.Path(ws).expanduser())
+        if not os.path.exists(ws):
+            subprocess.run([squad_bin, "ws-new", ws], check=False)
+    for ident, _action, folder in todo:
+        argv = [squad_bin, "add-container", ident, folder, ident]
+        if ws:
+            argv += ["--to", ws]
+        r = subprocess.run(argv, capture_output=True, text=True)
+        out = (r.stdout or r.stderr).strip().splitlines()
+        print(f"  {ident}: {out[0] if out else 'enrolled'}")
+    print(f"\n{len(todo)} seat(s) enrolled. Open {ws or 'the workspace'} on "
+          "this machine and each tab attaches to its container.")
+    return 0
+
+
 def capsules_command(args: argparse.Namespace, api: Any = None) -> int:
     """Capsules — a whole SQUAD on docker. `mcp-hub capsules list|compose|place`.
 
@@ -2084,6 +2163,9 @@ def capsules_command(args: argparse.Namespace, api: Any = None) -> int:
             print("\nnothing is running — a capsule is INERT. Place it:\n"
                   f"  mcp-hub capsules place {rec['id']} --machine <machine>")
             return 0
+
+        if args.action == "attach":
+            return _capsule_attach(args, api)
 
         # -- place ------------------------------------------------------
         if not args.target:
@@ -4903,10 +4985,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     capsules.add_argument(
-        "action", choices=["list", "compose", "place"],
-        help="list · compose: freeze a squad · place: one placement per seat",
+        "action", choices=["list", "compose", "place", "attach"],
+        help=("list · compose: freeze a squad · place: one placement per seat "
+              "· attach: give this machine's seats a tab and a workspace"),
     )
-    capsules.add_argument("target", nargs="?", help="place: which capsule")
+    capsules.add_argument("target", nargs="?",
+                          help="place/attach: which capsule")
+    capsules.add_argument(
+        "--workspace", default=None,
+        help=("attach: the .code-workspace to list the seats in — created if "
+              "absent, so the squad opens like any other"),
+    )
+    capsules.add_argument(
+        "--dry-run", action="store_true",
+        help="attach: print what would be enrolled; write nothing",
+    )
     capsules.add_argument("--squad", default=None, help="compose: which squad")
     capsules.add_argument(
         "--machine", default=None,

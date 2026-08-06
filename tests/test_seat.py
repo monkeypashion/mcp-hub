@@ -20,6 +20,7 @@ from mcp_hub.seat import (
     EXIT_CONTRACT,
     OAUTH_MIN_LEN,
     SeatContractError,
+    first_turn_prompt,
     hooks_settings_content,
     launch_argv,
     marker_content,
@@ -737,3 +738,37 @@ def test_the_after_gate_defaults_to_off():
     from mcp_hub.seat import needs_reregister
 
     assert needs_reregister({"online": False, "ts": 1000}, now=1030)
+
+
+# ---- SEAT_SQUADS must reach register() -------------------------------------
+
+def test_the_first_turn_asks_to_register_INTO_its_squads():
+    """`SEAT_SQUADS` was parsed into the contract and then dropped, while the
+    contract doc said it was passed to register(). A seat placed as part of a
+    squad came up squadless — and `capsules compose` reads squad_members, so it
+    froze a squad with no members in it."""
+    c = parse_seat_contract({
+        "SEAT_IDENTITY": "a-box", "MCP_HUB_URL": "http://h/mcp",
+        "SEAT_SQUADS": "capsule",
+    })
+    p = first_turn_prompt(c)
+    assert 'squads="capsule"' in p, p
+
+
+def test_no_SEAT_SQUADS_sends_no_squads_argument_at_all():
+    """register() treats empty as NO OPINION — deliberately, so a reconnect
+    cannot drop an agent out of its squads. Sending `squads=""` would be
+    indistinguishable from not asking, so it must be omitted entirely."""
+    c = parse_seat_contract({"SEAT_IDENTITY": "a-box",
+                             "MCP_HUB_URL": "http://h/mcp"})
+    assert "squads=" not in first_turn_prompt(c)
+
+
+def test_the_first_turn_prompt_stays_ONE_line_with_squads():
+    """`tmux send-keys -l` sends the buffer verbatim, so an embedded newline
+    submits half a prompt."""
+    c = parse_seat_contract({
+        "SEAT_IDENTITY": "a-box", "MCP_HUB_URL": "http://h/mcp",
+        "SEAT_SQUADS": "capsule,runtime",
+    })
+    assert "\n" not in first_turn_prompt(c)
