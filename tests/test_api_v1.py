@@ -836,3 +836,63 @@ class TestImageUnitValidation:
             headers=H,
         )
         assert r.status_code == 201, r.text
+
+
+# ---- machines report their roster so the board can attribute exactly -------
+
+def _tok(client, name):
+    return {"Authorization": f"Bearer {_machine(client, name)['token']}"}
+
+
+def test_a_machine_reports_its_roster_and_it_comes_back(client):
+    h = _tok(client, "box-r1")
+    client.post("/api/v1/machines/box-r1/status",
+                json={"agents": [{"agent": "pm-box", "worktree": "/code/pm"}]},
+                headers=h)
+    got = client.get("/api/v1/machines", headers=H).json()
+    assert got["agents"]["box-r1"] == [{"agent": "pm-box", "worktree": "/code/pm"}]
+
+
+def test_the_roster_is_a_SNAPSHOT_so_a_retired_agent_leaves(client):
+    """An accreting roster would keep attributing rows to folders the machine
+    no longer has — the same reason discovered workspaces replace rather than
+    accumulate."""
+    h = _tok(client, "box-r2")
+    client.post("/api/v1/machines/box-r2/status",
+                json={"agents": [{"agent": "a", "worktree": "/a"},
+                                 {"agent": "b", "worktree": "/b"}]}, headers=h)
+    client.post("/api/v1/machines/box-r2/status",
+                json={"agents": [{"agent": "a", "worktree": "/a"}]}, headers=h)
+    got = client.get("/api/v1/machines", headers=H).json()
+    assert [a["agent"] for a in got["agents"]["box-r2"]] == ["a"]
+
+
+def test_a_status_push_WITHOUT_agents_leaves_the_roster_alone(client):
+    """Absent key is "this edge does not report rosters", not "no agents".
+    Clearing on absence would make an older edge empty its own machine."""
+    h = _tok(client, "box-r3")
+    client.post("/api/v1/machines/box-r3/status",
+                json={"agents": [{"agent": "a", "worktree": "/a"}]}, headers=h)
+    client.post("/api/v1/machines/box-r3/status",
+                json={"workspaces": []}, headers=h)
+    got = client.get("/api/v1/machines", headers=H).json()
+    assert [a["agent"] for a in got["agents"]["box-r3"]] == ["a"]
+
+
+def test_an_empty_agents_LIST_does_clear_it(client):
+    """`[]` is a real report — the machine has no agents — and differs from
+    the key being absent."""
+    h = _tok(client, "box-r4")
+    client.post("/api/v1/machines/box-r4/status",
+                json={"agents": [{"agent": "a", "worktree": "/a"}]}, headers=h)
+    client.post("/api/v1/machines/box-r4/status", json={"agents": []}, headers=h)
+    got = client.get("/api/v1/machines", headers=H).json()
+    assert "box-r4" not in got["agents"]
+
+
+def test_a_machine_may_not_report_another_machines_roster(client):
+    _machine(client, "box-r6")
+    r = client.post("/api/v1/machines/box-r6/status",
+                    json={"agents": [{"agent": "x", "worktree": "/x"}]},
+                    headers=_tok(client, "box-r5"))
+    assert r.status_code == 403

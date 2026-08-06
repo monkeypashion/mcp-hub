@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import stat
+import time
 
 import pytest
 
@@ -524,3 +525,680 @@ async def test_jumping_repaints_the_detail_pane_not_just_the_cursor():
 def _detail_text(app) -> str:
     return " ".join(str(w.render())
                     for w in app.query_one("#detail").walk_children())
+
+
+# ---- the roster is re-read, not snapshotted ----
+#
+# `squad add-container` enrolled a seat and the board that was already open
+# never showed it — twice, on the same evening. The roster was read once at
+# construction while the board, the workspaces and the fleet all refreshed on
+# timers, so the one instrument the operator was actually looking at was the
+# one that could not see the change. "Restart the tab" is not an answer: a
+# missing row and a broken seat look identical from that chair.
+
+def _roster_app(roster_for, board=None):
+    """Same panel, with the roster INJECTED as a callable rather than a list.
+
+    The opening list is deliberately what the callable says at construction —
+    the real caller reads it the same way, so a test cannot pass by starting
+    from a roster the reader never produced.
+    """
+    return SettingsApp(roster_for(), scoped_to=None, model_for=_model_for,
+                       squad_bin="/usr/bin/SQUAD", hub_bin="/usr/bin/HUB",
+                       board_for=board, dark=None, poll_seconds=3600,
+                       this_machine="thisbox", roster_for=roster_for)
+
+
+def _tree_agents(app) -> list[str]:
+    return [(n.data or {}).get("agent") for n in app._agent_nodes()]
+
+
+@pytest.mark.asyncio
+async def test_a_seat_enrolled_after_the_board_opened_appears_in_it():
+    rows = list(AGENTS)
+    app = _roster_app(lambda: list(rows), board=_snapshot)
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        assert "delta" not in _tree_agents(app)
+        rows.append({"agent": "delta", "worktree": "/d", "klass": "faculty"})
+        app._poll_board()                       # the tick, not a restart
+        await pilot.pause()
+        await pilot.pause()
+        assert "delta" in _tree_agents(app), _tree_agents(app)
+
+
+@pytest.mark.asyncio
+async def test_a_seat_retired_after_the_board_opened_leaves_it():
+    rows = list(AGENTS)
+    app = _roster_app(lambda: list(rows), board=_snapshot)
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        rows.remove(AGENTS[2])                  # gamma retired
+        app._poll_board()
+        await pilot.pause()
+        await pilot.pause()
+        assert "gamma" not in _tree_agents(app), _tree_agents(app)
+
+
+@pytest.mark.asyncio
+async def test_the_cursor_holds_its_seat_when_the_roster_shifts_under_it():
+    """A new row at the FRONT renumbers every seat behind it. The detail pane
+    resolves the selection through `roster_ix`, so a stale index does not blank
+    the pane — it quietly describes the WRONG agent, which is worse.
+    """
+    rows = list(AGENTS)
+    app = _roster_app(lambda: list(rows), board=_snapshot)
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        await _goto(app, pilot, "beta")
+        assert "rm -rf" in _detail_text(app)
+        rows.insert(0, {"agent": "aaa-new", "worktree": "/n", "klass": "squad"})
+        app._poll_board()
+        await pilot.pause()
+        await pilot.pause()
+        assert app.selected["agent"] == "beta"
+        # the exact expression refresh_detail uses to find the seat's worktree
+        assert app.agents[app.selected["roster_ix"]]["agent"] == "beta"
+        assert "rm -rf" in _detail_text(app), "the pane followed the index, not the seat"
+
+
+@pytest.mark.asyncio
+async def test_a_roster_we_could_not_read_leaves_the_tree_alone():
+    """None (the read failed) and [] (nothing is enrolled) are different
+    answers. Collapsing them would let one unreadable tick empty the board."""
+    def boom():
+        raise OSError("squad.conf is busy")
+
+    app = SettingsApp(list(AGENTS), scoped_to=None, model_for=_model_for,
+                      squad_bin="/usr/bin/SQUAD", hub_bin="/usr/bin/HUB",
+                      board_for=_snapshot, dark=None, poll_seconds=3600,
+                      this_machine="thisbox", roster_for=boom)
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        assert app.is_running
+        assert _tree_agents(app) == ["alpha", "beta", "gamma"], _tree_agents(app)
+
+
+@pytest.mark.asyncio
+async def test_an_emptied_roster_is_reported_rather_than_ignored():
+    rows = list(AGENTS)
+    app = _roster_app(lambda: list(rows), board=_snapshot)
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        rows.clear()
+        app._poll_board()
+        await pilot.pause()
+        await pilot.pause()
+        assert _tree_agents(app) == [], _tree_agents(app)
+        assert app.is_running
+
+
+@pytest.mark.asyncio
+async def test_the_tick_runs_for_the_roster_alone_with_no_live_scan():
+    """`board_for` is optional. Gating the tick on it alone would leave the
+    roster frozen on any board opened without a scan.
+
+    Nothing here calls `_poll_board()` — that is the whole point. The panel
+    opens on a stale list and only the tick the app schedules for ITSELF can
+    reconcile it, so a gate that skips scheduling fails here. The first version
+    of this test pressed the poll by hand and passed with the gate reverted:
+    a tick you fire yourself proves nothing about when the app fires one.
+    """
+    rows = [*AGENTS, {"agent": "delta", "worktree": "/d", "klass": "faculty"}]
+    app = SettingsApp(list(AGENTS), scoped_to=None, model_for=_model_for,
+                      squad_bin="/usr/bin/SQUAD", hub_bin="/usr/bin/HUB",
+                      board_for=None, dark=None, poll_seconds=3600,
+                      this_machine="thisbox", roster_for=lambda: list(rows))
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        assert "delta" in _tree_agents(app), _tree_agents(app)
+
+
+@pytest.mark.asyncio
+async def test_reload_re_reads_the_roster_too():
+    """`r` is what the operator reaches for when the board looks wrong. It
+    refreshed the scan and the registry but not the roster, so the one key that
+    means "show me what is actually there" was the one that could not."""
+    rows = list(AGENTS)
+    app = SettingsApp(list(rows), scoped_to=None, model_for=_model_for,
+                      squad_bin="/usr/bin/SQUAD", hub_bin="/usr/bin/HUB",
+                      board_for=None, dark=None, poll_seconds=3600,
+                      this_machine="thisbox", roster_for=lambda: list(rows))
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        rows.append({"agent": "delta", "worktree": "/d", "klass": "faculty"})
+        await pilot.press("r")
+        await pilot.pause()
+        await pilot.pause()
+        assert "delta" in _tree_agents(app), _tree_agents(app)
+
+
+# ---- containers in the tree ------------------------------------------------
+
+CONTAINER_SEATS = [{
+    "identity": "mcp-hub-seat-thisbox", "machine": "thisbox", "repo": "",
+    "folder": "", "launch_args": "", "class": "squad", "cloned_from": "",
+    "spec": {"image": "mcp-hub-seat:latest",
+             "volumes": ["/home/me/work/seat:/home/seat/work"],
+             "memory_volume": "seat-memory:/home/seat/.claude"},
+}]
+
+SEAT_ROSTER = [
+    {"agent": "alpha", "worktree": "/a", "klass": "squad"},
+    {"agent": "mcp-hub-seat-thisbox", "worktree": "/home/me/work/seat",
+     "klass": "faculty"},
+]
+
+
+# The ORDINARY case: the container is there and doing what was asked. Without
+# a placement every row would wear `no placement`, which is a real state but
+# not the one most of these tests are about.
+HEALTHY_PLACEMENT = [{
+    "id": "pl-ok", "seat": "mcp-hub-seat-thisbox", "machine": "thisbox",
+    "substrate": "docker", "desired": "running", "status": "converged",
+    "observed": {"state": "running", "at": 1.0,
+                 "enumeration": {"container": "mcp-hub-seat-thisbox",
+                                 "alive": True, "exists": True,
+                                 "image_matches": True}},
+}]
+
+
+def _seat_app(seats=CONTAINER_SEATS, roster=SEAT_ROSTER,
+              placements=HEALTHY_PLACEMENT):
+    return SettingsApp(list(roster), scoped_to=None, model_for=_model_for,
+                       squad_bin="/usr/bin/SQUAD", hub_bin="/usr/bin/HUB",
+                       board_for=None, dark=None, poll_seconds=3600,
+                       this_machine="thisbox",
+                       workspaces_for=lambda: {"rows": [], "machines": ["thisbox"],
+                                               "this_machine": "thisbox", "note": ""},
+                       seats_for=lambda: list(seats),
+                       placements_for=lambda: list(placements))
+
+
+def _node_for(app, pred):
+    for n in app._all_nodes():
+        if pred(n.data or {}):
+            return n
+    return None
+
+
+@pytest.mark.asyncio
+async def test_a_container_gets_its_own_row_marked_as_a_container():
+    app = _seat_app()
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        node = _node_for(app, lambda d: d.get("kind") == "container")
+        assert node is not None, "no container row in the tree"
+        label = node.label.plain
+        assert "🐳" in label and "container" in label, label
+        # The IMAGE is NOT on the row: it costs 20 cells in a 52-cell panel and
+        # a Tree clips silently. It belongs to the detail pane, which the
+        # container-detail test asserts.
+        assert "mcp-hub-seat:latest" not in label, label
+
+
+@pytest.mark.asyncio
+async def test_the_container_row_does_not_claim_to_be_a_machine():
+    """It has no token, no edge and no ssh. A row reading `· remote` like a box
+    would invite `transport --host <the container>`, which can never work."""
+    app = _seat_app()
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        label = _node_for(app, lambda d: d.get("kind") == "container").label.plain
+        assert "this machine" not in label and "remote" not in label, label
+
+
+@pytest.mark.asyncio
+async def test_selecting_a_container_describes_it_rather_than_saying_nothing():
+    """Every new node kind that `refresh_detail` does not know falls through to
+    'nothing selected', which reads as a broken row."""
+    from textual.widgets import Tree
+    app = _seat_app()
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        node = _node_for(app, lambda d: d.get("kind") == "container")
+        app.query_one("#fleet", Tree).move_cursor(node)
+        await pilot.pause()
+        await pilot.pause()
+        text = _detail_text(app)
+        assert "nothing selected" not in text, text
+        assert "CONTAINER" in text
+        assert "mcp-hub-seat:latest" in text
+        # the way IN is the point: there is no sshd, so say what does work
+        assert "docker exec" in text, text
+        assert "/home/me/work/seat" in text, "the work mount is not shown"
+
+
+@pytest.mark.asyncio
+async def test_a_container_selection_survives_a_restructure():
+    """`_identity` falls through to the machine case for any kind it does not
+    name, so a container would be identified AS its host — and a restructure
+    would move the cursor up a level while the pane kept describing a box."""
+    app = _seat_app()
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        node = _node_for(app, lambda d: d.get("kind") == "container")
+        app._move_to(node)
+        await pilot.pause()
+        ident = app._identity(app.selected)
+        assert ident[0] == "container", ident
+        assert ident != app._identity(
+            _node_for(app, lambda d: d.get("kind") == "machine").data)
+
+
+@pytest.mark.asyncio
+async def test_a_seat_with_no_image_grows_no_container_row():
+    plain = [{**CONTAINER_SEATS[0], "spec": {}}]
+    app = _seat_app(seats=plain)
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        assert _node_for(app, lambda d: d.get("kind") == "container") is None
+
+
+@pytest.mark.asyncio
+async def test_no_tree_row_overflows_the_panel_it_is_drawn_in():
+    """A Tree CLIPS rather than wraps, so an overlong label loses its tail with
+    no sign that anything is missing — the operator read `container · mcp-hub`
+    and could not know `-seat:latest` had been cut off.
+
+    Asserted against the panel's real width and the real indent, for EVERY row
+    the tree draws, so the next thing anyone hangs on a label is measured
+    rather than eyeballed.
+    """
+    from rich.cells import cell_len
+    from textual.widgets import Tree
+
+    # A LOOSE ambiguous row is the widest thing the tree draws and was not in
+    # this fixture: the guard passed while `💤⚡ mcp-hub-dev-vm-1  workspace
+    # unknown · clones` overflowed on the real board. A width guard that never
+    # sees the widest row is not a width guard.
+    app = SettingsApp(
+        list(SEAT_ROSTER), scoped_to=None, model_for=_model_for,
+        squad_bin="/usr/bin/SQUAD", hub_bin="/usr/bin/HUB",
+        board_for=None, dark=None, poll_seconds=3600, this_machine="thisbox",
+        workspaces_for=lambda: {
+            "machines": ["thisbox", "dev-vm-1"], "this_machine": "thisbox",
+            "note": "", "rows": [
+                {"name": "squad", "machine": "dev-vm-1",
+                 "path": "/f/squad.code-workspace", "folders": 1, "error": "",
+                 "on_disk": True, "open_now": False, "registered": True,
+                 "squad": "", "listings": ["/code/org/mcp-hub"]},
+                {"name": "general", "machine": "dev-vm-1",
+                 "path": "/f/general.code-workspace", "folders": 1, "error": "",
+                 "on_disk": True, "open_now": False, "registered": True,
+                 "squad": "", "listings": ["/general/mcp-hub"]},
+            ]},
+        seats_for=lambda: list(CONTAINER_SEATS),
+        placements_for=lambda: list(HEALTHY_PLACEMENT),
+        fleet_for=lambda: {"ts": time.time(), "agents": [
+            # The real ambiguous agent, at its real length. A synthetic longer
+            # name would fail this guard for a row the fleet does not have,
+            # and the honest limit is stated in the assertion below.
+            {"name": "mcp-hub-dev-vm-1", "project": "org/mcp-hub",
+             "wakeable": True, "idle": True, "sessions": 1, "next": ""}]},
+    )
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        assert any("workspace unknown" in n.label.plain for n in app._all_nodes()), \
+            "the widest row is not in this fixture"
+        width = app.query_one("#fleet", Tree).size.width
+        assert width > 0
+        for node in app._all_nodes():
+            # depth * guide_depth, plus the expand arrow the Tree draws itself
+            depth, parent = 0, node.parent
+            while parent is not None:
+                depth += 1
+                parent = parent.parent
+            indent = node.tree.guide_depth * max(depth - 1, 0) + 2
+            used = cell_len(node.label.plain) + indent
+            assert used <= width, (
+                f"{node.label.plain!r} needs {used} cells in {width}: "
+                "the tail is silently clipped")
+
+
+# ---- staleness must not leave a live claim standing ------------------------
+
+def _stale_remote_app():
+    """A remote agent the snapshot calls WAKEABLE, from a snapshot old enough
+    to be not-reporting. Both facts come from the same file."""
+    return SettingsApp(
+        [], scoped_to=None, model_for=_model_for,
+        squad_bin="/usr/bin/SQUAD", hub_bin="/usr/bin/HUB",
+        board_for=None, dark=None, poll_seconds=3600, this_machine="thisbox",
+        workspaces_for=lambda: {"rows": [], "machines": ["thisbox", "farbox"],
+                                "this_machine": "thisbox", "note": ""},
+        fleet_for=lambda: {"ts": 1.0, "agents": [        # ts=1 → ancient
+            {"name": "pm-farbox", "project": "org/pm", "wakeable": True,
+             "idle": True, "sessions": 1, "next": ""}]},
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_not_reporting_row_drops_its_wake_marker():
+    """`⚠ ⚡ dreamteam-dev-vm-1  not reporting` said two contradictory things
+    at once: we cannot see this agent, AND it is wakeable. The wake flag is
+    read from the very snapshot the row has just called stale, so it is not a
+    second source — it is the same dead cache asserting liveness.
+    """
+    app = _stale_remote_app()
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        row = _label(app, "pm-farbox")
+        assert "not reporting" in row, row
+        assert "⚡" not in row, f"a stale row still claims wakeable: {row}"
+
+
+@pytest.mark.asyncio
+async def test_a_FRESH_remote_row_keeps_its_wake_marker():
+    """The guard above must not simply delete ⚡ from remote rows — that would
+    pass the test by removing theclaim rather than by qualifying it."""
+    app = SettingsApp(
+        [], scoped_to=None, model_for=_model_for,
+        squad_bin="/usr/bin/SQUAD", hub_bin="/usr/bin/HUB",
+        board_for=None, dark=None, poll_seconds=3600, this_machine="thisbox",
+        workspaces_for=lambda: {"rows": [], "machines": ["thisbox", "farbox"],
+                                "this_machine": "thisbox", "note": ""},
+        fleet_for=lambda: {"ts": time.time(), "agents": [
+            {"name": "pm-farbox", "project": "org/pm", "wakeable": True,
+             "idle": True, "sessions": 1, "next": ""}]},
+    )
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        row = _label(app, "pm-farbox")
+        assert "not reporting" not in row, row
+        assert "⚡" in row, row
+
+
+# ---- the panel is the operator's to size -----------------------------------
+
+@pytest.mark.asyncio
+async def test_the_tree_panel_widens_and_narrows_on_keys():
+    from textual.widgets import Tree
+    app = _seat_app()
+    async with app.run_test(size=(160, 34)) as pilot:
+        await pilot.pause()
+        start = app.query_one("#fleet", Tree).size.width
+        await pilot.press("]")
+        await pilot.pause()
+        wider = app.query_one("#fleet", Tree).size.width
+        assert wider > start, (start, wider)
+        await pilot.press("[")
+        await pilot.press("[")
+        await pilot.pause()
+        assert app.query_one("#fleet", Tree).size.width < wider
+
+
+@pytest.mark.asyncio
+async def test_resizing_starts_from_the_width_the_panel_really_has():
+    """The CSS width is a PERCENTAGE until the first keypress. Resizing from a
+    remembered constant would make the first `]` on a wide terminal shrink the
+    panel — the opposite of the key's name."""
+    from textual.widgets import Tree
+    app = _seat_app()
+    async with app.run_test(size=(200, 34)) as pilot:
+        await pilot.pause()
+        # OUTER width throughout: that is what the resize writes, and mixing
+        # it with `size` (the content box) is the drift this test exists for.
+        start = app.query_one("#fleet", Tree).outer_size.width
+        assert start > 52, f"a 200-col terminal should beat the floor: {start}"
+        await pilot.press("]")
+        await pilot.pause()
+        assert app.query_one("#fleet", Tree).outer_size.width \
+            == start + app.TREE_STEP, "the step drifted by the border/padding"
+
+
+@pytest.mark.asyncio
+async def test_a_wide_terminal_gives_the_tree_more_room_than_a_narrow_one():
+    from textual.widgets import Tree
+    widths = {}
+    for cols in (120, 200):
+        app = _seat_app()
+        async with app.run_test(size=(cols, 34)) as pilot:
+            await pilot.pause()
+            widths[cols] = app.query_one("#fleet", Tree).size.width
+    assert widths[200] > widths[120], widths
+    # `size.width` is the CONTENT box; the CSS min-width of 52 is the border
+    # box, so the floor shows up here as 52 minus border and padding.
+    assert widths[120] >= 49, f"the old fixed width is the FLOOR: {widths}"
+
+
+# ---- a container row reports what was OBSERVED, not what was declared -------
+#
+# The board drew `edge-probe-dev-vm-1` as a live substrate while the hub held
+# `desired: reclaimed · observed: reclaimed · exists: false · converged` for
+# it. The container node is built from the SEAT record — what may run — and the
+# placement carrying the observation was attached to the node and never read.
+
+def _placement(seat, desired="running", status="converged", state="running",
+               **enum):
+    e = {"container": seat, "alive": True, "exists": True}
+    e.update(enum)
+    return {"id": f"pl-{seat}", "seat": seat, "machine": "thisbox",
+            "substrate": "docker", "desired": desired, "status": status,
+            "observed": {"state": state, "at": 1.0, "enumeration": e}}
+
+
+def _placed_app(placements, seats=CONTAINER_SEATS):
+    return SettingsApp(
+        list(SEAT_ROSTER), scoped_to=None, model_for=_model_for,
+        squad_bin="/usr/bin/SQUAD", hub_bin="/usr/bin/HUB",
+        board_for=None, dark=None, poll_seconds=3600, this_machine="thisbox",
+        workspaces_for=lambda: {"rows": [], "machines": ["thisbox"],
+                                "this_machine": "thisbox", "note": ""},
+        seats_for=lambda: list(seats),
+        placements_for=lambda: list(placements),
+    )
+
+
+def _container_row(app) -> str:
+    for n in app._all_nodes():
+        if (n.data or {}).get("kind") == "container":
+            return n.label.plain
+    raise AssertionError("no container row")
+
+
+@pytest.mark.asyncio
+async def test_a_reclaimed_container_does_not_read_as_a_live_one():
+    seat = CONTAINER_SEATS[0]["identity"]
+    app = _placed_app([_placement(seat, desired="reclaimed",
+                                  state="reclaimed", exists=False, alive=False)])
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        row = _container_row(app)
+        assert "reclaimed" in row, row
+        assert "gone" in row, row
+
+
+@pytest.mark.asyncio
+async def test_a_container_nothing_has_scheduled_says_so():
+    """A seat with no placement is a declaration nobody has acted on. Drawing
+    it identically to a running one is the same lie in a quieter voice."""
+    app = _placed_app([])
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        assert "no placement" in _container_row(app)
+
+
+@pytest.mark.asyncio
+async def test_a_container_running_the_wrong_image_says_stale_image():
+    seat = CONTAINER_SEATS[0]["identity"]
+    app = _placed_app([_placement(seat, image_matches=False)])
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        assert "stale image" in _container_row(app)
+
+
+@pytest.mark.asyncio
+async def test_a_container_asked_to_run_that_is_not_running_says_so():
+    seat = CONTAINER_SEATS[0]["identity"]
+    app = _placed_app([_placement(seat, desired="running", state="stopped")])
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        assert "not running" in _container_row(app)
+
+
+@pytest.mark.asyncio
+async def test_a_healthy_container_stays_QUIET():
+    """Silence has to mean "seen, and as intended" — if a converged container
+    also wore a qualifier, none of the qualifiers above would carry weight."""
+    seat = CONTAINER_SEATS[0]["identity"]
+    app = _placed_app([_placement(seat)])
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        row = _container_row(app)
+        assert row.endswith("container"), row
+
+
+@pytest.mark.asyncio
+async def test_an_edge_that_never_reported_exists_is_not_called_reclaimed():
+    """`exists` absent means the edge did not report the field; `exists: False`
+    means it reported it absent. Truthiness collapses the two and would call an
+    unreported container reclaimed."""
+    seat = CONTAINER_SEATS[0]["identity"]
+    pl = _placement(seat)
+    del pl["observed"]["enumeration"]["exists"]
+    app = _placed_app([pl])
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        assert "reclaimed" not in _container_row(app)
+
+
+# ---- out-of-scope workspaces -----------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_workspace_this_board_is_not_scoped_to_says_so():
+    app = SettingsApp(
+        [], scoped_to="/w/windows.code-workspace", model_for=_model_for,
+        squad_bin="/usr/bin/SQUAD", hub_bin="/usr/bin/HUB",
+        board_for=None, dark=None, poll_seconds=3600, this_machine="thisbox",
+        workspaces_for=lambda: {
+            "machines": ["thisbox"], "this_machine": "thisbox", "note": "",
+            "rows": [
+                {"name": "windows", "machine": "thisbox",
+                 "path": "/w/windows.code-workspace", "folders": 1, "error": "",
+                 "on_disk": True, "open_now": False, "registered": True,
+                 "squad": "", "listings": ["/w/win"]},
+                {"name": "xport", "machine": "thisbox",
+                 "path": "/w/xport.code-workspace", "folders": 1, "error": "",
+                 "on_disk": True, "open_now": False, "registered": True,
+                 "squad": "", "listings": ["/w/xp"]},
+            ]},
+    )
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        rows = {(n.data or {}).get("name"): n.label.plain
+                for n in app._all_nodes() if (n.data or {}).get("kind") == "workspace"}
+        assert "not in this board's scope" in rows["xport"], rows
+        assert "not in this board's scope" not in rows["windows"], rows
+
+
+@pytest.mark.asyncio
+async def test_the_container_pane_explains_the_state_the_row_abbreviates():
+    """The row says `reclaimed · gone` because that is all 49 cells hold. The
+    pane is where the operator finds out what that means and who observed it."""
+    from textual.widgets import Tree
+    seat = CONTAINER_SEATS[0]["identity"]
+    app = _placed_app([_placement(seat, desired="reclaimed", state="reclaimed",
+                                  exists=False, alive=False)])
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        node = _node_for(app, lambda d: d.get("kind") == "container")
+        app.query_one("#fleet", Tree).move_cursor(node)
+        await pilot.pause()
+        await pilot.pause()
+        text = _detail_text(app)
+        assert "enumerated" in text and "did not find" in text, text
+
+
+@pytest.mark.asyncio
+async def test_out_of_scope_does_not_steal_the_open_now_mark():
+    """A workspace someone ELSE has open, that this board is not scoped to, is
+    both things at once. Written first as a branch in the label's cascade, the
+    scope note replaced the open-now colour — so a workspace with an operator
+    in it read as an unremarkable one. Caught by the existing workspace-view
+    suite, not by anything I wrote."""
+    app = SettingsApp(
+        [], scoped_to="/w/windows.code-workspace", model_for=_model_for,
+        squad_bin="/usr/bin/SQUAD", hub_bin="/usr/bin/HUB",
+        board_for=None, dark=None, poll_seconds=3600, this_machine="thisbox",
+        workspaces_for=lambda: {
+            "machines": ["thisbox"], "this_machine": "thisbox", "note": "",
+            "rows": [
+                {"name": "windows", "machine": "thisbox",
+                 "path": "/w/windows.code-workspace", "folders": 1, "error": "",
+                 "on_disk": True, "open_now": True, "registered": True,
+                 "squad": "", "listings": ["/w/win"]},
+                {"name": "elsewhere", "machine": "thisbox",
+                 "path": "/w/elsewhere.code-workspace", "folders": 1,
+                 "error": "", "on_disk": True, "open_now": True,
+                 "registered": True, "squad": "", "listings": ["/w/el"]},
+            ]},
+    )
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        node = next(n for n in app._all_nodes()
+                    if (n.data or {}).get("name") == "elsewhere")
+        label = node.label.plain
+        assert label.startswith("● elsewhere"), label     # still marked OPEN
+        assert "not in this board's scope" in label, label
+        styles = {s.style for s in node.label.spans if s.style}
+        assert any(app._palette()["success"] in str(s) for s in styles), styles
+
+
+@pytest.mark.asyncio
+async def test_an_ambiguous_remote_row_says_WHY_it_has_no_workspace():
+    """Moving the agent out of the workspaces is only half the fix. A row that
+    simply appears under the machine looks like an agent nobody filed, not one
+    whose workspace cannot be known — so the reason rides the row.
+
+    (The refusal itself is tested in test_fleet_tree; this is the sentence.)
+    """
+    def _wsrow(name, path, listing):
+        return {"name": name, "machine": "farbox", "path": path, "folders": 1,
+                "error": "", "on_disk": True, "open_now": False,
+                "registered": True, "squad": "", "listings": [listing]}
+
+    app = SettingsApp(
+        [], scoped_to=None, model_for=_model_for,
+        squad_bin="/usr/bin/SQUAD", hub_bin="/usr/bin/HUB",
+        board_for=None, dark=None, poll_seconds=3600, this_machine="thisbox",
+        workspaces_for=lambda: {
+            "machines": ["thisbox", "farbox"], "this_machine": "thisbox",
+            "note": "", "rows": [
+                _wsrow("squad", "/f/squad.code-workspace", "/code/org/mcp-hub"),
+                _wsrow("general", "/f/general.code-workspace", "/general/mcp-hub"),
+            ]},
+        fleet_for=lambda: {"ts": time.time(), "agents": [
+            {"name": "mcp-hub-farbox", "project": "org/mcp-hub",
+             "wakeable": True, "idle": True, "sessions": 1, "next": ""}]},
+    )
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        row = _label(app, "mcp-hub-farbox")
+        assert "workspace unknown" in row, row
+        assert "hub only" not in row, "the reason was overwritten by the state"

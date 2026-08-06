@@ -285,6 +285,18 @@ class OperatorApi:
     def list_machines(self) -> list[dict[str, Any]]:
         return self._request("GET", "/api/v1/machines").json()["machines"]
 
+    def machine_agents(self) -> dict[str, list[dict[str, str]]]:
+        """Each machine's reported roster: {machine: [{agent, worktree}]}.
+
+        A machine ABSENT from this map has not reported one — an older edge,
+        or one that has not run since it was upgraded. That is not the same
+        claim as an empty roster, and callers must not collapse the two: the
+        board falls back to matching by repo name for such a machine rather
+        than showing it as having no agents.
+        """
+        got = self._request("GET", "/api/v1/machines").json().get("agents")
+        return got if isinstance(got, dict) else {}
+
     def enrol_machine(
         self,
         name: str,

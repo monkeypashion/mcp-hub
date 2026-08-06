@@ -82,6 +82,41 @@ def _resolve(listing: str, ws_path: str) -> str:
     return posixpath.normpath(posixpath.join(posixpath.dirname(ws_path), listing))
 
 
+def container_image(seat: dict[str, Any]) -> str:
+    """The image a seat runs as, or "" if it is not containerized.
+
+    The seat record's `spec` is substrate-specific by design (one column, not
+    one per substrate), so the PRESENCE of an image is what makes a seat a
+    container. A worktree seat has no image and must not sprout a container
+    node — that would invent a substrate the machine does not have.
+    """
+    spec = seat.get("spec")
+    if not isinstance(spec, dict):
+        return ""
+    return str(spec.get("image") or "")
+
+
+def seat_folder(seat: dict[str, Any]) -> str:
+    """The HOST path a container seat's work lives at, or "".
+
+    `folder` when the hub was told one; otherwise the first bind mount, which
+    is the only other place the fact exists. NAMED volumes are skipped: the
+    memory volume is a name, not a path, and reading it as a worktree would
+    attribute the seat to whatever workspace happened to contain a folder of
+    that name.
+    """
+    if seat.get("folder"):
+        return str(seat["folder"]).rstrip("/")
+    spec = seat.get("spec")
+    if not isinstance(spec, dict):
+        return ""
+    for vol in spec.get("volumes") or []:
+        host = str(vol).partition(":")[0]
+        if host.startswith("/"):
+            return host.rstrip("/")
+    return ""
+
+
 def _contains(listing: str, worktree: str) -> bool:
     if not listing or not worktree:
         return False
@@ -120,6 +155,8 @@ def build_tree(
     scoped_to: str | None = None,
     listings_for: Callable[[str], list[str]] | None = None,
     placements: list[dict[str, Any]] | None = None,
+    seats: list[dict[str, Any]] | None = None,
+    machine_agents: dict[str, list[dict[str, str]]] | None = None,
     now: float,
 ) -> dict[str, Any]:
     """Merge roster + board + workspace registry + fleet snapshot into a tree.
@@ -143,11 +180,32 @@ def build_tree(
     for r in rows:
         if r.get("machine") and r["machine"] not in machines:
             machines.append(r["machine"])
+    for s in seats or []:
+        if s.get("machine") and s["machine"] not in machines:
+            machines.append(s["machine"])
     if this_machine and this_machine not in machines:
         machines.append(this_machine)
 
+    # {machine: {agent: worktree}} — the API hands back a LIST per machine so
+    # the wire format stays additive; the lookup is built once here rather than
+    # scanned per agent.
+    worktree_of: dict[str, dict[str, str]] = {
+        mach: {a["agent"]: a.get("worktree", "")
+               for a in rows if isinstance(a, dict) and a.get("agent")}
+        for mach, rows in (machine_agents or {}).items()
+        if isinstance(rows, list)
+    }
+
     fleet_ts = float(fleet.get("ts") or 0)
     stale = (now - fleet_ts) > FLEET_STALE_SECONDS if fleet_ts else True
+    # NEVER WRITTEN is not the same fact as GONE STALE, and after a reboot it
+    # is the ordinary one: the snapshot's writer is the heartbeat daemon, which
+    # only exists once an agent session starts. A board opened on a freshly
+    # booted box read `not reporting` across the whole fleet when the truth was
+    # that nothing on THIS box had looked yet (fireblade-wsl, 07:08 board vs
+    # 07:30 first daemon). Same rendering for both told the operator the fleet
+    # was down.
+    never = not fleet_ts
     fleet_agents = [
         a for a in (fleet.get("agents") or [])
         if isinstance(a, dict) and a.get("name")
@@ -179,9 +237,56 @@ def build_tree(
             "folders": r.get("folders"),
             "drift": (r.get("registered") is False) or not r.get("on_disk"),
             "listings": [_resolve(x, r.get("path", "")) for x in listings],
+            # Whether this board can SEE the agents in here at all. A scoped
+            # board is handed a roster filtered to its own workspace, so every
+            # OTHER local workspace draws with no children — and an empty node
+            # reads "no agents", which is a measurement nobody took. Remote
+            # rows are unaffected: their agents come from the fleet snapshot,
+            # which no scope filters.
+            "in_scope": (r["machine"] != this_machine
+                         or not scoped_to
+                         or r.get("path") == scoped_to),
             "agents": [],
         }
         ws_nodes.setdefault(r["machine"], []).append(node)
+
+    # -- containers: a substrate BETWEEN the machine and its agents --------
+    #
+    # A container is not a machine. It has no token, no edge, no ssh — the
+    # docker that runs it belongs to its host, and its identity derives from
+    # that host's name. So it hangs UNDER the box, beside that box's
+    # workspaces, and an agent inside it hangs under the container rather than
+    # under a host workspace.
+    #
+    # That last part is also the only honest fix for the duplicate rows. A
+    # remote agent with no worktree is matched by repo BASENAME, and a box
+    # with three clones of one repo (dev-vm-1 has three `mcp-hub` folders)
+    # attributes all three agents to every workspace listing any of them. The
+    # seat record carries the real folder, so a containerized agent stops
+    # guessing entirely.
+    containers: dict[str, list[dict[str, Any]]] = {}
+    by_identity: dict[str, dict[str, Any]] = {}
+    for s in seats or []:
+        ident = str(s.get("identity") or "")
+        image = container_image(s)
+        if not ident or not image:
+            continue          # a worktree seat is not a container
+        m = str(s.get("machine") or "") or machine_of(ident, machines)
+        node = {
+            "kind": "container",
+            "key": f"c:{m}/{ident}",
+            "identity": ident,
+            "agent": ident,   # the tree's agent-shaped lookups key on this
+            "machine": m,
+            "local": m == this_machine,
+            "image": image,
+            "folder": seat_folder(s),
+            "klass": str(s.get("class") or ""),
+            "placement": by_seat.get(ident),
+            "agents": [],
+        }
+        containers.setdefault(m, []).append(node)
+        by_identity[ident] = node
 
     # -- local agents: the roster is authoritative for this box ------------
     placed_names: set[str] = set()
@@ -208,6 +313,12 @@ def build_tree(
             "rec": rec or None,
             "placement": by_seat.get(name),
         }
+        box = by_identity.get(name)
+        if box is not None:
+            # It runs in a container: that is WHERE it is, and the host
+            # workspace listing its mount point is not a second home.
+            box["agents"].append(dict(node, key=f"a:{box['key']}/{name}"))
+            continue
         # A folder listed by three workspaces belongs to three workspaces —
         # that is exactly where multi-squad membership comes from, so the seat
         # appears under each rather than under whichever matched first.
@@ -241,15 +352,54 @@ def build_tree(
             "next": str(entry.get("next") or ""),
             "state": _remote_state(entry, stale),
             "stale": stale,
+            # Set below when several clones on that box share this repo name.
+            "ambiguous": [],
             "hand": False,     # a hand is a board fact; no pane, no claim
             "rec": None,
             "placement": by_seat.get(name),
         }
+        box = by_identity.get(name)
+        if box is not None:
+            box["agents"].append(dict(node, key=f"a:{box['key']}/{name}"))
+            continue
+        # EXACT first: when the machine has reported its roster we know this
+        # agent's worktree and can match it the way a local row does, by
+        # containment of a real path. Everything below is the fallback for a
+        # machine whose edge has not reported one.
+        wt = worktree_of.get(m, {}).get(name, "")
+        if wt:
+            node["worktree"] = wt
+            homes = [w for w in ws_nodes.get(m, [])
+                     if any(_contains(x, wt) for x in w["listings"])]
+            if homes:
+                for w in homes:
+                    w["agents"].append(dict(node, key=f"a:{w['key']}/{name}"))
+            else:
+                loose.setdefault(m, []).append(node)
+            continue
         repo = _repo_of(entry.get("project", ""), name, m)
         homes = [
             w for w in ws_nodes.get(m, [])
             if any(posixpath.basename(x) == repo for x in w["listings"])
         ]
+        # A remote row has NO worktree, so `repo` is matched by basename — and
+        # a box with several clones of one repo has several folders with that
+        # basename at DIFFERENT paths. dev-vm-1 has three `mcp-hub` folders:
+        # `code/monkeypashion/mcp-hub` (listed by squad AND runtime, which is
+        # genuine multi-membership) and `general/mcp-hub`, a different clone
+        # belonging to `mcp-hub-dev-vm-1-general`. The old code claimed all
+        # three, so one row in every board was false.
+        #
+        # Two distinct PATHS means we cannot tell which clone this is. Several
+        # workspaces listing the SAME path is not ambiguity — it is the
+        # multi-membership local rows already show. So: resolve when the
+        # candidates agree on a path, and refuse when they do not, rather than
+        # picking one. `node["ambiguous"]` is what the row says instead.
+        paths = {x for w in homes for x in w["listings"]
+                 if posixpath.basename(x) == repo}
+        if len(paths) > 1:
+            node["ambiguous"] = sorted(paths)
+            homes = []
         if homes:
             for w in homes:
                 w["agents"].append(dict(node, key=f"a:{w['key']}/{name}"))
@@ -258,7 +408,7 @@ def build_tree(
 
     # -- assemble ----------------------------------------------------------
     order = sorted(
-        set(machines) | set(ws_nodes) | set(loose),
+        set(machines) | set(ws_nodes) | set(loose) | set(containers),
         key=lambda m: (m != this_machine, m == UNKNOWN_MACHINE, m),
     )
     out: list[dict[str, Any]] = []
@@ -266,10 +416,13 @@ def build_tree(
         wss = sorted(ws_nodes.get(m, []), key=lambda w: w["name"])
         for w in wss:
             w["agents"].sort(key=lambda a: (a["roster_ix"] is None, a["agent"]))
+        cts = sorted(containers.get(m, []), key=lambda c: c["identity"])
+        for c in cts:
+            c["agents"].sort(key=lambda a: (a["roster_ix"] is None, a["agent"]))
         lo = sorted(loose.get(m, []), key=lambda a: (a["roster_ix"] is None,
                                                      a["roster_ix"] or 0,
                                                      a["agent"]))
-        if not wss and not lo and m != this_machine:
+        if not wss and not cts and not lo and m != this_machine:
             continue          # an enrolled box with nothing on it: no node
         out.append({
             "kind": "machine",
@@ -278,9 +431,12 @@ def build_tree(
             "local": m == this_machine,
             "unknown": m == UNKNOWN_MACHINE,
             "stale": stale and m != this_machine,
+            "never": never and m != this_machine,
             "workspaces": wss,
+            "containers": cts,
             "loose": lo,
-            "agent_count": sum(len(w["agents"]) for w in wss) + len(lo),
+            "agent_count": sum(len(w["agents"]) for w in wss)
+            + sum(len(c["agents"]) for c in cts) + len(lo),
             "open_count": sum(1 for w in wss if w["open_now"] or w["here"]),
             "drift_count": sum(1 for w in wss if w["drift"]),
         })
@@ -288,6 +444,7 @@ def build_tree(
         "machines": out,
         "this_machine": this_machine,
         "fleet_stale": stale,
+        "fleet_never": never,
         "fleet_ts": fleet_ts,
         "note": workspaces.get("note", ""),
     }
@@ -298,6 +455,8 @@ def walk_agents(tree: dict[str, Any]):
     for m in tree.get("machines", []):
         for w in m["workspaces"]:
             yield from w["agents"]
+        for c in m.get("containers", []):
+            yield from c["agents"]
         yield from m["loose"]
 
 
@@ -313,6 +472,11 @@ def structure_key(tree: dict[str, Any]) -> tuple:
         (m["key"], tuple(
             (w["key"], tuple(a["key"] for a in w["agents"]))
             for w in m["workspaces"]
+        ), tuple(
+            # Containers are structure too: omit them and a seat that comes up
+            # never gets a node, because the poll would relabel forever.
+            (c["key"], tuple(a["key"] for a in c["agents"]))
+            for c in m.get("containers", [])
         ), tuple(a["key"] for a in m["loose"]))
         for m in tree.get("machines", [])
     )

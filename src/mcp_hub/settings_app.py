@@ -149,7 +149,13 @@ Screen { layout: vertical; }
    full depth with its context and state still attached — measured, because a
    Tree CLIPS rather than wraps and an overflow here would be silent. */
 #fleet {
-    width: 52;
+    /* PROPORTIONAL, floored at the old fixed 52. A wide terminal gives the
+       tree room instead of leaving it at a width chosen for an 80-column one;
+       a narrow one still gets the 52 every label was measured against, so
+       nothing that fits today can start clipping. `[` and `]` override it. */
+    width: 34%;
+    min-width: 52;
+    max-width: 80;
     border-right: solid #d8d8d8;
     background: $surface;
     height: 1fr;
@@ -299,7 +305,17 @@ class SettingsApp(App):
         ("t", "toggle_theme", "Light/dark"),
         ("n", "next_hand", "Next needs-you"),
         ("e", "expand_all", "Expand/collapse"),
+        ("[", "narrow", "Narrower"),
+        ("]", "widen", "Wider"),
     ]
+
+    # Textual 8.2.8 ships no splitter or resize widget (checked, not assumed),
+    # so the panel is driven by keys rather than a drag handle. The floor is
+    # deliberately below the CSS min-width: that min is the DEFAULT nobody
+    # chose, this floor is how far the operator may go when they have chosen.
+    TREE_MIN_WIDTH = 30
+    TREE_MAX_WIDTH = 110
+    TREE_STEP = 4
 
     def __init__(self, agents: list[dict[str, str]], scoped_to: str | None,
                  model_for, squad_bin: str, hub_bin: str,
@@ -307,10 +323,19 @@ class SettingsApp(App):
                  poll_seconds: float = 3.0, workspaces_for=None,
                  presence_ping=None, presence_seconds: float = 60.0,
                  fleet_for=None, listings_for=None, placements_for=None,
+                 seats_for=None, machine_agents_for=None,
                  this_machine: str = "",
-                 workspaces_seconds: float = 30.0, now=None):
+                 workspaces_seconds: float = 30.0, now=None,
+                 roster_for=None):
         super().__init__()
         self.agents = agents
+        # Re-read on every board tick. `agents` is only the FIRST answer: the
+        # roster is a file another pane writes (`squad add-folder`,
+        # `add-container`, `rm`), so a board opened beforehand held a snapshot
+        # for its whole life and a newly enrolled seat was invisible in it —
+        # indistinguishable, from the operator's chair, from a seat that failed
+        # to come up (2026-08-05, reported twice).
+        self._roster_for = roster_for      # injected; None → the old snapshot
         # Passed in rather than derived here: `mcp-hub identity` owns machine
         # naming, and a second derivation is a second chance to disagree —
         # squad deriving from basename while the cli derived from the git
@@ -320,6 +345,8 @@ class SettingsApp(App):
         self._fleet_for = fleet_for            # injected; None → no remote rows
         self._listings_for = listings_for      # injected; reads a local ws file
         self._placements_for = placements_for  # injected; None hides placements
+        self._seats_for = seats_for            # injected; None hides containers
+        self._machine_agents_for = machine_agents_for  # None → basename match
         self._presence_ping = presence_ping    # injected; None disables it
         # Well inside the hub's 180s open-now window, so a single dropped
         # ping never blinks the workspace out of the manager's view.
@@ -345,6 +372,10 @@ class SettingsApp(App):
         self.workspaces: dict[str, Any] = {"rows": [], "machines": [], "note": ""}
         self.fleet: dict[str, Any] = {"ts": 0, "agents": []}
         self.placements: list[dict[str, Any]] = []
+        self.seats: list[dict[str, Any]] = []
+        # {} means NO machine has reported a roster, which is the old
+        # behaviour — not a claim that every machine is empty.
+        self.machine_agents: dict[str, list[dict[str, str]]] = {}
         self.tree_model: dict[str, Any] = {"machines": []}
         self.selected: dict[str, Any] | None = None
         self._pending_key: str | None = None
@@ -393,7 +424,9 @@ class SettingsApp(App):
         # laid out, so move_cursor() during on_mount is silently a no-op and
         # the panel opened on the machine heading instead.
         self.call_after_refresh(self._initial_select)
-        if self._board_for is not None:
+        # Either injection is reason enough to run the tick: the roster rides
+        # this poll, so a board with no live scan must still notice enrolment.
+        if self._board_for is not None or self._roster_for is not None:
             self._poll_board()                      # first paint: don't wait 3s
             self.set_interval(self._poll_seconds, self._poll_board)
         if self._workspaces_for is not None:
@@ -460,8 +493,14 @@ class SettingsApp(App):
         bits = []
         if m["drift_count"]:
             bits.append(f"⚠ {m['drift_count']} drift")
-        # A snapshot that stopped being written must not read as a quiet box.
-        if m["stale"]:
+        # A snapshot that stopped being written must not read as a quiet box —
+        # and one that was NEVER written must not read as one that stopped.
+        # After a reboot the daemon that writes it does not exist until an
+        # agent session starts, so the honest answer is that nothing has looked
+        # yet, not that the fleet has gone quiet.
+        if m.get("never"):
+            bits.append("no snapshot yet")
+        elif m["stale"]:
             bits.append("not reporting")
         colour = p["primary"] if m["local"] else p["secondary"]
         label = f"[b {colour}]{escape(head)}[/]"
@@ -492,6 +531,16 @@ class SettingsApp(App):
             tail, colour = "", p["success"]
         else:
             tail, colour = "", ""
+        # Scope is an INDEPENDENT fact, so it is added rather than substituted.
+        # As a branch in the cascade above it stole the colour from a workspace
+        # someone else had open — "another operator is in here" and "this board
+        # is not scoped to it" are both true at once, and the first is the
+        # stronger signal. It explains an EMPTY row: absence of measurement
+        # must not read as measurement of absence, since `xport` and `xport2`
+        # each hold a real agent and drew as bare rows. A warning already in
+        # `tail` outranks it — attention beats status, as the rows below.
+        if not w.get("in_scope", True) and not tail:
+            tail = "not in this board's scope"
         if w["squad"]:
             tail = f"{tail}  [{w['squad']}]" if tail else f"[{w['squad']}]"
         name = f"{glyph} {w['name']}"
@@ -527,13 +576,25 @@ class SettingsApp(App):
             colour, hand = "", ""
             wake = _GLYPH_WAKEABLE if a.get("wakeable") else ""
             if a.get("stale"):
-                glyph, bits = _GLYPH_NOT_REPORTING, ["not reporting"]
+                # The wake flag is read from the SAME snapshot this row has
+                # just called not-reporting, so keeping ⚡ lets a dead cache go
+                # on asserting liveness — `⚠ ⚡ dreamteam-dev-vm-1 not
+                # reporting` says both things at once and the operator has to
+                # decide which half to believe. Not reporting means we do not
+                # know, and ⚡ is a claim we can no longer make.
+                glyph, bits, wake = _GLYPH_NOT_REPORTING, ["not reporting"], ""
             else:
                 # `hub only` stays on the row: a remote `idle` is a weaker
                 # claim than a local one (a snapshot, not a scraped pane), and
                 # the two must not read identically.
                 glyph = _STATE_GLYPH.get(a.get("state", ""), _GLYPH_STOPPED)
                 bits = ["hub only"]
+            if a.get("ambiguous"):
+                # Several clones of this repo on that box, so which workspace
+                # it sits in is not knowable from a name. It hangs under the
+                # machine and says why, instead of being claimed by all of
+                # them — one of which was always wrong.
+                bits = ["workspace unknown"]
         # Two fixed columns, then a separator — without it a present ⚡ (already
         # two cells) ran straight into the name while an absent one left a gap,
         # so the name started in a different place depending on the wake state.
@@ -557,12 +618,104 @@ class SettingsApp(App):
         tail = " ".join(b for b in bits if b)
         return f"{head}  [dim]{escape(tail)}[/]" if tail else head
 
+    def _container_label(self, c: dict[str, Any], p: dict[str, str]) -> str:
+        """A container reads as a SUBSTRATE, not as a box.
+
+        🐳 and the word "container" rather than a machine's `· this machine /
+        · remote`: the difference the row has to carry is that you cannot ssh
+        to it, enrol it or transport to it — the docker that runs it belongs
+        to the machine above.
+        """
+        # The IMAGE is deliberately not here. An identity is ~21 cells and
+        # `mcp-hub-seat:latest` pushed the row to 57 in a 52-cell panel, where
+        # a Tree clips instead of wrapping — so the operator read
+        # `container · mcp-hub` and had no way to know the rest was missing.
+        # Same trap the machine label's own comment records. It is one keypress
+        # away in the detail pane.
+        n = len(c["agents"])
+        bits = ["container"]
+        # A seat record is what MAY run. Whether anything is actually there is
+        # the placement's observation, and drawing the row from the seat alone
+        # asserted `edge-probe-dev-vm-1` as a live substrate while the hub held
+        # `observed: reclaimed, exists: false` for it. The placement was already
+        # attached to this node and simply never read — desired state presented
+        # as observed state, which is the whole reason seat and placement are
+        # separate records.
+        state, colour = self._container_state(c)
+        if state:
+            # The qualifier REPLACES the word "container" rather than joining
+            # it: 🐳 already says container, and the pair overflowed a 49-cell
+            # content box at 64. The full sentence is in the detail pane.
+            bits = [state]
+        elif n != 1:
+            # 1 is the ordinary case and saying so on every row is noise; 0 is
+            # a container that IS there with nobody in it, which is not.
+            bits.append("empty" if n == 0 else f"{n} agents")
+        label = f"[b {colour or p['accent']}]🐳 {escape(c['identity'])}[/]"
+        return f"{label}  [dim]{escape(' · '.join(bits))}[/]"
+
+    def _container_state(self, c: dict[str, Any]) -> tuple[str, str]:
+        """What was OBSERVED of this container, and the colour it earns.
+
+        ("", "") means observed present and doing what was asked — the ordinary
+        case, which says nothing extra. Everything else is a claim the row must
+        qualify, so silence can only ever mean "seen, and as intended".
+        """
+        pal = self._palette()
+        pl = c.get("placement")
+        if not pl:
+            # Declared on the hub, scheduled nowhere. Nothing has ever looked.
+            return "no placement", pal["warning"]
+        status = pl.get("status", "")
+        if status == "pending-edge":
+            return "no edge yet", pal["warning"]
+        obs = pl.get("observed") or {}
+        enum = obs.get("enumeration") or {}
+        # `is False` and not falsiness: absent means the edge never reported
+        # the field, which is not the same claim as reporting it absent.
+        if enum.get("exists") is False or obs.get("state") == "reclaimed":
+            return "reclaimed · gone", pal["warning"]
+        if enum.get("image_matches") is False:
+            return "stale image", pal["warning"]
+        if status == "diverged":
+            return "DIVERGED", pal["error"]
+        if pl.get("desired") == "running" and obs.get("state") != "running":
+            return "not running", pal["warning"]
+        return "", ""
+
+    @staticmethod
+    def _container_state_detail(c: dict[str, Any]) -> str:
+        """The same finding, in a full sentence, for the pane that has room."""
+        pl = c.get("placement")
+        if not pl:
+            return ("the hub declares this seat but nothing has placed it, so "
+                    "no edge has ever been asked to run it")
+        obs = pl.get("observed") or {}
+        enum = obs.get("enumeration") or {}
+        want, saw = pl.get("desired", ""), obs.get("state") or "nothing"
+        if pl.get("status") == "pending-edge":
+            return f"want {want} — no edge has reported since it was asked"
+        if enum.get("exists") is False or obs.get("state") == "reclaimed":
+            return ("the edge enumerated this machine and did not find the "
+                    "container — it was reclaimed")
+        if enum.get("image_matches") is False:
+            return ("running, but from an older image than the placement asks "
+                    "for — containers are created once, so a rebuild never "
+                    "reaches a running one")
+        if pl.get("status") == "diverged":
+            return f"want {want}, saw {saw} — the edge could not converge it"
+        if want == "running" and saw != "running":
+            return f"want running, the edge saw {saw}"
+        return f"want {want}, saw {saw} — converged"
+
     def _label_for(self, data: dict[str, Any], p: dict[str, str]) -> str:
         kind = data.get("kind")
         if kind == "machine":
             return self._machine_label(data, p)
         if kind == "workspace":
             return self._workspace_label(data, p)
+        if kind == "container":
+            return self._container_label(data, p)
         return self._agent_label(data, p)
 
     @staticmethod
@@ -583,6 +736,11 @@ class SettingsApp(App):
             return ("agent", data.get("agent"))
         if kind == "workspace":
             return ("workspace", data.get("machine"), data.get("name"))
+        if kind == "container":
+            # Falling through to the machine case would silently identify a
+            # container AS its host, so a restructure would move the cursor up
+            # a level and the pane would describe the wrong thing.
+            return ("container", data.get("machine"), data.get("identity"))
         return ("machine", data.get("machine"))
 
     def _all_nodes(self) -> list[TreeNode]:
@@ -615,6 +773,8 @@ class SettingsApp(App):
             scoped_to=self.scoped_to,
             listings_for=self._listings_for,
             placements=self.placements,
+            seats=self.seats,
+            machine_agents=self.machine_agents,
             now=self._now(),
         )
 
@@ -630,6 +790,7 @@ class SettingsApp(App):
                 continue
             keys.add(m["key"])
             keys.update(w["key"] for w in m["workspaces"])
+            keys.update(c["key"] for c in m.get("containers", []))
         return keys
 
     def _rebuild_tree(self) -> None:
@@ -657,6 +818,12 @@ class SettingsApp(App):
                 by_key[w["key"]] = wn
                 for a in w["agents"]:
                     by_key[a["key"]] = wn.add_leaf(
+                        self._agent_label(a, p), data=a)
+            for c in m.get("containers", []):
+                cn = mn.add(self._container_label(c, p), data=c, expand=False)
+                by_key[c["key"]] = cn
+                for a in c["agents"]:
+                    by_key[a["key"]] = cn.add_leaf(
                         self._agent_label(a, p), data=a)
             for a in m["loose"]:
                 by_key[a["key"]] = mn.add_leaf(self._agent_label(a, p), data=a)
@@ -693,6 +860,10 @@ class SettingsApp(App):
             for w in m["workspaces"]:
                 fresh[w["key"]] = w
                 for a in w["agents"]:
+                    fresh[a["key"]] = a
+            for c in m.get("containers", []):
+                fresh[c["key"]] = c
+                for a in c["agents"]:
                     fresh[a["key"]] = a
             for a in m["loose"]:
                 fresh[a["key"]] = a
@@ -770,13 +941,40 @@ class SettingsApp(App):
                 placements = self._placements_for() or []
             except Exception:  # noqa: BLE001 — a dashboard never dies of this
                 placements = []
-        self.call_from_thread(self._apply_workspaces, data, placements)
+        # Seats travel with placements for the same reason: same registry,
+        # same clock, and the tree needs BOTH to draw a container — the seat
+        # says what the substrate is, the placement says what should be
+        # running in it.
+        seats: list[dict[str, Any]] = []
+        if self._seats_for is not None:
+            try:
+                seats = self._seats_for() or []
+            except Exception:  # noqa: BLE001 — a dashboard never dies of this
+                seats = []
+        # None (not {}) when the call fails: an unreachable hub must leave the
+        # last known rosters in place rather than silently demote every remote
+        # row back to basename matching.
+        magents = None
+        if self._machine_agents_for is not None:
+            try:
+                magents = self._machine_agents_for()
+            except Exception:  # noqa: BLE001
+                magents = None
+        self.call_from_thread(self._apply_workspaces, data, placements, seats,
+                              magents)
 
     def _apply_workspaces(self, data: dict[str, Any],
-                          placements: list[dict[str, Any]] | None = None) -> None:
+                          placements: list[dict[str, Any]] | None = None,
+                          seats: list[dict[str, Any]] | None = None,
+                          machine_agents: dict[str, list[dict[str, str]]]
+                          | None = None) -> None:
         self.workspaces = data
         if placements is not None:
             self.placements = placements
+        if seats is not None:
+            self.seats = seats
+        if machine_agents is not None:
+            self.machine_agents = machine_agents
         if self._fleet_for is not None:
             try:
                 self.fleet = self._fleet_for() or {"ts": 0, "agents": []}
@@ -795,11 +993,30 @@ class SettingsApp(App):
                         group="board-poll", exclusive=True)
 
     def _collect_board(self) -> None:
+        roster = self._read_roster()
         try:
-            snap = self._board_for()
+            snap = (self._board_for() if self._board_for is not None
+                    else self.board)
         except Exception as exc:  # noqa: BLE001 — a dashboard never takes the app down
             snap = {"agents": {}, "counts": {}, "error": str(exc)[:120]}
-        self.call_from_thread(self._apply_board, snap)
+        self.call_from_thread(self._apply_board, snap, roster)
+
+    def _read_roster(self) -> list[dict[str, str]] | None:
+        """The roster as it is on disk RIGHT NOW, or None if we could not read it.
+
+        None and [] are different answers and the caller treats them
+        differently: a read that failed is UNKNOWN and must leave the tree
+        alone, while an empty list is a real report (the last seat in this
+        workspace was retired) and is shown as one. Collapsing the two would
+        make a transient unreadable roster look like an emptied squad.
+        """
+        if self._roster_for is None:
+            return None
+        try:
+            rows = self._roster_for()
+        except Exception:  # noqa: BLE001 — a dashboard never dies of this
+            return None
+        return list(rows) if rows is not None else None
 
     # ---- presence: the one fact only this process knows ----
 
@@ -825,7 +1042,13 @@ class SettingsApp(App):
         else:
             self._presence_error = None
 
-    def _apply_board(self, snap: dict[str, Any]) -> None:
+    def _apply_board(self, snap: dict[str, Any],
+                     roster: list[dict[str, str]] | None = None) -> None:
+        # The roster lands BEFORE the board snapshot is rendered: `_sync_tree`
+        # below builds from both, and an agent enrolled this tick should appear
+        # already wearing whatever the scan found for it.
+        if roster is not None:
+            self.agents = roster
         self.board = snap
         counts = snap.get("counts") or {}
         if counts:
@@ -1027,6 +1250,9 @@ class SettingsApp(App):
             return
         if kind == "workspace":
             await detail.mount_all(self._workspace_widgets(sel))
+            return
+        if kind == "container":
+            await detail.mount_all(self._container_widgets(sel))
             return
         if kind == "agent" and not sel.get("local"):
             await detail.mount_all(self._remote_agent_widgets(sel))
@@ -1260,6 +1486,44 @@ class SettingsApp(App):
                 "until a daemon writes it again.", classes="note"))
         return out
 
+    def _container_widgets(self, c: dict[str, Any]) -> list[Any]:
+        """One container: what it is, where it runs, and how to get into it.
+
+        The last one is the point. A container has no sshd and never will —
+        the seat runs in bypass-permissions mode and a listening daemon with
+        credentials inside it widens exactly what the container bounds. So the
+        way in is `docker exec` on its HOST, and the pane says so rather than
+        leaving the operator to discover that Remote-SSH cannot target it.
+        """
+        out: list[Any] = [
+            Static(f"▌CONTAINER   {c['identity']}", classes="section section-live")]
+        local = c["machine"] == self.tree_model.get("this_machine")
+        out.append(self._fact(
+            "Runs on", f"{c['machine'] or '(unknown)'}"
+            f"{'  · this machine' if local else '  · remote'}",
+            source="its docker belongs to that box — a container is not a "
+                   "machine: no token, no edge, no ssh"))
+        state, _ = self._container_state(c)
+        out.append(self._fact(
+            "Observed", state or "running as placed",
+            "value-warn" if state else "value-on",
+            self._container_state_detail(c)))
+        out.append(self._fact("Image", c.get("image", "") or "(none)"))
+        if c.get("folder"):
+            out.append(self._fact(
+                "Work mount", c["folder"],
+                source="a HOST path, bind-mounted in"))
+        n = len(c["agents"])
+        out.append(self._fact(
+            "Agents", str(n), "value-on" if n else "value-warn",
+            "" if n else "the hub knows this container but no agent in it has "
+                         "registered"))
+        out.append(self._fact(
+            "Attach", f"docker exec -it {c['identity']} tmux attach -t seat",
+            source="what the workspace tab runs — Remote-SSH to the box "
+                   "above, then open its workspace"))
+        return out
+
     def _workspace_widgets(self, w: dict[str, Any]) -> list[Any]:
         """One workspace, three truth columns, drift loud.
 
@@ -1352,6 +1616,15 @@ class SettingsApp(App):
         out.append(self._fact("Machine", a["machine"] or "(unknown)"))
         if a.get("project"):
             out.append(self._fact("Project", a["project"]))
+        if a.get("ambiguous"):
+            # The row has 49 cells and says `workspace unknown`; this is where
+            # the operator finds out WHICH clones made it unknowable, and can
+            # settle it themselves by looking at the paths.
+            out.append(self._fact(
+                "Workspace", "unknown — several clones", "value-warn",
+                "a remote row carries no worktree, so it is matched by repo "
+                "name, and this box has that repo at: "
+                + ", ".join(a["ambiguous"])))
         if a.get("stale"):
             out.append(self._fact("State", "not reporting", "value-warn",
                                   "the fleet snapshot has gone stale"))
@@ -1572,11 +1845,38 @@ class SettingsApp(App):
 
     async def action_reload(self) -> None:
         await self.refresh_detail()
-        if self._board_for is not None:
+        if self._board_for is not None or self._roster_for is not None:
             self._poll_board()
         if self._workspaces_for is not None:
             self._poll_workspaces()
         self._set_status("reloaded")
+
+    def action_narrow(self) -> None:
+        self._resize_tree(-self.TREE_STEP)
+
+    def action_widen(self) -> None:
+        self._resize_tree(self.TREE_STEP)
+
+    def _resize_tree(self, delta: int) -> None:
+        """Resize from the width the panel ACTUALLY has, not from a remembered
+        number. The CSS width is a percentage until the first keypress, so a
+        counter starting at 52 would jump the panel on the first press of a
+        wide terminal — the operator would press `]` and watch it shrink.
+
+        OUTER size, not `size`: `styles.width` sets the BORDER box while
+        `size` reports the CONTENT box, so reading one to write the other
+        loses the border and padding on every press — `]` widened by 1 instead
+        of 4, `[` narrowed by 7. Caught by asserting the exact step rather
+        than merely "it got bigger".
+        """
+        tree = self.query_one("#fleet", Tree)
+        want = max(self.TREE_MIN_WIDTH,
+                   min(self.TREE_MAX_WIDTH,
+                       (tree.outer_size.width or 52) + delta))
+        tree.styles.width = want
+        tree.styles.min_width = want     # or the CSS floor would win it back
+        tree.styles.max_width = want
+        self._set_status(f"tree width {want} — [ narrower · ] wider")
 
     def action_toggle_theme(self) -> None:
         """The detector's answer, overridable in one keystroke — detection can

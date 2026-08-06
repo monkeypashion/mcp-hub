@@ -117,6 +117,20 @@ def init_api_tables(conn: sqlite3.Connection) -> None:
             last_open_ping REAL NOT NULL DEFAULT 0,
             PRIMARY KEY (machine, path)
         );
+        -- What each machine's squad roster says lives where. A REMOTE agent
+        -- row carries no worktree — the fleet snapshot is parsed from rendered
+        -- presence text — so the board matched it to a workspace by repo
+        -- BASENAME, and a box with several clones of one repo had every clone
+        -- claimed by every workspace listing any of them. One row in every
+        -- board was false. Only the machine itself can say which folder an
+        -- agent sits in, so the machine reports it and the board reads it.
+        CREATE TABLE IF NOT EXISTS api_machine_agents (
+            machine     TEXT NOT NULL,
+            agent       TEXT NOT NULL,
+            worktree    TEXT NOT NULL DEFAULT '',
+            reported_at REAL NOT NULL,
+            PRIMARY KEY (machine, agent)
+        );
         CREATE TABLE IF NOT EXISTS api_placements (
             id             TEXT PRIMARY KEY,
             seat           TEXT NOT NULL,
@@ -300,7 +314,24 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             rows = db().execute(
                 "SELECT * FROM api_machines WHERE archived = 0"
             ).fetchall()
-            return JSONResponse({"machines": [machine_json(r) for r in rows]})
+            # Each machine's reported roster rides along: the board needs
+            # agent → worktree to attribute a REMOTE row to a workspace
+            # exactly, and it already fetches machines on the poll that builds
+            # the tree. A machine whose edge has not reported one is ABSENT
+            # here rather than present-and-empty, so the board can tell "no
+            # roster reported" from "no agents" and fall back accordingly.
+            reported: dict[str, list[dict[str, str]]] = {}
+            for a in db().execute(
+                "SELECT machine, agent, worktree FROM api_machine_agents"
+                " ORDER BY machine, agent"
+            ).fetchall():
+                reported.setdefault(a["machine"], []).append(
+                    {"agent": a["agent"], "worktree": a["worktree"]}
+                )
+            return JSONResponse({
+                "machines": [machine_json(r) for r in rows],
+                "agents": reported,
+            })
         body = await body_of(request)
         name = body.get("name", "")
         if not name:
@@ -464,6 +495,25 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
                         now,
                         pings.get(ws["path"], 0),
                     ),
+                )
+        # The machine's roster: agent → worktree. SNAPSHOT semantics like the
+        # workspaces above — a retired agent must leave, and an accreting
+        # roster would keep attributing rows to folders nobody has any more.
+        # Absent key means "this edge does not report rosters yet", which is
+        # NOT the same as "this machine has no agents": the board falls back to
+        # its old basename matching for such a machine rather than emptying it.
+        if isinstance(body.get("agents"), list):
+            db().execute(
+                "DELETE FROM api_machine_agents WHERE machine = ?", (name,)
+            )
+            for a in body["agents"]:
+                if not isinstance(a, dict) or not a.get("agent"):
+                    continue
+                db().execute(
+                    "INSERT INTO api_machine_agents"
+                    " (machine, agent, worktree, reported_at)"
+                    " VALUES (?, ?, ?, ?)",
+                    (name, a["agent"], a.get("worktree", ""), now),
                 )
         # Board presence: "this workspace is open, operator eyes on" — a fact
         # only the board can know. Upserts, because the board may report a
