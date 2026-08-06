@@ -406,6 +406,70 @@ def build_tree(
         else:
             loose.setdefault(m, []).append(node)
 
+    # -- roster-only remote agents: ENROLLED there, ABSENT from the hub ----
+    #
+    # A remote row used to exist only where the hub had PRESENCE for it, so an
+    # agent alive on its machine but with a dropped hub binding rendered as
+    # nothing at all. That is the one state most worth seeing: it is what a
+    # redeploy leaves behind, and clearing it is an operator action. Measured
+    # 2026-08-06 — 21 of dev-vm-1's 31 roster agents were invisible, two of
+    # them tmux-up with a lost binding, while the board above them read clean.
+    #
+    # The machine already pushes its whole roster (api_machine_agents, used
+    # until now only to look up a worktree), so the fact was on the hub the
+    # whole time and only the JOIN was missing. Same lesson as the container
+    # rows: the data was already there.
+    #
+    # What such a row may claim is deliberately narrow. The push carries no
+    # tmux state, so it says `not on hub` and never `stopped` — a row that
+    # invented liveness would be the same error pointing the other way.
+    for m in sorted(worktree_of):
+        if m == this_machine:
+            # The local roster is this box's authority and has already drawn
+            # its agents WITH pane state. A local name missing from it is not
+            # a fact the hub's older copy of it should resurrect.
+            continue
+        for name, wt in sorted(worktree_of[m].items()):
+            if name in placed_names:
+                continue
+            placed_names.add(name)
+            node = {
+                "kind": "agent",
+                "key": f"a:{m}/{name}",
+                "agent": name,
+                "machine": m,
+                "local": False,
+                "roster_ix": None,
+                "worktree": wt,
+                "klass": "",
+                "project": "",
+                "wakeable": False,
+                "sessions": 0,
+                "next": "",
+                "state": "",
+                # NOT stale: staleness is a claim about the fleet snapshot,
+                # and this row does not come from it.
+                "stale": False,
+                "off_hub": True,
+                "ambiguous": [],
+                "hand": False,
+                "rec": None,
+                "placement": by_seat.get(name),
+            }
+            box = by_identity.get(name)
+            if box is not None:
+                box["agents"].append(dict(node, key=f"a:{box['key']}/{name}"))
+                continue
+            # Exact containment only. A roster row carries a real path, so the
+            # basename fallback the presence rows need has no place here.
+            homes = [w for w in ws_nodes.get(m, [])
+                     if wt and any(_contains(x, wt) for x in w["listings"])]
+            if homes:
+                for w in homes:
+                    w["agents"].append(dict(node, key=f"a:{w['key']}/{name}"))
+            else:
+                loose.setdefault(m, []).append(node)
+
     # -- assemble ----------------------------------------------------------
     order = sorted(
         set(machines) | set(ws_nodes) | set(loose) | set(containers),

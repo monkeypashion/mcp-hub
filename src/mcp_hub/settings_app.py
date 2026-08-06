@@ -575,7 +575,15 @@ class SettingsApp(App):
             # another box, so the row is thinner ON PURPOSE.
             colour, hand = "", ""
             wake = _GLYPH_WAKEABLE if a.get("wakeable") else ""
-            if a.get("stale"):
+            if a.get("off_hub"):
+                # Its machine's roster lists it; the hub has no presence for
+                # it. That is ALL this row knows — the roster push carries no
+                # pane state — so it must not read as `stopped`, which is a
+                # liveness claim nobody measured. Before this the row did not
+                # exist at all, which read as `nothing to see here` for the
+                # one condition that needs an operator.
+                glyph, bits, wake = _GLYPH_NOT_REPORTING, ["not on hub"], ""
+            elif a.get("stale"):
                 # The wake flag is read from the SAME snapshot this row has
                 # just called not-reporting, so keeping ⚡ lets a dead cache go
                 # on asserting liveness — `⚠ ⚡ dreamteam-dev-vm-1 not

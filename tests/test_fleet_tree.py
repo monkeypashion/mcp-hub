@@ -650,3 +650,66 @@ def test_a_reported_worktree_in_no_workspace_goes_loose_without_ambiguity():
     assert [a["agent"] for a in box["loose"]] == ["pm-box"]
     assert box["loose"][0]["ambiguous"] == [], \
         "it is not ambiguous — we know exactly where it is, and it is nowhere"
+
+
+# ---- roster-only remote agents: enrolled there, absent from the hub --------
+#
+# A remote row used to exist only where the hub had PRESENCE, so an agent alive
+# on its machine with a dropped binding rendered as nothing — the one state
+# worth seeing. Measured 2026-08-06: 21 of dev-vm-1's 31 roster agents invisible.
+
+def _pushed(**machines):
+    return {m: [{"agent": a, "worktree": w} for a, w in rows.items()]
+            for m, rows in machines.items()}
+
+
+def _by_name(tree):
+    return {a["agent"]: a for a in walk_agents(tree)}
+
+
+def test_a_remote_agent_off_the_hub_is_SHOWN_not_dropped():
+    t = _tree(machines=("here", "far"),
+              machine_agents=_pushed(far={"ghost-far": "/w/ghost"}))
+    got = _by_name(t)
+    assert "ghost-far" in got, "an agent its machine reports must not vanish"
+    assert got["ghost-far"]["off_hub"] is True
+
+
+def test_it_claims_no_liveness_it_did_not_measure():
+    """The roster push carries no pane state. `stopped` would be an invention —
+    the row exists to say the hub has lost it, and nothing more."""
+    g = _by_name(_tree(machines=("here", "far"),
+                       machine_agents=_pushed(far={"ghost-far": "/w/g"})))["ghost-far"]
+    assert g["state"] == "" and g["wakeable"] is False
+    assert g["stale"] is False, "staleness is a claim about the fleet snapshot"
+
+
+def test_hub_presence_WINS_over_the_roster_copy():
+    """An agent the hub can see is drawn from presence WITH its real state; the
+    roster copy must not add a second, thinner row for it."""
+    t = _tree(machines=("here", "far"),
+              fleet_agents=[{"name": "live-far", "wakeable": True,
+                             "state": "idle"}],
+              machine_agents=_pushed(far={"live-far": "/w/live"}))
+    assert len([a for a in walk_agents(t) if a["agent"] == "live-far"]) == 1
+    got = _by_name(t)["live-far"]
+    assert not got.get("off_hub") and got["wakeable"] is True
+
+
+def test_this_machine_is_left_to_its_own_roster():
+    """The local roster is the authority here and draws rows WITH pane state.
+    Resurrecting a local name from the hub's older copy would add a second,
+    thinner row for an agent that is right there to be read."""
+    t = _tree(machine_agents=_pushed(here={"gone-here": "/w/gone"}))
+    assert "gone-here" not in _by_name(t)
+
+
+def test_an_off_hub_agent_lands_in_its_workspace_by_REAL_path():
+    t = _tree(
+        machines=("here", "far"),
+        rows=[{"machine": "far", "name": "ws", "path": "/p/ws.code-workspace",
+               "listings": ["/w"], "registered": True, "on_disk": True}],
+        machine_agents=_pushed(far={"ghost-far": "/w/ghost"}),
+    )
+    ws = [w for m in t["machines"] for w in m["workspaces"] if w["name"] == "ws"][0]
+    assert [a["agent"] for a in ws["agents"]] == ["ghost-far"]
