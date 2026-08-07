@@ -1528,7 +1528,14 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         session_write = getattr(session, "_write_stream", None)
         if session_write is None:
             return True
-        for transport in instances.values():
+        # Snapshot before iterating: the manager mutates this dict from other
+        # threads as sessions connect/DELETE, and a live .values() iteration
+        # dies with "dictionary changed size during iteration" exactly during
+        # fleet churn — when this gate matters most. The sweep's identical
+        # loop below has carried the list() since it shipped; this one
+        # (flagged 2026-05-29) was deferred to ride a deploy and then missed
+        # three months of them.
+        for transport in list(instances.values()):
             if getattr(transport, "_write_stream", None) is session_write:
                 return GET_STREAM_KEY in getattr(transport, "_request_streams", {})
         # Session is bound but its transport is no longer in the manager's
