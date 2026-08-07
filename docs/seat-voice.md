@@ -78,6 +78,66 @@ Same trap as the FIFO in v1. The host writes **non-blocking and DROPS on
 would-block**. A stalled seat must never stall the stream. For realtime audio
 dropping is CORRECT.
 
+## The wire contract — both halves build against exactly this
+
+```
+listen    172.17.0.1:6981/tcp   ← the DOCKER GATEWAY ADDRESS, never 0.0.0.0
+audio     raw PCM s16le, 16000 Hz, 1 channel (no header, no framing)
+handshake container sends ONE line then never writes again:
+              "MCPHUBVOICE1 <seat-name>\n"   (ASCII, ≤128, [A-Za-z0-9_-])
+host      read the line (5s timeout) -> verify -> stream one-way, NEVER read
+```
+
+Anything malformed: **drop silently.** This listens where any container can
+reach it; do not explain yourself to whoever knocked.
+
+### 🔴 BIND THE GATEWAY ADDRESS, NEVER `0.0.0.0`
+
+Measured on dev-vm-1: `ufw status` shows `Anywhere on tailscale0 ALLOW
+Anywhere`. **The tailnet is unrestricted inbound.** So a wildcard bind puts a
+continuous live feed of the operator's microphone on every tailnet peer.
+
+⚠️ **The `ufw` rule we are ADDING does not cause this — the tailscale allow
+already there does.** Same class as the `DOCKER-USER` finding: *the thing that
+grants access is not the thing we are changing, so reviewing only our own diff
+misses it.* Scope the rule too: `from 172.17.0.0/16 to 172.17.0.1 port 6981`,
+not a bare port-open.
+
+### The handshake AUTHORISES but does not AUTHENTICATE
+
+`MCPHUBVOICE1 <seat>` proves nothing — seat names are public and guessable, so
+any container on the bridge can claim any name and receive the audio. The
+handshake solves the **misroute** problem, which was its job; it does not stop
+a rogue container eavesdropping.
+
+⇒ **Verify the PEER ADDRESS against docker at connection time**: ask docker
+which container holds the connecting address *now*, and confirm it matches the
+claimed seat. Authentication without secrets. **IP reuse cannot bite here** —
+the connection is established, so the address is current by definition — and it
+works for adopted containers because it asks docker rather than needing
+something injected at create time.
+
+### Seven properties the host side must hold
+
+1. **Non-blocking write, DROP on would-block.** Do not retry, do not enlarge
+   the buffer: neither prevents a stall, both lengthen it, and what drains is
+   stale audio transcribed as current.
+2. **Fail CLOSED on an unreadable roster.** "Cannot check who is asking" must
+   resolve to *no audio*.
+3. **Reap dead peers.** A SIGKILLed container can take ~15 minutes for TCP to
+   fail a write, and drop-on-would-block would cheerfully drop into a corpse.
+   Keepalive or reap on sustained would-block — otherwise *"the seat is deaf"*
+   and *"the seat is gone"* are indistinguishable.
+4. **Newest connection wins.** A restart can leave a half-open stream; without
+   this we fan one microphone into two sockets and nobody knows which is live.
+5. **The roster lookup is LOCAL, bounded and cached.** Network I/O here makes
+   audio inherit the hub's availability — breaking the no-external-dependency
+   requirement — and a hung lookup blocks the accept loop.
+6. **Cap pending handshakes.** Any container can connect; N silent connections
+   must not tie up the accept path.
+7. **Retry the bind.** `docker0` may not exist at boot or across a docker
+   restart. A service that exits once leaves audio dead until someone notices.
+
 ## 🔴 Why v2 (host pushes) was FALSIFIED — measured, not argued
 
 v2 had the host discover containers and push to each one's listener, with a

@@ -511,6 +511,14 @@ class DockerExecutor:
         # it is left to trip that refusal rather than being silently corrected
         # here: a launcher that quietly fixes a contradictory spec hides the
         # contradiction, and the next reader inherits it.
+        # The CONTAINER's own name, injected for BOTH shapes. A 1:1 seat can
+        # read SEAT_IDENTITY, but a POD has no single identity — and /voice is
+        # per CONTAINER (one audio island serving all N agents), so it needs a
+        # name that exists in both shapes. Derived here rather than declared in
+        # the spec, for the same reason SEAT_IDENTITY is: name and identity
+        # agreement true by construction, not by convention
+        # (docs/seat-voice.md, "how this gets into EVERY container").
+        argv += ["-e", f"SEAT_CONTAINER={seat}"]
         pod_agents = spec.get("agents")
         if pod_agents:
             argv += ["-e", "SEAT_MANIFEST=" + json.dumps(

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -49,6 +50,10 @@ from typing import Any
 # MCP_HUB_URL after import and DEFAULT_HUB_URL still holds the env value. The
 # settings panel reports provenance, so it needs the un-overridden default to
 # compare against.
+# The one voice port, every container (docs/seat-voice.md). Imported lazily in
+# the command itself; named here so the parser help can state it.
+_VOICE_PORT = 6981
+
 BUILTIN_HUB_URL = "http://100.109.6.114:8090/mcp"
 DEFAULT_HUB_URL = os.environ.get("MCP_HUB_URL", BUILTIN_HUB_URL)
 
@@ -4536,6 +4541,101 @@ def _parse_pod_agents(specs: list[str]) -> list[dict[str, str]]:
     return out
 
 
+def _seat_voice() -> None:
+    """Start the container's /voice client, detached, fail-open.
+
+    Every failure mode here resolves to "no audio": no binary, no gateway, no
+    host listening. None of them may touch the seat's exit path, which is why
+    nothing is awaited and every exception is swallowed.
+    """
+    try:
+        subprocess.Popen(
+            [sys.executable, "-m", "mcp_hub.cli", "voice-client"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        print("seat-entry: /voice client started", flush=True)
+    except Exception as exc:  # noqa: BLE001 — audio never fails a seat
+        print(f"seat-entry: /voice not started ({exc})", file=sys.stderr, flush=True)
+
+
+def voice_client_command(args: argparse.Namespace) -> int:
+    """In-container: pull audio from the host and feed this container's sink.
+
+    Runs as a child of seat-entry, and **must never be able to fail a seat**.
+    Voice is a convenience; a seat with no microphone is a working seat, and a
+    seat that refuses to start because the audio host is down is not.
+
+    NOTE what this does NOT do: bind, listen, or accept. The container is a
+    CLIENT only, which is what makes container-to-container injection have no
+    path rather than a filtered one (docs/seat-voice.md — v2 died to a
+    firewall rule that was present and inert).
+    """
+    import socket
+    import subprocess as _sp
+
+    from mcp_hub.voice import VOICE_CHANNELS, VOICE_RATE, default_gateway, open_stream
+
+    # Identity in preference order, and the order is the point:
+    #   SEAT_CONTAINER  the container's own name, injected for BOTH shapes
+    #   SEAT_IDENTITY   the 1:1 seat (a pod has none)
+    #   hostname        an ADOPTED container, created by something that is not
+    #                   this edge and therefore carries neither of the above
+    # The host authorises whatever arrives against the roster, so a name it
+    # does not recognise simply gets no audio.
+    seat = (args.seat
+            or os.environ.get("SEAT_CONTAINER")
+            or os.environ.get("SEAT_IDENTITY")
+            or socket.gethostname()
+            or "").strip()
+    if not seat:
+        print("voice: no seat identity — not connecting", file=sys.stderr)
+        return 0
+    try:
+        route = pathlib.Path("/proc/net/route").read_text(encoding="utf-8")
+    except OSError:
+        print("voice: no /proc/net/route — not connecting", file=sys.stderr)
+        return 0
+    gw = default_gateway(route)
+    if not gw:
+        # No default route: dial nothing rather than guess. A guessed gateway
+        # would send this seat's handshake somewhere unintended.
+        print("voice: no default gateway — not connecting", file=sys.stderr)
+        return 0
+    try:
+        sock = open_stream(gw, seat, port=args.port)
+    except OSError as exc:
+        # THE FAIL-CLOSED SIDE, and it is the good one: the host's PERMIT rule
+        # missing means no audio, loudly and immediately, rather than silent
+        # loss of an isolation property.
+        print(f"voice: no audio ({gw}:{args.port}: {exc})", file=sys.stderr)
+        return 0
+    # pacat owns the decode: raw s16le at the fleet's fixed rate into this
+    # container's OWN sink. Nothing here reaches the host's audio server.
+    pac = _sp.Popen(
+        ["pacat", "--playback", "--format=s16le",
+         f"--rate={VOICE_RATE}", f"--channels={VOICE_CHANNELS}"],
+        stdin=_sp.PIPE,
+    )
+    print(f"voice: streaming from {gw}:{args.port} as {seat}", file=sys.stderr)
+    try:
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            if pac.stdin is None:
+                break
+            pac.stdin.write(chunk)
+    except (OSError, BrokenPipeError):
+        pass
+    finally:
+        with contextlib.suppress(Exception):
+            sock.close()
+        with contextlib.suppress(Exception):
+            pac.terminate()
+    return 0
+
+
 def seat_entry_command(args: argparse.Namespace) -> int:
     """PID 1 of mcp-hub-seat — validate, prepare, launch (docs/seat-image.md).
 
@@ -4645,6 +4745,12 @@ def seat_entry_command(args: argparse.Namespace) -> int:
     if args.prepare_only:
         print("seat-entry: --prepare-only — not launching claude", flush=True)
         return 0
+
+    # /voice, once per CONTAINER, before any agent starts. Detached and
+    # deliberately unchecked: audio is a convenience and MUST NOT be able to
+    # fail a seat. A seat with no microphone is a working seat; a seat that
+    # refuses to start because the audio host is down is not.
+    _seat_voice()
 
     for session, contract, workdir in prepared:
         rc = _seat_launch(contract, workdir, session)
@@ -5299,6 +5405,21 @@ def build_parser() -> argparse.ArgumentParser:
     capsules.add_argument("--json", action="store_true",
                           help="Machine-readable output")
 
+    voice_client = sub.add_parser(
+        "voice-client",
+        help="Container-side /voice: pull audio from the host, feed the local sink",
+        description=(
+            "Runs INSIDE a seat container. Reads the default gateway from "
+            "/proc/net/route, connects out, names this seat, and streams the "
+            "operator's microphone into the container's own pulse sink. "
+            "Never binds a port. Never fails a seat."
+        ),
+    )
+    voice_client.add_argument("--seat", default="",
+                              help="Override SEAT_IDENTITY (tests/manual runs)")
+    voice_client.add_argument("--port", type=int, default=_VOICE_PORT,
+                              help=f"Host voice port (default {_VOICE_PORT})")
+
     seat_entry = sub.add_parser(
         "seat-entry",
         help="Container entrypoint: validate the seat contract, prepare, launch claude",
@@ -5387,6 +5508,8 @@ def main(argv: list[str] | None = None) -> int:
         return machines_command(args)
     if args.subcommand == "focus":
         return focus_command(args)
+    if args.subcommand == "voice-client":
+        return voice_client_command(args)
     if args.subcommand == "seat-entry":
         return seat_entry_command(args)
 

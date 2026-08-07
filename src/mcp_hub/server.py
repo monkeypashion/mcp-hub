@@ -3971,6 +3971,10 @@ _CLI_SUBCOMMANDS = {
     "machines",
     "focus",
     "seat-entry",
+    # Container-side /voice. Must be here or the `mcp-hub` console script
+    # silently treats it as a server flag and never forwards it — which is
+    # exactly what the reachability test caught.
+    "voice-client",
 }
 
 
