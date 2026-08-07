@@ -151,6 +151,45 @@ A seat that needs to violate any of these is not a seat — it is a
 privileged tool, and it should be an explicit operator act rather than a
 placement.
 
+### The ONE mount exception — a credential socket, and why it is not a precedent
+
+⚠️ Read this before citing it for anything else. **Someone will eventually
+point at this exception to justify mounting the docker socket. This paragraph
+is what stops them.**
+
+A seat that must fetch code needs a GitHub credential, and the naive design —
+a token inside the container, or worse a credential that lets the container
+MINT tokens — puts capability where the untrusted output runs. The codespace
+path never did this, and nobody had written down why: **the runner calls the
+token service from the HOST and injects only the results. A codespace holds
+tokens; it cannot mint** (dt, 2026-08-07). A container living for days with
+mint capability is strictly worse than one that dies in an hour holding a
+token: an adversary with execution inside does not steal a credential, they
+hold the ability to make new ones.
+
+So the seat is permitted **one** additional mount: a **unix socket to a
+mint-only agent**, one per agent, run by the estate that owns the credential —
+never by this one. The in-container helper is a thin forwarder speaking git's
+own credential-helper protocol.
+
+**Why this is allowed when the docker socket never is** — and the contrast IS
+the rule:
+
+| | credential socket | docker socket |
+| --- | --- | --- |
+| What it exposes | one operation: mint a token already scoped by the far side | the full Docker API |
+| Ceiling | the far side's scope; the container cannot widen it | root on the host |
+| Effect on the seat | **strictly LESS** capability than the credential it replaces | unbounded escalation |
+| Revocation | kill the agent or unmount — capability dies, container lives | none |
+
+The test to apply to any future mount request: **does it give the container
+strictly less capability than the alternative it replaces, and is its ceiling
+enforced by something outside the container?** A mint-only socket passes both.
+`/var/run/docker.sock` fails both, and no amount of "but we already allow a
+socket" changes that.
+
+Design record: `memory/project_interactive_factory_build_2026_08_07.md`.
+
 ## Modes
 
 - **`interactive`** (v1): long-running claude session under tmux, registered
