@@ -69,6 +69,15 @@ formats, resampled and mixed. Multi-source is in daily use, not theoretical.
 rig there (one systemd unit, the same receptor) rather than streaming audio
 host-to-host on top of a transport that already does that.
 
+⚠️ **This is an ECONOMY argument, not a safety one**, and the distinction
+matters because this line sits among genuine safety constraints. Direct UDP to
+a container is *redundant*, not dangerous — the container still receives only
+what it is sent; only the delivery mechanism differs. If a host genuinely
+cannot run the receptor (a minimal appliance: no python, no pulse), **the
+per-container UDP variant is the documented fallback** and costs the port
+allocator this design otherwise avoids. Named explicitly so nobody hitting that
+case believes they are violating the design.
+
 ## The three things that make a FIFO work — none optional
 
 ### 1. Bind-mount the DIRECTORY, never the FIFO node
@@ -88,21 +97,40 @@ Two failure modes if you mount the node:
 Recreation inside a mounted directory is visible to the container; the mount
 survives it.
 
+⭐ **Why every health check passes through this**: they verify **PRESENCE, not
+FLOW**. Sink exists, reader alive, no error returned — all true, all perfectly
+compatible with zero bytes moving. That generalises well past this bug: *any*
+check that asserts a component exists rather than that data arrived is blind to
+this whole class. It is exactly why the verification below measures RMS on a
+real capture rather than asking whether the pieces are there.
+
 ### 2. Drop frames — a FIFO has the WRONG backpressure semantics
 
 ⭐ The property being given up by leaving UDP, and it is invisible because it
 is a *non-feature*: **UDP drops when the far end cannot keep up, and for
 realtime audio dropping is CORRECT.** VBAN is fire-and-forget for this reason.
 
-A FIFO is lossless-with-backpressure. The default pipe buffer is 64KB — about
-**2 seconds** at 16kHz mono s16 — and once a container's reader stalls (load,
-`docker pause`, a wedged receptor) the buffer fills and **the writer blocks**,
-propagating the stall backwards into the audio path.
+A FIFO is lossless-with-backpressure. Measured on dev-vm-1 via `F_GETPIPE_SZ`:
+default capacity **65536 bytes**; 16kHz mono s16 is 32000 B/s; ⇒ **2.048
+seconds**. Once a container's reader stalls (load, `docker pause`, a wedged
+receptor) the buffer fills and **the writer blocks**, propagating the stall
+backwards into the audio path.
 
 ⇒ Open `O_NONBLOCK` and **drop on `EAGAIN`, explicitly.** A stalled seat must
 never apply backpressure. With a shared fan-out this would stop being a latency
 bug and become one seat stalling the whole fleet — which is the main reason the
 emitter is per-seat.
+
+🔴 **DO NOT ENLARGE THE PIPE.** `/proc/sys/fs/pipe-max-size` is 1048576 here, so
+`F_SETPIPE_SZ` can buy ~**32.8 seconds** of buffer. That is the "fix" a future
+maintainer reaches for on seeing dropped audio, and it is strictly worse: it
+does not prevent the stall, it **extends it 16×**, and what eventually drains is
+stale audio replayed into a live transcription. **Dropping is the cure; the
+buffer is the disease. Pipe size is not a tuning knob.**
+
+Note the two halves of this trap point in opposite directions — one maintainer
+"fixes" the dropping, another "fixes" the glitch by growing the buffer. Both
+are the same misreading: that losslessness is desirable here.
 
 ### 3. Reader-absent and reader-death
 
@@ -125,6 +153,65 @@ emitter is per-seat.
   **container's own** server. The ABSOLUTE path matters: tmux-launched agents
   often lack a usable `XDG_RUNTIME_DIR` and libpulse then finds nothing. This
   trap already cost time on the fireblade rig.
+
+## 🔴 How this gets into EVERY container, automatically
+
+Operator's question, 2026-08-07, and the design above did not answer it: it
+settled the mechanism and skipped **who installs it**. Two halves, two
+different answers.
+
+### Half 1 — the image: automatic by construction
+
+Packages, the ALSA conf and the pulse `client.conf` go in the **Dockerfile**.
+Every container built from that image has them; there is nothing per-seat to
+set and nothing to forget. This half is free.
+
+### Half 2 — the per-seat wiring: this is the real question
+
+The directory mount and the host emitter are per-container, so something has to
+add them at create time. Two candidate homes, and they are not equivalent:
+
+| Where the mount is decided | Automatic? |
+| --- | --- |
+| the seat's `spec` on the hub | ❌ whoever creates a seat must remember; one that missed it is **silently voiceless** |
+| injected by `create_argv` at container-create | ✅ true by construction — a seat that missed it cannot exist |
+
+**This repo has already paid for the answer, in both directions:**
+
+- ✅ `SEAT_IDENTITY` is injected by `create_argv` rather than read from the
+  spec, precisely so the container's name and its identity cannot disagree —
+  *"true by construction, not by convention"*.
+- 🔴 `spec.memory_volume` was the opposite: declared on every seat, read in one
+  branch, **mounted nowhere**. It cost three seats' memory on 2026-08-06,
+  destroyed on a stated belief in a field nothing implemented
+  (`reference_declared_is_not_enforced_2026_08_06`).
+
+⇒ **Derive it, don't declare it.** The mount belongs in the create path.
+
+### What makes this cheap: the mount grants nothing
+
+The bind-mounted directory is **inert** — an empty directory is not a
+capability. Everything the seat can hear comes from whether the host emitter is
+running for it. So the mount can be unconditional and harmless, and the
+**emitter stays the only switch**: revocation remains `kill <pid>`, and a seat
+with no emitter is deaf rather than broken.
+
+That also keeps the ceiling exactly where the mount rule requires it — outside
+the container — with no per-seat configuration to drift.
+
+### ⚠️ The one open decision
+
+`DockerExecutor` is deliberately incurious about what it runs: *"nginx, an
+inference server and a squad seat are the same shape to it, which is the
+point."* An unconditional audio mount teaches it about seats.
+
+Options, undecided and **operator's call**:
+1. `create_argv` gains a narrow, explicit discriminator for seat-shaped specs.
+2. The wiring attaches one layer up, at seat creation — which is exactly where
+   per-seat drift creeps back in.
+
+Recorded as a decision, not a detail, because picking it quietly is how
+`memory_volume` happened.
 
 ## Pods
 
