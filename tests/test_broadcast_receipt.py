@@ -395,3 +395,55 @@ async def test_a_JUST_PROMOTED_agent_starts_a_clean_run_on_the_next_generation(
 # ever needs a witness, the technique is the one that caught the catch-up fence
 # race: inject the competing commit at exactly the point the other thread would
 # reach it, rather than hoping a sleep lands in the window.
+
+
+# ---- the migration, against a database that already has agents ------------
+
+def test_the_migration_preserves_existing_cursors_and_is_idempotent(tmp_path):
+    """The one path that only ever runs in production.
+
+    Every other test here starts from a fresh database. The deploy does not:
+    it runs `init_db` against a live DB whose agents already carry real
+    cursors, and a migration that reset or shifted those would hand the whole
+    fleet a backlog (or eat one) at the moment of deploy — invisibly, because
+    nothing compares before and after.
+
+    Rewinding by dropping the two columns is a fair stand-in for the
+    pre-migration schema: they are exactly what the old DB lacks.
+    """
+    import time as _t
+
+    from mcp_hub.server import init_db
+
+    db = tmp_path / "prod.db"
+    init_db(db)
+    conn = sqlite3.connect(db)
+    conn.execute("ALTER TABLE agents DROP COLUMN broadcast_pending_id")
+    conn.execute("ALTER TABLE agents DROP COLUMN broadcast_pending_gen")
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(agents)")}
+    assert "broadcast_pending_id" not in cols, "the rewind did not rewind"
+    now = _t.time()
+    seeded = {"alpha": 10346, "beta": 0, "gamma": 99999}
+    for name, cur in seeded.items():
+        conn.execute(
+            "INSERT INTO agents (name, project, bio, registered, last_seen, "
+            "last_broadcast_seen_id) VALUES (?,?,?,?,?,?)",
+            (name, "org/x", "", now, now, cur),
+        )
+    conn.commit()
+    conn.close()
+
+    init_db(db)          # the migration
+    init_db(db)          # and again — a redeploy re-runs it
+
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    rows = list(conn.execute(
+        "SELECT name, last_broadcast_seen_id AS cur, broadcast_pending_id AS pend, "
+        "broadcast_pending_gen AS gen FROM agents"))
+    conn.close()
+    assert {r["name"]: r["cur"] for r in rows} == seeded, \
+        "the migration moved an existing agent's cursor"
+    # Nothing pending is the truthful state for a pre-migration hub: it
+    # advanced on push, so it has no outstanding claim to carry forward.
+    assert all(r["pend"] == 0 and r["gen"] == "" for r in rows), rows
