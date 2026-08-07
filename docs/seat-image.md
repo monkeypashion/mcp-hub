@@ -182,11 +182,36 @@ the rule:
 | Effect on the seat | **strictly LESS** capability than the credential it replaces | unbounded escalation |
 | Revocation | kill the agent or unmount — capability dies, container lives | none |
 
-The test to apply to any future mount request: **does it give the container
-strictly less capability than the alternative it replaces, and is its ceiling
-enforced by something outside the container?** A mint-only socket passes both.
-`/var/run/docker.sock` fails both, and no amount of "but we already allow a
-socket" changes that.
+The test to apply to any future mount request:
+
+1. **REPLACEMENT** — strictly less capability than the thing it replaces.
+2. **NET-NEW** — the *minimal sufficient* capability among implementations that
+   actually deliver the feature, and **the burden is on the requester** to show
+   the narrower implementations were considered and say why they were rejected.
+3. **In both cases**: the ceiling must be enforced by something OUTSIDE the
+   container.
+
+A mint-only socket passes. `/var/run/docker.sock` fails, and no amount of "but
+we already allow a socket" changes that.
+
+🔴 **Clause 1 used to be the WHOLE test, and it was malformed** — caught by
+`mcp-hub-dev-vm-1-general` on 2026-08-07, the first time it was applied to a
+real request (audio for `/voice`). "Strictly less than what it replaces" only
+means anything when a request *replaces* something. **A net-new capability
+replaces nothing, so it can never be "strictly less", so the rule refused it —
+not for being dangerous, but for being new.**
+
+⭐ The proof it was broken: **it would have forbidden the credential socket had
+that arrived first**, and the rule was written specifically to permit the
+credential socket. I derived a general principle from a single example and
+encoded an accident of that example — that it happened to be a replacement — as
+the principle itself. A rule that forbids the case it was written to allow is
+not strict, it is wrong.
+
+⇒ Clause 3 (the ceiling) is the hard gate and always was. Clause 2 is what
+makes clause 1 do real work on new features: it does not ask "is this safe?",
+which invites yes, but "**is this the narrowest thing that works, and what else
+did you try?**", which invites evidence.
 
 Design record: `memory/project_interactive_factory_build_2026_08_07.md`.
 
