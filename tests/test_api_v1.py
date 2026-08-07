@@ -70,7 +70,14 @@ class TestPositiveControl:
     def test_health_answers_without_auth(self, client):
         r = client.get("/health")
         assert r.status_code == 200
-        assert r.json()["status"] == "ok"
+        body = r.json()
+        assert body["status"] == "ok"
+        # Build identity + uptime: the two facts that discriminate
+        # deploy vs restart vs untouched without prod ssh.
+        assert "commit" in body
+        assert isinstance(body["uptime_seconds"], int)
+        assert body["uptime_seconds"] >= 0
+        assert body["started_at"].endswith("Z")
 
 
 # ---------------------------------------------------------------------------

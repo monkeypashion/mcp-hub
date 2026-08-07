@@ -36,13 +36,18 @@ def _resolve_commit() -> str:
     """Best-effort git SHA of the running code, for the /health endpoint.
 
     Resolution order: MCP_HUB_GIT_SHA env (baked at build time via the
-    Dockerfile ARG) → read the repo's .git directly (the image ships the
-    source incl. .git, so this works even when the env isn't set) →
-    'unknown'. Pure-Python git read so the slim image needs no git binary.
+    Dockerfile ARG) → SOURCE_COMMIT (Coolify injects the deployed sha into
+    the container's RUNTIME env on every deploy, no build wiring needed —
+    measured on prod 2026-08-07, where the ARG chain had baked the literal
+    string "unknown" and /health said so for two verification cycles) →
+    read the repo's .git directly (the image ships the source incl. .git,
+    so this works even when neither env is set) → 'unknown'. Pure-Python
+    git read so the slim image needs no git binary.
     """
-    sha = os.environ.get("MCP_HUB_GIT_SHA")
-    if sha and sha.strip() and sha.strip() != "unknown":
-        return sha.strip()
+    for var in ("MCP_HUB_GIT_SHA", "SOURCE_COMMIT"):
+        sha = os.environ.get(var)
+        if sha and sha.strip() and sha.strip() != "unknown":
+            return sha.strip()
     try:
         git_dir = Path(__file__).resolve().parents[2] / ".git"
         head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
@@ -61,6 +66,14 @@ def _resolve_commit() -> str:
     except Exception:  # noqa: BLE001
         pass
     return "unknown"
+
+
+# Process start, for /health's uptime. Commit answers "WHICH build is this?";
+# uptime answers "is this the SAME process I talked to before?" — together they
+# discriminate deploy vs restart vs untouched, which bindings-dropped alone
+# cannot (a deploy and a crash-restart look identical from the fleet side, and
+# that ambiguity has cost a verification step twice: 2026-07-27, 2026-08-07).
+_PROCESS_STARTED = time.time()
 
 
 class _ChannelNotification(BaseModel):
@@ -1405,6 +1418,10 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 "service": "mcp-hub",
                 "version": pkg_version,
                 "commit": _resolve_commit(),
+                "uptime_seconds": int(time.time() - _PROCESS_STARTED),
+                "started_at": time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime(_PROCESS_STARTED)
+                ),
                 "agents_bound": len(registry.names()),
             }
         )
@@ -3883,11 +3900,17 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         channels = conn.execute("SELECT COUNT(*) as c FROM channels").fetchone()
         messages = conn.execute("SELECT COUNT(*) as c FROM messages").fetchone()
         unread = conn.execute("SELECT COUNT(*) as c FROM messages WHERE read=0").fetchone()
+        # Build identity and uptime ride along so ANY seat can verify a deploy
+        # from inside a session — /health carries the same facts but needs
+        # plain HTTP to the hub, which agents don't always have.
+        uptime = int(time.time() - _PROCESS_STARTED)
         return (
             f"Agents online: {agents['c']}\n"
             f"Channels: {channels['c']}\n"
             f"Total messages: {messages['c']}\n"
-            f"Unread: {unread['c']}"
+            f"Unread: {unread['c']}\n"
+            f"Commit: {_resolve_commit()}\n"
+            f"Uptime: {uptime}s"
         )
 
     # ------------------------------------------------------------------
