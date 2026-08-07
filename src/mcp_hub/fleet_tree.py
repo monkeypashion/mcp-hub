@@ -306,6 +306,11 @@ def build_tree(
             "in_scope": (r["machine"] != this_machine
                          or not scoped_to
                          or r.get("path") == scoped_to),
+            # Filled in after the attribution passes, once the containers
+            # actually hold their agents. See "workspaces whose agents live in
+            # containers" below.
+            "container_ids": [],
+            "in_containers": 0,
             "agents": [],
         }
         ws_nodes.setdefault(r["machine"], []).append(node)
@@ -547,6 +552,34 @@ def build_tree(
                     w["agents"].append(dict(node, key=f"a:{w['key']}/{name}"))
             else:
                 loose.setdefault(m, []).append(node)
+
+    # -- workspaces whose agents live in containers ------------------------
+    #
+    # A containerized agent hangs under its container and NOT under the host
+    # workspace listing its mount point — deliberately, because it runs in one
+    # place and showing it in two says otherwise. But that leaves such a
+    # workspace drawing with no children, and an empty row reads as "no
+    # agents": a measurement nobody took. `capsule`, whose every member is
+    # containerized, rendered as an empty shell while its agents were on the
+    # board the whole time, one node down.
+    #
+    # So the workspace says where they WENT instead of reclaiming them. This
+    # is a NOTE, not a second home — the agents stay under their containers,
+    # `walk_agents` still yields each exactly once, and the count is derived
+    # from what the container actually holds rather than from what the
+    # workspace hoped for.
+    #
+    # A container with no known folder links to nothing. That is honest: the
+    # folder is the only evidence tying a container to a workspace, and
+    # guessing by repo name is the attribution defect the container nodes were
+    # built to end.
+    for m, cts in containers.items():
+        for w in ws_nodes.get(m, []):
+            mine = [c for c in cts
+                    if c["folder"]
+                    and any(_contains(x, c["folder"]) for x in w["listings"])]
+            w["container_ids"] = [c["identity"] for c in mine]
+            w["in_containers"] = sum(len(c["agents"]) for c in mine)
 
     # -- assemble ----------------------------------------------------------
     order = sorted(

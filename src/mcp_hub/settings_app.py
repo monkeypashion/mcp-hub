@@ -541,6 +541,18 @@ class SettingsApp(App):
         # `tail` outranks it — attention beats status, as the rows below.
         if not w.get("in_scope", True) and not tail:
             tail = "not in this board's scope"
+        # The same family as the scope note: this row's agents ARE measured,
+        # they just hang under the containers on this machine rather than
+        # here. Without it `capsule` — every member containerized — drew as a
+        # bare row, which reads as a workspace with nothing in it. Shown
+        # whenever there are any, not only when the row is otherwise empty: a
+        # workspace with two seats here and three in containers is
+        # under-reporting just as much, and one rule cannot drift from the
+        # other the way two would.
+        boxed = w.get("in_containers") or 0
+        if boxed:
+            note = f"{boxed} in containers"
+            tail = f"{tail} · {note}" if tail else note
         if w["squad"]:
             tail = f"{tail}  [{w['squad']}]" if tail else f"[{w['squad']}]"
         name = f"{glyph} {w['name']}"
@@ -1602,16 +1614,32 @@ class SettingsApp(App):
         out.append(self._fact(
             "Folder", self._short_dir(w["path"]) if w["path"] else "—",
             "value-ro", w["path"] or "no file on any machine that reported"))
+        boxed = w.get("in_containers") or 0
         out.append(self._fact(
             "Seats", str(len(w["agents"])) if w["agents"] else "none attributed",
             "value-ro" if w["agents"] else "value-off",
-            "" if w["agents"] else
-            "a remote workspace only lists its folders once REGISTERED, so its "
-            "seats sit under the machine instead"))
+            "" if w["agents"] else (
+                # Do NOT offer the remote-registration explanation when the
+                # containers already account for the emptiness. Two causes look
+                # identical in the count, and naming the wrong one sends the
+                # operator to register a workspace that is registered fine.
+                "they run in this machine's containers, listed below, and are "
+                "shown under those rather than here"
+                if boxed else
+                "a remote workspace only lists its folders once REGISTERED, so "
+                "its seats sit under the machine instead")))
         for a in w["agents"]:
             out.append(Static(
                 f"  {a['agent']}" + ("" if a["local"] else "   (presence only)"),
                 classes="ws-row" if a["local"] else "ws-row-open"))
+        if boxed:
+            # Named, not just counted: "3 in containers" tells the operator to
+            # go looking, and these are WHERE to look.
+            out.append(self._fact(
+                "In containers", str(boxed), "value-ro",
+                "this workspace's folders are mounted into them"))
+            for ident in w.get("container_ids") or []:
+                out.append(Static(f"  {ident}", classes="ws-row"))
         if reg is False and w["path"] and \
                 w["machine"] == self.tree_model.get("this_machine"):
             # Offered only where it can actually be done: registering another

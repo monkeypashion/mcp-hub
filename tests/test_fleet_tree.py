@@ -737,3 +737,107 @@ def test_absent_liveness_stays_UNKNOWN_not_false():
               machine_agents={"far": [{"agent": "old-far", "worktree": "/w/o",
                                        "comms": True}]})
     assert _by_name(t)["old-far"]["running"] is None
+
+
+# ---- a workspace whose agents live in containers ---------------------------
+#
+# The `capsule` defect: every member containerized, so the attribution passes
+# correctly hand each agent to its container and the workspace draws with no
+# children. An empty row reads as "no agents" — a measurement nobody took.
+
+
+def test_a_workspace_whose_seats_are_all_containerized_says_where_they_went():
+    t = _tree(
+        roster=[{"agent": "seat-here", "worktree": "/work/seat",
+                 "klass": "squad"}],
+        rows=[_ws("capsule", "here", ["/work"])],
+        seats=[_seat("seat-here", "here", folder="/work/seat")],
+    )
+    ws = t["machines"][0]["workspaces"][0]
+    assert ws["agents"] == [], "the agent was reclaimed by the workspace"
+    assert ws["in_containers"] == 1, \
+        "the row still reads as a workspace with nothing in it"
+    assert ws["container_ids"] == ["seat-here"]
+
+
+def test_the_note_does_NOT_move_the_agent_back_under_the_workspace():
+    """It is a note, not a second home. Counting it in both places would
+    reintroduce the duplicate rows the container nodes exist to end."""
+    t = _tree(
+        roster=[{"agent": "seat-here", "worktree": "/work/seat",
+                 "klass": "squad"}],
+        rows=[_ws("capsule", "here", ["/work"])],
+        seats=[_seat("seat-here", "here", folder="/work/seat")],
+    )
+    assert len(list(walk_agents(t))) == 1, "shown twice"
+    box = t["machines"][0]["containers"][0]
+    assert [a["agent"] for a in box["agents"]] == ["seat-here"]
+
+
+def test_a_pod_counts_EVERY_inhabitant_not_one_per_container():
+    """The count is of AGENTS, not containers — a 3-agent pod under one
+    workspace is three seats that workspace cannot see, not one."""
+    pod = _seat("duo-pod-here", "here", folder="/work/pod")
+    pod["spec"]["agents"] = [{"identity": "a-here"}, {"identity": "b-here"}]
+    t = _tree(
+        roster=[{"agent": "a-here", "worktree": "/work/pod", "klass": "squad"},
+                {"agent": "b-here", "worktree": "/work/pod", "klass": "squad"}],
+        rows=[_ws("capsule", "here", ["/work"])],
+        seats=[pod],
+    )
+    ws = t["machines"][0]["workspaces"][0]
+    assert ws["in_containers"] == 2
+    assert ws["container_ids"] == ["duo-pod-here"]
+
+
+def test_a_container_with_no_known_folder_is_attributed_to_NOTHING():
+    """The folder is the only evidence tying a container to a workspace.
+    Guessing by repo name is the attribution defect containers exist to end,
+    so an unknown folder links to nothing rather than to everything."""
+    t = _tree(
+        roster=[{"agent": "seat-here", "worktree": "/work/seat",
+                 "klass": "squad"}],
+        rows=[_ws("capsule", "here", ["/work"])],
+        seats=[_seat("seat-here", "here")],       # folder "" — the hub wasn't told
+    )
+    ws = t["machines"][0]["workspaces"][0]
+    assert ws["in_containers"] == 0
+    assert ws["container_ids"] == []
+
+
+def test_a_workspace_that_does_not_list_the_container_claims_nothing():
+    """Containment, not co-residence: two workspaces on one box, and only the
+    one whose folders reach the container counts it."""
+    t = _tree(
+        roster=[{"agent": "seat-here", "worktree": "/work/seat",
+                 "klass": "squad"}],
+        rows=[_ws("capsule", "here", ["/work"]),
+              _ws("elsewhere", "here", ["/other"])],
+        seats=[_seat("seat-here", "here", folder="/work/seat")],
+    )
+    by_name = {w["name"]: w for w in t["machines"][0]["workspaces"]}
+    assert by_name["capsule"]["in_containers"] == 1
+    assert by_name["elsewhere"]["in_containers"] == 0
+
+
+def test_an_empty_container_adds_nothing_to_its_workspace():
+    """A placement that never came up holds no agents, so the workspace has
+    none to point at — `1 in containers` there would be a claim about seats
+    that do not exist."""
+    t = _tree(
+        rows=[_ws("capsule", "here", ["/work"])],
+        seats=[_seat("seat-here", "here", folder="/work/seat")],
+    )
+    ws = t["machines"][0]["workspaces"][0]
+    assert ws["in_containers"] == 0
+    assert ws["container_ids"] == ["seat-here"], \
+        "the container is still LINKED — it is empty, not absent"
+
+
+def test_a_workspace_with_no_containers_carries_the_keys_anyway():
+    """Absent keys would make every caller reach for `.get`, and the one that
+    forgot would crash on the ordinary case."""
+    t = _tree(rows=[_ws("plain", "here", ["/work"])])
+    ws = t["machines"][0]["workspaces"][0]
+    assert ws["in_containers"] == 0
+    assert ws["container_ids"] == []

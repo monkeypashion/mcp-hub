@@ -1273,3 +1273,67 @@ async def test_an_edge_that_never_reported_liveness_keeps_the_weaker_line():
         await pilot.pause()
         row = _label(app, "old-farbox")
         assert "not on hub" in row and "running," not in row, row
+
+
+# ---- a workspace whose seats are all in containers -------------------------
+
+def _ws_label(app, name: str) -> str:
+    """One workspace's rendered row, as the operator reads it."""
+    for node in app._all_nodes():
+        data = node.data or {}
+        if data.get("kind") == "workspace" and data.get("name") == name:
+            return node.label.plain
+    raise AssertionError(f"workspace {name} is not in the tree")
+
+
+def _capsule_app():
+    """`capsule`: one workspace, one containerized seat inside its folders.
+
+    The container correctly claims the agent, so before the note this row
+    drew bare — a workspace that looks like it holds nothing while its seat
+    is one node below it on the same board.
+    """
+    return SettingsApp(
+        list(SEAT_ROSTER), scoped_to=None, model_for=_model_for,
+        squad_bin="/usr/bin/SQUAD", hub_bin="/usr/bin/HUB",
+        board_for=None, dark=None, poll_seconds=3600, this_machine="thisbox",
+        workspaces_for=lambda: {
+            "machines": ["thisbox"], "this_machine": "thisbox", "note": "",
+            "rows": [
+                {"name": "capsule", "machine": "thisbox",
+                 "path": "/f/capsule.code-workspace", "folders": 1, "error": "",
+                 "on_disk": True, "open_now": False, "registered": True,
+                 "squad": "", "listings": ["/home/me/work"]},
+                {"name": "plain", "machine": "thisbox",
+                 "path": "/f/plain.code-workspace", "folders": 1, "error": "",
+                 "on_disk": True, "open_now": False, "registered": True,
+                 "squad": "", "listings": ["/a"]},
+            ]},
+        seats_for=lambda: list(CONTAINER_SEATS),
+        fleet_for=lambda: {"ts": time.time(), "agents": []},
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_workspace_says_how_many_of_its_seats_are_in_containers():
+    """The `capsule` row. Its seat runs in a container and is shown there —
+    correctly — which left this row with no children at all. An empty row is
+    read as "no agents", and that is a measurement nobody took."""
+    app = _capsule_app()
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        row = _ws_label(app, "capsule")
+        assert "1 in containers" in row, row
+
+
+@pytest.mark.asyncio
+async def test_a_workspace_with_no_containers_says_nothing_about_them():
+    """The note appears only where it is true. A count of zero on every
+    ordinary workspace is noise that trains the operator to skip the tail."""
+    app = _capsule_app()
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        row = _ws_label(app, "plain")
+        assert "in containers" not in row, row
