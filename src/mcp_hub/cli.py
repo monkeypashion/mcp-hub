@@ -4198,15 +4198,47 @@ def _seat_prepare(contract: Any, workdir: pathlib.Path) -> tuple[Any, int | None
 
     workdir.mkdir(parents=True, exist_ok=True)
     if contract.repo and not any(workdir.iterdir()):
+        from mcp_hub.seat import GITHUB_TOKEN, https_repo_url
+
+        # The spec's URL is usually an ssh alias (`git@github-monkeypashion:`)
+        # that exists only in ONE machine's ~/.ssh/config. Inside a container
+        # it resolves to nothing, so it is normalised to github.com https,
+        # which the token can actually authenticate.
+        url = https_repo_url(contract.repo)
+        if not url:
+            print(
+                f"seat-entry: REFUSED (contract): cannot read an org/repo out "
+                f"of '{contract.repo}'. Refusing to guess — a wrong URL would "
+                f"clone the WRONG repo under the right name, and nothing "
+                f"downstream could tell.",
+                file=sys.stderr, flush=True,
+            )
+            return contract, EXIT_CONTRACT
+        if not (os.environ.get(GITHUB_TOKEN) or "").strip():
+            # At the door, loudly, like the Anthropic credential — not three
+            # git errors deep. A container has no ssh key and no credential
+            # store, so a private repo is simply unreachable without this.
+            print(
+                f"seat-entry: REFUSED (contract): {contract.identity} declares "
+                f"a repo but {GITHUB_TOKEN} is not set, and a container has no "
+                f"ssh key or credential store to fall back on. Inject it the "
+                f"same way as the Anthropic credential: add {GITHUB_TOKEN} to "
+                f"the edge host's ~/.mcp-hub/edge-env and name it in the "
+                f"seat spec's env_from_host. The hub stores the NAME only.",
+                file=sys.stderr, flush=True,
+            )
+            return contract, EXIT_CONTRACT
         clone = subprocess.run(
-            ["git", "clone", contract.repo, str(workdir)],
+            ["git", "clone", url, str(workdir)],
             capture_output=True,
             text=True,
         )
         if clone.returncode != 0:
+            # git echoes the URL it tried; with a credential HELPER (rather
+            # than a token embedded in the URL) there is no secret in it.
             print(
                 f"seat-entry: REFUSED (contract): clone of "
-                f"{contract.repo} failed: {clone.stderr.strip()}",
+                f"{url} failed: {clone.stderr.strip()}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -4421,7 +4453,20 @@ def _seat_home_setup() -> None:
     them once rather than N times — the three worst of the six gates between
     a running container and an agent on the hub are not multiplied by N.
     """
-    from mcp_hub.seat import hooks_settings_content
+    from mcp_hub.seat import (
+        GITHUB_TOKEN,
+        credential_helper_argv,
+        hooks_settings_content,
+    )
+
+    # Git credential helper, once per container, only when a token is present.
+    # It READS the env var at the moment git asks, so the token is never
+    # written to disk — unlike a token embedded in the clone URL, which
+    # persists verbatim in .git/config as remote.origin.url, survives the
+    # container, shows up in `git remote -v`, and would be read back by our own
+    # project derivation.
+    if (os.environ.get(GITHUB_TOKEN) or "").strip():
+        subprocess.run(credential_helper_argv(), capture_output=True)
 
     # Hook settings: write only if absent. A memory_volume mounted at
     # ~/.claude may carry a previous seat's (identical) settings — or an

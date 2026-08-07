@@ -28,6 +28,7 @@ Injected by the launcher (edge `DockerExecutor` via the seat's `spec.env` /
 | `SEAT_MODE` | no | `interactive` (default) or `headless`. See modes. |
 | `SEAT_PROMPT` | headless only | The prompt for `claude -p`. |
 | `SEAT_SQUADS` | no | Comma-separated squads passed to `register()`. Empty preserves, as always. |
+| `GITHUB_TOKEN` | to clone | **How a container fetches its own code.** Same channel as the Anthropic credential — hub stores the NAME, the edge host supplies the VALUE via `--env-from-host`. Installed as a git credential HELPER, so the token is never written to disk; a token embedded in the clone URL would persist in `.git/config` as `remote.origin.url`, survive the container, and show up in `git remote -v`. Not needed when the workdir is bind-mounted from the host, which is every seat on the fleet today. |
 | `CLAUDE_CODE_OAUTH_TOKEN` | one of | **The default lane** (operator decision 2026-08-04, card #353): a long-lived Claude Code OAuth token minted by `claude setup-token` on the edge host, injected via `--env-from-host` — the hub stores the NAME only, the value never enters the control plane. |
 | `ANTHROPIC_API_KEY` | one of | **The override lane.** API billing. Same `--env-from-host` channel. |
 

@@ -543,3 +543,100 @@ def test_empty_fields_are_omitted_not_sent_blank():
     from mcp_hub.cli import _parse_pod_agents
 
     assert _parse_pod_agents(["a=,"]) == [{"identity": "a"}]
+
+
+# ---- fetching the code: the container's own GitHub credential --------------
+#
+# The clone step had never run anywhere (measured 2026-08-07: every seat on the
+# fleet carried no repo and got a host bind-mount instead), and could not have:
+# a container has no ssh key, no ~/.gitconfig, no credential store.
+
+def test_an_ssh_alias_becomes_a_url_a_container_can_reach():
+    """`git@github-monkeypashion:` exists only in ONE machine's ~/.ssh/config.
+    Inside a container it resolves to nothing."""
+    from mcp_hub.seat import https_repo_url
+
+    assert https_repo_url("git@github-monkeypashion:monkeypashion/mcp-hub.git") \
+        == "https://github.com/monkeypashion/mcp-hub.git"
+
+
+def test_every_remote_form_lands_on_the_same_url():
+    from mcp_hub.seat import https_repo_url
+
+    forms = [
+        "git@github.com:org/repo.git",
+        "git@github-alias:org/repo.git",
+        "https://github.com/org/repo.git",
+        "ssh://git@github.com/org/repo",
+    ]
+    assert {https_repo_url(f) for f in forms} == {
+        "https://github.com/org/repo.git"}
+
+
+def test_an_unparseable_url_is_REFUSED_not_guessed():
+    """A wrong URL clones the WRONG repo under the right name, and nothing
+    downstream could detect it."""
+    from mcp_hub.seat import https_repo_url
+
+    assert https_repo_url("nonsense") == ""
+    assert https_repo_url("") == ""
+
+
+def test_the_token_is_never_written_to_disk():
+    """The obvious alternative — https://user:$TOKEN@github.com/... — persists
+    the credential verbatim in .git/config, where it survives the container and
+    shows up in `git remote -v`."""
+    from mcp_hub.seat import credential_helper_argv
+
+    argv = credential_helper_argv()
+    assert argv[:4] == ["git", "config", "--global", "credential.helper"]
+    helper = argv[4]
+    # The VARIABLE NAME, unexpanded — git expands it when it asks, not us.
+    assert '"password=$GITHUB_TOKEN"' in helper
+    assert "x-access-token" in helper
+
+
+def test_the_helper_names_whichever_variable_it_is_given():
+    from mcp_hub.seat import credential_helper_argv
+
+    assert "$OTHER_VAR" in credential_helper_argv("OTHER_VAR")[4]
+
+
+def test_a_repo_without_a_token_is_refused_AT_THE_DOOR(tmp_path, monkeypatch):
+    """Not three git errors deep — the same shape as the Anthropic credential
+    refusal, naming the fix."""
+    from mcp_hub.seat import EXIT_CONTRACT
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN)
+    monkeypatch.setenv("MCP_HUB_URL", HUB)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("SEAT_IDENTITY", raising=False)
+    monkeypatch.setenv("SEAT_MANIFEST", json.dumps({"agents": [
+        {"identity": "a", "repo": "git@github-org:org/repo.git"}]}))
+    work = home / "work"
+    rc = cli.seat_entry_command(argparse.Namespace(
+        workdir=str(work), prepare_only=True))
+    assert rc == EXIT_CONTRACT
+
+
+def test_a_BIND_MOUNTED_workdir_needs_no_token(tmp_path, monkeypatch):
+    """Every seat running today takes this path: the folder is already
+    populated, so nothing is fetched and no credential is required."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN)
+    monkeypatch.setenv("MCP_HUB_URL", HUB)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("SEAT_IDENTITY", raising=False)
+    monkeypatch.setenv("SEAT_MANIFEST", json.dumps({"agents": [
+        {"identity": "a", "repo": "git@github-org:org/repo.git"}]}))
+    work = home / "work"
+    (work / "a").mkdir(parents=True)
+    (work / "a" / "README.md").write_text("already here", encoding="utf-8")
+    rc = cli.seat_entry_command(argparse.Namespace(
+        workdir=str(work), prepare_only=True))
+    assert rc == 0

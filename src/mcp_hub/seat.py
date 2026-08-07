@@ -398,6 +398,60 @@ def pod_workspace(pod: PodContract, workdirs: Mapping[str, str]) -> dict:
     }
 
 
+# ------------------------------------------------------- fetching the code
+#
+# A container has no ssh key, no ~/.gitconfig and no credential store, so the
+# clone step in seat-entry could never have worked against a private repo — and
+# measured 2026-08-07, it had never run at all: every seat on the fleet was
+# handed a host bind-mount instead, so its workdir was never empty.
+#
+# The credential rides the SAME channel as the Anthropic one: the hub stores
+# the NAME, the edge host supplies the VALUE via `--env-from-host`. Nothing new
+# to learn, nothing secret in the control plane.
+
+GITHUB_TOKEN = "GITHUB_TOKEN"
+
+# github.com, always. A seat spec written on a machine with ssh aliases carries
+# `git@github-monkeypashion:org/repo.git`, and that alias exists only in that
+# machine's ~/.ssh/config — inside a container it resolves to nothing.
+_GITHUB_HTTPS = "https://github.com/{org}/{repo}.git"
+
+
+def https_repo_url(url: str) -> str:
+    """Any git remote form → the https URL a container can actually fetch.
+
+    Reuses `_parse_org_repo`, which already ignores the host entirely, so an
+    ssh alias and a canonical URL land on the same answer. Returns "" when the
+    form is unparseable rather than guessing — a wrong URL would clone the
+    wrong repo under the right name, which nothing downstream could detect.
+    """
+    from mcp_hub.cli import _parse_org_repo
+
+    parsed = _parse_org_repo(url or "")
+    if not parsed:
+        return ""
+    return _GITHUB_HTTPS.format(org=parsed[0], repo=parsed[1])
+
+
+def credential_helper_argv(token_var: str = GITHUB_TOKEN) -> list[str]:
+    """`git config --global` argv installing an ENV-READING credential helper.
+
+    The token is never written to disk. The obvious alternative — cloning from
+    `https://user:$TOKEN@github.com/...` — persists the credential verbatim in
+    `.git/config` as `remote.origin.url`, where it survives the container, ends
+    up in `git remote -v`, and would be read back by our own project
+    derivation. A helper reads the variable at the moment git asks, and leaves
+    nothing behind.
+
+    `x-access-token` is the username GitHub expects for token auth; the
+    password field carries the token.
+    """
+    helper = (
+        f'!f() {{ echo username=x-access-token; echo "password=${token_var}"; }}; f'
+    )
+    return ["git", "config", "--global", "credential.helper", helper]
+
+
 # ------------------------------------------------------------ file contents
 
 
