@@ -515,3 +515,31 @@ def test_a_pod_of_ONE_still_names_its_session_for_the_agent():
 
     assert container_attach({"identity": "pod-box", "members": ["only"]}) == [
         ("Attach", "docker exec -it pod-box tmux attach -t only")]
+
+
+# ---- declaring a pod from the CLI ------------------------------------------
+
+def test_agent_specs_split_on_EQUALS_not_colon():
+    """Every real repo value here is an ssh URL (`git@github-org:org/repo.git`)
+    and `:` would cut it in half. A separator that breaks on the only values
+    anyone passes is not a separator."""
+    from mcp_hub.cli import _parse_pod_agents
+
+    assert _parse_pod_agents(["a=git@github-org:org/repo.git,capsule"]) == [
+        {"identity": "a", "repo": "git@github-org:org/repo.git",
+         "squads": "capsule"}]
+
+
+def test_an_agent_may_be_just_a_name():
+    from mcp_hub.cli import _parse_pod_agents
+
+    assert _parse_pod_agents(["a", "b"]) == [{"identity": "a"},
+                                             {"identity": "b"}]
+
+
+def test_empty_fields_are_omitted_not_sent_blank():
+    """An empty `squads` would be indistinguishable from not asking, and
+    register treats empty as NO OPINION."""
+    from mcp_hub.cli import _parse_pod_agents
+
+    assert _parse_pod_agents(["a=,"]) == [{"identity": "a"}]

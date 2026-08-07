@@ -1926,6 +1926,14 @@ def seats_command(args: argparse.Namespace, api: Any = None) -> int:
                     spec["memory_volume"] = args.memory_volume
                 if args.command:
                     spec["command"] = shlex.split(args.command)
+                # A POD: several agents in one container
+                # (docs/n-seats-per-container.md). Declared here rather than
+                # inferred, because how many agents a container holds is not
+                # something any other field implies.
+                if args.agent:
+                    spec["agents"] = _parse_pod_agents(args.agent)
+                    if args.pod_squad:
+                        spec["squad"] = args.pod_squad
             rec = api.create_seat(args.repo, machine, args.folder,
                                   args.want_identity, args.launch_args,
                                   args.klass, spec)
@@ -4459,6 +4467,27 @@ def _seat_onboarding() -> None:
     claude_json.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
+def _parse_pod_agents(specs: list[str]) -> list[dict[str, str]]:
+    """`--agent identity[=repo[,squads]]` → the manifest's agents list.
+
+    `=` rather than `:` as the separator, because every real repo value here
+    is an ssh URL (`git@github-org:org/repo.git`) and splitting those on `:`
+    would cut the URL in half — a separator that breaks on the ONLY values
+    anyone passes is not a separator.
+    """
+    out = []
+    for raw in specs:
+        ident, _sep, rest = raw.partition("=")
+        repo, _sep2, squads = rest.partition(",")
+        row = {"identity": ident.strip()}
+        if repo.strip():
+            row["repo"] = repo.strip()
+        if squads.strip():
+            row["squads"] = squads.strip()
+        out.append(row)
+    return out
+
+
 def seat_entry_command(args: argparse.Namespace) -> int:
     """PID 1 of mcp-hub-seat — validate, prepare, launch (docs/seat-image.md).
 
@@ -5067,6 +5096,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="add: pass this variable through from the EDGE MACHINE's own "
              "environment. The hub stores the NAME only, never the value — so "
              "an API key never enters the control plane (repeatable)",
+    )
+    seats.add_argument(
+        "--agent", action="append", default=None,
+        metavar="IDENTITY[=REPO[,SQUADS]]",
+        help="add: an agent INSIDE this container, making it a POD of several "
+             "(docs/n-seats-per-container.md). Repeatable. Omit entirely for "
+             "the ordinary one-container-one-agent shape",
+    )
+    seats.add_argument(
+        "--pod-squad", default="",
+        help="add: the squad a --agent pod belongs to; names the "
+             ".code-workspace it writes inside itself",
     )
     seats.add_argument(
         "--memory-volume", default="",
