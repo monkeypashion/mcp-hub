@@ -365,3 +365,72 @@ def test_a_STALE_container_status_reads_UNKNOWN_not_online(env, tmp_path):
                        capture_output=True, text=True, timeout=60, env=e)
     row = [a for a in json.loads(r.stdout)["agents"] if a["agent"] == "s1"][0]
     assert row["hub"] == "?", row
+
+
+# ---- a POD tab attaches to ITS agent's session, not `seat` ------------------
+#
+# A pod holds several agents and names each tmux session for its agent
+# (docs/n-seats-per-container.md). `-t seat` does not exist inside one, so a
+# tab built the old way would fail against a perfectly healthy container — and
+# an operator reading a failing attach concludes the pod is broken.
+
+def test_a_1to1_row_is_BYTE_IDENTICAL_to_what_the_fleet_already_has(env, tmp_path):
+    """Every container row on the fleet was written without --session, and
+    none of them may change shape."""
+    work = tmp_path / "w"
+    work.mkdir()
+    r = _run(env, "add-container", "solo-box", str(work), "solo-box")
+    assert r.returncode == 0, r.stderr
+    assert env[1].read_text(encoding="utf-8").strip().split("|")[3] == \
+        "@docker:solo-box"
+
+
+def test_a_1to1_tab_still_attaches_to_seat(env, tmp_path):
+    work = tmp_path / "w"
+    work.mkdir()
+    _run(env, "add-container", "solo-box", str(work), "solo-box")
+    r = _run(env, "launch-cmd", "solo-box")
+    assert r.stdout.strip() == "docker exec -it solo-box tmux attach -t seat"
+
+
+def test_a_pod_row_records_its_session(env, tmp_path):
+    work = tmp_path / "w"
+    work.mkdir()
+    r = _run(env, "add-container", "mcp-hub-duo-box", str(work),
+             "duo-pod-box", "--session", "mcp-hub-duo-box")
+    assert r.returncode == 0, r.stderr
+    assert env[1].read_text(encoding="utf-8").strip().split("|")[3] == \
+        "@docker:duo-pod-box:mcp-hub-duo-box"
+
+
+def test_a_pod_tab_attaches_to_ITS_agent(env, tmp_path):
+    """The whole point — two agents in one container need two different
+    attach lines."""
+    work = tmp_path / "w"
+    work.mkdir()
+    _run(env, "add-container", "mcp-hub-duo-box", str(work), "duo-pod-box",
+         "--session", "mcp-hub-duo-box")
+    r = _run(env, "launch-cmd", "mcp-hub-duo-box")
+    assert r.stdout.strip() == (
+        "docker exec -it duo-pod-box tmux attach -t mcp-hub-duo-box")
+
+
+def test_two_pod_agents_in_ONE_container_get_distinct_lines(env, tmp_path):
+    for name in ("mcp-hub-duo-box", "vps-hetzner-duo-box"):
+        d = tmp_path / name
+        d.mkdir()
+        _run(env, "add-container", name, str(d), "duo-pod-box",
+             "--session", name)
+    lines = {n: _run(env, "launch-cmd", n).stdout.strip()
+             for n in ("mcp-hub-duo-box", "vps-hetzner-duo-box")}
+    assert lines["mcp-hub-duo-box"].endswith("-t mcp-hub-duo-box")
+    assert lines["vps-hetzner-duo-box"].endswith("-t vps-hetzner-duo-box")
+    assert len(set(lines.values())) == 2
+
+
+def test_an_unknown_flag_is_still_refused(env, tmp_path):
+    work = tmp_path / "w"
+    work.mkdir()
+    r = _run(env, "add-container", "s", str(work), "c", "--nope", "x")
+    assert r.returncode != 0
+    assert "--session" in r.stderr, "the refusal must name the valid flags"

@@ -206,7 +206,7 @@ pane_alive() {
 capture_for() {
   local a="$1" c
   if c="$(container_of "$a")"; then
-    docker exec "$c" tmux capture-pane -p -t seat 2>/dev/null
+    docker exec "$c" tmux capture-pane -p -t "$(session_of "$a")" 2>/dev/null
   else
     tm capture-pane -p -t "$a" 2>/dev/null
   fi
@@ -760,9 +760,32 @@ PYEOF
 # roster is a 5-field pipe format with several readers — a sixth column would
 # silently shift every field after it for all of them.
 container_of() {
-  local args
+  local args x
   args="$(field "$1" 4)"
-  case "$args" in @docker:*) printf '%s\n' "${args#@docker:}" ;; *) return 1 ;; esac
+  case "$args" in
+    @docker:*) x="${args#@docker:}"; printf '%s\n' "${x%%:*}" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Which tmux SESSION inside that container. A 1:1 seat has the single session
+# `seat` — what the image has always created and what every existing roster row
+# means. A POD holds several agents and names each session for its agent
+# (docs/n-seats-per-container.md), so the marker carries it as
+# `@docker:<container>:<session>`.
+#
+# Absent means `seat`, so every row written before pods existed keeps working
+# without being rewritten. Docker forbids `:` in a container name and the pod
+# manifest refuses it in an identity, so the split is unambiguous.
+session_of() {
+  local args x
+  args="$(field "$1" 4)"
+  case "$args" in
+    @docker:*)
+      x="${args#@docker:}"
+      case "$x" in *:*) printf '%s\n' "${x#*:}" ;; *) printf 'seat\n' ;; esac ;;
+    *) return 1 ;;
+  esac
 }
 
 # The exact line an agent's pane runs. ONE builder, so `launch-cmd` prints
@@ -771,7 +794,7 @@ container_of() {
 launch_line() {
   local a="$1" override="${2:-}" container args
   if container="$(container_of "$a")"; then
-    printf 'docker exec -it %s tmux attach -t seat\n' "$container"
+    printf 'docker exec -it %s tmux attach -t %s\n' "$container" "$(session_of "$a")"
     return 0
   fi
   args="${override:-$(field "$a" 4)}"
@@ -3540,21 +3563,33 @@ print("\n".join(r[2] for r in rows))
             # workspace file list it and the extension give it a tab. The tab
             # attaches to the container instead of running claude here.
             shift; c_name="${1:-}"; c_dir="${2:-}"; c_cont="${3:-}"; ws_arg=""
+            c_sess=""
             shift 3 2>/dev/null || true
             while [ $# -gt 0 ]; do case "$1" in
               --to) ws_arg="${2:-}"; shift 2 ;;
-              -*)   echo "!! unknown add-container flag '$1' (valid: --to)" >&2; exit 1 ;;
+              # A POD holds several agents and names each tmux session for its
+              # agent, so its tab cannot attach to `seat` — that session does
+              # not exist there, and the tab would fail against a perfectly
+              # healthy container.
+              --session) c_sess="${2:-}"; shift 2 ;;
+              -*)   echo "!! unknown add-container flag '$1' (valid: --to, --session)" >&2; exit 1 ;;
               *)    shift ;;
             esac; done
             [ -n "$c_name" ] && [ -n "$c_dir" ] && [ -n "$c_cont" ] || {
-              echo "usage: $CMD add-container <name> <dir> <container> [--to <ws>]" >&2; exit 1; }
+              echo "usage: $CMD add-container <name> <dir> <container> [--to <ws>] [--session <tmux>]" >&2; exit 1; }
             c_dir="$(untilde "$c_dir")"
             [ -d "$c_dir" ] || { echo "!! no such folder: $c_dir" >&2; exit 1; }
             if field "$c_name" 1 >/dev/null 2>&1 && grep -q "^$c_name|" "$CONF" 2>/dev/null; then
               echo "!! '$c_name' is already enrolled" >&2; exit 1; fi
             # faculty: the EDGE owns a container's lifecycle. `up` starting one
             # would race the placement that is realizing it.
-            printf '%s|%s||@docker:%s|faculty\n' "$c_name" "$c_dir" "$c_cont" >> "$CONF"
+            # Session appended only when given, so a 1:1 row is byte-identical
+            # to every one already on the fleet and `session_of` defaults it.
+            if [ -n "$c_sess" ]; then
+              printf '%s|%s||@docker:%s:%s|faculty\n' "$c_name" "$c_dir" "$c_cont" "$c_sess" >> "$CONF"
+            else
+              printf '%s|%s||@docker:%s|faculty\n' "$c_name" "$c_dir" "$c_cont" >> "$CONF"
+            fi
             echo "enrolled $c_name -> container $c_cont (folder $c_dir)"
             [ -n "$ws_arg" ] && ws_add_folder "$(untilde "$ws_arg")" "$c_dir" "$(basename "$c_dir")"
             echo "  its tab attaches to the container; the EDGE starts and stops it." ;;
