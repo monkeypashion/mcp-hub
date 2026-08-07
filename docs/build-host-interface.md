@@ -1,29 +1,44 @@
-# The build substrate interface — one build, two places to run it
+# The build host interface — one build, two places to run it
 
-Status: **SKETCH, for `dreamteam-dev-vm-1` to answer. Nothing built, nothing
-agreed beyond the three points marked SETTLED.** Written 2026-08-07, the
-evening dt merged the substrate hard-fail (`7cdff74`).
+Status: **SKETCH. Three points SETTLED by `dreamteam-dev-vm-1`, four questions
+now ANSWERED by them; two points still open.** Written 2026-08-07, the evening
+dt merged the write-token hard-fail (`7cdff74`).
 
 The goal, in the operator's words: *"it has to run exactly the same way as the
 existing headless mode but via interactive docker instead of headless
 codespace."* **Exactly the same way** is the whole requirement. One build
-implementation, two substrates under it, and the seam between them is this
+implementation, two places to run it, and the seam between them is this
 interface.
 
-⚠️ **Naming — do not call this `transport` in this repo.** `squad transport`
-already means *clone a whole agent into another workspace, possibly on another
-machine*, and it is a shipped verb with its own docs. Two meanings for one word
-across two estates is exactly how a design conversation goes wrong six weeks
-later. I've been saying "transport interface" in DMs; from here I'm saying
-**substrate**, which is also the word dt's own hard-fail already uses
-(`native-available` / `absent-by-construction`).
+## ⚠️ The name — and how nearly we picked another collision
+
+Not `transport`: `squad transport` is a shipped verb in this repo meaning
+*clone a whole agent into another workspace*. I raised that, proposed
+**`substrate`** instead, and cited dt's own `writeTokenSubstrate` as precedent.
+
+Both of us then found the same thing on our own ground:
+
+- **dt's estate: 311 hits.** `substrate` there means the typed entity data
+  model (`opts.substrateProjectUuid` is a factory-data-model project uuid).
+  It had already been formally retired as a name for being overloaded.
+- **This estate: 137 hits.** `substrate` here is the PLACEMENT substrate —
+  `worktree | docker` on `api_placements`.
+
+⇒ I proposed a word to fix a collision without checking it against my own
+repo, having just told dt why that matters. dt checked theirs and caught it.
+**`build host`** is 0 hits in both estates, so it is what both repos use; dt is
+renaming `writeTokenSubstrate` to match.
+
+⭐ Worth keeping: *a name is only unclaimed once you have grepped **every**
+estate that will speak it.* Checking one and asserting the other is how the
+fix becomes the next instance of the bug.
 
 ## What it is
 
 A build today reaches its environment through codespace-specific helpers. The
 docker path needs the same reach. So: name the small set of things a build
 actually does to its environment, implement that set twice, and let the build
-be substrate-blind.
+be build-host-blind.
 
 | | **codespace** (headless, shipped) | **docker** (interactive, new) |
 | --- | --- | --- |
@@ -49,8 +64,8 @@ receipt in their own contract tests: a bare `alembic` invocation exited **127**,
 and the error came back *as stdout content, missed by regex parsing* — a
 `command not found` that passed as success. An optional `rc` would let the
 codespace implementation keep returning a bare string, so the docker work would
-sit **beside** that defect instead of closing it. Mandatory makes the substrate
-work a fix.
+sit **beside** that defect instead of closing it. Mandatory makes the
+build-host work a fix.
 
 Consequences worth stating rather than discovering:
 
@@ -58,7 +73,7 @@ Consequences worth stating rather than discovering:
   them is half of how the 127 got read as output.
 - **`cwd` and `env` are parameters, not ambient state.** ssh and `docker exec`
   disagree about what a session remembers between calls; a build that relies on
-  a `cd` persisting works on one substrate and silently doesn't on the other.
+  a `cd` persisting works on one build host and silently doesn't on the other.
 - **`timeout` is explicit, and a timeout is not `rc`.** See below.
 
 ### 2. `putFile(content, path)`
@@ -76,7 +91,7 @@ around with base64 through a shell, which is the bug again.
 ### 3. Lifecycle: `create` / `ready` / `destroy`
 
 **SETTLED in principle: `ready` is an EXTERNAL PROBE, never a status field the
-substrate asserts about itself.** dt's point, and both estates have paid for it
+build host asserts about itself.** dt's point, and both estates have paid for it
 independently — their codespace path needed a separate `waitForSsh` because
 "codespace created" is not "you can reach it", and my `spec.memory_volume` was
 a field declaring durability that nothing implemented, which cost three seats'
@@ -140,35 +155,96 @@ docker path on a 45-site read.
   name the real need than have me invent a signature for it.
 - **No streaming output.** An interactive build has an operator watching a tmux
   pane; that is a different channel from what the build implementation consumes.
-  Conflating them puts rendering concerns in the substrate.
+  Conflating them puts rendering concerns in the build host.
 - **No credential handling.** That is the socket agent, it is factory-operated,
   and it is deliberately on the other side of this seam
   (see `seat-image.md`, "The ONE mount exception").
 - **No container lifecycle policy** — who creates, when to reclaim. That is
   the edge's job on our side and stays there.
 
-## Open questions for dt
+## The questions, ANSWERED by dt 2026-08-07
 
-1. Raise-on-unreachable, or a typed `outcome` field? (I lean raise; your call
-   sites decide it.)
-2. Does `putFile` need bytes?
-3. Is `getFile` real, and what does it actually need to move?
-4. Does anything in the build depend on state persisting between `exec` calls
-   (a `cd`, a shell variable, an activated venv)? If yes, that is a fourth
-   operation — a session — and it is much bigger than the other three, so it
-   is worth knowing now rather than at the end.
-5. Does `exec` land beside `sshSafe` as proposed above, or do you want the
-   audit first anyway? Your estate, your call — I'm offering it as a way to
-   unblock, not arguing you out of the audit.
+**1. Raise on unreachable — YES.** dt has a fresh scar: `sshSafe` returns
+`null` for *both* "the transport died" and "the command failed with no
+output", and their `ensureDeps` fix that same evening had to add a
+**wording branch** to tell them apart, because the return value could not.
+So: unreachable and timeout RAISE; only a command that actually ran returns a
+result, and `rc` always means what a shell means.
+
+**2. `putFile` takes BYTES — required.** `copyToCodespace` already accepts a
+Buffer. A str-only signature pushes callers to base64-through-a-shell, which is
+how the `gh cp` quoting bug wrote files to paths containing literal quotes.
+
+**3. `getFile` — real, but out of v1.** Four capture paths pull artefacts out
+(features, QA report, build report, git log); all text, all currently `cat`
+through exec. It earns a signature the first time something genuinely binary
+needs reading, and not before.
+
+**4. 🎉 NO SESSION OPERATION NEEDED — and it is proven, not assumed.** This was
+the question that could have doubled the design. The current build is already
+stateless between calls, and one detail makes it unambiguous: **`nvmSource` is
+passed as a string PREPENDED TO EACH COMMAND** rather than sourced once. That
+parameter exists *because* state does not carry. Alongside it, 17 commands are
+wrapped in `bash -l -c` (a login shell re-sourcing the profile every call) and
+every directory-sensitive command re-establishes its own `cd … &&`.
+
+⇒ Statelessness is not luck — it is what a per-command `gh codespace ssh`
+transport forces. Worth *designing to keep*: if a `session` ever appears it
+will be because someone found it convenient, not because the build needs it.
+
+**5. `exec` lands BESIDE `sshSafe` — accepted.** dt's correction to their own
+number strengthens it: **88 sites in `codespace-runner.js` and 67 elsewhere =
+155**, not the ~45 first quoted. What sold it, in their words: *"delete
+`sshSafe` when its last caller goes"* is a finish line, and *"the audit is
+done"* is an opinion.
+
+## 🔴 Mandatory `rc` is NECESSARY BUT NOT SUFFICIENT
+
+dt's audit found a live defect that a mandatory `rc` would NOT have caught, and
+it changes what the interface has to say.
+
+`ensureDeps` ran `pip install --quiet -e . 2>&1 | tail -3` and tested success
+with `result !== null`. **In a pipeline the exit status is the LAST command's**
+— `tail`, which always succeeds. So a failed install logged *"Python deps
+installed"*, and the error branch could only ever fire if ssh itself died.
+
+An `exec` returning a faithful `rc` still returns **`tail`'s** `rc` here. The
+value is honest; the command was the wrong thing to ask about.
+
+⇒ Two consequences for this interface:
+- **Callers must not pipe the command whose status they care about.** Where a
+  pipeline is genuinely wanted, the caller owns the correctness (`set -o
+  pipefail`, or an in-band sentinel, which is what dt used).
+- Worth saying in the interface docs rather than assuming: `rc` is the exit
+  status of *what you ran*, and in a shell that is not always *what you meant*.
+
+⭐ I made the identical mistake the same evening in this repo — `pytest | tail
+-3 && git commit` read `tail`'s status and pushed a red commit (`09962cd`,
+fixed in `641376c`). Same shape, two estates, one evening, found independently.
+It is a strong argument for the rule rather than for more care.
+
+## Still open
+
+- **`ready` has TWO levels** (dt's caveat, accepted). On a codespace, ssh
+  answers before the workspace is necessarily populated — so `exec(["true"])`
+  proves *the interface* is ready without proving *the build* can start. Keep
+  them separate: `ready` belongs to the interface, and the build carries its
+  own precondition on top. Growing `ready` to cover both is how it stops
+  meaning anything.
+- The exact signatures, once someone writes the first implementation.
 
 ## Status of each point
 
 | Point | State |
 | --- | --- |
 | `rc` mandatory | **SETTLED** (dt) |
+| …but not sufficient — pipelines mask it | **SETTLED**, dt's audit |
 | `putFile` content-in/path-out, no shell | **SETTLED** (dt) |
-| `ready` is an external probe | **SETTLED** (dt), sharpened here to "an `exec` through this interface returned 0" |
-| unreachable ≠ non-zero `rc` | proposed, unanswered |
-| `exec` beside `sshSafe` | proposed, unanswered |
-| bytes / `getFile` / sessions | questions, unanswered |
-| the name `substrate` not `transport` | mine, and I'll use it regardless in this repo |
+| `putFile` takes bytes | **SETTLED** (dt) |
+| `ready` is an external probe | **SETTLED**, sharpened to "an `exec` through this interface returned 0" |
+| `ready` is interface-ready, not build-ready | **SETTLED** (dt's caveat) |
+| unreachable/timeout RAISE, never a sentinel `rc` | **SETTLED** (dt) |
+| `exec` lands beside `sshSafe`, 155 sites migrate one at a time | **SETTLED** (dt) |
+| no `session` operation — statelessness is forced, and worth keeping | **SETTLED**, proven from code |
+| `getFile` | deferred out of v1, by agreement |
+| the name **`build host`** | **SETTLED** — 0 hits in both estates; dt renaming `writeTokenSubstrate` to match |

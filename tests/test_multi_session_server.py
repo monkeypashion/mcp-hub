@@ -224,26 +224,35 @@ async def test_broadcast_cursor_not_advanced_on_extra_only(server):
     )
 
 
-async def test_broadcast_cursor_advances_when_primary_delivers(server):
-    """Positive control: primary got the broadcast → cursor advances."""
+async def test_broadcast_records_pending_when_primary_delivers(server):
+    """Positive control: primary got the broadcast → the push is RECORDED.
+
+    It used to advance the cursor outright. It no longer does — push success
+    is a statement about a socket, not about an agent, and treating the two as
+    one silently ate six broadcasts on 2026-07-27 (tests/test_broadcast_
+    receipt.py). The property this test exists for is untouched: a delivered
+    primary is distinguished from an extra-only or failed delivery. Only the
+    column carrying that fact moved, from a claim about what was SEEN to one
+    about what was SENT.
+    """
     registry = server._hub_registry  # type: ignore[attr-defined]
     await _call_tool(server, "register", {"name": "alice", "project": "x"})
     await _call_tool(server, "register", {"name": "pm", "project": "y"})
     registry.bind("pm", _FakeSess())  # live primary
 
     conn = _server_db(server)
-    before = conn.execute(
-        "SELECT last_broadcast_seen_id FROM agents WHERE name = 'pm'"
-    ).fetchone()["last_broadcast_seen_id"]
+    q = ("SELECT broadcast_pending_id AS pending, last_broadcast_seen_id AS seen "
+         "FROM agents WHERE name = 'pm'")
+    before = conn.execute(q).fetchone()
 
     await _call_tool(
         server, "broadcast",
         {"scope": "fleet", "from_agent": "alice", "message": "fleet-wide"},
     )
-    after = conn.execute(
-        "SELECT last_broadcast_seen_id FROM agents WHERE name = 'pm'"
-    ).fetchone()["last_broadcast_seen_id"]
-    assert after > before
+    after = conn.execute(q).fetchone()
+    assert after["pending"] > before["pending"], "the delivered push was not recorded"
+    assert after["seen"] == before["seen"], \
+        "a successful push marked the broadcast SEEN — that is the defect"
 
 
 # ---------------------------------------------------------------------------
