@@ -36,6 +36,7 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from typing import Any
 
 # Fallback is the Tailscale-only prod endpoint — the public FQDN was
@@ -4164,55 +4165,27 @@ def heartbeat_daemon_command(args: argparse.Namespace) -> int:
     return 0
 
 
-def seat_entry_command(args: argparse.Namespace) -> int:
-    """PID 1 of mcp-hub-seat — validate, prepare, launch (docs/seat-image.md).
+# ---- seat-entry, shared by both shapes -------------------------------------
+#
+# 1:1 and N:1 differ only in HOW MANY inhabitants a container has, so they run
+# the same three steps per agent — prepare, launch, supervise — rather than two
+# implementations free to drift. Contract: docs/n-seats-per-container.md.
 
-    Refusals are LOUD and coded: 42 credential (the factory's auth-death
-    code — never misread as a build failure), 43 any other contract
-    violation. Everything before launch is idempotent so a container
-    restart re-runs it safely.
+
+def _seat_prepare(contract: Any, workdir: pathlib.Path) -> tuple[Any, int | None]:
+    """Clone if needed, re-derive the project, write the per-agent files.
+
+    Returns (contract, exit_code). The contract comes BACK because the project
+    is re-derived from the clone's origin, and it is frozen.
     """
+    from mcp_hub.edge import seed_first_launch
     from mcp_hub.seat import (
-        EXIT_AUTH,
         EXIT_CONTRACT,
-        SeatContractError,
-        hooks_settings_content,
-        launch_argv,
         marker_content,
         mcp_json_content,
-        parse_seat_contract,
-        validate_seat_credentials,
     )
 
-    verdict = validate_seat_credentials(os.environ)
-    if not verdict.ok:
-        print(f"seat-entry: REFUSED (auth): {verdict.error}", file=sys.stderr, flush=True)
-        return EXIT_AUTH
-
-    try:
-        contract = parse_seat_contract(os.environ)
-    except SeatContractError as e:
-        print(f"seat-entry: REFUSED (contract): {e}", file=sys.stderr, flush=True)
-        return EXIT_CONTRACT
-
-    if contract.mode == "headless":
-        # Reserved, deliberately unshipped: the structure exists so the
-        # factory merge is a flag not a fork, but shipping it untested
-        # would let a placement claim a mode nothing has ever run.
-        print(
-            "seat-entry: REFUSED (contract): SEAT_MODE=headless is "
-            "reserved but not yet shipped — run interactive, or build the "
-            "headless leg first (docs/seat-image.md, Modes).",
-            file=sys.stderr,
-            flush=True,
-        )
-        return EXIT_CONTRACT
-
-    workdir = pathlib.Path(
-        args.workdir or (pathlib.Path.home() / "work")
-    ).expanduser()
     workdir.mkdir(parents=True, exist_ok=True)
-
     if contract.repo and not any(workdir.iterdir()):
         clone = subprocess.run(
             ["git", "clone", contract.repo, str(workdir)],
@@ -4226,15 +4199,17 @@ def seat_entry_command(args: argparse.Namespace) -> int:
                 file=sys.stderr,
                 flush=True,
             )
-            return EXIT_CONTRACT
+            return contract, EXIT_CONTRACT
 
-    # Re-parse with the (possibly just-cloned) repo's origin so the
-    # project derives exactly the way the cli derives it everywhere else.
-    contract = parse_seat_contract(
-        os.environ, origin_url=_git_remote_url(str(workdir))
-    )
+    # Re-derive the project from the (possibly just-cloned) origin, exactly
+    # the way the cli derives it everywhere else.
+    origin = _git_remote_url(str(workdir))
+    if origin and not _explicit_project(contract):
+        parsed = _parse_org_repo(origin)
+        if parsed:
+            contract = replace(contract, project=f"{parsed[0]}/{parsed[1]}")
 
-    # Identity marker — ASSIGNED identity wins because the repo is NOT
+    # Identity marker — the ASSIGNED identity wins because the repo is NOT
     # opted into ~/.mcp-hub/config.json (derivation never applies).
     marker = workdir / AGENT_MARKER_PATH
     marker.parent.mkdir(parents=True, exist_ok=True)
@@ -4243,9 +4218,199 @@ def seat_entry_command(args: argparse.Namespace) -> int:
     )
 
     # .mcp.json generated from MCP_HUB_URL — never baked into the image.
+    # PROJECT scope, never user scope: in a pod the HOME is shared, so an
+    # `?agent=` stamp in a user-scope file would push one agent's DMs into
+    # another's session — the 2026-07-27 misroute, which needed exactly a
+    # shared file to happen.
     (workdir / ".mcp.json").write_text(
         json.dumps(mcp_json_content(contract), indent=2), encoding="utf-8"
     )
+
+    # Folder trust — the placement is the operator's explicit trust act.
+    seed_first_launch(str(workdir))
+    return contract, None
+
+
+def _seat_launch(contract: Any, workdir: pathlib.Path, session: str) -> int | None:
+    """Start claude, answer the one dialog it may show, send the first turn."""
+    from mcp_hub.seat import (
+        EXIT_CONTRACT,
+        first_turn_is_safe,
+        first_turn_prompt,
+        launch_argv,
+        pane_is_settled,
+        startup_dance_action,
+    )
+
+    launched = subprocess.run(
+        launch_argv(contract, str(workdir), session=session),
+        capture_output=True, text=True,
+    )
+    if launched.returncode != 0:
+        print(
+            f"seat-entry: launch failed ({session}): {launched.stderr.strip()}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 1
+
+    # Launch dance — claude stops on the development-channels dialog and
+    # WAITS (measured on the first live seat: container healthy, claude
+    # parked, never an agent). squad answers this on the host; a container
+    # has to answer it for itself.
+    pane = ""
+    for _ in range(25):
+        time.sleep(1)
+        pane = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-t", session],
+            capture_output=True,
+            text=True,
+        ).stdout
+        key = startup_dance_action(pane)
+        if key:
+            subprocess.run(["tmux", "send-keys", "-t", session, key])
+            continue
+        if pane_is_settled(pane):
+            break
+
+    # Never type into a dialog. The bypass-mode acceptance screen defaults
+    # to "No, exit", so the first-turn Enter confirmed the seat's own death
+    # — cleanly, exit 0, with nothing anywhere that looked wrong. A future
+    # unknown dialog gets the same treatment: refuse LOUDLY with a code
+    # `docker ps` can show, and print the pane so the screen that stopped
+    # us is in the log rather than in a tmux buffer that dies with it.
+    if not first_turn_is_safe(pane):
+        print(
+            f"seat-entry: REFUSED (contract): claude ({session}) is showing a "
+            "dialog this seat does not know how to answer, and a blind "
+            "keypress would confirm whatever its default row is. Pane "
+            f"follows:\n{pane}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return EXIT_CONTRACT
+    print(f"seat-entry: claude is up ({session})", flush=True)
+
+    # First turn. The register instruction rides in SessionStart's
+    # additionalContext, which only a RUNNING TURN consumes — and a
+    # container has no operator to type one. Without this the seat idles
+    # forever: hooks fired, daemon alive, ~/.claude/projects/ empty,
+    # never an agent (measured 2026-08-04).
+    #
+    # -l (literal) so nothing in the text is read as a key name; Enter is
+    # a SEPARATE send-keys because -l would type the word "Enter".
+    subprocess.run(
+        ["tmux", "send-keys", "-t", session, "-l", first_turn_prompt(contract)]
+    )
+    time.sleep(1)  # let the TUI ingest the paste before submitting
+    subprocess.run(["tmux", "send-keys", "-t", session, "Enter"])
+    print(
+        f"seat-entry: first turn sent ({session}) — the seat registers itself",
+        flush=True,
+    )
+    return None
+
+
+def _seat_supervise(seats: list[tuple[str, Any]]) -> int:
+    """Outlive the sessions, and nudge any agent that falls off the hub.
+
+    PID 1 must outlive the detached tmux sessions or docker reaps the
+    container while claude runs. It exits when the LAST session ends, so a
+    1:1 container still stops with its single seat.
+
+    It also SUPERVISES: every hub deploy drops all bindings, and a
+    human-driven agent re-registers at its next turn boundary because someone
+    types. An idle container has no turn boundary, so it stays silently
+    offline forever (measured: up 5 hours, healthy, absent from the hub).
+    PID 1 is the container's substitute for an operator noticing.
+
+    It supervises REGISTRATION, never session EXISTENCE (decision
+    2026-08-07): a session that has gone stays gone. Recreating one would
+    resurrect an agent the operator deliberately killed and leave them
+    fighting the container's own init for the only per-agent control there
+    is.
+    """
+    from mcp_hub.seat import (
+        first_turn_is_safe,
+        first_turn_prompt,
+        needs_reregister,
+    )
+
+    # The FIRST TURN counts as the first nudge: it is a registration attempt,
+    # so both the cooldown and the evidence gate run from it. Measured
+    # otherwise — the supervisor fired 6s later on a status cache written
+    # before the seat had registered, typing into a pane mid-registration.
+    last_nudge = {session: time.time() for session, _ in seats}
+    while True:
+        alive = [
+            (session, contract) for session, contract in seats
+            if subprocess.run(
+                ["tmux", "has-session", "-t", session], capture_output=True
+            ).returncode == 0
+        ]
+        if not alive:
+            return 0
+        time.sleep(5)
+
+        for session, contract in alive:
+            # Rate-limited PER AGENT: one nudge per SUPERVISOR_COOLDOWN at
+            # most. A re-register takes a turn to happen and a further daemon
+            # cycle to show up in the status cache, so a faster loop would
+            # type into the pane repeatedly while the first nudge was still
+            # working.
+            if time.time() - last_nudge[session] < SUPERVISOR_COOLDOWN:
+                continue
+            status_path = (
+                pathlib.Path.home() / ".mcp-hub"
+                / f"status-{contract.identity}.json"
+            )
+            try:
+                status = json.loads(status_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                status = None
+            if not needs_reregister(status, time.time(),
+                                    after=last_nudge[session]):
+                continue
+            pane = subprocess.run(
+                ["tmux", "capture-pane", "-p", "-t", session],
+                capture_output=True, text=True,
+            ).stdout
+            # Same rule as the first turn: never type into a dialog, and never
+            # interrupt a turn in progress — a nudge mid-work would be worse
+            # than the offline state it is fixing.
+            if not first_turn_is_safe(pane):
+                continue
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session, "-l",
+                 first_turn_prompt(contract)]
+            )
+            time.sleep(1)
+            subprocess.run(["tmux", "send-keys", "-t", session, "Enter"])
+            last_nudge[session] = time.time()
+            print(
+                f"seat-entry: {contract.identity} was offline on the hub — "
+                "re-register nudge sent",
+                flush=True,
+            )
+
+
+def _explicit_project(contract: Any) -> bool:
+    """Whether the project was ASSIGNED rather than defaulted to the identity.
+
+    An explicit project outranks the origin, so re-deriving must not overwrite
+    one. The identity default is what a derivation is allowed to replace.
+    """
+    return bool(contract.project) and contract.project != contract.identity
+
+
+def _seat_home_setup() -> None:
+    """The per-CONTAINER steps, which settle once however many agents share it.
+
+    Theme, onboarding and the bypass acceptance are HOME-level, so a pod pays
+    them once rather than N times — the three worst of the six gates between
+    a running container and an agent on the hub are not multiplied by N.
+    """
+    from mcp_hub.seat import hooks_settings_content
 
     # Hook settings: write only if absent. A memory_volume mounted at
     # ~/.claude may carry a previous seat's (identical) settings — or an
@@ -4263,15 +4428,16 @@ def seat_entry_command(args: argparse.Namespace) -> int:
             json.dumps(hooks_settings_content(), indent=2), encoding="utf-8"
         )
 
-    # Folder trust — the placement is the operator's explicit trust act.
-    from mcp_hub.edge import seed_first_launch
 
-    seed_first_launch(str(workdir))
+def _seat_onboarding() -> None:
+    """Tell claude its first-run wizard is done.
 
-    # Onboarding: a container HOME is fresh, so claude would open its
-    # first-run wizard and BLOCK — healthy to `docker ps`, never an agent.
-    # Merged into the same file seed_first_launch just wrote (read-modify-
-    # write, never a fresh dict) so neither seed erases the other.
+    A container's HOME is fresh, so without these claude opens the onboarding
+    wizard and BLOCKS — a seat that looks perfectly healthy to `docker ps` and
+    never becomes an agent. Merged into the same file seed_first_launch wrote
+    (read-modify-write, never a fresh dict) so neither seed erases the other,
+    which is why every seed runs before this.
+    """
     from mcp_hub.seat import onboarding_state
 
     claude_json = pathlib.Path.home() / ".claude.json"
@@ -4292,147 +4458,123 @@ def seat_entry_command(args: argparse.Namespace) -> int:
     claude_json.parent.mkdir(parents=True, exist_ok=True)
     claude_json.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
+
+def seat_entry_command(args: argparse.Namespace) -> int:
+    """PID 1 of mcp-hub-seat — validate, prepare, launch (docs/seat-image.md).
+
+    Two shapes, one implementation: `SEAT_MANIFEST` present means a POD of N
+    agents sharing this container's HOME and lifecycle
+    (docs/n-seats-per-container.md); absent means today's 1:1 contract, which
+    is a pod of one and runs the identical code.
+
+    Refusals are LOUD and coded: 42 credential (the factory's auth-death
+    code — never misread as a build failure), 43 any other contract
+    violation. Everything before launch is idempotent so a container
+    restart re-runs it safely.
+    """
+    from mcp_hub.seat import (
+        EXIT_AUTH,
+        EXIT_CONTRACT,
+        SeatContractError,
+        agent_contract,
+        parse_pod_manifest,
+        parse_seat_contract,
+        pod_workspace,
+        validate_seat_credentials,
+    )
+
+    # ONE credential for the container, however many agents share it.
+    # Measured 2026-08-06: three seats concurrently on one OAuth token, all
+    # ⚡ — N-in-one is that same account concurrency, not a new question.
+    verdict = validate_seat_credentials(os.environ)
+    if not verdict.ok:
+        print(f"seat-entry: REFUSED (auth): {verdict.error}", file=sys.stderr, flush=True)
+        return EXIT_AUTH
+
+    try:
+        pod = parse_pod_manifest(os.environ)
+        if pod is None:
+            contract = parse_seat_contract(os.environ)
+            if contract.mode == "headless":
+                # Reserved, deliberately unshipped: the structure exists so
+                # the factory merge is a flag not a fork, but shipping it
+                # untested would let a placement claim a mode nothing has
+                # ever run.
+                print(
+                    "seat-entry: REFUSED (contract): SEAT_MODE=headless is "
+                    "reserved but not yet shipped — run interactive, or build "
+                    "the headless leg first (docs/seat-image.md, Modes).",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return EXIT_CONTRACT
+            # A single seat is a pod of one; `seat` stays its session name so
+            # the attach affordance and the launch dance are unchanged.
+            plan = [(contract, pathlib.Path(
+                args.workdir or (pathlib.Path.home() / "work")
+            ).expanduser(), "seat")]
+        else:
+            root = pathlib.Path(
+                args.workdir or (pathlib.Path.home() / "work")
+            ).expanduser()
+            plan = [
+                (agent_contract(pod, a), root / a.identity, a.identity)
+                for a in pod.agents
+            ]
+    except SeatContractError as e:
+        print(f"seat-entry: REFUSED (contract): {e}", file=sys.stderr, flush=True)
+        return EXIT_CONTRACT
+
+    _seat_home_setup()
+
+    prepared: list[tuple[str, Any, pathlib.Path]] = []
+    for contract, workdir, session in plan:
+        contract, rc = _seat_prepare(contract, workdir)
+        if rc is not None:
+            return rc
+        prepared.append((session, contract, workdir))
+
+    # After every seed, never before — see _seat_onboarding.
+    _seat_onboarding()
+
     lane = {"oauth": "subscription OAuth", "api-key": "API key", "both": (
         "BOTH set — Claude Code's own hierarchy decides (unmeasured; "
         "see docs/seat-image.md)"
     )}[verdict.lane]
+    who = (f"pod of {len(prepared)}: "
+           + ", ".join(c.identity for _s, c, _w in prepared)) if pod else \
+        f"{prepared[0][1].identity} (project {prepared[0][1].project})"
     print(
-        f"seat-entry: {contract.identity} (project {contract.project}) "
-        f"mode={contract.mode} credential={lane}",
+        f"seat-entry: {who} mode={prepared[0][1].mode} credential={lane}",
         flush=True,
     )
+
+    if pod is not None:
+        # The file that makes ONE Dev Containers window a squad view. Written
+        # here, in the container, listing CONTAINER paths — nothing on the
+        # host can see these folders.
+        ws_name = f"{pod.squad or 'pod'}.code-workspace"
+        (pathlib.Path(args.workdir or (pathlib.Path.home() / "work"))
+         .expanduser() / ws_name).write_text(
+            json.dumps(
+                pod_workspace(pod, {c.identity: str(w)
+                                    for _s, c, w in prepared}),
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(f"seat-entry: wrote {ws_name}", flush=True)
 
     if args.prepare_only:
         print("seat-entry: --prepare-only — not launching claude", flush=True)
         return 0
 
-    argv = launch_argv(contract, str(workdir))
-    launched = subprocess.run(argv, capture_output=True, text=True)
-    if launched.returncode != 0:
-        print(
-            f"seat-entry: launch failed: {launched.stderr.strip()}",
-            file=sys.stderr,
-            flush=True,
-        )
-        return 1
+    for session, contract, workdir in prepared:
+        rc = _seat_launch(contract, workdir, session)
+        if rc is not None:
+            return rc
 
-    # Launch dance — claude stops on the development-channels dialog and
-    # WAITS (measured on the first live seat: container healthy, claude
-    # parked, never an agent). squad answers this on the host; a container
-    # has to answer it for itself.
-    from mcp_hub.seat import (
-        first_turn_is_safe,
-        pane_is_settled,
-        startup_dance_action,
-    )
-
-    pane = ""
-    for _ in range(25):
-        time.sleep(1)
-        pane = subprocess.run(
-            ["tmux", "capture-pane", "-p", "-t", "seat"],
-            capture_output=True,
-            text=True,
-        ).stdout
-        key = startup_dance_action(pane)
-        if key:
-            subprocess.run(["tmux", "send-keys", "-t", "seat", key])
-            continue
-        if pane_is_settled(pane):
-            break
-
-    # Never type into a dialog. The bypass-mode acceptance screen defaults
-    # to "No, exit", so the first-turn Enter confirmed the seat's own death
-    # — cleanly, exit 0, with nothing anywhere that looked wrong. A future
-    # unknown dialog gets the same treatment: refuse LOUDLY with a code
-    # `docker ps` can show, and print the pane so the screen that stopped
-    # us is in the log rather than in a tmux buffer that dies with it.
-    if not first_turn_is_safe(pane):
-        print(
-            "seat-entry: REFUSED (contract): claude is showing a dialog "
-            "this seat does not know how to answer, and a blind keypress "
-            "would confirm whatever its default row is. Pane follows:\n"
-            f"{pane}",
-            file=sys.stderr,
-            flush=True,
-        )
-        return EXIT_CONTRACT
-    print("seat-entry: claude is up", flush=True)
-
-    # First turn. The register instruction rides in SessionStart's
-    # additionalContext, which only a RUNNING TURN consumes — and a
-    # container has no operator to type one. Without this the seat idles
-    # forever: hooks fired, daemon alive, ~/.claude/projects/ empty,
-    # never an agent (measured 2026-08-04).
-    #
-    # -l (literal) so nothing in the text is read as a key name; Enter is
-    # a SEPARATE send-keys because -l would type the word "Enter".
-    from mcp_hub.seat import first_turn_prompt
-
-    subprocess.run(
-        ["tmux", "send-keys", "-t", "seat", "-l", first_turn_prompt(contract)]
-    )
-    time.sleep(1)  # let the TUI ingest the paste before submitting
-    subprocess.run(["tmux", "send-keys", "-t", "seat", "Enter"])
-    print("seat-entry: first turn sent — the seat registers itself", flush=True)
-    # PID 1 must outlive the detached tmux session or docker reaps the
-    # container while claude runs. Container stops when the session ends.
-    #
-    # It also SUPERVISES: every hub deploy drops all bindings, and a
-    # human-driven agent re-registers at its next turn boundary because
-    # someone types. An idle container has no turn boundary, so it stays
-    # silently offline forever (measured: up 5 hours, healthy, absent from
-    # the hub). PID 1 is the container's substitute for an operator
-    # noticing.
-    from mcp_hub.seat import needs_reregister
-
-    status_path = (
-        pathlib.Path.home() / ".mcp-hub" / f"status-{contract.identity}.json"
-    )
-    # The FIRST TURN counts as the first nudge: it is a registration attempt,
-    # so both the cooldown and the evidence gate run from it. Measured
-    # otherwise — the supervisor fired 6s later on a status cache written
-    # before the seat had registered, typing into a pane mid-registration.
-    last_nudge = time.time()
-    while True:
-        alive = subprocess.run(
-            ["tmux", "has-session", "-t", "seat"], capture_output=True
-        )
-        if alive.returncode != 0:
-            return 0
-        time.sleep(5)
-
-        # Rate-limited: one nudge per SUPERVISOR_COOLDOWN at most. A
-        # re-register takes a turn to happen and a further daemon cycle to
-        # show up in the status cache, so a faster loop would type into the
-        # pane repeatedly while the first nudge was still working.
-        if time.time() - last_nudge < SUPERVISOR_COOLDOWN:
-            continue
-        try:
-            status = json.loads(status_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            status = None
-        if not needs_reregister(status, time.time(), after=last_nudge):
-            continue
-        pane = subprocess.run(
-            ["tmux", "capture-pane", "-p", "-t", "seat"],
-            capture_output=True, text=True,
-        ).stdout
-        # Same rule as the first turn: never type into a dialog, and never
-        # interrupt a turn in progress — a nudge mid-work would be worse
-        # than the offline state it is fixing.
-        if not first_turn_is_safe(pane):
-            continue
-        subprocess.run(
-            ["tmux", "send-keys", "-t", "seat", "-l", first_turn_prompt(contract)]
-        )
-        time.sleep(1)
-        subprocess.run(["tmux", "send-keys", "-t", "seat", "Enter"])
-        last_nudge = time.time()
-        print(
-            "seat-entry: seat was offline on the hub — re-register nudge sent",
-            flush=True,
-        )
+    return _seat_supervise([(s, c) for s, c, _w in prepared])
 
 
 def build_parser() -> argparse.ArgumentParser:
