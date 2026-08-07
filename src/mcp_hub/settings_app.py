@@ -1543,10 +1543,15 @@ class SettingsApp(App):
             "Agents", str(n), "value-on" if n else "value-warn",
             "" if n else "the hub knows this container but no agent in it has "
                          "registered"))
-        out.append(self._fact(
-            "Attach", f"docker exec -it {c['identity']} tmux attach -t seat",
-            source="what the workspace tab runs — Remote-SSH to the box "
-                   "above, then open its workspace"))
+        # ONE line per inhabitant; the rule lives in fleet_tree so it can be
+        # tested without a terminal.
+        from mcp_hub.fleet_tree import container_attach
+
+        for label, command in container_attach(c):
+            out.append(self._fact(
+                label, command,
+                source="what the workspace tab runs — Remote-SSH to the box "
+                       "above, then open its workspace"))
         return out
 
     def _workspace_widgets(self, w: dict[str, Any]) -> list[Any]:

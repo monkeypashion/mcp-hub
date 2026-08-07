@@ -96,6 +96,62 @@ def container_image(seat: dict[str, Any]) -> str:
     return str(spec.get("image") or "")
 
 
+def container_members(seat: dict[str, Any]) -> list[str]:
+    """Who lives in this container — the identities that hang under its node.
+
+    A POD (`spec.agents`) holds several; a 1:1 seat holds exactly itself. Both
+    go through this so the single-seat case is the N=1 case of ONE rule rather
+    than a branch that can drift from the other.
+
+    Order is the manifest's, which is the order the operator declared the
+    squad in and the order the pod's own workspace file lists.
+    """
+    ident = str(seat.get("identity") or "")
+    spec = seat.get("spec")
+    rows = spec.get("agents") if isinstance(spec, dict) else None
+    if isinstance(rows, list) and rows:
+        out = [str((r or {}).get("identity") or "") for r in rows
+               if isinstance(r, dict)]
+        return [x for x in out if x]
+    return [ident] if ident else []
+
+
+def container_session(seat: dict[str, Any], agent: str) -> str:
+    """The tmux session `docker exec … attach -t` must name.
+
+    A pod names its sessions for the agents; a 1:1 container has the single
+    session `seat`, which is what the image has always created and what the
+    launch dance answers into. Getting this wrong produces an attach command
+    that fails against a perfectly healthy container.
+    """
+    spec = seat.get("spec")
+    rows = spec.get("agents") if isinstance(spec, dict) else None
+    return agent if isinstance(rows, list) and rows else "seat"
+
+
+def container_attach(node: dict[str, Any]) -> list[tuple[str, str]]:
+    """[(label, command)] — how the operator gets INTO this container.
+
+    One line per inhabitant. A pod's sessions are named for its agents, so a
+    single `-t seat` line would be a command that FAILS against a perfectly
+    healthy pod — and an operator reading a failing attach concludes the pod
+    is broken rather than the label.
+
+    Pure so it can be tested without a terminal: the rule is the interesting
+    part, and it was previously computed inside widget construction where
+    nothing could reach it.
+    """
+    ident = str(node.get("identity") or "")
+    members = list(node.get("members") or ([ident] if ident else []))
+    pod = members != [ident]
+    out = []
+    for member in members:
+        session = member if pod else "seat"
+        label = "Attach" if len(members) == 1 else f"Attach {member}"
+        out.append((label, f"docker exec -it {ident} tmux attach -t {session}"))
+    return out
+
+
 def seat_folder(seat: dict[str, Any]) -> str:
     """The HOST path a container seat's work lives at, or "".
 
@@ -276,11 +332,17 @@ def build_tree(
         if not ident or not image:
             continue          # a worktree seat is not a container
         m = str(s.get("machine") or "") or machine_of(ident, machines)
+        members = container_members(s)
         node = {
             "kind": "container",
             "key": f"c:{m}/{ident}",
             "identity": ident,
-            "agent": ident,   # the tree's agent-shaped lookups key on this
+            # The tree's agent-shaped lookups key on this. A POD is NOT an
+            # agent — no marker, no registration, nothing on the hub by that
+            # name — so it carries no agent name and anything asking gets an
+            # honest blank rather than a container's name masquerading as one.
+            "agent": "" if len(members) > 1 or members != [ident] else ident,
+            "members": members,
             "machine": m,
             "local": m == this_machine,
             "image": image,
@@ -290,7 +352,14 @@ def build_tree(
             "agents": [],
         }
         containers.setdefault(m, []).append(node)
-        by_identity[ident] = node
+        # EVERY inhabitant points at this node, so a pod's agents hang under
+        # their container exactly as a 1:1 seat's single agent does. Keyed on
+        # the members rather than on the container name: for a pod those are
+        # different strings, and keying on the container would leave its
+        # agents homeless — matched by repo basename, which is the
+        # attribution defect the container nodes exist to end.
+        for member in members:
+            by_identity[member] = node
 
     # -- local agents: the roster is authoritative for this box ------------
     placed_names: set[str] = set()

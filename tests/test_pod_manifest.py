@@ -411,3 +411,107 @@ def test_a_pod_with_no_memory_volume_still_says_so_rather_than_looping_agents():
         {"op": "harvest", "seat": "p"},
         {"spec": dict(POD_SPEC["spec"], memory_volume="")})
     assert out["skipped"] is True and r.calls == []
+
+
+# ---- phase 4: the board shows a pod ----------------------------------------
+
+def test_a_1to1_container_holds_exactly_itself():
+    """The single-seat case is the N=1 case of one rule, not a branch."""
+    from mcp_hub.fleet_tree import container_members, container_session
+
+    s = {"identity": "solo-box", "spec": {"image": "i"}}
+    assert container_members(s) == ["solo-box"]
+    assert container_session(s, "solo-box") == "seat"
+
+
+def test_a_pod_holds_its_manifest_in_order():
+    from mcp_hub.fleet_tree import container_members, container_session
+
+    s = {"identity": "capsule-pod-box", "spec": {
+        "image": "i", "agents": [{"identity": "b"}, {"identity": "a"}]}}
+    assert container_members(s) == ["b", "a"]
+    assert container_session(s, "a") == "a"
+
+
+def test_pod_inhabitants_hang_under_their_container():
+    """Keyed on the MEMBERS, not the container name — for a pod those differ,
+    and keying on the container would leave its agents homeless, matched by
+    repo basename, which is the defect container nodes exist to end."""
+    from mcp_hub.fleet_tree import build_tree, walk_agents
+
+    t = build_tree(
+        roster=[], board={"agents": {}},
+        workspaces={"rows": [], "machines": ["box"], "this_machine": "box"},
+        fleet={"ts": 1000.0, "agents": [{"name": "a"}, {"name": "b"}]},
+        this_machine="box",
+        seats=[{"identity": "capsule-pod-box", "machine": "box", "spec": {
+            "image": "i", "agents": [{"identity": "a"}, {"identity": "b"}]}}],
+        now=1000.0,
+    )
+    box = t["machines"][0]
+    assert [c["identity"] for c in box["containers"]] == ["capsule-pod-box"]
+    assert [a["agent"] for a in box["containers"][0]["agents"]] == ["a", "b"]
+    assert not box["loose"], "an inhabitant must not fall out to the machine"
+    assert len(list(walk_agents(t))) == 2
+
+
+def test_a_pod_node_carries_no_agent_NAME():
+    """A pod is not an agent — no marker, no registration, nothing on the hub
+    by that name. A container's name masquerading as an agent's is how a row
+    comes to claim a presence nobody has."""
+    from mcp_hub.fleet_tree import build_tree
+
+    t = build_tree(
+        roster=[], board={"agents": {}},
+        workspaces={"rows": [], "machines": ["box"], "this_machine": "box"},
+        fleet={"ts": 1000.0, "agents": []}, this_machine="box",
+        seats=[{"identity": "capsule-pod-box", "machine": "box", "spec": {
+            "image": "i", "agents": [{"identity": "a"}]}}],
+        now=1000.0,
+    )
+    assert t["machines"][0]["containers"][0]["agent"] == ""
+
+
+def test_a_1to1_container_keeps_its_agent_name():
+    from mcp_hub.fleet_tree import build_tree
+
+    t = build_tree(
+        roster=[], board={"agents": {}},
+        workspaces={"rows": [], "machines": ["box"], "this_machine": "box"},
+        fleet={"ts": 1000.0, "agents": []}, this_machine="box",
+        seats=[{"identity": "solo-box", "machine": "box",
+                "spec": {"image": "i"}}],
+        now=1000.0,
+    )
+    assert t["machines"][0]["containers"][0]["agent"] == "solo-box"
+
+
+def test_a_1to1_container_attaches_to_the_session_named_seat():
+    """`seat` is what the image creates and what the launch dance answers
+    into. Every container on the fleet uses this line."""
+    from mcp_hub.fleet_tree import container_attach
+
+    assert container_attach({"identity": "solo-box", "members": ["solo-box"]}) == [
+        ("Attach", "docker exec -it solo-box tmux attach -t seat")]
+
+
+def test_a_pod_attaches_PER_AGENT_by_session_name():
+    """A single `-t seat` line would fail against a healthy pod, and an
+    operator reading a failing attach concludes the pod is broken."""
+    from mcp_hub.fleet_tree import container_attach
+
+    assert container_attach(
+        {"identity": "capsule-pod-box", "members": ["a", "b"]}) == [
+        ("Attach a", "docker exec -it capsule-pod-box tmux attach -t a"),
+        ("Attach b", "docker exec -it capsule-pod-box tmux attach -t b"),
+    ]
+
+
+def test_a_pod_of_ONE_still_names_its_session_for_the_agent():
+    """N=1 is a pod, not a 1:1 seat — its entrypoint took the manifest branch
+    and named the session for the agent, so the attach must match what was
+    actually created rather than what the container count suggests."""
+    from mcp_hub.fleet_tree import container_attach
+
+    assert container_attach({"identity": "pod-box", "members": ["only"]}) == [
+        ("Attach", "docker exec -it pod-box tmux attach -t only")]
