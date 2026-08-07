@@ -4198,7 +4198,7 @@ def _seat_prepare(contract: Any, workdir: pathlib.Path) -> tuple[Any, int | None
 
     workdir.mkdir(parents=True, exist_ok=True)
     if contract.repo and not any(workdir.iterdir()):
-        from mcp_hub.seat import GITHUB_TOKEN, https_repo_url
+        from mcp_hub.seat import SEAT_GITHUB_TOKEN, https_repo_url
 
         # The spec's URL is usually an ssh alias (`git@github-monkeypashion:`)
         # that exists only in ONE machine's ~/.ssh/config. Inside a container
@@ -4214,15 +4214,15 @@ def _seat_prepare(contract: Any, workdir: pathlib.Path) -> tuple[Any, int | None
                 file=sys.stderr, flush=True,
             )
             return contract, EXIT_CONTRACT
-        if not (os.environ.get(GITHUB_TOKEN) or "").strip():
+        if not (os.environ.get(SEAT_GITHUB_TOKEN) or "").strip():
             # At the door, loudly, like the Anthropic credential — not three
             # git errors deep. A container has no ssh key and no credential
             # store, so a private repo is simply unreachable without this.
             print(
                 f"seat-entry: REFUSED (contract): {contract.identity} declares "
-                f"a repo but {GITHUB_TOKEN} is not set, and a container has no "
+                f"a repo but {SEAT_GITHUB_TOKEN} is not set, and a container has no "
                 f"ssh key or credential store to fall back on. Inject it the "
-                f"same way as the Anthropic credential: add {GITHUB_TOKEN} to "
+                f"same way as the Anthropic credential: add {SEAT_GITHUB_TOKEN} to "
                 f"the edge host's ~/.mcp-hub/edge-env and name it in the "
                 f"seat spec's env_from_host. The hub stores the NAME only.",
                 file=sys.stderr, flush=True,
@@ -4454,7 +4454,7 @@ def _seat_home_setup() -> None:
     a running container and an agent on the hub are not multiplied by N.
     """
     from mcp_hub.seat import (
-        GITHUB_TOKEN,
+        SEAT_GITHUB_TOKEN,
         credential_helper_argv,
         hooks_settings_content,
     )
@@ -4465,7 +4465,7 @@ def _seat_home_setup() -> None:
     # persists verbatim in .git/config as remote.origin.url, survives the
     # container, shows up in `git remote -v`, and would be read back by our own
     # project derivation.
-    if (os.environ.get(GITHUB_TOKEN) or "").strip():
+    if (os.environ.get(SEAT_GITHUB_TOKEN) or "").strip():
         subprocess.run(credential_helper_argv(), capture_output=True)
 
     # Hook settings: write only if absent. A memory_volume mounted at

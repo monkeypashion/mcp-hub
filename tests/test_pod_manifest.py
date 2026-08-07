@@ -592,7 +592,7 @@ def test_the_token_is_never_written_to_disk():
     assert argv[:4] == ["git", "config", "--global", "credential.helper"]
     helper = argv[4]
     # The VARIABLE NAME, unexpanded — git expands it when it asks, not us.
-    assert '"password=$GITHUB_TOKEN"' in helper
+    assert '"password=$SEAT_GITHUB_TOKEN"' in helper
     assert "x-access-token" in helper
 
 
@@ -612,7 +612,7 @@ def test_a_repo_without_a_token_is_refused_AT_THE_DOOR(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN)
     monkeypatch.setenv("MCP_HUB_URL", HUB)
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("SEAT_GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("SEAT_IDENTITY", raising=False)
     monkeypatch.setenv("SEAT_MANIFEST", json.dumps({"agents": [
         {"identity": "a", "repo": "git@github-org:org/repo.git"}]}))
@@ -630,7 +630,7 @@ def test_a_BIND_MOUNTED_workdir_needs_no_token(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN)
     monkeypatch.setenv("MCP_HUB_URL", HUB)
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("SEAT_GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("SEAT_IDENTITY", raising=False)
     monkeypatch.setenv("SEAT_MANIFEST", json.dumps({"agents": [
         {"identity": "a", "repo": "git@github-org:org/repo.git"}]}))

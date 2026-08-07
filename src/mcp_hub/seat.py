@@ -409,7 +409,18 @@ def pod_workspace(pod: PodContract, workdirs: Mapping[str, str]) -> dict:
 # the NAME, the edge host supplies the VALUE via `--env-from-host`. Nothing new
 # to learn, nothing secret in the control plane.
 
-GITHUB_TOKEN = "GITHUB_TOKEN"
+# PREFIXED, and never the bare `GITHUB_TOKEN` — dt, 2026-08-07, from their own
+# post-mortem (`codespace-runner.js:1138-1151`): the factory injected a
+# deps-READ token under that name, it clobbered the environment's native WRITE
+# token, and every agent push failed with "Repository not found". The rule they
+# paid for is ONE TOKEN PER ROLE, EACH WITH ITS OWN NAME — a read token that
+# borrows a well-known name will silently shadow a write token.
+#
+# We are not in a codespace today so nothing would collide yet, which is
+# exactly why the name is worth fixing NOW: seat-image.md aims this image at
+# the factory estate too, and the collision would appear only there, only on a
+# push, long after anyone connected it to this line.
+SEAT_GITHUB_TOKEN = "SEAT_GITHUB_TOKEN"
 
 # github.com, always. A seat spec written on a machine with ssh aliases carries
 # `git@github-monkeypashion:org/repo.git`, and that alias exists only in that
@@ -433,7 +444,7 @@ def https_repo_url(url: str) -> str:
     return _GITHUB_HTTPS.format(org=parsed[0], repo=parsed[1])
 
 
-def credential_helper_argv(token_var: str = GITHUB_TOKEN) -> list[str]:
+def credential_helper_argv(token_var: str = SEAT_GITHUB_TOKEN) -> list[str]:
     """`git config --global` argv installing an ENV-READING credential helper.
 
     The token is never written to disk. The obvious alternative — cloning from

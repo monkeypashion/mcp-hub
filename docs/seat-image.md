@@ -28,9 +28,50 @@ Injected by the launcher (edge `DockerExecutor` via the seat's `spec.env` /
 | `SEAT_MODE` | no | `interactive` (default) or `headless`. See modes. |
 | `SEAT_PROMPT` | headless only | The prompt for `claude -p`. |
 | `SEAT_SQUADS` | no | Comma-separated squads passed to `register()`. Empty preserves, as always. |
-| `GITHUB_TOKEN` | to clone | **How a container fetches its own code.** Same channel as the Anthropic credential — hub stores the NAME, the edge host supplies the VALUE via `--env-from-host`. Installed as a git credential HELPER, so the token is never written to disk; a token embedded in the clone URL would persist in `.git/config` as `remote.origin.url`, survive the container, and show up in `git remote -v`. Not needed when the workdir is bind-mounted from the host, which is every seat on the fleet today. |
+| `SEAT_GITHUB_TOKEN` | to clone | **How a container fetches its own code.** Same channel as the Anthropic credential — hub stores the NAME, the edge host supplies the VALUE via `--env-from-host`. Installed as a git credential HELPER, so the token is never written to disk; a token embedded in the clone URL would persist in `.git/config` as `remote.origin.url`, survive the container, and show up in `git remote -v`. Not needed when the workdir is bind-mounted from the host, which is every seat on the fleet today. |
 | `CLAUDE_CODE_OAUTH_TOKEN` | one of | **The default lane** (operator decision 2026-08-04, card #353): a long-lived Claude Code OAuth token minted by `claude setup-token` on the edge host, injected via `--env-from-host` — the hub stores the NAME only, the value never enters the control plane. |
 | `ANTHROPIC_API_KEY` | one of | **The override lane.** API billing. Same `--env-from-host` channel. |
+
+### Why `SEAT_GITHUB_TOKEN` and not `GITHUB_TOKEN`
+
+**One token per role, each with its own name** — dt's rule, 2026-08-07, paid
+for with a real incident (`codespace-runner.js:1138-1151`): the factory
+injected a deps-READ token as `GITHUB_TOKEN`, it clobbered the environment's
+native WRITE token, and every agent push failed with "Repository not found".
+Nothing collides in a docker seat today; the name is prefixed anyway because
+this image is aimed at the factory estate too, where the collision would
+surface only on a push and long after anyone would connect it to this choice.
+
+### Where this credential is WEAK, and the shape of the fix
+
+dt reviewed our approach and was explicit about both halves:
+
+- **Storage: ours is the better one, keep it.** The factory does
+  `git remote set-url origin https://x-access-token:${t}@github.com/...`
+  (`codespace-runner.js:842`), which writes the token into `.git/config`. They
+  get away with it because codespaces are torn down; **our containers live for
+  days, so that pattern would be strictly worse here than there.** Match the
+  factory's env names and exit codes — do NOT converge on this.
+- **Scope: ours is the weaker one.** A PAT is broad and long-lived where their
+  App installation token is narrow (`contents:read`, ~1h) and, critically,
+  **the caller cannot name the repos** — their gateway derives the repo set
+  from its own code, so a compromised caller cannot widen its own scope.
+
+The eventual fix is a gateway verb minting an installation token for a SEAT
+identity, with the helper calling it **per git operation** rather than caching
+it. That keeps the property we already have and adds the one we lack.
+
+⚠️ It cannot simply reuse the existing endpoint: `POST
+/provision/github-build-token` is gated behind `USE_GATEWAY_GITHUB` /
+`USE_GATEWAY_CODESPACE_CREDS` and scoped to product builds keyed on a factory
+project uuid. Seats are not product builds and have no such uuid — that is a
+new verb, not a new caller.
+
+⚠️ And a short-TTL token must **never be resolved at container start**. dt has
+a live defect of exactly this shape: a 1-hour `ghs_` persisted into a durable
+field, three deployed apps silently un-rebuildable, nothing alarming because
+the running containers kept serving. Fetch at point of use, or store an
+indirection that resolves at point of use.
 
 ## Auth: validate, never arbitrate
 
