@@ -1930,9 +1930,12 @@ def seats_command(args: argparse.Namespace, api: Any = None) -> int:
                 # (docs/n-seats-per-container.md). Declared here rather than
                 # inferred, because how many agents a container holds is not
                 # something any other field implies.
-                if args.agent:
+                # getattr, because callers build this Namespace by hand —
+                # the API tests do, and a new flag must not break a caller
+                # that predates it.
+                if getattr(args, "agent", None):
                     spec["agents"] = _parse_pod_agents(args.agent)
-                    if args.pod_squad:
+                    if getattr(args, "pod_squad", ""):
                         spec["squad"] = args.pod_squad
             rec = api.create_seat(args.repo, machine, args.folder,
                                   args.want_identity, args.launch_args,
