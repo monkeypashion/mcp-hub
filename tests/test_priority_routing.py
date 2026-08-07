@@ -1055,10 +1055,20 @@ async def test_broadcast_advances_sender_cursor(server):
     assert out == "", "Sender saw their own broadcast — cursor not advanced"
 
 
-async def test_broadcast_successful_push_advances_recipient_cursor(server):
-    """When push succeeds (recipient was reachable), advance THEIR cursor
-    past the broadcast — they saw it live, no need to re-surface via
-    Stop hook auto-pull."""
+async def test_broadcast_push_success_alone_does_not_silence_the_catch_up(server):
+    """A reachable recipient and an unreachable one, told apart correctly.
+
+    This used to assert that a successful push advanced the recipient's cursor
+    outright — "they saw it live". They had not: push success says the socket
+    took the bytes. On 2026-07-27 six broadcasts were marked seen against an
+    agent whose stream was provably dead, recoverable only from the database.
+
+    The asymmetry this test was written for survives intact — bob's delivered
+    push is recorded and alice's failed one is not — but bob is only excused
+    the catch-up once he has independently PROVED he rendered it, which is what
+    `wake_ack` records. Both agents are acked below so the surviving difference
+    is delivery, which is the thing under test.
+    """
     await _call_tool(server, "register", {"name": "alice", "project": "x"})
     await _call_tool(server, "register", {"name": "bob", "project": "y"})
 
@@ -1090,11 +1100,16 @@ async def test_broadcast_successful_push_advances_recipient_cursor(server):
     # Actually broadcast doesn't require publisher to exist in the DB —
     # touch_session is a no-op for unregistered names. Let's verify.
 
-    # Bob got the push → cursor should have advanced past the broadcast
+    # Both agents then do ordinary work, so neither is held back by missing
+    # render evidence and DELIVERY is the only thing left separating them.
+    registry.wake_ack("bob")
+    registry.wake_ack("alice")
+
+    # Bob got the push AND proved he rendered it → excused the catch-up.
     bob_out = await _call_tool(
         server, "get_broadcasts_for_agent", {"agent_name": "bob"},
     )
-    assert bob_out == "", "Successful push should have advanced bob's cursor"
+    assert bob_out == "", "a delivered-and-rendered broadcast surfaced again"
 
     # Alice push failed → cursor should NOT have advanced; she sees it on auto-pull
     alice_out = await _call_tool(

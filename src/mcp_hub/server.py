@@ -90,6 +90,13 @@ class _PushOutcome(NamedTuple):
     # than an absent binding. Empty for "not bound" — the sender needs to be
     # able to tell "they chose not to be interrupted" from "they are gone".
     suppressed: str = ""
+    # The binding generation the PRIMARY push actually went into, captured at
+    # push time rather than read back afterwards. Reading it after the fan-out
+    # is a TOCTOU: an agent that rebinds in between yields the NEW token, which
+    # would later match at drain time and promote a broadcast into "seen" for a
+    # session that never received it — reintroducing the exact silent loss the
+    # pending mechanism exists to end. Empty when the primary was not reached.
+    gen: str = ""
 
 
 # Allowed priority values for send/broadcast. The hub uses priority to decide
@@ -472,6 +479,36 @@ def init_db(db_path: Path = DB_PATH) -> None:
     try:
         conn.execute(
             "ALTER TABLE messages ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    # Migrate: the broadcast cursor's PENDING half — what was pushed live to
+    # this agent but has not yet been proven rendered, and the binding
+    # generation it was pushed to.
+    #
+    # A broadcast row is shared by every recipient, so it cannot carry the
+    # per-recipient `pushed_gen` that fixed the same class for DMs (PR #8).
+    # That asymmetry is why broadcasts were consciously left on
+    # advance-on-push-success — and why any dead stream (deploy churn, box
+    # sleep, wifi flap) silently ate them. The per-recipient fact has to live
+    # on the per-recipient row, which is this one.
+    #
+    # 0 / '' = nothing pending, which is exactly right for a pre-migration hub:
+    # it advanced on push, so it has no pending state to carry forward.
+    try:
+        conn.execute(
+            "ALTER TABLE agents ADD COLUMN broadcast_pending_id "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    try:
+        conn.execute(
+            "ALTER TABLE agents ADD COLUMN broadcast_pending_gen "
+            "TEXT NOT NULL DEFAULT ''"
         )
         conn.commit()
     except sqlite3.OperationalError:
@@ -1578,6 +1615,10 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         primary, extras = sessions[0], sessions[1:]
 
         primary_delivered = False
+        # Captured BEFORE the await, so it names the stream this push is going
+        # into rather than whatever is bound once the fan-out finishes. See the
+        # `gen` field on _PushOutcome for what reading it late would cost.
+        primary_gen = registry.generation(agent) or ""
         if _can_deliver_push(primary):
             if await registry.push(agent, notification):
                 primary_delivered = True
@@ -1602,7 +1643,10 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             # window, else the stream is presumed dead behind the live
             # binding — the one state transport introspection can't see.
             registry.expect_wake_ack(agent)
-        return _PushOutcome(delivered, primary_delivered)
+        return _PushOutcome(
+            delivered, primary_delivered,
+            gen=primary_gen if primary_delivered else "",
+        )
 
     # -- Presence --
 
@@ -2398,23 +2442,101 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             for agent in recipients:
                 tg.start_soon(_push_one, agent)
 
-        # Advance each recipient's cursor ONLY when the PRIMARY session got the
-        # live push. The cursor is per-agent (one row), so marking it "seen"
-        # silences the Stop-hook catch-up for EVERY session under that name —
-        # advancing it on an extra-only delivery would let the primary (or a
-        # gated session) permanently miss a broadcast it never received. Tying
-        # the advance to the primary mirrors the DM generation stamp: worst
-        # case a session that DID see it live sees it once more via Stop hook
-        # (a harmless dup), never silent loss. Single-session is unchanged
-        # (primary == the only session).
-        successes = [a for a, o in push_results.items() if o.primary]
-        if successes:
-            placeholders = ",".join("?" * len(successes))
+        # Record the push as PENDING, and do not touch the cursor.
+        #
+        # This used to advance `last_broadcast_seen_id` right here, on the
+        # PRIMARY session's push succeeding. That is push-success, not receipt,
+        # and the gap between them is not theoretical: 6 broadcast ids
+        # (10346-10351) were advanced past mcp-hub-dev-vm-1's cursor on
+        # 2026-07-27 while its GET stream was provably dead, and were
+        # recoverable only by a hand read of the database. Three triggers are on
+        # record — redeploy churn, box sleep, wifi flap — and every one of them
+        # turns a successful push into silent loss, because the cursor moving is
+        # what silences the Stop-hook catch-up that would otherwise be the
+        # backstop.
+        #
+        # So the advance moves to the drain, where there is evidence to justify
+        # it (see get_broadcasts_for_agent). Here we record only what is
+        # actually known: this id went out to that generation of that agent's
+        # binding. The generation is what makes the pending safe to promote
+        # later — it is minted per primary bind and includes the hub's boot id,
+        # so a rebind, an unbind or a hub restart all invalidate it, and a
+        # pending push can never be promoted against a session that never
+        # received it.
+        #
+        # Still keyed on `o.primary` for the original reason: the cursor is
+        # per-agent, so an extra-only delivery must not be able to silence the
+        # catch-up for the primary.
+        # 🔴 A PENDING RUN MAY NEVER SPAN A GENERATION CHANGE (dev, 2026-08-07).
+        #
+        # The generation validates the LAST push, but the promotion covers
+        # EVERY id at or below `pending`. A plain MAX() therefore erases which
+        # generation an earlier claim belonged to, and the drain then marks it
+        # seen on the strength of a later push to a different stream:
+        #
+        #   cursor=10 · 11 pushed to G1 · deploy kills G1 before it renders ·
+        #   rebind G2 · 12 pushed to G2 and rendered · agent acks ·
+        #   drain: pending=12, gen=G2 matches, evidence good -> cursor=12,
+        #   and 11 is excluded from that very select and from every later one.
+        #
+        # That is the original silent loss, on the exact deploy-churn trigger
+        # this fix exists for, reintroduced by the fix itself.
+        #
+        # So the stamp is a three-way decision, taken atomically in SQL because
+        # a read-then-write here is a TOCTOU (thread-local connections, one
+        # transaction per statement — the same reason the drain reads its fence
+        # first). SQLite evaluates every SET expression against the PRE-update
+        # row, so all three branches see the old values:
+        #
+        #   same generation      -> extend the run (MAX). Every id in it went
+        #                           to one stream, so one render proves them all.
+        #                           ⚠️ ASSUMPTION, named because it is one
+        #                           (dev, 2026-08-07): per-message loss does not
+        #                           happen on a live, rendering stream. If a
+        #                           single mid-run notification were dropped on
+        #                           an otherwise-healthy binding, the run's one
+        #                           render would promote it unseen. No known
+        #                           mechanism does that — a client parse failure
+        #                           is systematic rather than per-message, and
+        #                           stream death changes the generation — so
+        #                           this is where the dup-vs-loss line is drawn
+        #                           deliberately. A new per-message failure mode
+        #                           invalidates this branch, not the design.
+        #   no run outstanding   -> start a fresh one at this id.
+        #   run outstanding on a
+        #   DIFFERENT generation -> ⚠️ REFUSE TO STAMP. Those ids were pushed
+        #                           into a stream that never proved anything, so
+        #                           nothing above them may be promoted past
+        #                           them. Leaving the stale pending in place is
+        #                           what blocks it: its generation cannot match
+        #                           at drain time. The catch-up then delivers
+        #                           the whole range — the abandoned ids because
+        #                           they were genuinely never seen, and this one
+        #                           again as a duplicate. Dup, never loss.
+        #
+        # ⚠️ This leans on generation tokens NEVER REPEATING (dev's point): a
+        # repeated token would turn a stale stamp into a valid promotion. They
+        # are `<boot>:<seq>` with `boot` a fresh uuid4 per hub PROCESS and `seq`
+        # monotonic within it, so a repeat needs a uuid4 collision. If that
+        # scheme ever changes, this is a caller that breaks silently.
+        successes = [(a, o.gen) for a, o in push_results.items()
+                     if o.primary and o.gen]
+        for agent, gen in successes:
             conn.execute(
-                f"UPDATE agents SET last_broadcast_seen_id = "
-                f"MAX(last_broadcast_seen_id, ?) WHERE name IN ({placeholders})",
-                (broadcast_id, *successes),
+                "UPDATE agents SET "
+                "  broadcast_pending_id = CASE"
+                "    WHEN broadcast_pending_gen = ? THEN MAX(broadcast_pending_id, ?)"
+                "    WHEN broadcast_pending_id <= last_broadcast_seen_id THEN ?"
+                "    ELSE broadcast_pending_id END,"
+                "  broadcast_pending_gen = CASE"
+                "    WHEN broadcast_pending_gen = ? THEN ?"
+                "    WHEN broadcast_pending_id <= last_broadcast_seen_id THEN ?"
+                "    ELSE broadcast_pending_gen END "
+                "WHERE name = ?",
+                (gen, broadcast_id, broadcast_id,
+                 gen, gen, gen, agent),
             )
+        if successes:
             conn.commit()
 
         # Honest woke count — anyone we delivered a live wake to (primary or an
@@ -3016,10 +3138,18 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                   only shortened — the footer points at the full text.
         """
         conn = _get_db(db_path)
+        # READ THE RENDER EVIDENCE BEFORE ACKING. `wake_ack` below CLEARS the
+        # pending expectation, so asking afterwards always answers "proven" —
+        # the gate would be permanently open and this whole fix inert. Same
+        # ordering discipline get_messages already follows for its compact
+        # leg, and the same shape as the fence-before-scan below.
+        wake_render_unproven = registry.has_pending_wake_ack(agent_name)
+        gen_now = registry.generation(agent_name)
         # Broadcast drain is a wake-ack too — same rationale as get_messages.
         registry.wake_ack(agent_name)
         row = conn.execute(
-            "SELECT last_broadcast_seen_id FROM agents WHERE name = ?",
+            "SELECT last_broadcast_seen_id, broadcast_pending_id, "
+            "broadcast_pending_gen FROM agents WHERE name = ?",
             (agent_name,),
         ).fetchone()
         if row is None:
@@ -3032,6 +3162,56 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             touch_session(agent_name, ctx)
 
         cursor = row["last_broadcast_seen_id"]
+
+        # -- promote the pending push, but only against evidence -------------
+        #
+        # broadcast() no longer advances the cursor when a push succeeds; it
+        # records what went out and to which binding generation. This is where
+        # that becomes "seen", and it needs BOTH facts to be true:
+        #
+        #   1. the generation still matches — the agent is holding the SAME
+        #      stream the push went into. A rebind, an unbind or a hub restart
+        #      all mint a new token (it carries the boot id), so a push into a
+        #      stream that has since died can never be promoted.
+        #   2. that stream has PROVEN it renders — the wake it received
+        #      produced some independent agent activity before this drain. A
+        #      live binding is not enough: a half-dead stream passes presence
+        #      while rendering nothing, which is exactly the ⚡-but-deaf state
+        #      that made "delivered live" a false claim on Windows 2026-07-23.
+        #
+        # ⭐ Gating on ACTIVITY rather than on transport is what makes this
+        # cover the second, independent mechanism as well: a channel
+        # notification the CLIENT cannot parse (strict pydantic validation on
+        # the notification params) is a push that never reaches the agent while
+        # every server-side transport signal reports success. No deliverability
+        # gate could see it. An evidence gate does, because an agent that never
+        # rendered the wake never acts on it.
+        #
+        # ⚠️ THE TWO CHECKS ARE NOT INDEPENDENT, AND NEITHER SUBSUMES THE OTHER.
+        # Do not drop one because the other's tests stay green (dev, 2026-08-07).
+        # The generation bug can only BITE while the evidence gate is open — a
+        # push stamped with the wrong session's token is harmless for as long as
+        # that session has an unacked wake. So a test aimed at the generation
+        # passes on the evidence gate's strength unless it first satisfies it;
+        # mine did exactly that until a mutation caught it. Anyone removing
+        # either check will find the other's suite entirely green.
+        #
+        # Failing this test is not an error and not a loss — it just leaves the
+        # cursor where it was, so the rows below include the pushed ones and the
+        # agent catches up. That is the entire cure.
+        pending = row["broadcast_pending_id"] or 0
+        pending_gen = row["broadcast_pending_gen"] or ""
+        if (
+            pending > cursor
+            and pending_gen and gen_now and pending_gen == gen_now
+            and not wake_render_unproven
+        ):
+            cursor = pending
+            conn.execute(
+                "UPDATE agents SET last_broadcast_seen_id = ? WHERE name = ?",
+                (cursor, agent_name),
+            )
+            conn.commit()
 
         # Second delivery path — see the note in broadcast(). An agent catches
         # up on fleet-wide rows (audience = '') plus those of every squad it is

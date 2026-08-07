@@ -175,10 +175,20 @@ def _server_db(server):
     return _gdb(db_path)
 
 
-async def test_broadcast_advances_cursor_only_for_successful_pushes(server):
+async def test_broadcast_records_pending_only_for_successful_pushes(server):
     """Mixed success: some recipients accept the push, some return False.
-    Only the successes get their last_broadcast_seen_id advanced — failures
-    catch up via Stop-hook auto-pull on their next turn boundary."""
+    Only the successes are recorded, and failures catch up via Stop-hook
+    auto-pull on their next turn boundary.
+
+    This used to assert `last_broadcast_seen_id`, because a successful push
+    advanced the cursor immediately. It no longer does: push success is a
+    statement about a socket, and treating it as receipt is what silently ate
+    six broadcasts on 2026-07-27 (see tests/test_broadcast_receipt.py). The
+    property being asserted here is unchanged — the fan-out distinguishes a
+    delivered push from an undelivered one, and only touches the successes —
+    but the column that records it moved to `broadcast_pending_id`, which is a
+    claim about what was SENT rather than about what was seen.
+    """
     await _call_tool(server, "register", {"name": "sender", "project": "proj_sender"})
     await _register_and_bind(server, ["good_1", "good_2", "bad_1"])
 
@@ -199,13 +209,20 @@ async def test_broadcast_advances_cursor_only_for_successful_pushes(server):
 
     conn = _server_db(server)
     rows = {
-        r["name"]: r["last_broadcast_seen_id"]
+        r["name"]: (r["broadcast_pending_id"], r["last_broadcast_seen_id"])
         for r in conn.execute(
-            "SELECT name, last_broadcast_seen_id FROM agents"
+            "SELECT name, broadcast_pending_id, last_broadcast_seen_id FROM agents"
         ).fetchall()
     }
-    # Both successes should have been advanced to the broadcast's id.
-    # bad_1's cursor stays at 0 (the default).
-    assert rows["good_1"] > 0
-    assert rows["good_2"] > 0
-    assert rows["bad_1"] == 0
+    # Both successes are recorded as pending; bad_1 has nothing (the default).
+    assert rows["good_1"][0] > 0
+    assert rows["good_2"][0] > 0
+    assert rows["bad_1"][0] == 0
+    # And no RECIPIENT's cursor moved — not even the successes. That is the
+    # fix: the push going out is not the agent having seen it.
+    #
+    # The sender is excluded deliberately, not to make this pass: a sender is
+    # bumped past their own broadcast by a separate, older rule, and that one
+    # is sound for the obvious reason — they wrote it.
+    assert all(cursor == 0 for name, (_, cursor) in rows.items()
+               if name != "sender"), rows
