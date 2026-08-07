@@ -307,3 +307,107 @@ def test_a_single_seat_still_lands_in_the_bare_workdir(tmp_path, monkeypatch):
     assert (work / ".claude" / "hub-agent.json").exists()
     assert not (work / "solo").exists()
     assert not list(work.glob("*.code-workspace"))
+
+
+# ---- phase 3: the edge places a pod ----------------------------------------
+
+class _R:
+    def __init__(self, rcs=None):
+        self.calls = []
+        self._rcs = list(rcs or [])
+
+    def __call__(self, cmd, cwd=None):
+        self.calls.append(cmd)
+        rc = self._rcs.pop(0) if self._rcs else 0
+        return rc, "out"
+
+
+POD_SPEC = {"spec": {
+    "image": "mcp-hub-seat:latest",
+    "memory_volume": "pod-mem:/home/seat/.claude",
+    "squad": "capsule",
+    "agents": [{"identity": "a", "repo": "git@h:o/a.git"},
+               {"identity": "b", "repo": "git@h:o/b.git"}],
+}}
+
+
+def _envs(argv):
+    return [argv[i + 1] for i, x in enumerate(argv) if x == "-e"]
+
+
+def test_a_pod_is_created_with_a_MANIFEST_and_no_identity():
+    """A container carrying both is refused at its own door, so the launcher
+    must send exactly one shape."""
+    from mcp_hub.edge import DockerExecutor
+
+    argv = DockerExecutor.create_argv("capsule-pod-box", POD_SPEC["spec"])
+    envs = _envs(argv)
+    assert not any(e.startswith("SEAT_IDENTITY=") for e in envs)
+    manifest = [e for e in envs if e.startswith("SEAT_MANIFEST=")]
+    assert len(manifest) == 1
+    doc = json.loads(manifest[0].split("=", 1)[1])
+    assert [a["identity"] for a in doc["agents"]] == ["a", "b"]
+    assert doc["squad"] == "capsule"
+
+
+def test_a_1to1_seat_still_gets_SEAT_IDENTITY_and_no_manifest():
+    """Every container on the fleet today takes this branch."""
+    from mcp_hub.edge import DockerExecutor
+
+    envs = _envs(DockerExecutor.create_argv("solo-box", {"image": "img"}))
+    assert "SEAT_IDENTITY=solo-box" in envs
+    assert not any(e.startswith("SEAT_MANIFEST=") for e in envs)
+
+
+def test_the_manifest_is_injected_AFTER_spec_env_so_it_wins():
+    """Same rule as SEAT_IDENTITY: a stale spec must not be able to make a
+    container report one membership to docker and another to the hub."""
+    from mcp_hub.edge import DockerExecutor
+
+    spec = dict(POD_SPEC["spec"], env={"SEAT_MANIFEST": "stale"})
+    envs = [e for e in _envs(DockerExecutor.create_argv("p", spec))
+            if e.startswith("SEAT_MANIFEST=")]
+    assert len(envs) == 2 and envs[-1] != "SEAT_MANIFEST=stale"
+
+
+def test_a_pod_harvests_once_per_agent_in_ITS_OWN_workdir():
+    """`memory-export` resolves identity from cwd, so `-w` IS the choice of
+    which agent is harvested."""
+    from mcp_hub.edge import DockerExecutor
+
+    r = _R()
+    out = DockerExecutor(r, {}).execute({"op": "harvest", "seat": "p"}, POD_SPEC)
+    assert out["rc"] == 0
+    assert [c[3] for c in r.calls] == ["/home/seat/work/a", "/home/seat/work/b"]
+    assert [a["identity"] for a in out["agents"]] == ["a", "b"]
+
+
+def test_ONE_failed_export_fails_the_whole_harvest():
+    """A pod where one agent's export failed has NOT been harvested. Reporting
+    0 because the others succeeded would let reclaim destroy the container on
+    the strength of a partial save — the exact loss this step prevents."""
+    from mcp_hub.edge import DockerExecutor
+
+    out = DockerExecutor(_R([0, 3]), {}).execute(
+        {"op": "harvest", "seat": "p"}, POD_SPEC)
+    assert out["rc"] == 3
+
+
+def test_a_1to1_harvest_is_unchanged():
+    from mcp_hub.edge import DockerExecutor
+
+    r = _R()
+    DockerExecutor(r, {}).execute(
+        {"op": "harvest", "seat": "s"},
+        {"spec": {"image": "i", "memory_volume": "m:/home/seat/.claude"}})
+    assert r.calls[-1] == ["docker", "exec", "s", "mcp-hub", "memory-export"]
+
+
+def test_a_pod_with_no_memory_volume_still_says_so_rather_than_looping_agents():
+    from mcp_hub.edge import DockerExecutor
+
+    r = _R()
+    out = DockerExecutor(r, {}).execute(
+        {"op": "harvest", "seat": "p"},
+        {"spec": dict(POD_SPEC["spec"], memory_volume="")})
+    assert out["skipped"] is True and r.calls == []

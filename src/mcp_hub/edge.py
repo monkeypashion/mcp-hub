@@ -46,6 +46,12 @@ EDGE_ENV_FILE = Path.home() / ".mcp-hub" / "edge-env"
 # EDGE host's HOME. Destination for a `memory_volume` given as a bare name.
 SEAT_STATE_DIR = "/home/seat/.claude"
 
+# The image's WORKDIR, and the root a pod hangs its per-agent workdirs under
+# (`<root>/<identity>`). Harvest targets these with `docker exec -w`, because
+# `memory-export` resolves identity from its cwd — so the path IS the choice of
+# which agent is being harvested. Must match seat/Dockerfile.
+SEAT_WORK_DIR = "/home/seat/work"
+
 
 def load_env_file(path: Path) -> dict[str, str]:
     """Parse systemd's EnvironmentFile dialect. Missing file → {}.
@@ -495,7 +501,24 @@ class DockerExecutor:
         # hand-edited spec cannot make a container report one name to
         # docker and another to the hub. Name/identity agreement is true
         # by construction, not by convention.
-        argv += ["-e", f"SEAT_IDENTITY={seat}"]
+        #
+        # A POD (`spec.agents`) has no single identity, so it gets a manifest
+        # instead and SEAT_IDENTITY is NOT sent — the entrypoint refuses a
+        # container carrying both, because one readable as either shape has an
+        # ambiguous identity (docs/n-seats-per-container.md).
+        #
+        # A spec that sets `env.SEAT_IDENTITY` *and* `agents` is malformed, and
+        # it is left to trip that refusal rather than being silently corrected
+        # here: a launcher that quietly fixes a contradictory spec hides the
+        # contradiction, and the next reader inherits it.
+        pod_agents = spec.get("agents")
+        if pod_agents:
+            argv += ["-e", "SEAT_MANIFEST=" + json.dumps(
+                {"squad": str(spec.get("squad") or ""), "agents": pod_agents},
+                separators=(",", ":"),
+            )]
+        else:
+            argv += ["-e", f"SEAT_IDENTITY={seat}"]
         # SECRETS: the hub stores the NAME, this machine supplies the VALUE.
         #
         # A seat spec lives in the hub's SQLite and anything holding the
@@ -560,6 +583,34 @@ class DockerExecutor:
             if not spec.get("memory_volume"):
                 return {**base, "skipped": True,
                         "reason": "no memory_volume in spec — nothing to harvest"}
+            agents = spec.get("agents") or []
+            if agents:
+                # A POD harvests ONCE PER AGENT. `memory-export` resolves
+                # identity from its cwd (the marker in that workdir), so `-w`
+                # is what selects which agent is being harvested — the same
+                # mechanism the 1:1 seat gets for free from the image's
+                # WORKDIR, made explicit because there are now N of them.
+                results = []
+                for a in agents:
+                    ident = str((a or {}).get("identity") or "")
+                    if not ident:
+                        continue
+                    rc, out = self._run([
+                        "docker", "exec", "-w", f"{SEAT_WORK_DIR}/{ident}",
+                        seat, "mcp-hub", "memory-export",
+                    ])
+                    results.append({"identity": ident, "rc": rc,
+                                    "output": out[-200:]})
+                # The WORST rc wins. A pod where one agent's export failed has
+                # NOT been harvested, and reporting 0 because the others
+                # succeeded would let reclaim destroy the container on the
+                # strength of a partial save — which is the whole failure this
+                # step exists to prevent.
+                return {**base, "rc": max((r["rc"] for r in results), default=0),
+                        "agents": results,
+                        "output": "; ".join(
+                            f"{r['identity']}: rc={r['rc']}" for r in results
+                        ) or "no identities in manifest"}
             cmd = ["docker", "exec", seat, "mcp-hub", "memory-export"]
         elif op == "materialize":
             if not spec.get("image"):
