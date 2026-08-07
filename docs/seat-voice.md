@@ -143,6 +143,34 @@ Two findings from the v1 review that outlived the design:
   it never leaves UDP. ⇒ *When replacing a mechanism, enumerate what the old
   one did badly; that is where its useful properties hide.*
 
+## 🔴 v1 also had an arbitrary-write hole, found after it was rejected
+
+Recorded because it nearly shipped, and because the reason it cannot bite v2 is
+not that we were careful.
+
+v1 argued its per-seat directory was **inert** — "an empty directory is not a
+capability" — and used that to license mounting it into every container.
+`mcp-hub-dev-vm-1-general` falsified it with a working exploit: the container
+replaces the FIFO with a **symlink**, the host emitter opens its own path
+`O_RDWR` and writes, follows the link, and **clobbers an arbitrary host file as
+`monke`** — a user in `sudo` and `docker`. The attacker picks the target, not
+the bytes, which is destructive on its own.
+
+⭐ **Our own hardening was the enabler.** `O_RDWR` was chosen so the emitter's
+open would never block waiting for a reader; `O_RDWR` follows symlinks. *A
+mitigation adopted for one property was the precondition for a failure in
+another.*
+
+The fix would have been `:ro` (measured: blocks `rm`/`touch`/`ln -s`, and a
+FIFO still reads fine because opening a pipe `O_RDONLY` is not a filesystem
+write) plus `O_NOFOLLOW` + `fstat`/`S_ISFIFO` on the writer. The general rule
+now lives in `seat-image.md`: **a bind mount is inert only if READ-ONLY.**
+
+⭐ **v2 needs none of it, because v2 has no mount at all.** The operator's
+requirements removed the mount for universality and automation — and
+incidentally removed a live arbitrary-write primitive nobody had found yet.
+*A constraint imposed for one reason eliminated a hazard imposed by another.*
+
 ## Container-side requirements (measured: all four seats have ZERO audio wiring)
 
 - **packages** (base Debian 13 trixie): `alsa-utils libasound2-plugins
