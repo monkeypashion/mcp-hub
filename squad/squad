@@ -106,6 +106,47 @@ has_resume() {
   case " $(field "$1" 4) " in *" $RESUME_FLAG "*) return 0 ;; *) return 1 ;; esac
 }
 
+# What heal should DO about one unhealthy agent. PURE — no tmux, no pane, no
+# side effects — so the rule can be asserted directly instead of only through a
+# live squad with real sessions. Same argument fleet_tree.py makes about the
+# join: the rule is the interesting part, and buried inside the loop nothing
+# could reach it.
+#
+#   $1 state   no-signal | offline | unwakeable
+#   $2 struck  1 if this agent was already nudged inside the strike window
+#   $3 args    the roster's launch-args field
+#   $4 idle    1 if it is idle, i.e. its pane may be touched at all
+#
+# Exactly one verdict:
+#   daemon    respawn the heartbeat daemon — quiet, costs the agent nothing
+#   defer     busy: never type over a dialog or kill a live turn
+#   relaunch  the nudge failed and the roster permits a resuming restart
+#   blocked   the nudge failed, a restart IS the cure, the roster forbids it
+#   nudge     first strike: ask it to re-register
+#
+# `blocked` is the case this function was extracted for. It used to fall into
+# `nudge`, so a wake-capable agent without $RESUME_FLAG was told to re-register
+# every two minutes forever — and told that a relaunch would fix it and would
+# resume its conversation. For that agent all three claims are false: it has
+# already re-registered and it did not work, heal will not relaunch it, and a
+# restart would not resume anything. Repeating advice we KNOW cannot work is
+# worse than silence: it spends the agent's context and teaches it to distrust
+# the channel. So the operator — the only party who can fix it — is told
+# instead.
+heal_action() {
+  local state="$1" struck="$2" args="$3" idle="$4"
+  if [ "$state" = "no-signal" ] && [ "$struck" != 1 ]; then echo daemon; return; fi
+  if [ "$idle" != 1 ]; then echo defer; return; fi
+  if [ "$struck" = 1 ]; then
+    case " $args " in
+      *" $RESUME_FLAG "*) echo relaunch ;;
+      *) echo blocked ;;
+    esac
+    return
+  fi
+  echo nudge
+}
+
 # Strip whole-word tokens matching an ERE out of an args string.
 # `|| true` is LOAD-BEARING: with pipefail (line 14) grep -v exits 1 when it
 # filters out EVERY line — exactly the case where the flag being removed was the
@@ -2125,8 +2166,14 @@ case "${1:-help}" in
                 [ -n "$started" ] || continue
                 [ "$started" -lt "$disrupt" ] || continue      # postdates it — stream is fine
                 args="$(field "$a" 4)"
-                case "$args" in *--continue*) ;; *)
-                  echo "!! $a: DEAF (predates hub disruption) but roster lacks --continue — not restarting; conversation would be lost" >&2
+                # Word-boundary, matching has_resume and heal_action — a bare
+                # substring would count a future `--continue-on-error` as
+                # resume-capable and relaunch the agent blank.
+                case " $args " in *" $RESUME_FLAG "*) ;; *)
+                  # Names the CURE, not just the blocker. The operator is the
+                  # only party who can clear this, and an accurate diagnosis
+                  # they cannot act on still leaves the agent stuck.
+                  echo "!! $a: DEAF (predates hub disruption) but roster lacks $RESUME_FLAG — not restarting; conversation would be lost. Fix: $CMD resume on $a && $CMD restart $a" >&2
                   continue ;;
                 esac
                 # COOLDOWN — the storm guard. Each disruption stamp makes every
@@ -2225,16 +2272,21 @@ case "${1:-help}" in
               # (2026-07-20: learned the hard way — this path restarted the hub
               # agent mid-turn while it was building this very feature.)
               st="$(classify_agent "$a")"
-              if [ "$state" = "no-signal" ] && [ -z "$(find "$flag" -mmin -10 2>/dev/null)" ]; then
+              struck=0; if [ -n "$(find "$flag" -mmin -10 2>/dev/null)" ]; then struck=1; fi
+              idle=0; if [ "$st" = "idle" ]; then idle=1; fi
+              case "$(heal_action "$state" "$struck" "$args" "$idle")" in
+              daemon)
                 # first strike: revive the daemon quietly — no agent turn spent.
                 # If the binding is also gone, the revived daemon writes an
                 # offline cache and the next pass takes the nudge path below.
                 echo "$a: no status signal — heartbeat daemon presumed dead; respawning it"
                 spawn_daemon "$a" || echo "!! $a: daemon respawn failed (mcp-hub binary not found?)" >&2
                 touch "$flag"
-              elif [ "$st" != "idle" ]; then
+                ;;
+              defer)
                 echo "$a: $state but $st — deferring (never type over a dialog or kill a live turn)"
-              elif [ -n "$(find "$flag" -mmin -10 2>/dev/null)" ] && [[ "$args" == *--continue* ]]; then
+                ;;
+              relaunch)
                 if [ "$relaunched" -ge "$HEAL_MAX_RELAUNCH" ]; then
                   echo "$a: STILL $state — deferred, $HEAL_MAX_RELAUNCH relaunch(es) already this pass"
                   continue
@@ -2243,7 +2295,26 @@ case "${1:-help}" in
                 echo "$a: STILL $state after a nudge — restarting in place (--continue keeps context)"
                 relaunch_agent "$a"
                 rm -f "$flag"
-              else
+                ;;
+              blocked)
+                # Detected-deaf-and-unrecoverable. Report to the operator and
+                # leave the pane alone; `touch "$flag"` holds the strike window
+                # open so this does not decay back into the nudge every ten
+                # minutes. A recovered agent clears the flag above, so nothing
+                # here can wedge permanently.
+                #
+                # KNOWN CONSEQUENCE, deliberate: a permanently-warm flag also
+                # means the `daemon` arm never fires for this agent again, since
+                # that arm is first-strike-only. Accepted — respawning the
+                # daemon would restore accurate STATUS for an agent that is
+                # still deaf, and the operator action named below restarts the
+                # daemon anyway. The rule this encodes: once an agent needs a
+                # human, heal stops attempting automatic repairs on it and
+                # spends its effort telling the human instead.
+                echo "!! $a: STILL $state and a restart is the cure — but the roster lacks $RESUME_FLAG, so heal will not relaunch it (the conversation would be lost). Fix: $CMD resume on $a && $CMD restart $a" >&2
+                touch "$flag"
+                ;;
+              nudge)
                 echo "$a: $state on hub — nudging re-register"
                 # Copy branches on WHY the agent looks offline. The correlation
                 # test (2026-07-25, residual zero) proved every recent "offline"
@@ -2266,7 +2337,15 @@ case "${1:-help}" in
                 type_line "$a" "$nudge" \
                   || echo "!! $a: nudge send-keys failed/timed out (pane wedged?) — skipping" >&2
                 touch "$flag"
-              fi
+                ;;
+              *)
+                # An unmatched verdict does NOTHING and still counts as healed,
+                # which is silence dressed as a repair — strictly worse than the
+                # defect this case block was written to fix. A new verdict in
+                # heal_action with no arm here must be loud.
+                echo "!! $a: heal_action returned a verdict this pass does not handle — nothing done (bug)" >&2
+                ;;
+              esac
               healed=$((healed+1))
             done
             [ "$healed" = 0 ] && echo "all up agents healthy — nothing to heal" || true ;;
