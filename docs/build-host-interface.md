@@ -33,6 +33,21 @@ renaming `writeTokenSubstrate` to match.
 estate that will speak it.* Checking one and asserting the other is how the
 fix becomes the next instance of the bug.
 
+dt's sharpening, which is the better half of the rule:
+
+> **The check feels unnecessary precisely when the word feels natural.**
+> `substrate` felt obvious to both of us *because* it was already in both our
+> heads — meaning two different things. The words most likely to collide are
+> the ones nobody thinks to verify.
+
+Neither of us gets to feel clever about it: I proposed the word without
+grepping my own repo, and dt had *shipped* it hours earlier without grepping
+theirs, while holding a note saying it had been formally retired there for
+being overloaded. `build host` is the first name in the exchange anybody
+checked before adopting. (dt renamed on `a1ab435`: `writeTokenSubstrate` →
+`buildHostWriteToken`. `substrateProjectUuid` is deliberately untouched — that
+is the other meaning, and merging them would be the bug we are removing.)
+
 ## What it is
 
 A build today reaches its environment through codespace-specific helpers. The
