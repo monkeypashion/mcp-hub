@@ -208,6 +208,54 @@ encoded an accident of that example — that it happened to be a replacement —
 the principle itself. A rule that forbids the case it was written to allow is
 not strict, it is wrong.
 
+### 🔴 A WRITABLE mount is never inert — proven, not argued (2026-08-07)
+
+I claimed a bind-mounted directory containing only a pipe was "inert — an empty
+directory is not a capability", and used that to license mounting it into every
+container unconditionally. `mcp-hub-dev-vm-1-general` **falsified it with a
+working exploit**, not an objection:
+
+1. Container: `rm` the FIFO, `ln -s <any host path>` in its place.
+2. The HOST emitter opens its own path `O_RDWR` and writes what it believes is
+   audio.
+3. It follows the symlink and **clobbers an arbitrary host file as `monke`** —
+   a user in `sudo` and `docker`.
+
+The attacker does not choose the bytes (they are the operator's voice) but does
+choose the **target**, which is destructive on its own and worse against
+anything later executed or parsed.
+
+⭐ **The enabler was our own hardening choice.** `O_RDWR` was adopted so the
+emitter's open would never block waiting for a reader — a fix for a liveness
+bug — and `O_RDWR` follows symlinks. *A mitigation adopted for one property can
+be the precondition for a failure in another.*
+
+⭐ And the reasoning that made it possible was mine, inverted: I had corrected
+the same agent that uid-1000-equals-uid-1000 is "plumbing, not a boundary". It
+is — and that same equivalence is exactly what makes the host directory
+writable by the container.
+
+**The rule that follows, and it is general:**
+
+> **A bind mount is inert only if it is READ-ONLY. If any privileged process
+> writes through a path the container can alter, the container has an
+> arbitrary-write primitive with the writer's privileges.**
+
+So: `:ro` on any mount the container does not legitimately need to write —
+measured, `:ro` blocks `rm`/`touch`/`ln -s` while a FIFO still reads fine,
+because opening a pipe `O_RDONLY` is not a filesystem write. Plus `O_NOFOLLOW`
++ `fstat`/`S_ISFIFO` on the writer's side, so one dropped Docker flag is not
+the only thing standing between a typo and an arbitrary write.
+
+⚠️ **The `:ro` is not an implementation detail — it is what LICENSES an
+unconditional mount.** Derived-and-unconditional is safe only when the thing
+derived is genuinely inert. Anyone dropping the flag as noise silently reopens
+this.
+
+⚠️ **Applies to the credential socket too**, when it is built: if the socket's
+path sits in a directory the container can write, the same swap redirects it.
+Raised with the factory estate rather than assumed away.
+
 ⇒ Clause 3 (the ceiling) is the hard gate and always was. Clause 2 is what
 makes clause 1 do real work on new features: it does not ask "is this safe?",
 which invites yes, but "**is this the narrowest thing that works, and what else
