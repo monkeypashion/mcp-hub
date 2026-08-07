@@ -3538,6 +3538,30 @@ print("\n".join(r[2] for r in rows))
             fi
             teardown_workspace "$ws_arg" "$del" "$dry" "$rmws"
             exit $? ;;
+  ws-add)   # squad ws-add <agent> --to <file.code-workspace>
+            # Put an ALREADY-ENROLLED agent's folder into a workspace. The
+            # counterpart of ws-remove, and the gap that made a pod awkward:
+            # a folder could only ever be ADDED as a side effect of enrolling
+            # something (`add`, `add-folder`, `add-container --to`), so an
+            # agent enrolled before its workspace existed had no supported way
+            # in. The unsupported ways are both bad — hand-editing a
+            # hand-formatted JSONC file behind squad's back, or `rm` + re-add,
+            # which also opts the PROJECT out and silences hooks for every
+            # other clone of that repo on the box.
+            shift; ws_arg=""; a_arg=""
+            while [ $# -gt 0 ]; do case "$1" in
+              --to) ws_arg="${2:-}"; shift 2 ;;
+              -*) echo "!! unknown ws-add flag '$1' (valid: --to)" >&2; exit 1 ;;
+              *)  a_arg="$1"; shift ;;
+            esac; done
+            [ -n "$ws_arg" ] || { echo "usage: $CMD ws-add <agent> --to <file.code-workspace>" >&2; exit 1; }
+            a="$(need_agent "$a_arg")" || exit 1
+            ws_arg="$(untilde "$ws_arg")"
+            [ -f "$ws_arg" ] || { echo "!! no such workspace: $ws_arg (make one with '$CMD ws-new')" >&2; exit 1; }
+            d="$(untilde "$(field "$a" 2)")"
+            [ -d "$d" ] || { echo "!! $a's folder is missing: $d" >&2; exit 1; }
+            ws_add_folder "$ws_arg" "$d" "$(basename "$d")"
+            echo "added $a -> $(basename "$ws_arg")" ;;
   ws-remove) # squad ws-remove [agent] --from <file.code-workspace>
              # Removes the agent's FOLDER from that workspace only. The agent
              # stays enrolled and still appears in any other workspace listing
@@ -3734,6 +3758,7 @@ workspaces (a "workspace" is a .code-workspace file; the cockpit shows a tab per
                                 enrol an EXISTING folder as an agent. git optional — where a
                                 remote exists identity is derived and comms come free.
   $CMD ws-new <ws>              create an empty target workspace (transport creates it too)
+  $CMD ws-add <agent> --to <ws>       list an enrolled agent's folder in a workspace
   $CMD ws-remove [agent] --from <ws>
                                 drop the agent's FOLDER from that workspace. Stays enrolled.
   $CMD preflight [--host <h>]   can that machine RECEIVE an agent? Asked before any bytes

@@ -434,3 +434,55 @@ def test_an_unknown_flag_is_still_refused(env, tmp_path):
     r = _run(env, "add-container", "s", str(work), "c", "--nope", "x")
     assert r.returncode != 0
     assert "--session" in r.stderr, "the refusal must name the valid flags"
+
+
+# ---- ws-add: the counterpart of ws-remove ----------------------------------
+#
+# A folder could only ever be ADDED to a workspace as a side effect of
+# enrolling something, so an agent enrolled before its workspace existed had no
+# supported way in. Both unsupported ways are bad: hand-editing a
+# hand-formatted JSONC file behind squad's back, or `rm` + re-add — which also
+# opts the PROJECT out and silences hooks for every other clone of that repo on
+# the box.
+
+def _ws(tmp_path):
+    ws = tmp_path / "t.code-workspace"
+    ws.write_text('{\n  "folders": [\n  ]\n}\n', encoding="utf-8")
+    return ws
+
+
+def test_ws_add_lists_an_enrolled_agents_folder(env, tmp_path):
+    work = tmp_path / "w"
+    work.mkdir()
+    _run(env, "add-container", "a-box", str(work), "c1")
+    ws = _ws(tmp_path)
+    r = _run(env, "ws-add", "a-box", "--to", str(ws))
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert str(work) in ws.read_text(encoding="utf-8")
+
+
+def test_ws_add_is_idempotent(env, tmp_path):
+    work = tmp_path / "w"
+    work.mkdir()
+    _run(env, "add-container", "a-box", str(work), "c1")
+    ws = _ws(tmp_path)
+    _run(env, "ws-add", "a-box", "--to", str(ws))
+    r = _run(env, "ws-add", "a-box", "--to", str(ws))
+    assert r.returncode == 0
+    assert ws.read_text(encoding="utf-8").count(str(work)) == 1
+
+
+def test_ws_add_refuses_a_workspace_that_does_not_exist(env, tmp_path):
+    """Creating one silently would leave the operator with a file they never
+    asked for, in a place they did not choose."""
+    work = tmp_path / "w"
+    work.mkdir()
+    _run(env, "add-container", "a-box", str(work), "c1")
+    r = _run(env, "ws-add", "a-box", "--to", str(tmp_path / "nope.code-workspace"))
+    assert r.returncode != 0
+    assert "ws-new" in r.stderr, "the refusal must name the fix"
+
+
+def test_ws_add_refuses_an_unknown_agent(env, tmp_path):
+    r = _run(env, "ws-add", "ghost", "--to", str(_ws(tmp_path)))
+    assert r.returncode != 0
