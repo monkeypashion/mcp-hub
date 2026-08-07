@@ -2490,6 +2490,18 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         #
         #   same generation      -> extend the run (MAX). Every id in it went
         #                           to one stream, so one render proves them all.
+        #                           ⚠️ ASSUMPTION, named because it is one
+        #                           (dev, 2026-08-07): per-message loss does not
+        #                           happen on a live, rendering stream. If a
+        #                           single mid-run notification were dropped on
+        #                           an otherwise-healthy binding, the run's one
+        #                           render would promote it unseen. No known
+        #                           mechanism does that — a client parse failure
+        #                           is systematic rather than per-message, and
+        #                           stream death changes the generation — so
+        #                           this is where the dup-vs-loss line is drawn
+        #                           deliberately. A new per-message failure mode
+        #                           invalidates this branch, not the design.
         #   no run outstanding   -> start a fresh one at this id.
         #   run outstanding on a
         #   DIFFERENT generation -> ⚠️ REFUSE TO STAMP. Those ids were pushed
