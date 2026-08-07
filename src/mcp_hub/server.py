@@ -3900,6 +3900,63 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         return row["content"] if row else ""
 
     @mcp.tool()
+    def comms_stats(days: int = 7) -> str:
+        """Comms-volume figures for the last `days` days — counts and bytes by
+        type, priority, and sender. FIGURES ONLY, never message bodies: this
+        tool exists to weigh the traffic, and a stats tool that quoted
+        messages would itself become part of the context tax it measures
+        (the 2026-06-14 finding: re-injection, not raw volume, drives the
+        60%-context spike).
+
+        Args:
+            days: Window in days (default 7, clamped to 1..90).
+        """
+        days = max(1, min(int(days), 90))
+        conn = _get_db(db_path)
+        since = time.time() - days * 86400
+        total, total_bytes = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(body)), 0) FROM messages "
+            "WHERE ts >= ?",
+            (since,),
+        ).fetchone()
+        by_type = conn.execute(
+            """SELECT CASE
+                     WHEN to_agent IS NOT NULL AND to_agent != '' THEN 'dm'
+                     WHEN channel = ? THEN 'broadcast'
+                     ELSE 'channel post' END AS kind,
+                   COUNT(*), COALESCE(SUM(LENGTH(body)), 0)
+               FROM messages WHERE ts >= ? GROUP BY kind ORDER BY 2 DESC""",
+            (_BROADCAST_CHANNEL, since),
+        ).fetchall()
+        by_prio = conn.execute(
+            "SELECT priority, COUNT(*) FROM messages WHERE ts >= ? "
+            "GROUP BY priority ORDER BY 2 DESC",
+            (since,),
+        ).fetchall()
+        senders = conn.execute(
+            """SELECT from_agent, COUNT(*) AS n,
+                   COALESCE(SUM(LENGTH(body)), 0) AS b
+               FROM messages WHERE ts >= ?
+               GROUP BY from_agent ORDER BY n DESC LIMIT 10""",
+            (since,),
+        ).fetchall()
+        lines = [
+            f"Last {days}d: {total} messages, {total_bytes / 1024:.0f} KiB "
+            f"({total / days:.0f}/day)"
+        ]
+        lines.append("By type: " + " · ".join(
+            f"{r[0]} {r[1]} ({r[2] / 1024:.0f} KiB)" for r in by_type
+        ) if by_type else "By type: none")
+        lines.append("By priority: " + " · ".join(
+            f"{r[0]} {r[1]}" for r in by_prio
+        ) if by_prio else "By priority: none")
+        lines.append("Top senders:")
+        for r in senders:
+            lines.append(f"  {r['from_agent']}: {r['n']} msgs, "
+                         f"{r['b'] / 1024:.0f} KiB")
+        return "\n".join(lines)
+
+    @mcp.tool()
     def hub_status() -> str:
         """Get hub statistics — agents online, channels, message counts."""
         conn = _get_db(db_path)
