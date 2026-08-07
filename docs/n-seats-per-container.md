@@ -1,6 +1,6 @@
 # N seats per container — design
 
-Status: **DESIGN, nothing built.** Written 2026-08-06 after the 1:1 container
+Status: **DESIGN, nothing built. The three open questions are DECIDED (see foot).** Written 2026-08-06 after the 1:1 container
 squad went live on dev-vm-1 (three containers, three agents, one OAuth token,
 all ⚡). Operator direction: *"finish the 1:1 squad and then look at the N
 seats in one container so that we fully support both options."* Both shapes
@@ -190,11 +190,50 @@ multiply the worst gates.
 6. Dev Containers door measured last, as its own step, against the workspace
    file the pod wrote.
 
-## Open questions (operator)
+## Decisions (2026-08-07)
 
-- **Pod naming**: placement-assigned like today — proposal `<squad>-pod-<machine>`.
-- **`capsules compose`** currently emits one compose service per seat; does it
-  gain a `--pod` flag (one service, `SEAT_MANIFEST` from the frozen member
-  list), or is pod-composition a separate verb?
-- **Per-agent retirement** inside a running pod: edge op, or operator act via
-  `docker exec`? (Deferrable; reclaim-the-pod covers v1.)
+The three open questions were delegated to me ("pick some sensible behaviour").
+Recorded here with the reasoning, so the next person reads a decision rather
+than re-opens a question.
+
+**1. Pod naming: `<squad>-pod-<machine>`, assigned by the placement.**
+
+Sanitized by the same rule as agent identity (lowercase, non `[a-z0-9_-]` → `-`)
+— dots especially, because tmux reads `.` as its pane separator and a dotted
+name produces an agent that runs and cannot be addressed.
+
+Machine-scoped because two boxes may each host a pod of the same squad, and the
+suffix keeps `machine_of()` — which resolves a name by its hostname suffix —
+working unchanged. Assigned, never derived inside the container: the rule that a
+container's hostname must not be able to name anything is not relaxed for pods.
+
+**2. The topology flag belongs on `place`, not `compose`: `capsules place <id>
+--machine <m> --pod`.**
+
+This is a change of mind from the question as posed, and the better answer.
+`compose` FREEZES membership — a squad's seats as they are at that moment. How
+those frozen seats are then REALIZED, as N containers or as one, is a property
+of the placement, not of the freeze. Putting `--pod` on `compose` would bake a
+substrate decision into an artifact whose whole job is to be inert and
+re-placeable, and changing your mind about topology would mean re-freezing —
+which also re-reads the squad and so is no longer the same capsule.
+
+On `place` it costs nothing and buys something real: ONE capsule can be placed
+1:1 on one machine and as a pod on another, which is exactly how the two shapes
+get compared on equal footing.
+
+**3. The pod is the unit of placement AND of reclaim. Per-agent retirement is
+deferred, and PID 1 must not fight it.**
+
+Reclaiming a pod harvests all N, then destroys once. Retiring ONE agent inside a
+running pod stays an operator act (`docker exec <pod> tmux kill-session -t
+<identity>`) until there is a reason for an edge op — a verb nothing has needed
+yet is a verb written blind.
+
+The load-bearing consequence: **PID 1 supervises REGISTRATION, not session
+existence.** It nudges an agent that has fallen off the hub, as it does today,
+but it never recreates a session that has gone. Otherwise the supervisor would
+resurrect a deliberately killed agent and the operator's only per-agent control
+would be in a fight with the container's own init. When the LAST session ends,
+PID 1 exits and the container stops — which mirrors 1:1, where the container's
+lifetime is its session's.
