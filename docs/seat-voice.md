@@ -1,8 +1,9 @@
 # `/voice` in a containerised seat — design
 
-Status: **DESIGN v2, NOTHING BUILT.** v1 (per-seat FIFO) was rejected by the
-operator's requirements on 2026-08-07; the reasoning is kept below because it
-is why several things here look the way they do. Redesign approved same day.
+Status: **DESIGN v3, NOTHING BUILT.** v1 (per-seat FIFO) rejected on the
+operator's requirements; **v2 (host pushes to container) falsified by
+measurement** — see below. v3 inverts the direction. Every rejected version is
+kept, because each was killed by something worth not rediscovering.
 
 ## The requirements that decide everything
 
@@ -13,88 +14,116 @@ Operator, 2026-08-07:
 > can't be dependent on any **external systems** for the set up. It must be
 > **from inside out** auto configured.
 
-Four constraints, and they are not satisfied by "wire each seat up carefully":
-
-1. **Every configuration, identically** — 1:1, N:1 pods, and containers this
-   system did not create.
+1. **Every configuration, identically** — 1:1, N:1 pods, containers this system
+   did not create.
 2. **Fully automated** — no per-container step anyone can forget.
 3. **No external dependency** for setup.
 4. **Inside-out** — the container configures itself.
 
-⭐ Constraint 4 is the load-bearing one. It converts the question from *"how do
-we wire a seat for audio?"* to *"how does a seat wire ITSELF?"*, and that
-single change is what makes all the configurations collapse into one case.
-
-## The design: uniform container, discovering host
+## The design: the container PULLS
 
 ```
- host                                           container (ANY configuration)
- ─────────────────────────────────────────      ─────────────────────────────
- claude_mic.monitor                             entrypoint (identical everywhere):
-     │                                            pulse server
-     │  one emitter per CONTAINER,                  └ null sink `claude_mic`
-     │  created by DISCOVERY not config             └ ALSA default -> pulse
-     ▼                                            VBAN receptor, 0.0.0.0:6980
- vban -> <container-ip>:6980  ──────────────▶      (its OWN netns)
-                                                        │
-                                                        ▼
-                                                  arecord / `/voice`
+ host                                    container (ANY configuration)
+ ──────────────────────────────────      ─────────────────────────────────
+ claude_mic.monitor                      entrypoint, identical everywhere:
+     │                                     read default gw from /proc/net/route
+     │                                     connect OUT to <gw>:<port>
+     │                                     send seat name  ── handshake ──▶
+     ▼                                     read stream -> own pulse sink
+ host verifies name, then                        │
+ streams one-way, NEVER reads  ──────────────────┘
+                                                 ▼
+                                           arecord / `/voice`
 ```
 
-### Why this satisfies constraint 4, concretely
+**The host never addresses a container.** It does not discover, look up, or
+hold an address. It answers connections and streams.
 
-**The container's audio configuration contains nothing about itself.** No
-identity, no port allocation, no path, no address — the receptor binds a
-**fixed** port because each container has its **own network namespace**, so
-every seat in the fleet can bind the same port with no collision and no
-allocator.
+### Why this is the narrowest thing that works
 
-⇒ The image and entrypoint are **byte-identical in every configuration**. A
-1:1 seat, a pod, and an adopted container run exactly the same audio setup,
-because there is nothing configuration-shaped in it to differ.
+- **No listener in the container**, so container-to-container injection has
+  **no path** — not a blocked path, no path. That is structural, not a filter.
+- **No discovery, no lookup, no address churn, and no IP-reuse misroute** — the
+  whole class disappears because nothing on the host is aimed at a container.
+- **Adopted containers work identically**: they self-connect at entrypoint, so
+  nothing has to know they exist.
+- **The gateway address is self-discoverable from inside** (`/proc/net/route`,
+  measured — no configuration).
+- **Literally inside-out**, which is the operator's word.
 
-### Why this satisfies constraints 1–3: discovery, not configuration
+### ⭐ The argument that decides it: which way does it fail?
 
-The host runs **one** service. It does not read per-container config, because
-none exists. It enumerates **agent-seat containers from the roster and the
-hub's seat records** — which is the same list that already knows about both
-creation paths — resolves each container's current address, and maintains one
-emitter per container.
+v3 needs **one ufw PERMIT rule** (`docker0 → host:<port>`). v2 needed **one
+DOCKER-USER DENY rule**. Same cost, opposite failure mode:
 
-- **1:1** — container is the seat. One emitter.
-- **N:1 pod** — one emitter per **CONTAINER**, serving all N agents, because
-  the island belongs to the container.
-- **Adopted (`squad add-container`)** — works, **and this is the case v1 could
-  not serve at all**. Nothing had to happen at creation time, so a container
-  this system never created is not a special case.
+| | missing / inert |
+| --- | --- |
+| **PERMIT** rule (v3) | **fails CLOSED** — no audio, loudly, immediately |
+| **DENY** rule (v2) | **fails OPEN** — no isolation, silently, while audio works perfectly |
 
-⚠️ **Address churn is a lookup, not a problem.** Container IPs move across
-restarts, which is why a static allocation would rot. Discovery asks docker
-what the address is *now*, every cycle — the same reason the enumeration
-contract asks `docker ps` what exists rather than trusting a side table.
+Tonight was a catalogue of things silently absent while looking healthy. Prefer
+the failure mode *"voice doesn't work"* over *"the isolation isn't there and
+nothing says so."*
 
-## 🔴 Injection: the risk this design reopens, and how far the mitigation goes
+### The handshake earns its place
 
-A network path between host and container means container A can, in principle,
-send UDP to container B's receptor — and B would transcribe it as the
-operator's speech. **This is the risk v1's pipe eliminated structurally, and
-this design does not.** Stated plainly rather than softened, because a
-mitigation is not an impossibility.
+Any container on the bridge could connect. The container states its seat name
+and the host verifies before streaming — so a wrong peer is a **detectable
+mismatch** rather than silent audio to the wrong agent. It is doing real work,
+not decoration.
 
-Two layers, and they are different in kind:
+### Carried forward unchanged: TCP is lossless-with-backpressure
 
-1. **Receptor-side source filter** — accept only from the docker gateway. A
-   seat's packets carry its own address and are dropped. This is *in* the
-   container, so it is a filter the container itself enforces.
-2. **Host-side firewall rule** — drop container→container traffic to the audio
-   port in `DOCKER-USER`. **This one is enforced outside the container**, which
-   is what the mount rule's clause 3 actually requires, so it is the layer that
-   carries the guarantee. Layer 1 is defence in depth, not the ceiling.
+Same trap as the FIFO in v1. The host writes **non-blocking and DROPS on
+would-block**. A stalled seat must never stall the stream. For realtime audio
+dropping is CORRECT.
 
-⇒ Build **both**, and do not describe layer 1 as sufficient.
+## 🔴 Why v2 (host pushes) was FALSIFIED — measured, not argued
 
-**Revocation** stays simple and outside: stop the emitter for a seat and it is
-deaf. Per-container, no cooperation, no restart.
+v2 had the host discover containers and push to each one's listener, with a
+`DOCKER-USER` rule as the ceiling and a receptor source-filter as defence in
+depth. Both claims failed.
+
+**Claim: "a DOCKER-USER rule is the ceiling, enforced outside the container."**
+🔴 **FALSE on the box the seats run on.** Measured:
+
+```
+/proc/sys/net/bridge/bridge-nf-call-iptables  ->  DOES NOT EXIST
+lsmod | grep br_netfilter                     ->  NOT LOADED
+iptables -S DOCKER-USER                       ->  -N DOCKER-USER   (empty)
+```
+
+Two containers on the same `docker0` bridge talk over **L2 bridging**. Without
+`br_netfilter` that traffic **never enters iptables**, so the rule filters
+nothing. Injection was demonstrated live between two seat containers
+(`172.17.0.7` → `172.17.0.6:6980`, victim logged the payload).
+
+⭐ **The rule would have been PRESENT AND INERT.** I would have written it,
+`iptables -S` would have shown it, and I would have reasonably called clause 3
+satisfied — while injection still worked. That is **exactly** the failure class
+this whole design process has been about: *verified by PRESENCE, not by FLOW.*
+**A rule that exists is not a rule that runs.**
+
+⇒ If any future design leans on a firewall rule, the acceptance test cannot be
+"the rule is installed". It must be "**the attack, executed, fails**".
+
+⚠️ And loading `br_netfilter` is not a free flag — it changes how ALL bridged
+traffic on the host is handled, and becomes a **hidden prerequisite** a rebuilt
+or different host silently lacks. That is requirement 3 broken invisibly.
+
+**Claim: "address churn is just a lookup."** 🔴 **Answered the wrong problem.**
+The objection was not staleness, it was **IP REUSE**: `172.17.0.6` was held by
+two different containers minutes apart. A stale address does not point at
+nothing — **it points at a different live seat**. Between discovery cycles, the
+operator's voice is delivered to the wrong agent, with **no attacker, no
+misconfiguration, just timing**, and every health check green on both sides.
+Discovery shortens that window; it cannot close it, because the emitter's
+target is only ever as fresh as its last lookup.
+
+⚠️ On the source-filter defence in depth: seats run uid 1000 with
+`CapEff: 0000000000000000` (no raw sockets, so no spoofing) — but `CapBnd`
+still carries `NET_RAW` and the image ships **8 setuid-root binaries**. The
+floor under that mitigation is lower than it looks.
 
 ## Why not mount the host audio socket (v1's first rejection, still valid)
 
@@ -222,6 +251,19 @@ Every line above is design. No image rebuilt, no emitter, no firewall rule.
 When built, `mcp-hub-seat` must be rebuilt under a **DATE tag, never over
 `:latest`** — three live 1:1 seats run `:latest`.
 
-Split, if approved: container side (image, entrypoint, receptor) here; host
-side (discovery service, emitters, `DOCKER-USER` rule) with
-`mcp-hub-dev-vm-1-general`, each owner able to verify their own half.
+Split, if approved: container side (image, entrypoint, the outbound connect +
+handshake) here; host side (the listener, the ufw PERMIT rule, non-blocking
+writes) with `mcp-hub-dev-vm-1-general`, each owner able to verify their own
+half.
+
+⚠️ **The acceptance test for this design is not "it works".** Three things must
+be demonstrated by execution, because every one of them has already been
+believed on the strength of a component being present:
+
+1. **Audio flows** — `arecord` in the container, RMS non-zero while someone
+   speaks. Not "the sink exists".
+2. **Injection has no path** — run the attack from a second container and show
+   it fails. Not "the rule is installed".
+3. **Removing the PERMIT rule kills audio** — proving the control is the thing
+   actually carrying the guarantee, rather than something else happening to
+   work.
