@@ -15,7 +15,6 @@ from mcp_hub.voice_host import (
     parse_container_map,
     parse_squad_roster,
     roster_names,
-    verify_peer,
 )
 
 ROSTER_CONF = """\
@@ -80,23 +79,23 @@ def test_roster_accepts_both_naming_conventions():
 # -- authentication, not just authorisation ----------------------------------
 
 
-def test_verify_peer_matches_name_or_id():
+def test_a_seat_may_name_itself_by_name_or_id():
     cmap = parse_container_map(INSPECT)
-    assert verify_peer("172.17.0.2", "mcp-hub-seat-dev-vm-1", cmap)
-    assert verify_peer("172.17.0.2", "ccce49f2061c", cmap)
+    assert authorised("172.17.0.2", "mcp-hub-seat-dev-vm-1", cmap, ROSTER)
+    assert authorised("172.17.0.2", "ccce49f2061c", cmap, ROSTER)
 
 
 def test_a_container_cannot_claim_another_seats_name():
     # THE attack the handshake alone cannot stop: seat names are public, so a
     # rogue container could ask for any of them and be fed the operator's mic.
     cmap = parse_container_map(INSPECT)
-    assert not verify_peer("172.17.0.5", "mcp-hub-seat-dev-vm-1", cmap)
     assert not authorised("172.17.0.5", "mcp-hub-seat-dev-vm-1", cmap, ROSTER)
 
 
 def test_unknown_address_is_refused():
+    # An address docker cannot account for is not a seat we will feed.
     cmap = parse_container_map(INSPECT)
-    assert not verify_peer("172.17.0.99", "duo-pod-dev-vm-1", cmap)
+    assert not authorised("172.17.0.99", "duo-pod-dev-vm-1", cmap, ROSTER)
 
 
 def test_empty_roster_fails_closed():

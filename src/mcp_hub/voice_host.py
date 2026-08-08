@@ -18,13 +18,21 @@ WHAT THIS FILE IS DEFENDING, in the order the properties are easiest to lose:
   blanket tailscale allow is. `listen_address()` exists so that choice is
   stated once, in a function with a test, rather than inlined at a `bind()`.
 
-* **The handshake AUTHORISES but does not AUTHENTICATE.** Seat names are public
-  and guessable, so a name alone is a claim, not proof. `verify_peer` asks
-  docker which container holds the *connecting address right now* and checks it
-  matches. IP reuse — observed here, one address held by two containers minutes
-  apart — cannot bite: the connection is established, so the address is current
-  by definition. This is also why an ADOPTED container needs no special case;
-  docker knows it without anything having been injected at create time.
+* **The ADDRESS is the identity; the CLAIM is advisory.** Seat names are public
+  and guessable, and the claim is asserted by the very party being checked, so
+  it cannot authenticate itself. `decide` asks docker which container holds the
+  *connecting address right now* and treats that answer as the identity — a
+  third party vouching. IP reuse — observed here, one address held by two
+  containers minutes apart — cannot bite: the connection is established, so the
+  address is current by definition. This is also why an ADOPTED container needs
+  no special case; docker knows it without anything injected at create time.
+
+  ⚠️ This used to say the address must MATCH THE CLAIM, and an earlier
+  `verify_peer` implemented exactly that. It was wrong and is gone: a container
+  created with an explicit `--hostname` reports a name unrelated to anything
+  docker knows it by (measured), so matching would refuse adopted containers
+  silently and permanently. The claim is now refused only when it CONTRADICTS
+  the address by naming a different live container.
 
 * **Fail CLOSED, everywhere.** An unreadable roster, an unmappable peer, an
   unparsable line: every one of them resolves to *no audio*. The thing on the
@@ -181,22 +189,6 @@ def roster_names(cmap: dict[str, Container]) -> set[str]:
             names.add(c.id)
             names.add(c.id[:12])
     return names
-
-
-def verify_peer(peer_ip: str, claimed: str,
-                cmap: dict[str, Container]) -> bool:
-    """Does the container at this address actually have the name it claims?
-
-    This is the authentication the handshake alone cannot provide. Unknown
-    address -> False, because an address docker cannot account for is not a
-    seat we are willing to feed.
-    """
-    if not peer_ip or not claimed:
-        return False
-    c = cmap.get(peer_ip)
-    if c is None:
-        return False
-    return claimed in (c.name, c.id, c.id[:12])
 
 
 def decide(peer_ip: str, claimed: str, cmap: dict[str, Container],
