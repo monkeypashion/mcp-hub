@@ -11,7 +11,7 @@ widget rather than clicks on list rows — still real input, still the same app.
 from __future__ import annotations
 
 import pytest
-from textual.widgets import Tree
+from textual.widgets import Select, Tree
 
 from mcp_hub.settings_app import SettingsApp
 
@@ -86,6 +86,53 @@ def _detail_text(app) -> str:
 _SETTLE = 25
 
 
+async def _ready(pilot, app, tries: int = 200) -> None:
+    """Wait until the controls are POPULATED — not until a frame has elapsed.
+
+    🔴 One `await pilot.pause()` after `run_test()` is a fixed frame count
+    standing in for a condition: **the same substitution `_ran` exists to
+    remove, one step earlier, in the setup every test here shares.** A `Select`
+    is constructed with `value=` and `allow_blank=False`, but the reactive is
+    only applied once the widget MOUNTS — so under load `.value` still reads
+    `Select.NULL` and the test either compares NULL against a real value or
+    assigns to a control that is not ready. No wait placed *after* that point
+    can repair it.
+
+    Found by mcp-hub-dev-vm-1-general 2026-08-08: **3 failures in 20 runs** on a
+    box whose *ambient* load average is 42 (16 tmux agents, four seat
+    containers, rclone, squad heal). It does NOT reproduce on an 8-core box
+    under 8 CPU burners (0/25 measured), so this is not a bound anyone can tune
+    by watching it pass locally — hence a condition rather than a bigger number.
+
+    ⭐ **The old single pause had ZERO margin, measured.** Instrumented on an
+    idle 8-core box, this loop consumes **exactly 1 pause, 15 runs out of 15** —
+    the condition is unmet on entry and met after one. So `await pilot.pause()`
+    was not comfortably sufficient, it was *exactly* sufficient, and any load
+    that pushes the requirement to 2 breaks it. That is why the failure looks
+    machine-specific rather than rare: it isn't a long tail, it's a boundary.
+
+    ⚠️ **Not a product defect.** The panel would show a blank control for a
+    frame, and `_on_select_changed` refuses `Select.NULL` anyway because it is
+    never in the row's `choices`.
+
+    ⚠️ **This fix cannot be mutation-verified here.** Reverting the loop to a
+    single pause still passes 8/8 locally, because the box that reproduces the
+    failure is not this one. The local evidence is the zero-margin measurement
+    above, not a red test — say so rather than implying it was proven here.
+
+    Compares against `Select.NULL` by identity: in textual 8.2.8 `Select.BLANK`
+    is an unrelated plain `False`, so both `str(v) == "Select.NULL"` and
+    `Select.BLANK` would be wrong here in different ways.
+    """
+    for _ in range(tries):
+        sels = app.query("Select")
+        if sels and not any(s.value is Select.NULL for s in sels):
+            return
+        await pilot.pause()
+    raise AssertionError(
+        "controls never populated — every Select still reads Select.NULL")
+
+
 async def _ran(pilot, ran, tries: int = 200) -> list:
     """Wait for the command to be RECORDED, not for a fixed number of frames.
 
@@ -142,6 +189,7 @@ async def test_widget_ids_are_never_reused_between_renders():
         for _ in range(3):
             for name in ("real", "real-two"):
                 await _goto(app, pilot, name)
+                await _ready(pilot, app)
                 ids = {s.id for s in app.query("Select")}
                 assert ids, "controls vanished after switching agents"
                 assert not (ids & seen), f"id reused across renders: {ids & seen}"
@@ -154,7 +202,7 @@ async def test_it_opens_on_an_agent_that_has_settings():
     row 0 showed an empty panel that read as a broken feature."""
     app = _app()
     async with app.run_test(size=(110, 30)) as pilot:
-        await pilot.pause()
+        await _ready(pilot, app)
         assert app.selected["agent"] == "real", app.selected
         assert app.query("Select"), "opened on an agent with nothing to change"
 
@@ -178,7 +226,7 @@ async def test_changing_a_dropdown_runs_the_command_the_model_named():
     ran: list = []
     app = _app(ran)
     async with app.run_test(size=(110, 30)) as pilot:
-        await pilot.pause()
+        await _ready(pilot, app)
         sel = app.query("Select").last()      # Comms, currently "off"
         sel.value = "on"
         await _ran(pilot, ran)
@@ -190,7 +238,7 @@ async def test_a_mute_goes_to_the_hub_binary_not_squad():
     ran: list = []
     app = _app(ran)
     async with app.run_test(size=(110, 30)) as pilot:
-        await pilot.pause()
+        await _ready(pilot, app)
         sel = app.query("Select").first()     # the dreamteam squad row
         sel.value = "muted"
         await _ran(pilot, ran)
@@ -212,7 +260,7 @@ async def test_selecting_the_value_already_set_runs_nothing():
     ran: list = []
     app = _app(ran)
     async with app.run_test(size=(110, 30)) as pilot:
-        await pilot.pause()
+        await _ready(pilot, app)
         sel = app.query("Select").last()
         sel.value = "off"                     # already off
         for _ in range(_SETTLE):
@@ -230,6 +278,6 @@ async def test_every_editable_row_shows_its_current_value_as_selected():
     choices said "hear", so nothing could ever be selected."""
     app = _app()
     async with app.run_test(size=(110, 30)) as pilot:
-        await pilot.pause()
+        await _ready(pilot, app)
         values = sorted(str(s.value) for s in app.query("Select"))
         assert values == ["hearing", "off"], values
