@@ -94,8 +94,23 @@ RUN mkdir -p /home/seat/work
 # Point libpulse at the container's OWN server by ABSOLUTE path. Load-bearing:
 # tmux-launched agents often lack a usable XDG_RUNTIME_DIR, and libpulse then
 # finds nothing — a trap that already cost time on the fireblade rig.
+# 🔴 NO `default-server` HERE — it is correct on the HOST and fatal in the
+# CONTAINER. pulseaudio refuses to start when one is configured:
+#   "User-configured server at unix:/run/user/1000/pulse/native,
+#    refusing to start/autospawn"
+# ...so the line added to help clients FIND the server is the line that
+# prevents the server from existing. Measured in a throwaway container.
+#
+# The reason it was needed on the host does not apply here: `ENV
+# XDG_RUNTIME_DIR=/run/user/1000` above is baked into the IMAGE, so every
+# process inherits it — including tmux-launched agents, which is the exact case
+# the absolute path was protecting against. libpulse then finds
+# $XDG_RUNTIME_DIR/pulse/native by itself.
+#
+# `autospawn = no` STAYS: seat-entry starts the server explicitly with
+# /etc/pulse/seat-voice.pa, and an autospawned one would use default.pa
+# instead — no null sink, so nowhere for the host stream to go.
 RUN mkdir -p /home/seat/.config/pulse && printf '%s\n' \
-        'default-server = unix:/run/user/1000/pulse/native' \
         'autospawn = no' \
         > /home/seat/.config/pulse/client.conf
 
