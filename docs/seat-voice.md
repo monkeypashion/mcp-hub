@@ -449,6 +449,19 @@ believed on the strength of a component being present:
 
    ⇒ Per-box, per-run: floors differ between machines and move with input gain,
    so a floor measured yesterday or elsewhere proves nothing today.
+
+   🔴 **The quiet window must be ESTABLISHED, not assumed.** *A floor you did not
+   establish is not a floor* — the same way a wait that never runs is not a wait.
+   **Ask** for deliberate silence and confirm you got it; an interval when nobody
+   *happened* to be speaking is a different measurement wearing the same name.
+
+   ⚠️ **The tell that you have events in your "floor": stable RMS with a WANDERING
+   PEAK.** A genuine noise floor holds both steady. Measured on dev-vm-1 —
+   RMS 2101 / 1752 / 1781 (stable) with peaks 6928 / 10103 / 12304 (spreading
+   2×) — which reads as a quiet room *plus intermittent sounds*, not as a floor.
+   That mislabelling nearly carried a conclusion about the operator's input gain
+   (a compressed dynamic range) that the data could not support in either
+   direction.
 2. **Injection has no path** — run the attack from a second container and show
    it fails. Not "the rule is installed".
 3. **Removing the PERMIT rule kills audio** — proving the control is the thing
