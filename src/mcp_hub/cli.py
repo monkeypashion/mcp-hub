@@ -4675,8 +4675,24 @@ def voice_client_command(args: argparse.Namespace) -> int:
     # pacat owns the decode: raw s16le at the fleet's fixed rate into this
     # container's OWN sink. Nothing here reaches the host's audio server.
     pac = _sp.Popen(
+        # 🔴 --latency-msec IS NOT OPTIONAL. Without it PulseAudio picks its own
+        # playback buffer, and its default is enormous: MEASURED in a live seat
+        # at "Buffer Latency: 960000 usec" with a total sink latency of 1.02
+        # SECONDS. The operator's first real use was "quite laggy, I had to
+        # speak slowly" — that second was mostly this line.
+        #
+        # 80ms matches what the host side already uses for `parec` and for the
+        # VBAN receptor's own `pacat`, so the whole chain now has one buffer
+        # depth rather than three plus a default nobody chose.
+        #
+        # ⚠️ Do not raise it to "fix" a dropout. Buffering hides a stall by
+        # delaying it, and this stream is deliberately lossy (see
+        # voice.send_or_drop) precisely so that a slow seat loses audio rather
+        # than accumulating it. Late audio is transcribed as though it were
+        # current, which is worse than missing audio.
         ["pacat", "--playback", "--format=s16le",
-         f"--rate={VOICE_RATE}", f"--channels={VOICE_CHANNELS}"],
+         f"--rate={VOICE_RATE}", f"--channels={VOICE_CHANNELS}",
+         "--latency-msec=80"],
         stdin=_sp.PIPE,
     )
     print(f"voice: streaming from {gw}:{args.port} as {seat}", file=sys.stderr)
