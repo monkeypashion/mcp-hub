@@ -116,19 +116,43 @@ grants access is not the thing we are changing, so reviewing only our own diff
 misses it.* Scope the rule too: `from 172.17.0.0/16 to 172.17.0.1 port 6981`,
 not a bare port-open.
 
-### The handshake AUTHORISES but does not AUTHENTICATE
+### The ADDRESS is the identity; the CLAIM is advisory
 
-`MCPHUBVOICE1 <seat>` proves nothing — seat names are public and guessable, so
-any container on the bridge can claim any name and receive the audio. The
-handshake solves the **misroute** problem, which was its job; it does not stop
-a rogue container eavesdropping.
+`MCPHUBVOICE1 <seat>` proves nothing. Seat names are public and guessable, and
+**the claim is asserted by the very party being checked** — it cannot
+authenticate itself. The handshake solves the **misroute** problem, which was
+its job; it does not stop a rogue container eavesdropping.
 
-⇒ **Verify the PEER ADDRESS against docker at connection time**: ask docker
-which container holds the connecting address *now*, and confirm it matches the
-claimed seat. Authentication without secrets. **IP reuse cannot bite here** —
-the connection is established, so the address is current by definition — and it
-works for adopted containers because it asks docker rather than needing
-something injected at create time.
+⇒ **Ask docker which container holds the connecting address, and treat that
+answer as the identity.** Docker is a third party vouching. Authentication
+without secrets. **IP reuse cannot bite here** — the connection is established,
+so the address is current by definition — and it works for adopted containers
+because it asks docker rather than needing something injected at create time.
+
+⚠️ **This section used to say the address must MATCH THE CLAIM, and that was
+wrong** (corrected 2026-08-08 after measurement). A container created with an
+explicit `--hostname` reports a name with **no relationship to anything docker
+knows it by** — measured: hostname `totally-unrelated-name`, docker name
+`voice.drift.tmp`, id `ecde055f0717`. Under match-the-claim such a container is
+refused permanently and silently. The claim is now logged, and refused only
+when it **contradicts** the address by naming a *different* live container —
+the impersonation case, which the handshake alone could never have caught.
+
+🔴 **AUTHENTICATE ≠ AUTHORISE — do not let the second disappear with the
+first.** Identity-from-the-address answers *"which container is this?"*, not
+*"may it listen?"*. Dropping the roster check along with the claim makes the
+gate "any live container on the bridge", which hands the operator's **live
+microphone** to anything anyone ever `docker run`s on the box — a CI job, a
+scratch image, a database. Nobody starting a container thinks they are starting
+a microphone client. So:
+
+```
+authenticate:  peer address -> docker -> the container's REAL name + id
+authorise:     is that container in the roster (property 5)?
+```
+
+Both. The first is what makes adopted seats work under any name; the second is
+where *"this one may listen to the room"* is actually decided.
 
 ### Seven properties the host side must hold
 
@@ -137,6 +161,16 @@ something injected at create time.
    stale audio transcribed as current.
 2. **Fail CLOSED on an unreadable roster.** "Cannot check who is asking" must
    resolve to *no audio*.
+
+   ⚠️ **WHICH roster — see property 5, and read it before reaching for the
+   obvious thing.** The host author reached for two wrong ones in a row before
+   the right one was traced, and *both were the natural choice at the time*:
+   `mcp-hub seats list` (which is a **network** call, so it cannot be the
+   answer) and the container **image** (which is a fact about today's fleet,
+   not a rule about seats). The answer is the local
+   `~/.config/squad/squad.conf`. Naming it here because a reader who arrives at
+   "fail closed on the roster" has already assumed they know what the roster
+   is.
 3. **Reap dead peers.** A SIGKILLed container can take ~15 minutes for TCP to
    fail a write, and drop-on-would-block would cheerfully drop into a corpse.
    Keepalive or reap on sustained would-block — otherwise *"the seat is deaf"*
