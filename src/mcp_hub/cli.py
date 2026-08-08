@@ -2254,6 +2254,32 @@ def capsules_command(args: argparse.Namespace, api: Any = None) -> int:
                       f"{c.get('created', '')}")
             return 0
 
+        if args.action == "rm":
+            # 🔴 The gap the operator found by asking the right question:
+            # "through the CLI, can we support any container or workspace or
+            # squad scenario?" Every other registry could be emptied — seats
+            # archive, placements reclaim, workspaces remove — and capsules
+            # could only ever GROW. The server has had DELETE /capsules/{id}
+            # all along; nothing reached it.
+            if not args.target:
+                print("name the capsule to remove (mcp-hub capsules list)",
+                      file=sys.stderr)
+                return 1
+            if args.dry_run:
+                print(f"would remove capsule {args.target} "
+                      "(placements it already made are untouched)")
+                return 0
+            api.delete_capsule(args.target)
+            # Said explicitly because the opposite is the natural fear, and it
+            # is what would stop someone tidying: a capsule is a SNAPSHOT, not
+            # a live link. `place` copies the manifest into per-seat
+            # placements and nothing refers back, so removing one takes away
+            # the ability to re-place that snapshot and nothing else.
+            print(f"capsule {args.target} removed — anything it already "
+                  "placed keeps running; you can no longer re-place THIS "
+                  "snapshot (compose a fresh one from the live squad)")
+            return 0
+
         if args.action == "compose":
             if not args.squad:
                 print("--squad required — a capsule freezes ONE squad",
@@ -5744,9 +5770,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     capsules.add_argument(
-        "action", choices=["list", "compose", "place", "attach"],
+        "action", choices=["list", "compose", "place", "attach", "rm"],
         help=("list · compose: freeze a squad · place: one placement per seat "
-              "· attach: give this machine's seats a tab and a workspace"),
+              "· attach: give this machine's seats a tab and a workspace "
+              "· rm: forget a snapshot (what it already placed keeps running)"),
     )
     capsules.add_argument("target", nargs="?",
                           help="place/attach: which capsule")
