@@ -6392,7 +6392,9 @@ def build_parser() -> argparse.ArgumentParser:
     seats.add_argument(
         "--timeout", type=int, default=None, metavar="SECONDS",
         help="add (headless): kill the turn after this long, recording exit "
-             "124 with partial output kept (default 1800; 0 = unbounded)",
+             "124 with partial output kept (default 1800; 0 = unbounded — "
+             "the one value where the flag disarms itself: nothing will "
+             "ever reap a hung turn)",
     )
     seats.add_argument("--class", dest="klass", default="squad",
                        choices=["squad", "faculty"],
