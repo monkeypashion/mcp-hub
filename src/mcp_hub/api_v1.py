@@ -740,11 +740,33 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             return JSONResponse(seat_json(row, presence=True))
         if request.method == "PATCH":
             body = await body_of(request)
+            # 🔴 THE SPEC WAS UNEDITABLE, which made this route unable to
+            # change anything that matters about a container seat: image, env,
+            # volumes — and, once briefs existed, the BRIEF. Re-briefing a
+            # seat meant reclaiming its placement, archiving it and declaring
+            # a new one, which is a teardown dressed as an edit.
+            #
+            # MERGED, not replaced: a PATCH that sent only `{"brief": ...}`
+            # and silently dropped the image would produce a seat that could
+            # never be materialized again, and nothing would say why. Callers
+            # patch what they mean to change.
+            spec = json.loads(row["spec"] or "{}")
+            incoming = body.get("spec")
+            if incoming is not None:
+                if not isinstance(incoming, dict):
+                    return _err(422, "spec must be an object")
+                for k, v in incoming.items():
+                    if v is None:
+                        spec.pop(k, None)   # explicit null REMOVES a key
+                    else:
+                        spec[k] = v
             db().execute(
-                "UPDATE api_seats SET launch_args = ?, class = ? WHERE identity = ?",
+                "UPDATE api_seats SET launch_args = ?, class = ?, spec = ?"
+                " WHERE identity = ?",
                 (
                     body.get("launch_args", row["launch_args"]),
                     body.get("class", row["class"]),
+                    json.dumps(spec),
                     identity,
                 ),
             )
@@ -783,9 +805,33 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             "SELECT 1 FROM api_seats WHERE identity = ?", (new_identity,)
         ).fetchone():
             return _err(409, f"seat '{new_identity}' already exists")
+        # 🔴 THE SPEC MUST TRAVEL. This INSERT omitted `spec` entirely, so
+        # cloning a DOCKER seat produced a row with no image, no volumes, no
+        # env and no brief — a worktree seat wearing the original's name. It
+        # would have been declared successfully and then failed to materialize
+        # with a message about the wrong thing.
+        #
+        # Pod inhabitants are re-identified with the same suffix, for the
+        # reason capsule minting learned the hard way: suffixing only the
+        # container leaves two containers holding agents with IDENTICAL hub
+        # names, which moves the collision somewhere nothing can see it.
+        spec = json.loads(row["spec"] or "{}")
+        if spec.get("agents"):
+            spec["agents"] = [
+                {**a, "identity": f"{a.get('identity', '')}-{suffix}"}
+                for a in spec["agents"]
+            ]
+            if spec.get("squad"):
+                spec["squad"] = f"{spec['squad']}-{suffix}"
+        if spec.get("memory_volume"):
+            # A clone sharing the original's memory volume would have the two
+            # seats writing each other's memory and results — and a reclaim of
+            # either would harvest a volume the other still uses.
+            spec["memory_volume"] = f"{spec['memory_volume']}-{suffix}"
         db().execute(
             "INSERT INTO api_seats (identity, repo, machine, folder, launch_args,"
-            " class, cloned_from, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " class, cloned_from, created, spec)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 new_identity,
                 row["repo"],
@@ -795,6 +841,7 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
                 row["class"],
                 identity,
                 _now(),
+                json.dumps(spec),
             ),
         )
         db().commit()

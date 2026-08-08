@@ -187,9 +187,19 @@ def test_headless_is_a_flag_not_tribal_env_knowledge(capsys):
     # No image: SEAT_MODE means nothing to a worktree seat.
     (dict(repo="org/x", folder="/srv/x", prompt="go", memory_volume="m"),
      "--image"),
-    # A pod: SEAT_PROMPT is single-valued, a pod has several agents.
+    # A pod given a single-valued PROMPT: one prompt cannot address N agents.
+    #
+    # ⚠️ This case used to expect "1:1" — the old rule refused headless pods
+    # OUTRIGHT. It was narrowed 2026-08-08 to what its own reasoning actually
+    # supported: the PROMPT is the single-valued thing, and briefs are
+    # per-agent and always worked for pods. So a briefed headless pod is now
+    # legal (see test_headless_pod.py) and only the prompt is refused.
     (dict(image="i", prompt="go", memory_volume="m",
-          agent=["a=org/a", "b=org/b"]), "1:1"),
+          agent=["a=org/a", "b=org/b"]), "single-valued"),
+    # A pod with NO brief: every inhabitant needs an instruction, or it runs a
+    # turn that does nothing and exits — which the edge reads as a crash.
+    (dict(image="i", memory_volume="m", agent=["a=org/a", "b=org/b"]),
+     "--brief"),
 ])
 def test_headless_declaration_refuses_at_the_earliest_gate(capsys, kw, expect):
     """The same rules seat-entry's door and the edge enforce, surfaced at

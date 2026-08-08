@@ -163,7 +163,11 @@ def _run_headless(monkeypatch, tmp_path, script, timeout=0):
     monkeypatch.setattr(
         seat, "launch_argv", lambda c, w, session="seat": ["sh", "-c", script])
     contract = _contract(timeout=timeout)
-    rc = cli._seat_headless(contract, tmp_path)
+    # Returns (rc, verdict) since headless pods landed: the POD runner needs
+    # each agent's verdict to aggregate, and re-reading it off disk would make
+    # the summary depend on a file the agent had just written — one more way
+    # for a result to be lost between two places that both think they have it.
+    rc, _verdict = cli._seat_headless(contract, tmp_path)
     base = tmp_path / ".claude" / HEADLESS_RESULTS_SUBDIR / "errand-1"
     return rc, base
 
