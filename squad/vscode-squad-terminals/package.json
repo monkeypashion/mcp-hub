@@ -2,7 +2,7 @@
   "name": "squad-terminals",
   "displayName": "Squad Terminals",
   "description": "Auto-opens one plain terminal per squad agent (squad attach) with icon+color, and adds per-agent squad actions to the terminal tab context menu.",
-  "version": "0.32.0",
+  "version": "0.33.0",
   "publisher": "monkeypashion",
   "engines": {
     "vscode": "^1.90.0"
@@ -242,6 +242,26 @@
         "command": "squad.focus.off",
         "title": "Focus: off (wakes resume now)",
         "category": "Squad"
+      },
+      {
+        "command": "squad.seatLogs",
+        "title": "Show result / logs\u2026",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.seatRebrief",
+        "title": "Re-brief\u2026",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.seatClone",
+        "title": "Clone seat\u2026",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.manage",
+        "title": "Squad management\u2026",
+        "category": "Squad"
       }
     ],
     "submenus": [
@@ -275,11 +295,19 @@
       },
       {
         "id": "squad.enrolMenu",
-        "label": "Add & remove"
+        "label": "Remove this agent"
       },
       {
         "id": "squad.focusMenu",
         "label": "Focus (do not disturb)"
+      },
+      {
+        "id": "squad.seatMenu",
+        "label": "Seat (container)"
+      },
+      {
+        "id": "squad.workspaceMenu",
+        "label": "Workspace\u2026"
       }
     ],
     "menus": {
@@ -332,6 +360,11 @@
           "when": "squad.isAgent"
         },
         {
+          "submenu": "squad.focusMenu",
+          "group": "1_talk@5",
+          "when": "squad.isAgent"
+        },
+        {
           "command": "squad.startAttach",
           "group": "2_lifecycle@1",
           "when": "squad.isAgent"
@@ -348,27 +381,38 @@
         },
         {
           "submenu": "squad.messagingMenu",
-          "group": "3_groups@1"
+          "group": "3_groups@1",
+          "when": "squad.isAgent"
         },
         {
           "submenu": "squad.moveMenu",
-          "group": "3_groups@2"
+          "group": "3_groups@2",
+          "when": "squad.isAgent"
+        },
+        {
+          "submenu": "squad.seatMenu",
+          "group": "3_groups@3",
+          "when": "squad.isAgent"
         },
         {
           "submenu": "squad.enrolMenu",
-          "group": "3_groups@3"
+          "group": "3_groups@4",
+          "when": "squad.isAgent"
         },
         {
           "submenu": "squad.modelMenu",
-          "group": "4_session@1"
+          "group": "4_session@1",
+          "when": "squad.isAgent"
         },
         {
           "submenu": "squad.effortMenu",
-          "group": "4_session@2"
+          "group": "4_session@2",
+          "when": "squad.isAgent"
         },
         {
           "submenu": "squad.voiceMenu",
-          "group": "4_session@3"
+          "group": "4_session@3",
+          "when": "squad.isAgent"
         },
         {
           "submenu": "squad.launchMenu",
@@ -381,9 +425,12 @@
           "when": "squad.isAgent"
         },
         {
-          "submenu": "squad.focusMenu",
-          "group": "1_talk@5",
-          "when": "squad.isAgent"
+          "submenu": "squad.workspaceMenu",
+          "group": "6_scope@1"
+        },
+        {
+          "command": "squad.manage",
+          "group": "6_scope@2"
         }
       ],
       "squad.modelMenu": [
@@ -456,22 +503,22 @@
         {
           "command": "squad.comms.on",
           "group": "1_comms@1",
-          "when": "squad.isAgent && !squad.hasComms"
+          "when": "squad.isAgent"
         },
         {
           "command": "squad.comms.off",
           "group": "1_comms@2",
-          "when": "squad.isAgent && squad.hasComms"
+          "when": "squad.isAgent"
         },
         {
           "command": "squad.resume.on",
           "group": "2_resume@1",
-          "when": "squad.isAgent && !squad.hasResume"
+          "when": "squad.isAgent"
         },
         {
           "command": "squad.resume.off",
           "group": "2_resume@2",
-          "when": "squad.isAgent && squad.hasResume"
+          "when": "squad.isAgent"
         }
       ],
       "squad.messagingMenu": [
@@ -496,42 +543,18 @@
           "command": "squad.duplicate",
           "group": "1_move@2",
           "when": "squad.isAgent"
-        },
-        {
-          "command": "squad.transportAll",
-          "group": "2_bulk@1"
-        },
-        {
-          "command": "squad.transportWorkspace",
-          "group": "2_bulk@2"
         }
       ],
       "squad.enrolMenu": [
         {
-          "command": "squad.addFolder",
-          "group": "1_add@1"
-        },
-        {
-          "command": "squad.addFromGitHub",
-          "group": "1_add@2"
-        },
-        {
-          "command": "squad.capsuleAttach",
-          "group": "1_add@3"
-        },
-        {
           "command": "squad.wsRemove",
-          "group": "2_remove@1",
+          "group": "1_remove@1",
           "when": "squad.isAgent"
         },
         {
           "command": "squad.retire",
-          "group": "3_danger@1",
+          "group": "2_danger@1",
           "when": "squad.isAgent"
-        },
-        {
-          "command": "squad.teardownWorkspace",
-          "group": "3_danger@2"
         }
       ],
       "squad.focusMenu": [
@@ -553,6 +576,49 @@
         {
           "command": "squad.focus.off",
           "group": "2_off@1",
+          "when": "squad.isAgent"
+        }
+      ],
+      "squad.workspaceMenu": [
+        {
+          "command": "squad.addFolder",
+          "group": "1_add@1"
+        },
+        {
+          "command": "squad.addFromGitHub",
+          "group": "1_add@2"
+        },
+        {
+          "command": "squad.capsuleAttach",
+          "group": "1_add@3"
+        },
+        {
+          "command": "squad.transportAll",
+          "group": "2_bulk@1"
+        },
+        {
+          "command": "squad.transportWorkspace",
+          "group": "2_bulk@2"
+        },
+        {
+          "command": "squad.teardownWorkspace",
+          "group": "3_danger@1"
+        }
+      ],
+      "squad.seatMenu": [
+        {
+          "command": "squad.seatLogs",
+          "group": "1_read@1",
+          "when": "squad.isAgent"
+        },
+        {
+          "command": "squad.seatRebrief",
+          "group": "2_write@1",
+          "when": "squad.isAgent"
+        },
+        {
+          "command": "squad.seatClone",
+          "group": "2_write@2",
           "when": "squad.isAgent"
         }
       ]
