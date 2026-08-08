@@ -33,6 +33,12 @@ from typing import Any, Callable
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
+# Safe at module level: server.py imports THIS module lazily, inside
+# create_server, precisely so the http surface stays optional for stdio runs.
+# The one-way edge means the loan deadline is enforced by the same function on
+# both surfaces — a second implementation here is a second chance to disagree.
+from mcp_hub.server import purge_expired_memberships
+
 SUBSTRATES = ("worktree", "docker")
 
 # Default settings block for rendered .code-workspace files — mirrors what
@@ -55,6 +61,22 @@ def _sha(text: bytes) -> str:
 
 def _err(status: int, detail: str) -> JSONResponse:
     return JSONResponse({"detail": detail}, status_code=status)
+
+
+def _sanitize_label(label: str) -> str:
+    """A suffix that is safe as a hub identity, a container name and a tmux
+    session all at once.
+
+    `.` and `:` are excluded deliberately, not incidentally: tmux reads them as
+    its pane and window separators, so a dotted name produces an agent that
+    RUNS and cannot be addressed — measured on the fleet. The same rule is
+    enforced at the far end by `seat._tmux_safe`; this stops a bad label
+    reaching a container in the first place.
+    """
+    kept = "".join(
+        c if (c.isalnum() or c in "-_") else "-" for c in label.strip().lower()
+    ).strip("-")
+    return kept[:32]
 
 
 def init_api_tables(conn: sqlite3.Connection) -> None:
@@ -272,6 +294,7 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
         return out
 
     def squad_json(row: sqlite3.Row) -> dict:
+        purge_expired_memberships(db())
         count = db().execute(
             "SELECT COUNT(*) AS n FROM squad_members WHERE squad = ?",
             (row["name"],),
@@ -879,6 +902,7 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             "SELECT 1 FROM api_squads WHERE name = ? AND archived = 0", (name,)
         ).fetchone():
             return _err(404, f"no squad '{name}'")
+        purge_expired_memberships(db())
         rows = db().execute(
             "SELECT * FROM squad_members WHERE squad = ? ORDER BY joined", (name,)
         ).fetchall()
@@ -890,6 +914,11 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
                         "muted": bool(r["muted"]),
                         "source": r["source"],
                         "joined": r["joined"],
+                        # 0 = permanent. Reported for every member so a reader
+                        # never has to infer "no key means forever" — a loan
+                        # and an ordinary membership must be distinguishable
+                        # without knowing the convention.
+                        "expires": r["expires"],
                     }
                     for r in rows
                 ]
@@ -912,15 +941,30 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             return _err(404, f"no squad '{name}'")
         if request.method == "PUT":
             body = await body_of(request)
+            try:
+                expires = float(body.get("expires", 0) or 0)
+            except (TypeError, ValueError):
+                return _err(422, "expires must be a unix timestamp (0 = permanent)")
+            if expires and expires <= _now():
+                # Accepting it would create a membership that the very next
+                # read deletes — the caller would see success and then an
+                # absent member, and reasonably conclude the add had failed.
+                return _err(422, "expires is in the past — that loan is already over")
             db().execute(
-                "INSERT INTO squad_members (agent, squad, muted, joined, source)"
-                " VALUES (?, ?, ?, ?, 'api')"
+                "INSERT INTO squad_members"
+                " (agent, squad, muted, joined, source, expires)"
+                " VALUES (?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT(agent, squad)"
-                " DO UPDATE SET muted = excluded.muted",
-                (seat, name, int(bool(body.get("muted", False))), _now()),
+                " DO UPDATE SET muted = excluded.muted,"
+                "               source = excluded.source,"
+                "               expires = excluded.expires",
+                (seat, name, int(bool(body.get("muted", False))), _now(),
+                 str(body.get("source") or "api"), expires),
             )
             db().commit()
-            return JSONResponse({"seat": seat, "squad": name})
+            return JSONResponse(
+                {"seat": seat, "squad": name, "expires": expires}
+            )
         member = db().execute(
             "SELECT 1 FROM squad_members WHERE agent = ? AND squad = ?",
             (seat, name),
@@ -1074,6 +1118,11 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
         references) and VERIFIABLE (the manifest hashes every entry).
         """
         squad = squad_row["name"]
+        # A capsule is meant to REPRODUCE the squad. Freezing a lapsed loan
+        # into it would resurrect the borrowed agent on every future place —
+        # the expiry would hold on the live squad and be permanently undone by
+        # its own snapshot.
+        purge_expired_memberships(db())
         member_rows = db().execute(
             "SELECT agent FROM squad_members WHERE squad = ? ORDER BY joined",
             (squad,),
@@ -1222,6 +1271,64 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             headers={"content-disposition": f'attachment; filename="{cid}.tar.gz"'},
         )
 
+    def _mint_capsule_seats(
+        frozen: list[dict], label: str, machine: str,
+    ) -> tuple[list[str], JSONResponse | None]:
+        """Clone a capsule's seats under `<identity>-<label>`. New rows, so the
+        second copy is a genuinely separate squad rather than the same one
+        described twice.
+
+        🔴 THE POD CASE, which is easy to miss and reintroduces the exact bug
+        one level down. A pod seat's spec carries `agents[].identity` — the
+        inhabitants' OWN hub names. Suffixing only the container's identity
+        would put two containers up with different names holding agents with
+        IDENTICAL names, so the collision moves from the thing you can see
+        (docker ps) to the thing you cannot. Every inhabitant is re-identified
+        with the same label.
+        """
+        rows: list[tuple] = []
+        for s in frozen:
+            src = s["identity"]
+            new_id = f"{src}-{label}"
+            if not s.get("spec") and not s.get("repo"):
+                # A member with no seat row froze as a bare {"identity": ...}.
+                # There is nothing to clone, and inventing a spec would
+                # materialize a container the squad never actually had.
+                return [], _err(
+                    422,
+                    f"'{src}' is a squad member with no seat declaration, so "
+                    "there is nothing to copy. Declare it with `mcp-hub seats "
+                    "add` and re-compose, or place this capsule as-is.",
+                )
+            if db().execute(
+                "SELECT 1 FROM api_seats WHERE identity = ?", (new_id,)
+            ).fetchone():
+                return [], _err(
+                    409,
+                    f"seat '{new_id}' already exists — that label has been "
+                    "used for this capsule before. Pick another `as` label.",
+                )
+            spec = dict(s.get("spec") or {})
+            if spec.get("agents"):
+                spec["agents"] = [
+                    {**a, "identity": f"{a.get('identity', '')}-{label}"}
+                    for a in spec["agents"]
+                ]
+                if spec.get("squad"):
+                    spec["squad"] = f"{spec['squad']}-{label}"
+            rows.append((
+                new_id, s.get("repo", ""), machine, s.get("folder", ""),
+                s.get("launch_args", ""), s.get("class", "squad"),
+                src, _now(), json.dumps(spec),
+            ))
+        for r in rows:
+            db().execute(
+                "INSERT INTO api_seats (identity, repo, machine, folder,"
+                " launch_args, class, cloned_from, created, spec)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", r,
+            )
+        return [r[0] for r in rows], None
+
     @route("/api/v1/capsules/{cid}/place", methods=["POST"])
     async def capsule_place(request: Request) -> Response:
         got = operator_only(request)
@@ -1241,17 +1348,59 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
         ).fetchone():
             return _err(404, f"no machine '{machine}'")
         manifest = json.loads(row["manifest"])
+        label = _sanitize_label(str(body.get("as") or ""))
+        if body.get("as") and not label:
+            return _err(422, "`as` must contain letters, digits, - or _")
+
+        if label:
+            minted, err = _mint_capsule_seats(manifest["seats"], label, machine)
+            if err:
+                return err
+            targets = minted
+        else:
+            # 🔴 THE COLLISION. A capsule freezes IDENTITIES, so placing one
+            # twice used to write a second placement for the same seat on
+            # another machine — two containers, one hub identity, both
+            # registering, last one silently owning the wake binding. That is
+            # the duplicate-agent failure the derived-identity work exists to
+            # prevent, and it arrived through the back door: nothing here
+            # looked at what was already placed.
+            #
+            # Running the same squad twice is a REAL need (two takes on one
+            # design), so this refuses and names the flag that does it properly
+            # rather than refusing and leaving the operator stuck.
+            clash = [
+                s["identity"] for s in manifest["seats"]
+                if db().execute(
+                    "SELECT 1 FROM api_placements WHERE seat = ?"
+                    " AND desired != 'reclaimed'", (s["identity"],),
+                ).fetchone()
+            ]
+            if clash:
+                return _err(
+                    409,
+                    "already placed: " + ", ".join(sorted(clash))
+                    + " — placing this capsule again would give one identity "
+                    "two containers, and whichever registered last would "
+                    "silently own the name. Reclaim those placements to MOVE "
+                    "the squad, or pass `as` to place a SECOND copy under "
+                    "fresh identities.",
+                )
+            targets = [s["identity"] for s in manifest["seats"]]
+
         ids = []
-        for seat in manifest["seats"]:
+        for identity in targets:
             pid = f"pl-{secrets.token_hex(8)}"
             db().execute(
                 "INSERT INTO api_placements (id, seat, machine, substrate,"
                 " desired, created) VALUES (?, ?, ?, 'docker', 'running', ?)",
-                (pid, seat["identity"], machine, _now()),
+                (pid, identity, machine, _now()),
             )
             ids.append(pid)
         db().commit()
-        return JSONResponse({"placements": ids}, status_code=201)
+        return JSONResponse(
+            {"placements": ids, "seats": targets}, status_code=201
+        )
 
     # -- placements ---------------------------------------------------------
 

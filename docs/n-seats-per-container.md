@@ -1,6 +1,15 @@
 # N seats per container — design
 
-Status: **DESIGN, nothing built. The three open questions are DECIDED (see foot).** Written 2026-08-06 after the 1:1 container
+Status: **SHIPPED.** `seats add --agent … --pod-squad …` declares a pod, the
+edge sends `SEAT_MANIFEST`, and `seat-entry` runs N agents in one container.
+Pods also accept a **brief** (`--brief`, pod-wide, or per-agent in the
+manifest) — `SEAT_PROMPT` remains refused for a pod because one prompt cannot
+address N agents, but a brief is a FILE every inhabitant reads, which is a
+different thing.
+
+⚠️ This status line read *"DESIGN, nothing built"* until 2026-08-08, months
+after the code shipped. A stale status is worse than none: it is the reason a
+gap review nearly recorded pods as unavailable. Written 2026-08-06 after the 1:1 container
 squad went live on dev-vm-1 (three containers, three agents, one OAuth token,
 all ⚡). Operator direction: *"finish the 1:1 squad and then look at the N
 seats in one container so that we fully support both options."* Both shapes
