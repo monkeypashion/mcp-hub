@@ -4698,6 +4698,246 @@ def voice_client_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _voice_container_map(timeout: float = 5.0) -> dict[str, tuple[str, str]]:
+    """Ask docker who is at which address, RIGHT NOW.
+
+    Asked per connection rather than cached, because the answer is the
+    authentication: docker's IP REUSE (observed here — one address held by two
+    containers minutes apart) makes any stored mapping a misroute waiting to
+    happen. A live answer cannot be stale, since the connection is already
+    established and the address is therefore current by definition.
+
+    Every failure returns {} — an empty map is refused by `authorised`, so a
+    docker that will not answer means no audio rather than unchecked audio.
+    """
+    from mcp_hub.voice_host import parse_container_map
+
+    fmt = ("{{.Id}}|{{.Name}}|{{.Config.Image}}|"
+           "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}")
+    try:
+        ids = subprocess.run(
+            ["docker", "ps", "-q"], capture_output=True, text=True,
+            timeout=timeout, check=False, creationflags=_NO_WINDOW_FLAG,
+        ).stdout.split()
+        if not ids:
+            return {}
+        out = subprocess.run(
+            ["docker", "inspect", "--format", fmt, *ids], capture_output=True,
+            text=True, timeout=timeout, check=False, creationflags=_NO_WINDOW_FLAG,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    return parse_container_map(out)
+
+
+def _voice_roster(conf: str = "") -> set[str]:
+    """The enrolled container seats on this machine, read fresh.
+
+    LOCAL by requirement — the hub's seat list is an HTTP call, so authorising
+    against it would make the operator's microphone depend on the hub being
+    reachable and let a slow hub stall the accept loop.
+
+    Read PER CONNECTION, never cached: a cached roster outlives a retirement,
+    and the container that keeps receiving audio after being retired is the one
+    nobody looks for. Re-reading a small local file costs nothing.
+
+    Unreadable or missing -> empty set -> refused by `decide`.
+    """
+    from mcp_hub.voice_host import DEFAULT_SQUAD_CONF, parse_squad_roster
+
+    path = conf or os.environ.get("SQUAD_CONF") or DEFAULT_SQUAD_CONF
+    try:
+        text = pathlib.Path(path).expanduser().read_text(encoding="utf-8")
+    except OSError:
+        return set()
+    return parse_squad_roster(text)
+
+
+def voice_host_command(args: argparse.Namespace) -> int:
+    """Host-side /voice: serve the operator's microphone to seats that dial in.
+
+    The container connects to US and names itself (docs/seat-voice.md). This
+    side verifies the caller, then streams ONE WAY and never reads the socket
+    again — so a seat has no channel back and injection has no path.
+
+    ⚠️ Binds the docker gateway, NEVER the wildcard. ufw on this box permits
+    everything inbound on `tailscale0`, so `0.0.0.0` would publish the
+    operator's live microphone to every tailnet peer. The PERMIT rule this
+    feature needs is not what would expose it — the pre-existing blanket
+    tailscale allow is, which is why the bind address is a security control and
+    lives in `voice_host.listen_address` with a test on it.
+    """
+    import socket
+    import subprocess as _sp
+    import threading
+
+    from mcp_hub.voice import (
+        HANDSHAKE_TIMEOUT_SECONDS,
+        VOICE_CHANNELS,
+        VOICE_RATE,
+        FrameSender,
+        parse_handshake,
+    )
+    from mcp_hub.voice_host import (
+        HANDSHAKE_MAX_BYTES,
+        MAX_STREAMS,
+        decide,
+        listen_address,
+    )
+
+    addr = listen_address(args.gateway)
+    # Newest connection per seat wins: a restarted container's old socket can
+    # linger half-open, and two live streams for one seat means neither of us
+    # can say which is being heard.
+    live: dict[str, Any] = {}
+    lock = threading.Lock()
+
+    def _read_handshake(sock: Any) -> str:
+        """One short line, capped. Anything else is dropped without explanation.
+
+        This listens where any container can reach it, so a peer that opens a
+        connection and never sends a newline must not be able to grow our
+        memory or hold a slot.
+        """
+        buf = b""
+        sock.settimeout(HANDSHAKE_TIMEOUT_SECONDS)
+        while b"\n" not in buf and len(buf) < HANDSHAKE_MAX_BYTES:
+            try:
+                more = sock.recv(64)
+            except OSError:
+                return ""
+            if not more:
+                return ""
+            buf += more
+        return parse_handshake(buf.split(b"\n")[0])
+
+    def _serve(sock: Any, peer: str) -> None:
+        claimed = _read_handshake(sock)
+        if not claimed:
+            # Silent TO THE PEER, loud in our own log: see below.
+            print(f"voice-host: REFUSED {peer}: unparsable handshake",
+                  file=sys.stderr, flush=True)
+            with contextlib.suppress(Exception):
+                sock.close()
+            return
+        ok, seat, why = decide(
+            peer, claimed, _voice_container_map(), _voice_roster(args.squad_conf),
+        )
+        if why:
+            # ⚠️ Every refusal is logged HERE and nothing is ever said back to
+            # the peer. Silence towards a stranger on the bridge is right;
+            # silence towards ourselves is how a control ends up fail-closed
+            # and undiagnosable, which has cost this design a night already.
+            verdict = "REFUSED" if not ok else "note"
+            print(f"voice-host: {verdict} {peer} ({claimed!r}): {why}",
+                  file=sys.stderr, flush=True)
+        if not ok:
+            with contextlib.suppress(Exception):
+                sock.close()
+            return
+        with lock:
+            prior = live.pop(seat, None)
+            live[seat] = sock
+        if prior is not None:
+            with contextlib.suppress(Exception):
+                prior.close()
+
+        # A SIGKILLed container leaves TCP retrying for ~15 minutes, so without
+        # keepalive we would happily drop audio into a corpse and "the seat is
+        # deaf" would be indistinguishable from "the seat is gone".
+        with contextlib.suppress(OSError):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            for opt, val in (("TCP_KEEPIDLE", 30), ("TCP_KEEPINTVL", 10),
+                             ("TCP_KEEPCNT", 3)):
+                if hasattr(socket, opt):
+                    sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), val)
+        sock.setblocking(False)
+
+        # One capture per connection. Concurrent capture from the monitor is
+        # measured to work (two simultaneous readers, identical output), and a
+        # capture per seat means a stalled seat cannot affect any other.
+        try:
+            cap = _sp.Popen(
+                ["parec", "-d", args.source, "--format=s16le",
+                 f"--rate={VOICE_RATE}", f"--channels={VOICE_CHANNELS}",
+                 "--latency-msec=80"],
+                stdout=_sp.PIPE, stderr=_sp.DEVNULL,
+            )
+        except OSError as exc:
+            print(f"voice-host: no capture for {seat} ({exc})", file=sys.stderr)
+            with contextlib.suppress(Exception):
+                sock.close()
+            return
+        print(f"voice-host: streaming to {seat} ({peer})", file=sys.stderr, flush=True)
+        sender = FrameSender(sock)
+        stalled_since = time.time()
+        try:
+            while True:
+                if cap.stdout is None:
+                    break
+                chunk = cap.stdout.read(640)      # 20ms at 16kHz mono s16
+                if not chunk:
+                    break
+                if sender.send(chunk):
+                    stalled_since = time.time()
+                elif time.time() - stalled_since > args.dead_after:
+                    # Sustained zero progress: the peer is gone or wedged.
+                    # Reap it rather than dropping into it indefinitely.
+                    print(f"voice-host: {seat} not draining — dropping",
+                          file=sys.stderr, flush=True)
+                    break
+        except OSError:
+            pass
+        finally:
+            with contextlib.suppress(Exception):
+                cap.terminate()
+            with contextlib.suppress(Exception):
+                sock.close()
+            with lock:
+                if live.get(seat) is sock:
+                    live.pop(seat, None)
+            print(f"voice-host: {seat} disconnected", file=sys.stderr, flush=True)
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # docker0 may not exist yet (boot ordering, a docker restart). Retry rather
+    # than exit: a service that dies once leaves audio off until someone
+    # notices, which is the silent-absence failure this design keeps meeting.
+    while True:
+        try:
+            srv.bind((addr, args.port))
+            break
+        except OSError as exc:
+            print(f"voice-host: waiting to bind {addr}:{args.port} ({exc})",
+                  file=sys.stderr, flush=True)
+            time.sleep(5.0)
+    srv.listen(16)
+    print(f"voice-host: listening {addr}:{args.port}, source {args.source}",
+          file=sys.stderr, flush=True)
+    try:
+        while True:
+            try:
+                sock, peer = srv.accept()
+            except OSError:
+                continue
+            with lock:
+                too_many = len(live) >= MAX_STREAMS
+            if too_many:
+                # Stop accepting rather than fan the microphone into an
+                # unbounded number of sockets.
+                with contextlib.suppress(Exception):
+                    sock.close()
+                continue
+            threading.Thread(target=_serve, args=(sock, peer[0]),
+                             daemon=True).start()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        with contextlib.suppress(Exception):
+            srv.close()
+    return 0
+
+
 def seat_entry_command(args: argparse.Namespace) -> int:
     """PID 1 of mcp-hub-seat — validate, prepare, launch (docs/seat-image.md).
 
@@ -5482,6 +5722,36 @@ def build_parser() -> argparse.ArgumentParser:
     voice_client.add_argument("--port", type=int, default=_VOICE_PORT,
                               help=f"Host voice port (default {_VOICE_PORT})")
 
+    voice_host = sub.add_parser(
+        "voice-host",
+        help="Host-side /voice: serve the operator's mic to seats that dial in",
+        description=(
+            "Runs on the DOCKER HOST. Binds the bridge gateway (never the "
+            "wildcard — ufw permits everything on tailscale0, so 0.0.0.0 "
+            "would publish the microphone to the tailnet), verifies each "
+            "caller against docker, then streams one way and never reads."
+        ),
+    )
+    voice_host.add_argument("--port", type=int, default=_VOICE_PORT,
+                            help=f"Listen port (default {_VOICE_PORT})")
+    voice_host.add_argument("--gateway", default="",
+                            help="Bind address (default: the docker bridge gateway)")
+    voice_host.add_argument("--source", default="claude_mic.monitor",
+                            help="Pulse source to capture (default claude_mic.monitor)")
+    voice_host.add_argument("--squad-conf", default="",
+                            help=(
+                                "Roster deciding which containers are SEATS "
+                                "(default $SQUAD_CONF or "
+                                "~/.config/squad/squad.conf). Read per "
+                                "connection; unreadable means no audio"
+                            ))
+    voice_host.add_argument("--dead-after", type=float, default=60.0,
+                            help=(
+                                "Seconds of zero progress before a peer is "
+                                "reaped — TCP alone takes ~15 min to notice a "
+                                "killed container (default 60)"
+                            ))
+
     seat_entry = sub.add_parser(
         "seat-entry",
         help="Container entrypoint: validate the seat contract, prepare, launch claude",
@@ -5572,6 +5842,8 @@ def main(argv: list[str] | None = None) -> int:
         return focus_command(args)
     if args.subcommand == "voice-client":
         return voice_client_command(args)
+    if args.subcommand == "voice-host":
+        return voice_host_command(args)
     if args.subcommand == "seat-entry":
         return seat_entry_command(args)
 

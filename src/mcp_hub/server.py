@@ -3975,6 +3975,8 @@ _CLI_SUBCOMMANDS = {
     # silently treats it as a server flag and never forwards it — which is
     # exactly what the reachability test caught.
     "voice-client",
+    # Host-side /voice, same reachability requirement.
+    "voice-host",
 }
 
 
