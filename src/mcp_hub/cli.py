@@ -1970,6 +1970,52 @@ def seats_command(args: argparse.Namespace, api: Any = None) -> int:
         return 1
 
 
+def _report_leftovers(api: Any, seat: str, machine: str) -> None:
+    """After a reclaim, NAME what still describes the seat.
+
+    🔴 Destroying the container removes ONE of five records. The other four —
+    the seat declaration, the roster row, the workspace registration and the
+    workspace file — survive by design, and nothing used to say so. The
+    operator deleted four containers, watched the board still show them, and
+    reasonably asked why they had not cleaned themselves up.
+
+    ⚠️ This deliberately does NOT cascade. A seat OUTLIVING its placement is
+    the whole point of splitting them — it is what lets an agent move machines
+    without being re-declared — and the roster row and workspace file belong to
+    that machine and to the operator, not to the hub. A hub that reached across
+    and deleted operator-owned files because a container stopped would be worse
+    than one that leaves them.
+
+    ⇒ So: keep every layer's autonomy, remove the surprise. Turn a five-step
+    ritual you had to KNOW into one the tool tells you.
+    """
+    if not seat:
+        return
+    todo: list[str] = []
+    try:
+        if any(s.get("identity") == seat for s in (api.list_seats() or [])):
+            todo.append(f"seat declaration     mcp-hub seats rm {seat}")
+    except Exception:  # noqa: BLE001 — advice must never fail the command
+        pass
+    try:
+        reg = api.get_registry() or {}
+        for w in reg.get("definitions", []):
+            if machine and w.get("machine") not in ("", machine):
+                continue
+            if any(seat in str(x) for x in (w.get("listings") or [])):
+                todo.append(
+                    f"workspace {w['name']!r}    mcp-hub workspaces remove {w['name']}")
+    except Exception:  # noqa: BLE001
+        pass
+    # Always named: this tool cannot see another machine's roster file, so
+    # silence here would read as "nothing left" — the exact wrong inference.
+    where = f" on {machine}" if machine else ""
+    todo.append(f"roster row{where}   squad rm {seat}   (run there)")
+    print(f"\n  the container will be gone; these still describe {seat}:")
+    for line in todo:
+        print(f"    {line}")
+
+
 def placements_command(args: argparse.Namespace, api: Any = None) -> int:
     """Placements — WHERE a seat runs. `mcp-hub placements list|set|reclaim`.
 
@@ -2019,9 +2065,16 @@ def placements_command(args: argparse.Namespace, api: Any = None) -> int:
                 print("reclaim HARVESTS then DESTROYS the substrate; "
                       "re-run with --yes", file=sys.stderr)
                 return 1
+            seat_name, machine = "", ""
+            for p in (api.list_placements() or []):
+                if p.get("id") == args.target:
+                    seat_name = p.get("seat", "")
+                    machine = p.get("machine", "")
+                    break
             api.reclaim_placement(args.target)
             print(f"{args.target}: reclaim requested — the machine's next edge "
                   "pass harvests memory, verifies, then destroys")
+            _report_leftovers(api, seat_name, machine)
             return 0
 
         # -- set --------------------------------------------------------
