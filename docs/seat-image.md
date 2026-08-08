@@ -27,6 +27,7 @@ Injected by the launcher (edge `DockerExecutor` via the seat's `spec.env` /
 | `MCP_HUB_URL` | yes | Hub endpoint. `.mcp.json` is **generated from this at start, never baked into the image** — a baked URL is the transport `.mcp.json` mistake in a new costume. |
 | `SEAT_MODE` | no | `interactive` (default) or `headless`. See modes. |
 | `SEAT_PROMPT` | headless only | The prompt for `claude -p`. |
+| `SEAT_TIMEOUT` | no | Seconds before a headless turn is killed (recorded as exit 124, partial output kept). Headless default 1800; `0` = unbounded. |
 | `SEAT_SQUADS` | no | Comma-separated squads passed to `register()`. Empty preserves, as always. |
 | `SEAT_GITHUB_TOKEN` | to clone | **How a container fetches its own code.** Same channel as the Anthropic credential — hub stores the NAME, the edge host supplies the VALUE via `--env-from-host`. Installed as a git credential HELPER, so the token is never written to disk; a token embedded in the clone URL would persist in `.git/config` as `remote.origin.url`, survive the container, and show up in `git remote -v`. Not needed when the workdir is bind-mounted from the host, which is every seat on the fleet today. |
 | `CLAUDE_CODE_OAUTH_TOKEN` | one of | **The default lane** (operator decision 2026-08-04, card #353): a long-lived Claude Code OAuth token minted by `claude setup-token` on the edge host, injected via `--env-from-host` — the hub stores the NAME only, the value never enters the control plane. |
@@ -268,19 +269,36 @@ Design record: `memory/project_interactive_factory_build_2026_08_07.md`.
 - **`interactive`** (v1): long-running claude session under tmux, registered
   on the hub, driven by hub messages and/or attach. The container's lifetime
   is the session's.
-- **`headless`**: `claude -p "$SEAT_PROMPT"`, one shot, exit code is the
-  verdict — the shape codespace-runner runs today. A mode of the SAME image, so
-  a factory build on the edge is a flag, not a fork. `SEAT_BRIEF` stands in for
-  `SEAT_PROMPT` (the launch becomes "read ./BRIEF.md and carry it out"), which
-  is how an errand gets material longer than an argv. Output goes to stdout and
-  nowhere else — read it with `mcp-hub seats logs <identity>`, on the machine
-  that holds the container.
+- **`headless`**: `claude -p "$SEAT_PROMPT" --output-format json`, one shot,
+  then exit — the shape codespace-runner runs today. A mode of the SAME image,
+  so a factory build on the edge is a flag, not a fork. `SEAT_BRIEF` stands in
+  for `SEAT_PROMPT` (the launch becomes "read ./BRIEF.md and carry it out"),
+  which is how an errand gets material longer than an argv.
 
-  ⚠️ **Shipped 2026-08-08, END-TO-END UNVERIFIED.** The entrypoint refused this
-  mode as "reserved but not yet shipped" until then, which was honest — nothing
-  had ever run it. The refusal was removed because it left the operator's solo
-  errand with no implementation at all, and the path is unit-tested; no
-  container has executed it. Treat the first headless placement as the test.
+  **Container-proven 2026-08-08** (throwaway on `:latest`, trivial prompt,
+  rc=0) — the "shipped but end-to-end unverified" warning that stood here is
+  retired by that run, not by a test suite.
+
+  - **A headless seat REQUIRES a memory volume.** The result artifact —
+    `~/.claude/seat-results/<identity>/{output.log,result.json,exit_code}` —
+    is written before exit, because it survives NOTHING else: `docker logs`
+    die with `docker rm`, and reclaim's exec-harvest refuses on an exited
+    container (both measured). No volume → seat-entry refuses at the door
+    (exit 43) and the edge skips the materialize with the fix in the reason.
+  - **The verdict is the turn's, not the CLI's.** Exit code 0 only means
+    claude ran; `result.json` carries the turn's own structured record
+    (`is_error`, `subtype`, `result`) from `--output-format json`.
+  - **`SEAT_TIMEOUT`** (seconds, headless default 1800, 0 = unbounded) kills
+    a hung turn and records exit 124 — `timeout(1)`'s word, disjoint from
+    42/43. The partial `output.log` is still written; it is the evidence
+    that diagnoses the hang.
+  - **Placed with `desired: ran`** — run once, EVER. The edge reports what
+    it observed: `completed` (exit 0, converges) or `failed` (anything
+    else, diverges loudly). A failed errand is never auto-retried; that is
+    the operator's call.
+  - Read the output with `mcp-hub seats logs <identity>` on the machine that
+    held the container — it falls back to the volume artifact once the
+    container is gone.
 
 ## Brief and inputs
 

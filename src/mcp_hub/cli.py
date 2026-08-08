@@ -2087,6 +2087,19 @@ def _seat_logs(args: argparse.Namespace, api: Any, machine: str) -> int:
         argv.append("--follow")
     argv.append(args.identity)
     try:
+        probe = subprocess.run(
+            ["docker", "ps", "-a", "--filter", f"name=^{args.identity}$",
+             "--format", "{{.Names}}"],
+            capture_output=True, text=True,
+        )
+        if probe.returncode == 0 and args.identity not in \
+                probe.stdout.split():
+            # The container is GONE — reclaimed, or removed by hand. For a
+            # headless seat that is the NORMAL end state, and its output was
+            # written to the memory volume before exit precisely so this
+            # moment still has an answer. Read it from there, through the
+            # seat's own image (guaranteed pullable here: the seat ran here).
+            return _seat_logs_artifact(api, args.identity)
         # Streamed, not captured: --follow must reach the operator live, and a
         # long log should not be buffered whole before its first line shows.
         return subprocess.run(argv).returncode
@@ -2094,6 +2107,59 @@ def _seat_logs(args: argparse.Namespace, api: Any, machine: str) -> int:
         print("docker is not on PATH here — this is the machine that holds "
               "the container, so it should be", file=sys.stderr)
         return 1
+
+
+def _seat_logs_artifact(api: Any, identity: str) -> int:
+    """A reclaimed headless seat's output, read from its memory volume.
+
+    The volume is the ONE place the result survives the container: docker
+    logs die with `docker rm`, and reclaim's exec-harvest cannot touch an
+    exited container (both measured 2026-08-08). Read via a throwaway
+    container on the seat's own image — the volume's mountpoint under
+    /var/lib/docker is root-owned, so the docker daemon is the only reader
+    this user actually has.
+
+    Every dead end names its cause: "no artifact" without saying WHY reads
+    like a seat that printed nothing, and an operator who believes that
+    stops looking.
+    """
+    from mcp_hub.seat import HEADLESS_RESULTS_SUBDIR
+
+    spec = {}
+    for s in api.list_seats():
+        if s.get("identity") == identity:
+            spec = s.get("spec") or {}
+            break
+    memvol = str(spec.get("memory_volume") or "")
+    image = str(spec.get("image") or "")
+    if not memvol:
+        print(f"{identity}: container is gone and the seat was declared "
+              f"WITHOUT a memory volume — so there is no artifact, not "
+              f"because it printed nothing but because nothing durable "
+              f"existed to write to. (Headless seats now refuse to start "
+              f"like this; this one predates that or never ran.)",
+              file=sys.stderr)
+        return 1
+    if not image:
+        print(f"{identity}: container is gone and its spec names no image — "
+              f"nothing to read the volume with.", file=sys.stderr)
+        return 1
+    vol = memvol.split(":")[0]
+    # The volume mounts AT ~/.claude, so from the volume's root the artifact
+    # is under seat-results/ directly — no .claude prefix.
+    base = f"/artifact/{HEADLESS_RESULTS_SUBDIR}/{identity}"
+    script = (
+        f'if [ ! -d "{base}" ]; then '
+        f'echo "no headless artifact on volume \'{vol}\' — the seat never '
+        f'ran to completion on an image that writes one" >&2; exit 9; fi; '
+        f'cat "{base}/output.log" 2>/dev/null; '
+        f'if [ -f "{base}/result.json" ]; then '
+        f'echo; echo "--- result.json ---"; cat "{base}/result.json"; fi'
+    )
+    return subprocess.run(
+        ["docker", "run", "--rm", "-v", f"{vol}:/artifact:ro",
+         "--entrypoint", "sh", image, "-c", script]
+    ).returncode
 
 
 def _report_leftovers(api: Any, seat: str, machine: str) -> None:
@@ -2205,9 +2271,10 @@ def placements_command(args: argparse.Namespace, api: Any = None) -> int:
 
         # -- set --------------------------------------------------------
         desired = args.desired or "running"
-        if desired not in ("running", "stopped"):
-            print("desired must be running or stopped (reclaim is its own verb, "
-                  "because it destroys)", file=sys.stderr)
+        if desired not in ("running", "stopped", "ran"):
+            print("desired must be running, stopped, or ran — `ran` is the "
+                  "headless ask: run ONCE, ever, and never restart (reclaim "
+                  "is its own verb, because it destroys)", file=sys.stderr)
             return 1
         if args.target:
             if args.dry_run:
@@ -4836,29 +4903,97 @@ def _seat_prepare(contract: Any, workdir: pathlib.Path) -> tuple[Any, int | None
 
 
 def _seat_headless(contract: Any, workdir: pathlib.Path) -> int:
-    """One-shot `claude -p`, output to stdout, exit code passed through.
+    """One-shot `claude -p`: teed to the memory volume, bounded, then exit.
 
-    ⚠️ UNVERIFIED END TO END at the time of writing: the refusal this replaced
-    said headless was "reserved but not yet shipped", and that was honest —
-    no container has ever run this path. The decision logic is unit-tested;
-    the actual run is not, and will not be until a headless seat is built and
-    placed. Anyone reading a green test suite should not conclude otherwise.
+    Container-proven 2026-08-08 (throwaway on :latest, trivial prompt,
+    rc=0) — the "UNVERIFIED END TO END" warning this paragraph replaced is
+    retired by that run, not by any test suite.
 
-    Output goes to STDOUT and nowhere else, which is what makes `mcp-hub seats
-    logs` the way to read it. Not written to a file inside the container: a
-    reclaim destroys the container, so a file there is a result that exists
-    only until someone tidies up.
+    Three properties, each bought by a measurement:
+
+    * **TEE, never capture.** Output still reaches stdout AS IT ARRIVES —
+      `docker logs -f` on a long errand must show progress, so
+      `capture_output=True` (the obvious way to get bytes for the artifact)
+      would silently regress live visibility exactly where watching matters
+      most. And teed INCREMENTALLY, so a killed turn leaves its partial
+      output behind — that partial is what diagnoses the hang.
+    * **The artifact outlives the container.** stdout dies with `docker rm`,
+      and reclaim's harvest (`docker exec`) REFUSES on an exited container
+      (both measured) — so the result is written under ~/.claude, the one
+      directory the memory volume makes durable, BEFORE the process exits.
+      No volume mounted there → refused at the door instead (see the
+      dispatch site): a headless seat whose result provably dies with it is
+      a contract violation, same family as headless-without-a-prompt.
+    * **Bounded.** Nobody watches a headless seat, so a hung turn would hold
+      the container — and its `running` report — forever. SEAT_TIMEOUT
+      (headless default 1800s) kills it and records 124, timeout(1)'s own
+      word for it; the partial output.log is still written.
     """
-    from mcp_hub.seat import launch_argv
+    import threading
 
-    print(f"seat-entry: headless — one turn, then exit ({contract.identity})",
-          flush=True)
-    # No capture: the operator reads this through `docker logs`, and buffering
-    # it here would mean a long-running turn shows nothing until it finishes.
-    proc = subprocess.run(launch_argv(contract, str(workdir)), cwd=str(workdir))
-    print(f"seat-entry: headless turn finished rc={proc.returncode}",
-          flush=True)
-    return proc.returncode
+    from mcp_hub.seat import (
+        EXIT_TIMEOUT,
+        headless_result_paths,
+        headless_verdict,
+        launch_argv,
+    )
+
+    paths = headless_result_paths(str(pathlib.Path.home()), contract.identity)
+    pathlib.Path(paths["output"]).parent.mkdir(parents=True, exist_ok=True)
+
+    bound = f", timeout {contract.timeout}s" if contract.timeout else ""
+    print(f"seat-entry: headless — one turn, then exit "
+          f"({contract.identity}{bound})", flush=True)
+
+    # stderr stays inherited (straight to docker logs): merging it into
+    # stdout would corrupt the JSON record result.json is parsed from.
+    proc = subprocess.Popen(
+        launch_argv(contract, str(workdir)), cwd=str(workdir),
+        stdout=subprocess.PIPE,
+    )
+    timed_out = False
+
+    def _expire() -> None:
+        nonlocal timed_out
+        timed_out = True
+        proc.kill()
+
+    timer = (threading.Timer(contract.timeout, _expire)
+             if contract.timeout else None)
+    if timer:
+        timer.start()
+    chunks: list[bytes] = []
+    try:
+        with open(paths["output"], "wb") as log:
+            assert proc.stdout is not None
+            while True:
+                chunk = proc.stdout.read(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                log.write(chunk)
+                log.flush()
+                sys.stdout.buffer.write(chunk)
+                sys.stdout.buffer.flush()
+        rc = proc.wait()
+    finally:
+        if timer:
+            timer.cancel()
+    if timed_out:
+        rc = EXIT_TIMEOUT
+        print(f"seat-entry: headless turn KILLED after {contract.timeout}s — "
+              f"partial output is in the artifact", flush=True)
+
+    output = b"".join(chunks).decode("utf-8", errors="replace")
+    doc = headless_verdict(rc, timed_out, output)
+    doc["identity"] = contract.identity
+    pathlib.Path(paths["result"]).write_text(
+        json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    pathlib.Path(paths["exit_code"]).write_text(f"{rc}\n", encoding="utf-8")
+
+    print(f"seat-entry: headless turn finished rc={rc} — result at "
+          f"{paths['result']}", flush=True)
+    return rc
 
 
 def _seat_launch(contract: Any, workdir: pathlib.Path, session: str) -> int | None:
@@ -5644,7 +5779,30 @@ def seat_entry_command(args: argparse.Namespace) -> int:
     # and starting an audio client for it would be a running process serving
     # no one. It is also the launch dance's only true exception — there is no
     # TUI to show a dialog, so there is nothing to answer.
+    #
+    # ⚠️ `prepared[0]` ONLY is safe here, but the safety is NON-LOCAL: it
+    # lives in seat.py's parse_pod_manifest, which refuses SEAT_MODE=headless
+    # for pods at the door — so a headless container always holds exactly one
+    # agent. If pods ever gain a headless mode, this line becomes a real bug
+    # (agents 2..N silently never run).
     if prepared[0][1].mode == "headless":
+        # The result artifact only survives reclaim if ~/.claude is a MOUNT
+        # (the memory volume). Without one the result provably dies with the
+        # container — `docker logs` die with `docker rm` and exec-harvest
+        # refuses on an exited container, both measured 2026-08-08 — so the
+        # placement is a contract violation, refused at the door like
+        # headless-without-a-prompt. Loud beats a fix that only looks like
+        # one: with no volume this seat would run, succeed, and leave nothing.
+        state_dir = pathlib.Path.home() / ".claude"
+        if not os.path.ismount(str(state_dir)):
+            print(
+                f"seat-entry: SEAT_MODE=headless but {state_dir} is not a "
+                f"mount — this seat was placed without a memory volume, so "
+                f"its result would die with the container. Place it with "
+                f"--memory-volume <name> (mounted at {state_dir}).",
+                file=sys.stderr, flush=True,
+            )
+            return EXIT_CONTRACT
         return _seat_headless(prepared[0][1], prepared[0][2])
 
     # /voice, once per CONTAINER, before any agent starts. Detached and
@@ -6216,12 +6374,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     placements.add_argument(
         "action", choices=["list", "set", "reclaim"],
-        help="list · set: running|stopped · reclaim: harvest then destroy",
+        help="list · set: running|stopped|ran · reclaim: harvest then destroy",
     )
     placements.add_argument("target", nargs="?", default=None,
                             help="set/reclaim: placement id")
     placements.add_argument("desired", nargs="?", default=None,
-                            help="set: running|stopped")
+                            help="set: running|stopped|ran (ran = headless: "
+                                 "run once, never restart)")
     placements.add_argument("--seat", default="", help="set: create for this seat")
     placements.add_argument("--machine", default=None, help="set: on this machine")
     placements.add_argument("--substrate", default="worktree",

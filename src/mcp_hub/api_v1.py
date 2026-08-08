@@ -319,6 +319,19 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
     def placement_status(row: sqlite3.Row) -> str:
         if row["observed_state"] is None:
             return "pending-edge"
+        # `ran` is a headless placement's TERMINAL desired state, and no
+        # enumeration ever literally reads "ran" — the edge reports what it
+        # SAW: `completed` (exit 0) satisfies the ask; `running` is the
+        # errand in flight, which is a delay, not a disagreement, and
+        # calling it diverged would page someone about a job doing exactly
+        # what was asked. Everything else — `failed`, `stopped` (created
+        # but never ran) — genuinely diverges, loudly.
+        if row["desired"] == "ran":
+            if row["observed_state"] == "completed":
+                return "converged"
+            if row["observed_state"] == "running":
+                return "in-flight"
+            return "diverged"
         if row["observed_state"] == row["desired"]:
             return "converged"
         return "diverged"
@@ -1461,8 +1474,12 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
         if request.method == "PATCH":
             body = await body_of(request)
             desired = body.get("desired", row["desired"])
-            if desired not in ("running", "stopped"):
-                return _err(422, "desired must be running|stopped")
+            # `ran` — run once, ever — is how a HEADLESS seat is asked for:
+            # `running` would make the reconciler restart the finished
+            # container and re-run the errand. `reclaimed` is still not a
+            # value here: destroy stays behind its own verb (DELETE).
+            if desired not in ("running", "stopped", "ran"):
+                return _err(422, "desired must be running|stopped|ran")
             db().execute(
                 "UPDATE api_placements SET desired = ? WHERE id = ?",
                 (desired, pid),

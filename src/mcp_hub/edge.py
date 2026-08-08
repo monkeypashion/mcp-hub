@@ -172,6 +172,17 @@ def plan(
                 actions.append({**base, "op": "start", "fresh": True})
             elif not local["running"]:
                 actions.append({**base, "op": "start"})
+        elif desired == "ran":
+            # HEADLESS terminal state: run ONCE, ever. Materialize if absent;
+            # an exited container is deliberately NOT restarted — restart is
+            # exactly the re-run-the-errand bug this state exists to prevent.
+            # The report says how it went (completed converges, failed
+            # diverges loudly); acting on a failure is the operator's call,
+            # not the reconciler's — a retry loop on a deterministic failure
+            # is 30 wasted runs a night, invisibly.
+            if not local["materialized"]:
+                actions.append({**base, "op": "materialize"})
+                actions.append({**base, "op": "start", "fresh": True})
         elif desired == "stopped":
             if local["running"]:
                 actions.append({**base, "op": "stop"})
@@ -282,6 +293,16 @@ def observed_report(
             "report a state no evidence supports"
         )
     state = "running" if enumeration.get("alive") else "stopped"
+    # A HEADLESS seat that exited has FINISHED, not stopped. Without this,
+    # "finished cleanly" == "crashed" == "never started" — all `stopped` —
+    # and against desired=running the remedy (start) would RE-RUN the errand.
+    # The exit code is the discriminator: 0 completed, anything else failed
+    # (including the door's own 42/43/124, which are failures with names).
+    # `exit_code` is only enumerated for containers docker says are `exited`,
+    # so a merely-created one cannot read as completed here.
+    if (enumeration.get("headless") and not enumeration.get("alive")
+            and "exit_code" in enumeration):
+        state = "completed" if enumeration["exit_code"] == 0 else "failed"
     # A COMPLETED reclaim. Without this a successful harvest-then-destroy
     # reports `saw stopped` against `want reclaimed` — diverged forever,
     # a finished job that looks like a failed one (measured on the live
@@ -641,6 +662,19 @@ class DockerExecutor:
                 # cannot detect — `docker ps` would report it healthy.
                 return {**base, "skipped": True,
                         "reason": "no image in seat spec — refusing to guess one"}
+            if ((spec.get("env") or {}).get("SEAT_MODE") == "headless"
+                    and not spec.get("memory_volume")):
+                # The memory volume is where a headless RESULT survives —
+                # docker logs die with `docker rm`, and exec-harvest refuses
+                # on an exited container (both measured 2026-08-08). Without
+                # one, seat-entry refuses at its door anyway (exit 43); this
+                # skip catches it a pass earlier, with the fix in the reason
+                # instead of a dead container in the enumeration.
+                return {**base, "skipped": True, "reason": (
+                    "SEAT_MODE=headless with no memory_volume — the result "
+                    "would die with the container. Re-declare the seat with "
+                    "--memory-volume <name>."
+                )}
             wanted = list(spec.get("env_from_host") or [])
             if wanted and not any(self._environ.get(n) for n in wanted):
                 # NONE of the named credentials is set here, so this container
@@ -736,13 +770,21 @@ def enumerate_docker(runner: Any, seats: list[str]) -> dict[str, dict[str, Any]]
     # container created from last month's `latest`. Only inspect exposes the
     # image ID that would reveal drift.
     #
+    # The SAME call now carries `.State.Status` and `.State.ExitCode` — how a
+    # finished headless seat becomes distinguishable from a crashed or
+    # never-started one. `docker ps` cannot say (its {{.Status}} is freetext);
+    # inspect can, and we are already paying for the call.
+    #
     # Skipped entirely when nothing is materialized: `docker inspect` with no
     # arguments is an error, and a pointless call would fail the whole pass.
     images: dict[str, str] = {}
+    exit_codes: dict[str, int] = {}
     present = [s for s in seats if s in found]
     if present:
         rc, iout = runner(
-            ["docker", "inspect", "--format", "{{.Name}} {{.Image}}", *present]
+            ["docker", "inspect", "--format",
+             "{{.Name}} {{.Image}} {{.State.Status}} {{.State.ExitCode}}",
+             *present]
         )
         if rc != 0:
             raise EnumerationFailed(
@@ -753,13 +795,23 @@ def enumerate_docker(runner: Any, seats: list[str]) -> dict[str, dict[str, Any]]
         for line in iout.splitlines():
             parts = line.split()
             if len(parts) >= 2:
-                images[parts[0].lstrip("/").strip()] = parts[1].strip()
+                name = parts[0].lstrip("/").strip()
+                images[name] = parts[1].strip()
+                # Exit code ONLY for `exited` — a `created` container also
+                # reports code 0, and reading that as "completed" would call
+                # a job done that never ran.
+                if len(parts) >= 4 and parts[2] == "exited":
+                    try:
+                        exit_codes[name] = int(parts[3])
+                    except ValueError:
+                        pass
 
     return {
         s: {
             "materialized": s in found,
             "running": found.get(s) == "running",
             "image": images.get(s) if s in found else None,
+            **({"exit_code": exit_codes[s]} if s in exit_codes else {}),
         }
         for s in seats
     }
@@ -895,6 +947,16 @@ def edge_apply(
                 "alive": state["running"],
                 "exists": state["materialized"],
             }
+            # Exit code + mode ride ALONG so observed_report can tell a
+            # finished headless errand from a crash. The mode comes from the
+            # SPEC's env — the same single source seat-entry reads — never
+            # inferred from how the container looks.
+            if "exit_code" in state:
+                enumeration["exit_code"] = state["exit_code"]
+            spec_env = (specs.get(p["seat"], {}).get("spec") or {}) \
+                .get("env") or {}
+            if spec_env.get("SEAT_MODE") == "headless":
+                enumeration["headless"] = True
             # Image drift, reported only where BOTH sides are known: the
             # image the container runs (enumerated) and the current ID of
             # the tag its spec names (resolved). Either unknown -> the key

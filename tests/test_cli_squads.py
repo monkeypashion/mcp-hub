@@ -310,12 +310,18 @@ def test_logs_refuses_and_NAMES_THE_MACHINE_when_the_seat_is_elsewhere(capsys):
     args.machine = None
     args.tail = "200"
     args.follow = False
+    # A name no real box carries: the test ran green for weeks and then
+    # failed on dev-vm-1 itself, because the placement said "dev-vm-1" and
+    # the premise ("the seat is elsewhere") collapses on the machine whose
+    # name it borrowed. Hostname-coupled fixtures are latent until the one
+    # box they name runs the suite.
     rc = cli.seats_command(
-        args, api=LogsApi([{"seat": "errand-1", "machine": "dev-vm-1"}]))
+        args, api=LogsApi([{"seat": "errand-1", "machine": "not-this-box"}]))
     err = capsys.readouterr().err
     assert rc == 1
-    assert "dev-vm-1" in err
-    assert "ssh dev-vm-1" in err, "refused without saying where to go instead"
+    assert "not-this-box" in err
+    assert "ssh not-this-box" in err, \
+        "refused without saying where to go instead"
 
 
 def test_logs_says_so_when_the_seat_was_never_PLACED(capsys):

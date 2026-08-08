@@ -148,6 +148,12 @@ class SeatContract:
     # Both default empty, which is every seat placed before they existed.
     brief: str = ""
     inputs: tuple[tuple[str, str], ...] = ()
+    # Seconds before a headless turn is killed (124 written as its verdict).
+    # 0 = unbounded — the interactive default, where a human is watching.
+    # Headless defaults to HEADLESS_TIMEOUT_DEFAULT at parse time: nobody
+    # watches a headless seat, so a hung turn would hold the container (and
+    # its "running" report) forever.
+    timeout: int = 0
 
 
 # The brief and its material, as they land inside the container. Relative to
@@ -156,6 +162,69 @@ class SeatContract:
 # "give these two agents different jobs" unexpressible.
 BRIEF_FILE = "BRIEF.md"
 INPUTS_DIR = "inputs"
+
+# Where a headless run's result survives. Under ~/.claude because that is
+# what the memory volume mounts — the ONE directory that outlives reclaim
+# (docker logs die with `docker rm`, and `docker exec` harvest cannot touch
+# an exited container: both measured 2026-08-08). In a SUBDIR, not loose in
+# ~/.claude: that volume is the agent's MEMORY dir, and a result artifact
+# sitting in its root will eventually be read as memory by something
+# (mcp-hub-fireblade-wsl's constraint, and right).
+#
+# Two names because there are two readers with two roots: inside the
+# container the path hangs off HOME (`~/.claude/seat-results/...`); reading
+# the volume after reclaim, the volume root IS `.claude`, so the artifact
+# sits at `seat-results/...` from there.
+HEADLESS_RESULTS_SUBDIR = "seat-results"
+HEADLESS_RESULTS_DIR = ".claude/" + HEADLESS_RESULTS_SUBDIR
+
+# 30 minutes. Long enough for a real errand, short enough that a hung turn
+# does not hold a container (and its `running` report) hostage overnight.
+HEADLESS_TIMEOUT_DEFAULT = 1800
+
+# The exit code a timed-out headless turn records — timeout(1)'s own dialect,
+# and disjoint from EXIT_AUTH (42) / EXIT_CONTRACT (43).
+EXIT_TIMEOUT = 124
+
+
+def headless_result_paths(home: str, identity: str) -> dict[str, str]:
+    """Absolute paths of the three artifact files for one headless run.
+
+    output.log — the turn's stdout, teed as it arrives (partial on timeout,
+    deliberately: the partial output is the evidence that diagnoses the hang).
+    result.json — the structured verdict written after the turn.
+    exit_code — the bare integer, cheap to read from a shell.
+    """
+    base = os.path.join(home, HEADLESS_RESULTS_DIR, identity)
+    return {
+        "output": os.path.join(base, "output.log"),
+        "result": os.path.join(base, "result.json"),
+        "exit_code": os.path.join(base, "exit_code"),
+    }
+
+
+def headless_verdict(exit_code: int, timed_out: bool,
+                     output: str) -> dict[str, Any]:
+    """The result.json body: liveness (exit code) + the turn's own verdict.
+
+    The exit code is a WEAK signal — `claude -p` exits 0 because the CLI ran,
+    not because the task was done. `--output-format json` makes the turn emit
+    a structured final record (`is_error`, `subtype`, `result`), so the
+    verdict is something the TURN asserts. An unparsable output degrades to
+    the exit code alone rather than failing: the artifact must always be
+    written, or a broken run leaves nothing to diagnose it with.
+    """
+    doc: dict[str, Any] = {"exit_code": exit_code, "timed_out": timed_out}
+    try:
+        rec = json.loads(output)
+        if isinstance(rec, dict):
+            for k in ("is_error", "subtype", "result", "num_turns",
+                      "total_cost_usd", "duration_ms", "session_id"):
+                if k in rec:
+                    doc[k] = rec[k]
+    except ValueError:
+        doc["unparsed"] = True
+    return doc
 
 
 def _parse_inputs(raw: str) -> tuple[tuple[str, str], ...]:
@@ -232,6 +301,24 @@ def parse_seat_contract(
             "one-shot claude with no instruction does nothing and exits, "
             "which the edge would read as a crash."
         )
+    raw_timeout = (environ.get("SEAT_TIMEOUT") or "").strip()
+    if raw_timeout:
+        try:
+            timeout = int(raw_timeout)
+        except ValueError:
+            raise SeatContractError(
+                f"SEAT_TIMEOUT '{raw_timeout}' is not an integer number of "
+                f"seconds. 0 means unbounded."
+            ) from None
+        if timeout < 0:
+            raise SeatContractError(
+                f"SEAT_TIMEOUT {timeout} is negative — use 0 for unbounded."
+            )
+    else:
+        # Unset means the MODE's default, not zero: nobody watches a headless
+        # seat, so unbounded-by-omission would let a hung turn hold the
+        # container (still reporting `running`) forever.
+        timeout = HEADLESS_TIMEOUT_DEFAULT if mode == "headless" else 0
 
     project = (environ.get("SEAT_PROJECT") or "").strip()
     if not project and origin_url:
@@ -255,6 +342,7 @@ def parse_seat_contract(
         repo=environ.get("SEAT_REPO", ""),
         brief=environ.get("SEAT_BRIEF", ""),
         inputs=_parse_inputs(environ.get("SEAT_INPUTS", "")),
+        timeout=timeout,
     )
 
 
@@ -678,12 +766,20 @@ def launch_argv(contract: SeatContract, workdir: str,
         # readable in the workdir afterwards, it can be arbitrarily long
         # without fighting an argv limit, and it can reference ./inputs/.
         # An explicit prompt still wins — it is the more specific instruction.
+        #
+        # `--output-format json` (verified against 2.1.226 in the image, not
+        # assumed): the exit code only says the CLI ran, so the turn's own
+        # structured record (`is_error`/`subtype`/`result`) is what carries
+        # the task verdict into result.json. It costs no live visibility —
+        # text mode also prints nothing until the turn ends (measured).
         if contract.prompt:
-            return ["claude", "-p", contract.prompt]
+            return ["claude", "-p", contract.prompt,
+                    "--output-format", "json"]
         material = (f" Your material is in ./{INPUTS_DIR}/."
                     if contract.inputs else "")
         return ["claude", "-p",
-                f"Read ./{BRIEF_FILE} and carry it out.{material}"]
+                f"Read ./{BRIEF_FILE} and carry it out.{material}",
+                "--output-format", "json"]
     return [
         "tmux",
         "new-session",

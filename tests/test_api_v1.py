@@ -758,6 +758,56 @@ class TestPlacements:
             == "diverged"
         )
 
+    # -- `ran`: the headless terminal ask — run once, EVER ------------------
+
+    def _ran(self, client) -> str:
+        pid = self._placed(client)
+        r = client.patch(
+            f"/api/v1/placements/{pid}", json={"desired": "ran"}, headers=H
+        )
+        assert r.status_code == 200, r.text
+        return pid
+
+    def _observe(self, client, pid, state):
+        r = client.post(
+            f"/api/v1/placements/{pid}/observed",
+            json={"state": state, "enumeration": {"exit_code": 0}},
+            headers=H,
+        )
+        assert r.status_code == 200, r.text
+        return client.get(f"/api/v1/placements/{pid}", headers=H).json()
+
+    def test_ran_completed_converges(self, client):
+        # No enumeration ever literally reads "ran" — the edge reports what
+        # it SAW, and exit-0 `completed` is what satisfies the ask.
+        pid = self._ran(client)
+        assert self._observe(client, pid, "completed")["status"] == "converged"
+
+    def test_ran_failed_diverges(self, client):
+        pid = self._ran(client)
+        assert self._observe(client, pid, "failed")["status"] == "diverged"
+
+    def test_ran_running_is_in_flight_not_diverged(self, client):
+        # The errand mid-run is a DELAY, not a disagreement; "diverged"
+        # would page someone about a job doing exactly what was asked.
+        pid = self._ran(client)
+        assert self._observe(client, pid, "running")["status"] == "in-flight"
+
+    def test_ran_never_observed_is_pending_edge(self, client):
+        pid = self._ran(client)
+        got = client.get(f"/api/v1/placements/{pid}", headers=H).json()
+        assert got["status"] == "pending-edge"
+
+    def test_reclaimed_still_not_a_desired_value(self, client):
+        # Destroy stays behind its own verb (DELETE) — a destroy reachable
+        # by typing a word into a state field happens by accident.
+        pid = self._placed(client)
+        r = client.patch(
+            f"/api/v1/placements/{pid}", json={"desired": "reclaimed"},
+            headers=H,
+        )
+        assert r.status_code == 422
+
     def test_delete_is_reclaim_with_three_phases(self, client):
         pid = self._placed(client)
         r = client.delete(f"/api/v1/placements/{pid}", headers=H)
