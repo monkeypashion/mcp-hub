@@ -501,10 +501,21 @@ believed on the strength of a component being present:
    signal = RMS of N seconds while the operator speaks
    require signal >= 3 x floor        # and record both numbers, not a boolean
    ```
-   ⚠️ **The margin is thinner than 3× sounds.** Speech measured 6638 RMS against
-   a 1800 floor — **3.7×**. So the pass is real but not comfortable, and a
-   quietly-spoken phrase could fail honestly. Record the numbers; a boolean
-   discards the only evidence that would explain a marginal result.
+   🔴 **3× IS TOO STRICT — use PEAK as the discriminator.** Measured with the
+   operator genuinely speaking into a seat container: half-second RMS rose
+   1438 → 2823 (**2.0×**) while **peak hit 17970 against a floor peak of
+   ~3000**. The RMS ratio called that "flat" and was wrong; the peak was never
+   ambiguous. RMS is diluted by the silence between words, so a real phrase in
+   a real room lands nearer 2× than 3× — dev flagged the margin as thin when I
+   wrote 3× and they were right.
+   ```
+   require peak >= 4 x floor_peak     # 17970 vs ~3000 = 6x, never ambiguous
+   and     record rms, peak and the per-half-second series
+   ```
+   ⭐ The per-half-second series is what makes a marginal result readable — the
+   onset is visible in it (`1455 1455 | 2110 2572 2823`) even when the summary
+   ratio is unconvincing. **A single number cannot show you where the speech
+   started.**
 
    ⇒ Per-box, per-run: floors differ between machines and move with input gain,
    so a floor measured yesterday or elsewhere proves nothing today.
