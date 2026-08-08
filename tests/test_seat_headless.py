@@ -20,6 +20,7 @@ was written).
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 
@@ -197,9 +198,11 @@ class TestSeatHeadless:
     def test_timeout_kills_and_keeps_partial_output(
             self, monkeypatch, tmp_path, capfd):
         # The partial log is the point of the timeout: it is the only
-        # evidence that diagnoses the hang. It also PROVES the tee is
-        # incremental — a writer that buffered until exit would leave an
-        # empty file when killed.
+        # evidence that diagnoses the hang. NOTE this does NOT prove the
+        # tee is incremental, though a first version claimed it did: kill
+        # closes the pipe, the pending read hits EOF, and EOF flushes the
+        # buffer — so a buffer-until-exit writer passes this test too.
+        # Incrementality is test_tee_is_incremental_mid_run's job.
         rc, base = _run_headless(
             monkeypatch, tmp_path, "echo partial; sleep 30", timeout=1)
         assert rc == EXIT_TIMEOUT
@@ -207,6 +210,35 @@ class TestSeatHeadless:
         doc = json.loads((base / "result.json").read_text())
         assert doc["timed_out"] is True
         assert doc["exit_code"] == EXIT_TIMEOUT
+
+    def test_tee_is_incremental_mid_run(self, monkeypatch, tmp_path, capfd):
+        # ⭐ The ONLY decidable probe for streaming reads the artifact WHILE
+        # the turn is still alive — a test whose subject terminates can
+        # never prove it, because termination flushes whatever was buffered
+        # (which is exactly how `read(4096)` shipped: every terminating
+        # test green, and a live `docker logs -f` showing nothing until the
+        # end. Caught by mcp-hub-fireblade-wsl with this probe's shape).
+        import threading
+
+        seen: list[str] = []
+
+        def probe():
+            time.sleep(1.5)
+            log = tmp_path / ".claude" / HEADLESS_RESULTS_SUBDIR / \
+                "errand-1" / "output.log"
+            seen.append(log.read_text() if log.exists() else "<missing>")
+
+        t = threading.Thread(target=probe)
+        t.start()
+        rc, base = _run_headless(
+            monkeypatch, tmp_path, "echo EARLY; sleep 3; echo LATE")
+        t.join()
+        assert rc == 0
+        assert seen == ["EARLY\n"], (
+            f"mid-run artifact held {seen[0]!r} — EARLY was emitted 1.5s "
+            f"before the probe, so the tee is buffering, not streaming"
+        )
+        assert (base / "output.log").read_text() == "EARLY\nLATE\n"
 
 
 # ---------------------------------------------------------------------------

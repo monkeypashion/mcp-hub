@@ -180,6 +180,13 @@ def plan(
             # diverges loudly); acting on a failure is the operator's call,
             # not the reconciler's — a retry loop on a deterministic failure
             # is 30 wasted runs a night, invisibly.
+            #
+            # A container stuck at `created` (materialized, start failed)
+            # also plans nothing and is deliberately LEFT TO DIVERGE: no
+            # exit code is enumerated for `created`, so observed reads
+            # `stopped` against desired `ran` — loud, and honest about a
+            # start this edge could not confirm ever ran. Auto-starting it
+            # here would risk the re-run this state exists to prevent.
             if not local["materialized"]:
                 actions.append({**base, "op": "materialize"})
                 actions.append({**base, "op": "start", "fresh": True})

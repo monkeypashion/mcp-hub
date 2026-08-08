@@ -1976,12 +1976,47 @@ def seats_command(args: argparse.Namespace, api: Any = None) -> int:
                 print(f"{' and '.join(missing)} required — a seat without them "
                       "cannot be materialized anywhere", file=sys.stderr)
                 return 1
+            # HEADLESS as a first-class flag, not tribal --env knowledge. The
+            # checks mirror the runtime gates (seat-entry's door, the edge's
+            # materialize skip) at the EARLIEST moment — declaration — where
+            # the fix is one flag away instead of a dead container later.
+            # getattr throughout: hand-built Namespaces predate these flags.
+            mode = getattr(args, "mode", "") or ""
+            if mode == "headless":
+                refuse = ""
+                if not args.image:
+                    refuse = ("headless is a container mode — name an --image "
+                              "(SEAT_MODE means nothing to a worktree seat)")
+                elif getattr(args, "agent", None):
+                    refuse = ("headless has no meaning for a pod — "
+                              "SEAT_PROMPT is single-valued and a pod has "
+                              "several agents. Place headless seats 1:1")
+                elif (not getattr(args, "prompt", "")
+                        and not getattr(args, "brief", "")):
+                    refuse = ("headless needs --prompt or --brief — a "
+                              "one-shot claude with no instruction does "
+                              "nothing and exits, which reads as a crash")
+                elif not args.memory_volume:
+                    refuse = ("headless needs --memory-volume — the result "
+                              "artifact is written there because it survives "
+                              "NOTHING else (docker logs die with rm, "
+                              "exec-harvest refuses on an exited container)")
+                if refuse:
+                    print(refuse, file=sys.stderr)
+                    return 1
             spec: dict[str, Any] = {}
             if args.image:
                 spec["image"] = args.image
-                if args.env:
-                    spec["env"] = dict(
-                        kv.split("=", 1) for kv in args.env if "=" in kv)
+                env: dict[str, str] = dict(
+                    kv.split("=", 1) for kv in (args.env or []) if "=" in kv)
+                if mode:
+                    env["SEAT_MODE"] = mode
+                if getattr(args, "prompt", ""):
+                    env["SEAT_PROMPT"] = args.prompt
+                if getattr(args, "timeout", None) is not None:
+                    env["SEAT_TIMEOUT"] = str(args.timeout)
+                if env:
+                    spec["env"] = env
                 if args.port:
                     spec["ports"] = list(args.port)
                 if args.volume:
@@ -4967,7 +5002,17 @@ def _seat_headless(contract: Any, workdir: pathlib.Path) -> int:
         with open(paths["output"], "wb") as log:
             assert proc.stdout is not None
             while True:
-                chunk = proc.stdout.read(4096)
+                # read1, NOT read: on a BufferedReader, read(n) blocks until
+                # n bytes OR EOF, so the tee would buffer a long errand's
+                # output until 4096 bytes piled up or the turn ended — both
+                # live properties gone while every terminating test stays
+                # green (termination flushes; only a mid-run probe can tell
+                # the two apart — see test_tee_is_incremental_mid_run).
+                # Measured: read(4096) sat 2.5s on `echo FIRST; sleep 2.5;
+                # echo SECOND` and returned both lines together; read1
+                # returned FIRST at 0.00s. Caught by mcp-hub-fireblade-wsl
+                # in review.
+                chunk = proc.stdout.read1(4096)
                 if not chunk:
                     break
                 chunks.append(chunk)
@@ -6283,7 +6328,8 @@ def build_parser() -> argparse.ArgumentParser:
     seats.add_argument(
         "action", choices=["list", "add", "rm", "logs"],
         help=("list · add: declare a seat · rm: archive it (placements "
-              "first) · logs: what it has printed"),
+              "first) · logs: what it has printed (container gone → reads "
+              "the headless result artifact from the memory volume)"),
     )
     seats.add_argument("identity", nargs="?", default=None,
                        help="rm/logs: which seat")
@@ -6331,6 +6377,23 @@ def build_parser() -> argparse.ArgumentParser:
              "one is a service, and has nothing to preserve",
     )
     seats.add_argument("--command", default="", help="add: override the image CMD")
+    seats.add_argument(
+        "--mode", default="", choices=["interactive", "headless"],
+        help="add: headless = one `claude -p` turn, then exit — place it "
+             "with `placements set ... ran`. Needs --prompt or --brief, and "
+             "--memory-volume (the result artifact lives there and survives "
+             "reclaim). Default: interactive",
+    )
+    seats.add_argument(
+        "--prompt", default="",
+        help="add (headless): the one turn's instruction. --brief stands in "
+             "when this is empty (the seat is told to read BRIEF.md)",
+    )
+    seats.add_argument(
+        "--timeout", type=int, default=None, metavar="SECONDS",
+        help="add (headless): kill the turn after this long, recording exit "
+             "124 with partial output kept (default 1800; 0 = unbounded)",
+    )
     seats.add_argument("--class", dest="klass", default="squad",
                        choices=["squad", "faculty"],
                        help="add: faculty seats are never auto-started by `up`")

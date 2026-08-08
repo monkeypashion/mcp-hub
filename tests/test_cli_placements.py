@@ -163,6 +163,45 @@ def test_memory_volume_is_what_separates_a_seat_from_a_service(capsys):
     assert api.calls[0][7]["memory_volume"] == "pm-memory"
 
 
+def test_headless_is_a_flag_not_tribal_env_knowledge(capsys):
+    """--mode headless assembles the same spec env a hand-rolled
+    `--env SEAT_MODE=headless` would — the affordance IS the feature; an
+    operator should not need to know the env var names."""
+    api = FakeApi()
+    rc = cli.seats_command(
+        _args(action="add", repo="org/e", machine="box", image="mcp-hub-seat",
+              mode="headless", prompt="do the thing", timeout=600,
+              memory_volume="e-mem"), api=api)
+    assert rc == 0
+    env = api.calls[0][7]["env"]
+    assert env["SEAT_MODE"] == "headless"
+    assert env["SEAT_PROMPT"] == "do the thing"
+    assert env["SEAT_TIMEOUT"] == "600"
+
+
+@pytest.mark.parametrize("kw,expect", [
+    # No instruction: a one-shot with nothing to do reads as a crash.
+    (dict(image="i", memory_volume="m"), "--prompt or --brief"),
+    # No volume: the result would provably die with the container.
+    (dict(image="i", prompt="go"), "--memory-volume"),
+    # No image: SEAT_MODE means nothing to a worktree seat.
+    (dict(repo="org/x", folder="/srv/x", prompt="go", memory_volume="m"),
+     "--image"),
+    # A pod: SEAT_PROMPT is single-valued, a pod has several agents.
+    (dict(image="i", prompt="go", memory_volume="m",
+          agent=["a=org/a", "b=org/b"]), "1:1"),
+])
+def test_headless_declaration_refuses_at_the_earliest_gate(capsys, kw, expect):
+    """The same rules seat-entry's door and the edge enforce, surfaced at
+    DECLARATION — where the fix is one flag away instead of a dead container
+    two minutes later."""
+    rc = cli.seats_command(
+        _args(action="add", machine="box", mode="headless", **kw),
+        api=FakeApi())
+    assert rc == 1
+    assert expect in capsys.readouterr().err
+
+
 def test_archiving_a_seat_with_placements_explains_the_refusal(capsys):
     api = FakeApi(fail="hub API error 409 on /api/v1/seats/x: active placements")
     rc = cli.seats_command(_args(action="rm", identity="x-box"), api=api)
