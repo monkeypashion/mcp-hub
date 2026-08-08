@@ -4035,6 +4035,12 @@ _CLI_SUBCOMMANDS = {
     "machines",
     "focus",
     "seat-entry",
+    # Container-side /voice. Must be here or the `mcp-hub` console script
+    # silently treats it as a server flag and never forwards it — which is
+    # exactly what the reachability test caught.
+    "voice-client",
+    # Host-side /voice, same reachability requirement.
+    "voice-host",
 }
 
 
@@ -4048,9 +4054,25 @@ def main():
         from .cli import main as cli_main
         _sys.exit(cli_main(_sys.argv[1:]))
 
+    # 🔴 ADVERTISE THE SUBCOMMANDS. The console script is this module, so
+    # `mcp-hub --help` renders THIS parser — which knows nothing about the 24
+    # verbs above, because they are dispatched by the argv check rather than by
+    # argparse. Every one of them has good `--help`; none of them could be
+    # FOUND without already knowing its name (operator, 2026-08-08: "is it all
+    # captured in cli args with proper help?" — it was not).
+    #
+    # Built from `_CLI_SUBCOMMANDS` rather than typed out, so a verb cannot be
+    # added to the dispatch set and stay invisible here.
+    _verbs = "  ".join(sorted(_CLI_SUBCOMMANDS))
     parser = argparse.ArgumentParser(
         prog="mcp-hub",
-        description="Inter-agent messaging hub for Claude sessions",
+        description="MCP Hub — the server, plus this machine's utility CLI",
+        epilog=(
+            "subcommands (each takes --help):\n"
+            f"{_verbs}\n\n"
+            "with no subcommand, mcp-hub runs the SERVER with the options above."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--transport",

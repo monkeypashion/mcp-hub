@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -49,6 +50,10 @@ from typing import Any
 # MCP_HUB_URL after import and DEFAULT_HUB_URL still holds the env value. The
 # settings panel reports provenance, so it needs the un-overridden default to
 # compare against.
+# The one voice port, every container (docs/seat-voice.md). Imported lazily in
+# the command itself; named here so the parser help can state it.
+_VOICE_PORT = 6981
+
 BUILTIN_HUB_URL = "http://100.109.6.114:8090/mcp"
 DEFAULT_HUB_URL = os.environ.get("MCP_HUB_URL", BUILTIN_HUB_URL)
 
@@ -1965,6 +1970,52 @@ def seats_command(args: argparse.Namespace, api: Any = None) -> int:
         return 1
 
 
+def _report_leftovers(api: Any, seat: str, machine: str) -> None:
+    """After a reclaim, NAME what still describes the seat.
+
+    🔴 Destroying the container removes ONE of five records. The other four —
+    the seat declaration, the roster row, the workspace registration and the
+    workspace file — survive by design, and nothing used to say so. The
+    operator deleted four containers, watched the board still show them, and
+    reasonably asked why they had not cleaned themselves up.
+
+    ⚠️ This deliberately does NOT cascade. A seat OUTLIVING its placement is
+    the whole point of splitting them — it is what lets an agent move machines
+    without being re-declared — and the roster row and workspace file belong to
+    that machine and to the operator, not to the hub. A hub that reached across
+    and deleted operator-owned files because a container stopped would be worse
+    than one that leaves them.
+
+    ⇒ So: keep every layer's autonomy, remove the surprise. Turn a five-step
+    ritual you had to KNOW into one the tool tells you.
+    """
+    if not seat:
+        return
+    todo: list[str] = []
+    try:
+        if any(s.get("identity") == seat for s in (api.list_seats() or [])):
+            todo.append(f"seat declaration     mcp-hub seats rm {seat}")
+    except Exception:  # noqa: BLE001 — advice must never fail the command
+        pass
+    try:
+        reg = api.get_registry() or {}
+        for w in reg.get("definitions", []):
+            if machine and w.get("machine") not in ("", machine):
+                continue
+            if any(seat in str(x) for x in (w.get("listings") or [])):
+                todo.append(
+                    f"workspace {w['name']!r}    mcp-hub workspaces remove {w['name']}")
+    except Exception:  # noqa: BLE001
+        pass
+    # Always named: this tool cannot see another machine's roster file, so
+    # silence here would read as "nothing left" — the exact wrong inference.
+    where = f" on {machine}" if machine else ""
+    todo.append(f"roster row{where}   squad rm {seat}   (run there)")
+    print(f"\n  the container will be gone; these still describe {seat}:")
+    for line in todo:
+        print(f"    {line}")
+
+
 def placements_command(args: argparse.Namespace, api: Any = None) -> int:
     """Placements — WHERE a seat runs. `mcp-hub placements list|set|reclaim`.
 
@@ -2014,9 +2065,16 @@ def placements_command(args: argparse.Namespace, api: Any = None) -> int:
                 print("reclaim HARVESTS then DESTROYS the substrate; "
                       "re-run with --yes", file=sys.stderr)
                 return 1
+            seat_name, machine = "", ""
+            for p in (api.list_placements() or []):
+                if p.get("id") == args.target:
+                    seat_name = p.get("seat", "")
+                    machine = p.get("machine", "")
+                    break
             api.reclaim_placement(args.target)
             print(f"{args.target}: reclaim requested — the machine's next edge "
                   "pass harvests memory, verifies, then destroys")
+            _report_leftovers(api, seat_name, machine)
             return 0
 
         # -- set --------------------------------------------------------
@@ -2194,6 +2252,32 @@ def capsules_command(args: argparse.Namespace, api: Any = None) -> int:
                 seats = len((c.get("manifest") or {}).get("seats") or [])
                 print(f"{c['id']:<16} {c['squad']:<20} {seats:>2} seat(s)  "
                       f"{c.get('created', '')}")
+            return 0
+
+        if args.action == "rm":
+            # 🔴 The gap the operator found by asking the right question:
+            # "through the CLI, can we support any container or workspace or
+            # squad scenario?" Every other registry could be emptied — seats
+            # archive, placements reclaim, workspaces remove — and capsules
+            # could only ever GROW. The server has had DELETE /capsules/{id}
+            # all along; nothing reached it.
+            if not args.target:
+                print("name the capsule to remove (mcp-hub capsules list)",
+                      file=sys.stderr)
+                return 1
+            if args.dry_run:
+                print(f"would remove capsule {args.target} "
+                      "(placements it already made are untouched)")
+                return 0
+            api.delete_capsule(args.target)
+            # Said explicitly because the opposite is the natural fear, and it
+            # is what would stop someone tidying: a capsule is a SNAPSHOT, not
+            # a live link. `place` copies the manifest into per-seat
+            # placements and nothing refers back, so removing one takes away
+            # the ability to re-place that snapshot and nothing else.
+            print(f"capsule {args.target} removed — anything it already "
+                  "placed keeps running; you can no longer re-place THIS "
+                  "snapshot (compose a fresh one from the live squad)")
             return 0
 
         if args.action == "compose":
@@ -4536,6 +4620,419 @@ def _parse_pod_agents(specs: list[str]) -> list[dict[str, str]]:
     return out
 
 
+_VOICE_LOG = "/tmp/voice-client.log"  # noqa: S108 — in-container, readable by exec
+
+
+def _seat_pulse() -> bool:
+    """Start the container's OWN pulse server + null sink. Fail-open.
+
+    🔴 WHY THIS EXISTS: the image installed `pulseaudio` and never ran it, so
+    `voice-client` connected to the host, received audio, and had **nowhere to
+    put it** — `pacat` and `arecord` both died with "Connection refused"
+    (measured in a throwaway container, mcp-hub-dev-vm-1-general 2026-08-08).
+    The client half was fail-open and silent, so a seat with completely broken
+    audio started, registered and looked healthy.
+
+    Deliberately EXPLICIT rather than via `autospawn`: this runs before the
+    client, in a known order, from `/etc/pulse/seat-voice.pa` — which loads a
+    null sink, because a container has no hardware and therefore no sink at
+    all. Autospawn would produce a running server with nothing to play into.
+
+    Returns whether a server is answering. Never raises: audio must not be able
+    to fail a seat.
+    """
+    try:
+        # Idempotent: seat-entry can run again in a recreated container, and a
+        # second server would fail to bind rather than replace the first.
+        if subprocess.run(["pactl", "info"], capture_output=True,
+                          timeout=10).returncode == 0:
+            return True
+        subprocess.run(
+            ["pulseaudio", "--daemonize=yes", "--exit-idle-time=-1",
+             "-n", "--file=/etc/pulse/seat-voice.pa"],
+            capture_output=True, timeout=30, check=False,
+        )
+        r = subprocess.run(["pactl", "info"], capture_output=True, timeout=10)
+        if r.returncode == 0:
+            print("seat-entry: /voice pulse server up (sink claude_mic)",
+                  flush=True)
+            return True
+        # LOUD about a broken audio stack, while still not failing the seat.
+        # Silence here is what turned a one-line diagnosis into a container
+        # teardown; the seat survives either way.
+        print("seat-entry: /voice UNAVAILABLE — pulse server did not start; "
+              f"pactl says: {(r.stderr or b'').decode('utf-8', 'replace').strip()[:160]}",
+              file=sys.stderr, flush=True)
+        return False
+    except Exception as exc:  # noqa: BLE001 — audio never fails a seat
+        print(f"seat-entry: /voice UNAVAILABLE — pulse not started ({exc})",
+              file=sys.stderr, flush=True)
+        return False
+
+
+def _seat_voice() -> None:
+    """Start the container's /voice client, detached, fail-open.
+
+    Every failure mode here resolves to "no audio": no binary, no gateway, no
+    host listening. None of them may touch the seat's exit path, which is why
+    nothing is awaited and every exception is swallowed.
+
+    ⚠️ The client's stderr goes to a LOG, never to DEVNULL. It used to be
+    discarded, so `voice-client`'s own "Connection refused" — the message that
+    would have identified the missing pulse server immediately — was thrown
+    away at the moment it was produced. Fail-open must not mean fail-silent.
+    """
+    if not _seat_pulse():
+        # No server means the client has nowhere to play. Starting it anyway
+        # would spin a process that can only fail, and say so nowhere.
+        print("seat-entry: /voice client NOT started (no pulse server)",
+              file=sys.stderr, flush=True)
+        return
+    try:
+        log = open(_VOICE_LOG, "ab", buffering=0)  # noqa: SIM115 — outlives us
+        subprocess.Popen(
+            [sys.executable, "-m", "mcp_hub.cli", "voice-client"],
+            stdout=log, stderr=log, start_new_session=True,
+        )
+        print(f"seat-entry: /voice client started (log {_VOICE_LOG})",
+              flush=True)
+    except Exception as exc:  # noqa: BLE001 — audio never fails a seat
+        print(f"seat-entry: /voice not started ({exc})", file=sys.stderr, flush=True)
+
+
+def voice_client_command(args: argparse.Namespace) -> int:
+    """In-container: pull audio from the host and feed this container's sink.
+
+    Runs as a child of seat-entry, and **must never be able to fail a seat**.
+    Voice is a convenience; a seat with no microphone is a working seat, and a
+    seat that refuses to start because the audio host is down is not.
+
+    NOTE what this does NOT do: bind, listen, or accept. The container is a
+    CLIENT only, which is what makes container-to-container injection have no
+    path rather than a filtered one (docs/seat-voice.md — v2 died to a
+    firewall rule that was present and inert).
+    """
+    import socket
+    import subprocess as _sp
+
+    from mcp_hub.voice import VOICE_CHANNELS, VOICE_RATE, default_gateway, open_stream
+
+    # Identity in preference order, and the order is the point:
+    #   SEAT_CONTAINER  the container's own name, injected for BOTH shapes
+    #   SEAT_IDENTITY   the 1:1 seat (a pod has none)
+    #   hostname        an ADOPTED container, created by something that is not
+    #                   this edge and therefore carries neither of the above
+    # The host authorises whatever arrives against the roster, so a name it
+    # does not recognise simply gets no audio.
+    seat = (args.seat
+            or os.environ.get("SEAT_CONTAINER")
+            or os.environ.get("SEAT_IDENTITY")
+            or socket.gethostname()
+            or "").strip()
+    if not seat:
+        print("voice: no seat identity — not connecting", file=sys.stderr)
+        return 0
+    try:
+        route = pathlib.Path("/proc/net/route").read_text(encoding="utf-8")
+    except OSError:
+        print("voice: no /proc/net/route — not connecting", file=sys.stderr)
+        return 0
+    gw = default_gateway(route)
+    if not gw:
+        # No default route: dial nothing rather than guess. A guessed gateway
+        # would send this seat's handshake somewhere unintended.
+        print("voice: no default gateway — not connecting", file=sys.stderr)
+        return 0
+    try:
+        sock = open_stream(gw, seat, port=args.port)
+    except OSError as exc:
+        # THE FAIL-CLOSED SIDE, and it is the good one: the host's PERMIT rule
+        # missing means no audio, loudly and immediately, rather than silent
+        # loss of an isolation property.
+        print(f"voice: no audio ({gw}:{args.port}: {exc})", file=sys.stderr)
+        return 0
+    # pacat owns the decode: raw s16le at the fleet's fixed rate into this
+    # container's OWN sink. Nothing here reaches the host's audio server.
+    pac = _sp.Popen(
+        # 🔴 --latency-msec IS NOT OPTIONAL. Without it PulseAudio picks its own
+        # playback buffer, and its default is enormous: MEASURED in a live seat
+        # at "Buffer Latency: 960000 usec" with a total sink latency of 1.02
+        # SECONDS. The operator's first real use was "quite laggy, I had to
+        # speak slowly" — that second was mostly this line.
+        #
+        # 80ms matches what the host side already uses for `parec` and for the
+        # VBAN receptor's own `pacat`, so the whole chain now has one buffer
+        # depth rather than three plus a default nobody chose.
+        #
+        # ⚠️ Do not raise it to "fix" a dropout. Buffering hides a stall by
+        # delaying it, and this stream is deliberately lossy (see
+        # voice.send_or_drop) precisely so that a slow seat loses audio rather
+        # than accumulating it. Late audio is transcribed as though it were
+        # current, which is worse than missing audio.
+        ["pacat", "--playback", "--format=s16le",
+         f"--rate={VOICE_RATE}", f"--channels={VOICE_CHANNELS}",
+         "--latency-msec=80"],
+        stdin=_sp.PIPE,
+    )
+    print(f"voice: streaming from {gw}:{args.port} as {seat}", file=sys.stderr)
+    try:
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            if pac.stdin is None:
+                break
+            pac.stdin.write(chunk)
+    except (OSError, BrokenPipeError):
+        pass
+    finally:
+        with contextlib.suppress(Exception):
+            sock.close()
+        with contextlib.suppress(Exception):
+            pac.terminate()
+    return 0
+
+
+def _voice_container_map(timeout: float = 5.0) -> dict[str, tuple[str, str]]:
+    """Ask docker who is at which address, RIGHT NOW.
+
+    Asked per connection rather than cached, because the answer is the
+    authentication: docker's IP REUSE (observed here — one address held by two
+    containers minutes apart) makes any stored mapping a misroute waiting to
+    happen. A live answer cannot be stale, since the connection is already
+    established and the address is therefore current by definition.
+
+    Every failure returns {} — an empty map is refused by `authorised`, so a
+    docker that will not answer means no audio rather than unchecked audio.
+    """
+    from mcp_hub.voice_host import parse_container_map
+
+    fmt = ("{{.Id}}|{{.Name}}|{{.Config.Image}}|"
+           "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}")
+    try:
+        ids = subprocess.run(
+            ["docker", "ps", "-q"], capture_output=True, text=True,
+            timeout=timeout, check=False, creationflags=_NO_WINDOW_FLAG,
+        ).stdout.split()
+        if not ids:
+            return {}
+        out = subprocess.run(
+            ["docker", "inspect", "--format", fmt, *ids], capture_output=True,
+            text=True, timeout=timeout, check=False, creationflags=_NO_WINDOW_FLAG,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    return parse_container_map(out)
+
+
+def _voice_roster(conf: str = "") -> set[str]:
+    """The enrolled container seats on this machine, read fresh.
+
+    LOCAL by requirement — the hub's seat list is an HTTP call, so authorising
+    against it would make the operator's microphone depend on the hub being
+    reachable and let a slow hub stall the accept loop.
+
+    Read PER CONNECTION, never cached: a cached roster outlives a retirement,
+    and the container that keeps receiving audio after being retired is the one
+    nobody looks for. Re-reading a small local file costs nothing.
+
+    Unreadable or missing -> empty set -> refused by `decide`.
+    """
+    from mcp_hub.voice_host import DEFAULT_SQUAD_CONF, parse_squad_roster
+
+    path = conf or os.environ.get("SQUAD_CONF") or DEFAULT_SQUAD_CONF
+    try:
+        text = pathlib.Path(path).expanduser().read_text(encoding="utf-8")
+    except OSError:
+        return set()
+    return parse_squad_roster(text)
+
+
+def voice_host_command(args: argparse.Namespace) -> int:
+    """Host-side /voice: serve the operator's microphone to seats that dial in.
+
+    The container connects to US and names itself (docs/seat-voice.md). This
+    side verifies the caller, then streams ONE WAY and never reads the socket
+    again — so a seat has no channel back and injection has no path.
+
+    ⚠️ Binds the docker gateway, NEVER the wildcard. ufw on this box permits
+    everything inbound on `tailscale0`, so `0.0.0.0` would publish the
+    operator's live microphone to every tailnet peer. The PERMIT rule this
+    feature needs is not what would expose it — the pre-existing blanket
+    tailscale allow is, which is why the bind address is a security control and
+    lives in `voice_host.listen_address` with a test on it.
+    """
+    import socket
+    import subprocess as _sp
+    import threading
+
+    from mcp_hub.voice import (
+        HANDSHAKE_TIMEOUT_SECONDS,
+        VOICE_CHANNELS,
+        VOICE_RATE,
+        FrameSender,
+        parse_handshake,
+    )
+    from mcp_hub.voice_host import (
+        HANDSHAKE_MAX_BYTES,
+        MAX_STREAMS,
+        decide,
+        listen_address,
+    )
+
+    addr = listen_address(args.gateway)
+    # Newest connection per seat wins: a restarted container's old socket can
+    # linger half-open, and two live streams for one seat means neither of us
+    # can say which is being heard.
+    live: dict[str, Any] = {}
+    lock = threading.Lock()
+
+    def _read_handshake(sock: Any) -> str:
+        """One short line, capped. Anything else is dropped without explanation.
+
+        This listens where any container can reach it, so a peer that opens a
+        connection and never sends a newline must not be able to grow our
+        memory or hold a slot.
+        """
+        buf = b""
+        sock.settimeout(HANDSHAKE_TIMEOUT_SECONDS)
+        while b"\n" not in buf and len(buf) < HANDSHAKE_MAX_BYTES:
+            try:
+                more = sock.recv(64)
+            except OSError:
+                return ""
+            if not more:
+                return ""
+            buf += more
+        return parse_handshake(buf.split(b"\n")[0])
+
+    def _serve(sock: Any, peer: str) -> None:
+        claimed = _read_handshake(sock)
+        if not claimed:
+            # Silent TO THE PEER, loud in our own log: see below.
+            print(f"voice-host: REFUSED {peer}: unparsable handshake",
+                  file=sys.stderr, flush=True)
+            with contextlib.suppress(Exception):
+                sock.close()
+            return
+        ok, seat, why = decide(
+            peer, claimed, _voice_container_map(), _voice_roster(args.squad_conf),
+        )
+        if why:
+            # ⚠️ Every refusal is logged HERE and nothing is ever said back to
+            # the peer. Silence towards a stranger on the bridge is right;
+            # silence towards ourselves is how a control ends up fail-closed
+            # and undiagnosable, which has cost this design a night already.
+            verdict = "REFUSED" if not ok else "note"
+            print(f"voice-host: {verdict} {peer} ({claimed!r}): {why}",
+                  file=sys.stderr, flush=True)
+        if not ok:
+            with contextlib.suppress(Exception):
+                sock.close()
+            return
+        with lock:
+            prior = live.pop(seat, None)
+            live[seat] = sock
+        if prior is not None:
+            with contextlib.suppress(Exception):
+                prior.close()
+
+        # A SIGKILLed container leaves TCP retrying for ~15 minutes, so without
+        # keepalive we would happily drop audio into a corpse and "the seat is
+        # deaf" would be indistinguishable from "the seat is gone".
+        with contextlib.suppress(OSError):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            for opt, val in (("TCP_KEEPIDLE", 30), ("TCP_KEEPINTVL", 10),
+                             ("TCP_KEEPCNT", 3)):
+                if hasattr(socket, opt):
+                    sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), val)
+        sock.setblocking(False)
+
+        # One capture per connection. Concurrent capture from the monitor is
+        # measured to work (two simultaneous readers, identical output), and a
+        # capture per seat means a stalled seat cannot affect any other.
+        try:
+            cap = _sp.Popen(
+                ["parec", "-d", args.source, "--format=s16le",
+                 f"--rate={VOICE_RATE}", f"--channels={VOICE_CHANNELS}",
+                 "--latency-msec=80"],
+                stdout=_sp.PIPE, stderr=_sp.DEVNULL,
+            )
+        except OSError as exc:
+            print(f"voice-host: no capture for {seat} ({exc})", file=sys.stderr)
+            with contextlib.suppress(Exception):
+                sock.close()
+            return
+        print(f"voice-host: streaming to {seat} ({peer})", file=sys.stderr, flush=True)
+        sender = FrameSender(sock)
+        stalled_since = time.time()
+        try:
+            while True:
+                if cap.stdout is None:
+                    break
+                chunk = cap.stdout.read(640)      # 20ms at 16kHz mono s16
+                if not chunk:
+                    break
+                if sender.send(chunk):
+                    stalled_since = time.time()
+                elif time.time() - stalled_since > args.dead_after:
+                    # Sustained zero progress: the peer is gone or wedged.
+                    # Reap it rather than dropping into it indefinitely.
+                    print(f"voice-host: {seat} not draining — dropping",
+                          file=sys.stderr, flush=True)
+                    break
+        except OSError:
+            pass
+        finally:
+            with contextlib.suppress(Exception):
+                cap.terminate()
+            with contextlib.suppress(Exception):
+                sock.close()
+            with lock:
+                if live.get(seat) is sock:
+                    live.pop(seat, None)
+            print(f"voice-host: {seat} disconnected", file=sys.stderr, flush=True)
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # docker0 may not exist yet (boot ordering, a docker restart). Retry rather
+    # than exit: a service that dies once leaves audio off until someone
+    # notices, which is the silent-absence failure this design keeps meeting.
+    while True:
+        try:
+            srv.bind((addr, args.port))
+            break
+        except OSError as exc:
+            print(f"voice-host: waiting to bind {addr}:{args.port} ({exc})",
+                  file=sys.stderr, flush=True)
+            time.sleep(5.0)
+    srv.listen(16)
+    print(f"voice-host: listening {addr}:{args.port}, source {args.source}",
+          file=sys.stderr, flush=True)
+    try:
+        while True:
+            try:
+                sock, peer = srv.accept()
+            except OSError:
+                continue
+            with lock:
+                too_many = len(live) >= MAX_STREAMS
+            if too_many:
+                # Stop accepting rather than fan the microphone into an
+                # unbounded number of sockets.
+                with contextlib.suppress(Exception):
+                    sock.close()
+                continue
+            threading.Thread(target=_serve, args=(sock, peer[0]),
+                             daemon=True).start()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        with contextlib.suppress(Exception):
+            srv.close()
+    return 0
+
+
 def seat_entry_command(args: argparse.Namespace) -> int:
     """PID 1 of mcp-hub-seat — validate, prepare, launch (docs/seat-image.md).
 
@@ -4645,6 +5142,12 @@ def seat_entry_command(args: argparse.Namespace) -> int:
     if args.prepare_only:
         print("seat-entry: --prepare-only — not launching claude", flush=True)
         return 0
+
+    # /voice, once per CONTAINER, before any agent starts. Detached and
+    # deliberately unchecked: audio is a convenience and MUST NOT be able to
+    # fail a seat. A seat with no microphone is a working seat; a seat that
+    # refuses to start because the audio host is down is not.
+    _seat_voice()
 
     for session, contract, workdir in prepared:
         rc = _seat_launch(contract, workdir, session)
@@ -5267,9 +5770,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     capsules.add_argument(
-        "action", choices=["list", "compose", "place", "attach"],
+        "action", choices=["list", "compose", "place", "attach", "rm"],
         help=("list · compose: freeze a squad · place: one placement per seat "
-              "· attach: give this machine's seats a tab and a workspace"),
+              "· attach: give this machine's seats a tab and a workspace "
+              "· rm: forget a snapshot (what it already placed keeps running)"),
     )
     capsules.add_argument("target", nargs="?",
                           help="place/attach: which capsule")
@@ -5298,6 +5802,51 @@ def build_parser() -> argparse.ArgumentParser:
     )
     capsules.add_argument("--json", action="store_true",
                           help="Machine-readable output")
+
+    voice_client = sub.add_parser(
+        "voice-client",
+        help="Container-side /voice: pull audio from the host, feed the local sink",
+        description=(
+            "Runs INSIDE a seat container. Reads the default gateway from "
+            "/proc/net/route, connects out, names this seat, and streams the "
+            "operator's microphone into the container's own pulse sink. "
+            "Never binds a port. Never fails a seat."
+        ),
+    )
+    voice_client.add_argument("--seat", default="",
+                              help="Override SEAT_IDENTITY (tests/manual runs)")
+    voice_client.add_argument("--port", type=int, default=_VOICE_PORT,
+                              help=f"Host voice port (default {_VOICE_PORT})")
+
+    voice_host = sub.add_parser(
+        "voice-host",
+        help="Host-side /voice: serve the operator's mic to seats that dial in",
+        description=(
+            "Runs on the DOCKER HOST. Binds the bridge gateway (never the "
+            "wildcard — ufw permits everything on tailscale0, so 0.0.0.0 "
+            "would publish the microphone to the tailnet), verifies each "
+            "caller against docker, then streams one way and never reads."
+        ),
+    )
+    voice_host.add_argument("--port", type=int, default=_VOICE_PORT,
+                            help=f"Listen port (default {_VOICE_PORT})")
+    voice_host.add_argument("--gateway", default="",
+                            help="Bind address (default: the docker bridge gateway)")
+    voice_host.add_argument("--source", default="claude_mic.monitor",
+                            help="Pulse source to capture (default claude_mic.monitor)")
+    voice_host.add_argument("--squad-conf", default="",
+                            help=(
+                                "Roster deciding which containers are SEATS "
+                                "(default $SQUAD_CONF or "
+                                "~/.config/squad/squad.conf). Read per "
+                                "connection; unreadable means no audio"
+                            ))
+    voice_host.add_argument("--dead-after", type=float, default=60.0,
+                            help=(
+                                "Seconds of zero progress before a peer is "
+                                "reaped — TCP alone takes ~15 min to notice a "
+                                "killed container (default 60)"
+                            ))
 
     seat_entry = sub.add_parser(
         "seat-entry",
@@ -5387,6 +5936,10 @@ def main(argv: list[str] | None = None) -> int:
         return machines_command(args)
     if args.subcommand == "focus":
         return focus_command(args)
+    if args.subcommand == "voice-client":
+        return voice_client_command(args)
+    if args.subcommand == "voice-host":
+        return voice_host_command(args)
     if args.subcommand == "seat-entry":
         return seat_entry_command(args)
 

@@ -12,6 +12,7 @@ import stat
 import time
 
 import pytest
+from textual.widgets import Select
 
 from mcp_hub import board_data
 from mcp_hub.settings_app import SettingsApp
@@ -257,8 +258,25 @@ async def test_a_broken_collector_degrades_to_a_settings_panel():
         await pilot.pause()
         await pilot.pause()
         assert app.sub_title == "live data unavailable"
+        # ⚠️ `assert sel is not None` used to stand here and could NEVER fail:
+        # DOMQuery.first() raises NoMatches on an empty result rather than
+        # returning None, so the assertion asserted nothing and the `.first()`
+        # call was doing all the work silently.
+        #
+        # "Settings still editable" means the control is POPULATED, not merely
+        # mounted — a Select whose value is still Select.NULL is exactly the
+        # blank control this degradation is supposed to avoid. Waits on that
+        # condition rather than on a frame count: measured, this app mounts and
+        # populates in 1 pause while the test allowed 2, so the margin here was
+        # 1 where test_settings_app's was 0 (which is why that file flaked on a
+        # loaded box at 3/20 and this one did not). Same shape, more headroom.
+        for _ in range(200):
+            sels = app.query("Select")
+            if sels and not any(s.value is Select.NULL for s in sels):
+                break
+            await pilot.pause()
         sel = app.query("Select").first()             # settings still editable
-        assert sel is not None
+        assert sel.value is not Select.NULL, "settings degraded to a blank control"
 
 
 @pytest.mark.asyncio

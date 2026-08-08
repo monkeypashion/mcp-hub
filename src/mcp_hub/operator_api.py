@@ -274,6 +274,17 @@ class OperatorApi:
             "POST", f"/api/v1/capsules/{cid}/place", json={"machine": machine}
         ).json()
 
+    def delete_capsule(self, cid: str) -> dict[str, Any]:
+        """Forget a frozen squad. The PLACEMENTS it made are untouched.
+
+        A capsule is a snapshot, not a live link: `place` copies the manifest
+        into per-seat placements and nothing refers back afterwards. So
+        deleting one removes the ability to re-place THAT snapshot and changes
+        nothing about anything already running — which is why this needs no
+        cascade and no "placements first" gate, unlike `seats rm`.
+        """
+        return self._request("DELETE", f"/api/v1/capsules/{cid}").json()
+
     def machine_placements(self, machine: str) -> list[dict[str, Any]]:
         return self._request(
             "GET", f"/api/v1/machines/{machine}/placements"

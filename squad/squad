@@ -962,20 +962,56 @@ add_agent() {  # squad add <org>/<repo> — clone/pull, opt in, enroll/migrate u
 }
 
 rm_agent() {   # squad rm [agent] — exact inverse of add: session, roster, opt-in, daemon state
-  local a="$1" dir proj safe
+  local a="$1" dir proj safe optnote=""
   dir="$(untilde "$(field "$a" 2)")"
   tm kill-session -t "=$a" 2>/dev/null || true
   tmp="$(mktemp)"; awk -F'|' -v a="$a" '$1!=a' "$CONF" > "$tmp" && mv "$tmp" "$CONF"
-  # opt the project back out so hooks go silent for this repo again
+  # Opt the project back out so hooks go silent for this repo again — but ONLY
+  # if no OTHER enrolled agent still lives in it.
+  #
+  # 🔴 THE OPT-IN IS PER PROJECT, THE REMOVAL IS PER AGENT. Until 2026-08-08
+  # this opted out unconditionally, so retiring one clone of a repo silently
+  # disconnected every sibling: removing `mcp-hub-fireblade-wsl-xport` set
+  # `projects: []` and took the hub identity off BOTH the operator's live
+  # hub-maintainer agent and `-windows`, which shared the project. Nothing
+  # failed loudly — `mcp-hub identity` simply stopped resolving, so the Stop
+  # hook, SessionStart and the heartbeat daemon all became silent no-ops. It
+  # was caught only because this function happens to PRINT the opt-out.
+  #
+  # The roster row is already gone by this point (above), so "any remaining
+  # row" is exactly the right question to ask.
   if [ -d "$dir" ]; then
     proj="$(worktree_project "$dir")"
-    [ -n "$proj" ] && optin_project remove "$proj"
+    if [ -n "$proj" ]; then
+      local sib="" n w d2
+      while IFS='|' read -r n w _rest; do
+        [ -n "$n" ] || continue
+        case "$n" in \#*) continue ;; esac
+        d2="$(untilde "$w")"
+        [ -d "$d2" ] || continue
+        if [ "$(worktree_project "$d2")" = "$proj" ]; then sib="$n"; break; fi
+      done < "$CONF"
+      if [ -n "$sib" ]; then
+        echo "hub opt-in KEPT: $proj — still used by '$sib'"
+        optnote=" (hub opt-in kept — shared with '$sib')"
+      else
+        optin_project remove "$proj"
+      fi
+    fi
   fi
   # retire daemon + state files
   safe="$(printf '%s' "$a" | sed 's/[^A-Za-z0-9_-]/_/g')"
   [ -f "$HOME/.mcp-hub/heartbeat-$safe.pid" ] && kill "$(cat "$HOME/.mcp-hub/heartbeat-$safe.pid" 2>/dev/null)" 2>/dev/null
   rm -f "$HOME/.mcp-hub/heartbeat-$safe.pid" "$HOME/.mcp-hub/status-$safe.json"
-  echo "removed '$a' (session, roster, hub opt-in, daemon) — repo left in place"
+  # ⚠️ Do not claim the opt-in was removed when it was deliberately kept — the
+  # summary line is what the operator reads, and a wrong one here is how a
+  # silent disconnect gets believed in the other direction too.
+  echo "removed '$a' (session, roster, hub opt-in, daemon)${optnote} — repo left in place"
+  # Removal is FOUR places and this verb owns two of them. The workspace file
+  # still lists the folder and the hub still has the workspace definition, so a
+  # caller who stops here leaves a `ghost — registered, no file` on the board.
+  echo "  still to do if you are retiring it fully: remove the folder from any" \
+       ".code-workspace, and 'mcp-hub workspaces remove <name>' on the hub"
 }
 
 # ── ext_align: keep the cockpit extension's installed dir name in step ──────

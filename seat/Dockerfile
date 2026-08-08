@@ -10,9 +10,24 @@ FROM python:3.12-slim
 # git: SEAT_REPO clone + origin-derived project; tmux: the attachable
 # session hub push-wake lands in; curl+ca-certificates: the claude
 # installer; procps: `ps` for tmux and live debugging.
+# alsa-utils: arecord, which /voice records with. libasound2-plugins: the
+# ALSA->pulse pcm plugin — the piece everyone forgets, and without it arecord
+# fails with "audio open error: No such file or directory". pulseaudio-utils:
+# pacat, to feed the container's OWN sink. pulseaudio: that sink's server,
+# which is per-container and reaches nothing outside it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git tmux curl ca-certificates procps \
+        alsa-utils libasound2-plugins pulseaudio-utils pulseaudio \
     && rm -rf /var/lib/apt/lists/*
+
+# ALSA's default device IS the container's own pulse server. Baked into the
+# IMAGE, not injected per container: this is the half of /voice that is
+# automatic by construction, so a seat cannot exist without it
+# (docs/seat-voice.md, "how this gets into EVERY container").
+RUN mkdir -p /etc/alsa/conf.d && printf '%s\n' \
+        'pcm.!default { type pulse }' \
+        'ctl.!default { type pulse }' \
+        > /etc/alsa/conf.d/99-pulseaudio-default.conf
 
 # mcp-hub itself: seat-entry (PID 1), the hooks the settings file names
 # (stop-hook / session-start / heartbeat-daemon), and memory-export for the
@@ -22,6 +37,46 @@ RUN pip install --no-cache-dir /opt/mcp-hub
 
 # Non-root. claude installs per-user; PATH gains ~/.local/bin for it.
 RUN useradd -m -s /bin/bash seat
+
+# 🔴 THE SERVER THIS IMAGE INSTALLS MUST ALSO BE STARTED, AND WITH A SINK.
+# Until 2026-08-08 the package was installed, its comment above said "that
+# sink's server" — and NOTHING EVER RAN IT. Measured in a throwaway container
+# (mcp-hub-dev-vm-1-general): `pactl info`, `pacat` and `arecord` all failed
+# with "Connection refused". Every piece present, nothing running: a comment
+# asserting a component is not a component.
+#
+# `autospawn = no` (set below) stays deliberately. Autospawn would start a
+# server from the DEFAULT script, which hunts for hardware a container does not
+# have and creates NO null sink — so `pacat` would still have nowhere to play,
+# and would fail more confusingly than it does now. seat-entry starts the
+# server explicitly instead, in a known order, with this script.
+#
+# `-n --file=` means ONLY these modules load: no udev, no hardware detection,
+# no bluetooth. A container has no devices, so the default script is all
+# failure modes and no benefit.
+#
+# ⚠️ ROOT-OWNED PATHS, SO THIS MUST PRECEDE `USER seat` — and follow `useradd`,
+# because the chown resolves `seat:seat`. Placed after the USER switch first
+# time round, and the build died at step 12/16 with "cannot create
+# /etc/pulse/seat-voice.pa: Permission denied".
+RUN mkdir -p /etc/pulse && printf '%s\n' \
+        '# The container half of the /voice chain, mirroring the host rig:' \
+        '# a null sink to play the host stream INTO, and its monitor as the' \
+        '# default source, so arecord (and therefore /voice) reads it back.' \
+        'load-module module-native-protocol-unix' \
+        'load-module module-null-sink sink_name=claude_mic rate=16000 channels=1 sink_properties=device.description=claude_mic' \
+        'set-default-sink claude_mic' \
+        'set-default-source claude_mic.monitor' \
+        > /etc/pulse/seat-voice.pa
+
+# XDG_RUNTIME_DIR must EXIST and be owned by the seat, because client.conf
+# (below) names `/run/user/1000/pulse/native` by absolute path and the server
+# creates its socket under $XDG_RUNTIME_DIR. Created at build time: /run is a
+# plain image directory here, so this persists into every container.
+ENV XDG_RUNTIME_DIR=/run/user/1000
+RUN mkdir -p /run/user/1000 && chown seat:seat /run/user/1000 \
+    && chmod 700 /run/user/1000
+
 USER seat
 ENV PATH="/home/seat/.local/bin:${PATH}"
 RUN curl -fsSL https://claude.ai/install.sh | bash \
@@ -35,6 +90,51 @@ RUN curl -fsSL https://claude.ai/install.sh | bash \
 # workdir (found by the first container smoke test, not by unit tests —
 # they run as one user on the host and cannot see ownership).
 RUN mkdir -p /home/seat/work
+
+# Point libpulse at the container's OWN server by ABSOLUTE path. Load-bearing:
+# tmux-launched agents often lack a usable XDG_RUNTIME_DIR, and libpulse then
+# finds nothing — a trap that already cost time on the fireblade rig.
+# 🔴 NO `default-server` HERE — it is correct on the HOST and fatal in the
+# CONTAINER. pulseaudio refuses to start when one is configured:
+#   "User-configured server at unix:/run/user/1000/pulse/native,
+#    refusing to start/autospawn"
+# ...so the line added to help clients FIND the server is the line that
+# prevents the server from existing. Measured in a throwaway container.
+#
+# The reason it was needed on the host does not apply here: `ENV
+# XDG_RUNTIME_DIR=/run/user/1000` above is baked into the IMAGE, so every
+# process inherits it — including tmux-launched agents, which is the exact case
+# the absolute path was protecting against. libpulse then finds
+# $XDG_RUNTIME_DIR/pulse/native by itself.
+#
+# `autospawn = no` STAYS: seat-entry starts the server explicitly with
+# /etc/pulse/seat-voice.pa, and an autospawned one would use default.pa
+# instead — no null sink, so nowhere for the host stream to go.
+RUN mkdir -p /home/seat/.config/pulse && printf '%s\n' \
+        'autospawn = no' \
+        > /home/seat/.config/pulse/client.conf
+
+# 🔴 THE SERVER THIS IMAGE INSTALLS MUST ALSO BE STARTED, AND WITH A SINK.
+# Until 2026-08-08 the package was installed, the comment above said "that
+# sink's server" — and NOTHING EVER RAN IT. Measured in a throwaway container
+# from this Dockerfile (mcp-hub-dev-vm-1-general): `pactl info`, `pacat` and
+# `arecord` all failed with "Connection refused". Every piece present, nothing
+# running: a comment asserting a component is not a component.
+#
+# `autospawn = no` above stays deliberately. Autospawn would start a server
+# from the DEFAULT script, which hunts for hardware a container does not have
+# and creates NO null sink — so `pacat` would still have nowhere to play, and
+# would fail more confusingly than it does now. The server is started
+# explicitly by seat-entry instead, in a known order, with this script.
+#
+# `-n --file=` means ONLY these modules load: no udev, no hardware detection,
+# no bluetooth. A container has no devices, so the default script is all
+# failure modes and no benefit.
+# ⚠️ The two root-owned pieces of this (`/etc/pulse/seat-voice.pa` and
+# `/run/user/1000`) live ABOVE the `USER seat` line, not here — see there. They
+# were written here first and the build died at step 12/16 with
+# "cannot create /etc/pulse/seat-voice.pa: Permission denied".
+
 WORKDIR /home/seat/work
 
 # The contract door: env in (SEAT_IDENTITY, MCP_HUB_URL, credential...),

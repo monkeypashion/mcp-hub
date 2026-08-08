@@ -160,3 +160,45 @@ class TestCollect:
         rows = {r["name"]: r for r in out["rows"]}
         assert rows["ghost"]["registered"] is True
         assert rows["ghost"]["on_disk"] is False
+
+
+def test_a_DELETED_local_workspace_is_not_reported_as_on_disk(tmp_path):
+    """🔴 The hub REMEMBERS what a machine once reported, so a file deleted
+    since is still in `discovered` — and the row used to take `on_disk: True`
+    straight from that record.
+
+    Measured 2026-08-08: `showcase.code-workspace` was deleted, `find ~`
+    confirmed no copy anywhere, and `mcp-hub workspaces list` still printed
+    `✔ disk`. The manager asserted a file that was not there, which is the one
+    thing this column exists to answer.
+
+    The clause that keeps local enumeration authoritative only ran when the
+    file still EXISTED; absence fell through to the branch that trusted the
+    hub. Absence is exactly where freshness matters most.
+    """
+    registry = {"definitions": [],
+                "discovered": [{"machine": "thisbox",
+                                "path": "/home/me/Projects/gone.code-workspace",
+                                "registered": False}]}
+    rows = collect_workspaces(_FakeAPI(registry), [tmp_path], "thisbox")
+    gone = [r for r in rows["rows"] if r["name"] == "gone"]
+    assert gone, "the row vanished entirely — it should be shown, just not as on-disk"
+    assert gone[0]["on_disk"] is False, (
+        "reported a locally-deleted workspace as present on disk, on the "
+        "authority of the hub's memory of it")
+
+
+def test_a_REMOTE_machines_workspace_still_trusts_the_hub(tmp_path):
+    """The positive control, and it is what stops the fix going too far: we
+    cannot stat another box's disk, so for a REMOTE machine the hub's record is
+    the best evidence there is. Without this, 'ignore the hub' would pass the
+    test above while blanking every remote row in the fleet view."""
+    registry = {"definitions": [],
+                "discovered": [{"machine": "otherbox",
+                                "path": "/home/me/Projects/remote.code-workspace",
+                                "registered": True}]}
+    rows = collect_workspaces(_FakeAPI(registry), [tmp_path], "thisbox")
+    remote = [r for r in rows["rows"] if r["name"] == "remote"]
+    assert remote and remote[0]["on_disk"] is True, (
+        "blanked a remote machine's workspace — this machine's scan says "
+        "nothing about another box's disk")
