@@ -51,6 +51,12 @@ VOICE_PORT = 6981
 VOICE_RATE = 16000
 VOICE_CHANNELS = 1
 
+# Bytes per FRAME — the indivisible unit of the format (s16 = 2 bytes/sample).
+# Dropping any smaller unit than this corrupts the stream permanently; see
+# send_or_drop. Derived rather than hardcoded so a move to stereo does not
+# require anyone to remember this file exists.
+VOICE_FRAME_BYTES = VOICE_CHANNELS * 2
+
 # Wire protocol, deliberately one line of ASCII: the container's first act is to
 # say who it is, and the host's first act is to check. Anything else is a
 # protocol nobody can debug with `nc`.
@@ -118,9 +124,14 @@ def parse_handshake(line: bytes) -> str:
     if magic != VOICE_MAGIC:
         return ""
     name = name.strip()
-    # A seat name is an agent identity: lowercase, digits, dash, underscore
-    # (the same sanitize rule the rest of the fleet derives). Anything else is
-    # not a name we could match against the roster anyway.
+    # A seat name is an agent identity: letters, digits, dash, underscore —
+    # matching the wire contract's [A-Za-z0-9_-]. Anything else is not a name
+    # we could match against the roster anyway.
+    #
+    # ⚠️ `isalnum()` is Unicode-aware ('٣'.isalnum() is True), so this is only
+    # ASCII-safe because of the strict ASCII decode two lines up. That is
+    # correctness by a neighbouring line rather than by this one — do not
+    # "simplify" the decode without replacing this check.
     if not name or len(name) > 128:
         return ""
     if not all(c.isalnum() or c in "-_" for c in name):
@@ -147,30 +158,62 @@ def authorise(seat: str, known: Callable[[], set[str]]) -> bool:
     return seat in (names or set())
 
 
-def send_or_drop(sock: Any, chunk: bytes) -> int:
-    """Write what fits, DROP the rest, never block.
+def send_or_drop(sock: Any, chunk: bytes, carry: bytes = b"",
+                 frame_size: int = VOICE_FRAME_BYTES) -> tuple[int, bytes]:
+    """Write what fits, DROP whole FRAMES, never block.
 
     ⚠️ THE DROP IS THE FEATURE. A TCP stream is lossless-with-backpressure and
     realtime audio wants the opposite: when a seat cannot keep up, the correct
     behaviour is to lose audio, not to queue it and deliver it late. Queued
-    audio arrives stale and is transcribed as though it were current.
+    audio arrives stale and is transcribed as though it were current. **Do not
+    add a retry loop and do not enlarge the socket buffer: neither prevents the
+    stall, both lengthen it.**
 
-    This is the third time this project has had to re-learn it — VBAN is
-    fire-and-forget by design, v1 lost the property by moving to a pipe and had
-    to re-add it explicitly, and it would be lost again by "fixing" this to
-    retry. **Do not add a retry loop, and do not enlarge the socket buffer:
-    neither prevents the stall, both lengthen it.**
+    🔴 BUT THE DROP MUST OPERATE ON WHOLE FRAMES. `send()` returns however many
+    bytes fitted, and that count is usually ODD — measured over real TCP,
+    **10 of 12 partial sends returned an odd count** (mcp-hub-dev-vm-1-general,
+    2026-08-08). Dropping the remainder then leaves the peer holding half a
+    sample, and since TCP is a byte stream it pairs that orphan with the first
+    byte of the NEXT chunk. Every sample after that point is built from two
+    halves of different samples: not a glitch, **permanent noise**, because
+    nothing in the stream ever tells the reader it is off by one.
 
-    Returns bytes actually written (0 when the peer is not draining).
+    It only triggers when the socket buffer fills — i.e. under load — so it is
+    intermittent, absent on a quiet box, and presents as a TRANSCRIPTION
+    QUALITY problem, which sends the first suspicion to the mic or the model
+    rather than the socket.
+
+    ⇒ So: carry the orphaned partial frame and prepend it to the next chunk.
+    **The carry is at most one frame minus one byte, and can never grow — it is
+    not a retry and not a queue.** Everything beyond it is still dropped, so
+    this is still lossy and still non-blocking.
+
+    Returns `(bytes_written, carry)`. The caller MUST thread `carry` into the
+    next call; dropping it on the floor reintroduces the bug.
     """
+    data = carry + chunk
     try:
-        return sock.send(chunk)
+        sent = sock.send(data)
     except (BlockingIOError, InterruptedError):
-        return 0
+        return 0, carry
     except OSError as exc:
         if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-            return 0
+            return 0, carry
         raise
+    # ⚠️ ALIGNMENT IS CUMULATIVE, NOT PER-CALL. `sent % frame_size` is the
+    # obvious expression and it is WRONG: this call may send an odd count while
+    # the peer's TOTAL is even, i.e. perfectly aligned, and carrying a byte
+    # then CREATES the misalignment it was meant to prevent. (Caught by the
+    # stream test, which failed against this exact mistake.)
+    #
+    # The peer's phase before this call is implied by the carry we were holding:
+    # a carry of k bytes means it was waiting for k more to finish a frame.
+    phase_before = (frame_size - len(carry)) % frame_size
+    phase_after = (phase_before + sent) % frame_size
+    if not phase_after:
+        return sent, b""
+    # Exactly the bytes that finish the frame the peer is now half-holding.
+    return sent, data[sent:sent + (frame_size - phase_after)]
 
 
 def connect_argv(gateway: str, port: int = VOICE_PORT) -> tuple[str, int]:

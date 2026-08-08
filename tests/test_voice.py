@@ -129,6 +129,87 @@ class _Sock:
         return result
 
 
+def test_a_dropped_PARTIAL_frame_would_shift_every_sample_after_it():
+    """🔴 The bug my other tests could not see (found 2026-08-08 by
+    mcp-hub-dev-vm-1-general, measured: 10 of 12 real partial TCP sends
+    returned an ODD count).
+
+    `send_or_drop` was correct as specified — write what fits, drop the rest.
+    The defect was in the SPECIFICATION: "drop the rest" is unsafe when the
+    unit dropped is smaller than the unit the FORMAT is made of. A lone
+    orphaned byte at the peer pairs with the first byte of the next chunk and
+    every sample afterwards is two halves of different samples — permanent
+    noise, not a glitch, because nothing in the stream says it is off by one.
+
+    ⭐ This asserts the STREAM, not the call. A per-call test cannot catch it:
+    each individual send is correct, and the damage is only visible in what the
+    peer has accumulated one call later.
+    """
+    received = bytearray()
+
+    class _OddSock:
+        """Sends an odd number of bytes, which is the common real case."""
+
+        def send(self, data):
+            n = min(len(data), 5)      # odd on purpose
+            received.extend(data[:n])
+            return n
+
+    sock = _OddSock()
+    carry = b""
+    # Every frame is (0x01, 0x02) — so at the peer, ALIGNED means every even
+    # offset holds 0x01 and every odd offset holds 0x02. That is the property;
+    # total length being even is NOT (20 odd sends of 5 bytes sum to 100, which
+    # is even while the stream is thoroughly shifted — this test asserted that
+    # weaker thing first and passed against the bug).
+    for _ in range(20):
+        _sent, carry = voice.send_or_drop(sock, b"\x01\x02" * 8, carry)
+        assert len(carry) < voice.VOICE_FRAME_BYTES, "the carry grew — that is a queue"
+
+    assert len(received) % voice.VOICE_FRAME_BYTES == 0, "peer holds a part-frame"
+    firsts = set(received[0::2])
+    seconds = set(received[1::2])
+    assert firsts == {0x01} and seconds == {0x02}, (
+        f"peer's stream is BYTE-SHIFTED: even offsets={sorted(firsts)}, "
+        f"odd offsets={sorted(seconds)} — every sample from the shift onward is "
+        "two halves of different samples"
+    )
+
+
+def test_the_carry_is_bounded_and_never_becomes_a_queue():
+    """The line between this fix and the retry loop we banned. If the carry can
+    grow, we have reintroduced buffering — and buffered realtime audio arrives
+    stale and is transcribed as current."""
+    class _Trickle:
+        def send(self, data):
+            return 1               # worst case: one byte at a time
+
+    carry = b""
+    for _ in range(50):
+        _sent, carry = voice.send_or_drop(_Trickle(), b"\x01\x02" * 64, carry)
+        assert len(carry) <= voice.VOICE_FRAME_BYTES - 1
+
+
+def test_a_whole_frame_write_carries_NOTHING():
+    """The ordinary case must not accumulate state."""
+    class _Even:
+        def send(self, data):
+            return 8
+    sent, carry = voice.send_or_drop(_Even(), b"\x01\x02" * 8)
+    assert (sent, carry) == (8, b"")
+
+
+def test_a_blocked_write_PRESERVES_the_carry():
+    """Losing the carry on a would-block is the same bug by another route: the
+    peer keeps its half-sample and the completing byte is gone forever."""
+    class _Blocked:
+        def send(self, data):
+            raise BlockingIOError()
+    sent, carry = voice.send_or_drop(_Blocked(), b"\x01\x02", carry=b"\x09")
+    assert sent == 0
+    assert carry == b"\x09", "the completing byte was dropped — stream stays shifted"
+
+
 def test_a_stalled_seat_drops_audio_instead_of_blocking_the_host():
     """⚠️ THE DROP IS THE FEATURE. A stream is lossless-with-backpressure and
     realtime audio wants the opposite: queued audio arrives stale and is
@@ -137,14 +218,16 @@ def test_a_stalled_seat_drops_audio_instead_of_blocking_the_host():
     for stall in (BlockingIOError(), InterruptedError(),
                   OSError(errno.EAGAIN, "would block"),
                   OSError(errno.EWOULDBLOCK, "would block")):
-        assert voice.send_or_drop(_Sock(lambda c, e=stall: e), b"pcm") == 0
+        assert voice.send_or_drop(_Sock(lambda c, e=stall: e), b"pcm") == (0, b"")
 
 
 def test_a_partial_write_reports_what_actually_went():
     """Not what we hoped went. A caller that assumes the whole chunk landed
     silently corrupts the stream."""
     sock = _Sock(lambda c: 2)
-    assert voice.send_or_drop(sock, b"pcmpcm") == 2
+    sent, carry = voice.send_or_drop(sock, b"pcmpcm")
+    assert sent == 2
+    assert carry == b""          # 2 bytes IS a whole frame — nothing orphaned
     assert sock.sent == [b"pc"]
 
 
