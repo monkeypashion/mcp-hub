@@ -587,6 +587,21 @@ def init_db(db_path: Path = DB_PATH) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_squad_members_squad ON squad_members(squad)"
     )
+    # A LOAN: membership that ends by itself. 0 means permanent, which is what
+    # every existing row is and what an unqualified join keeps meaning — the
+    # column is additive, so nothing on the live hub changes shape.
+    #
+    # Borrowing a specialist for a spike is a real operator move, and the
+    # version of it that relies on remembering to hand them back is the version
+    # where a squad quietly accumulates members who stopped being in it months
+    # ago. See purge_expired_memberships for why the deadline is ENFORCED at
+    # every read rather than merely recorded here.
+    try:
+        conn.execute(
+            "ALTER TABLE squad_members ADD COLUMN expires REAL NOT NULL DEFAULT 0"
+        )
+    except sqlite3.OperationalError:
+        pass  # already migrated — idempotent-by-exception, as elsewhere
     conn.commit()
 
     # Per-channel subscriptions (2026-07-29, operator-approved): channel
@@ -711,6 +726,60 @@ def init_db(db_path: Path = DB_PATH) -> None:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def purge_expired_memberships(conn: sqlite3.Connection,
+                              now: float | None = None) -> int:
+    """Drop loans whose deadline has passed. Returns how many ended.
+
+    🔴 WHY THIS IS A PURGE AND NOT A `WHERE` CLAUSE ON ONE QUERY.
+
+    An expiring membership is a claim about DELIVERY: after the deadline the
+    borrowed agent stops hearing that squad. There are four places that decide
+    delivery — `_squads_of` (which carries the live-push scope check AND the
+    Stop-hook catch-up), both `list_squads` branches, and the broadcast
+    recipient filter — plus the API's member reads and `compose_capsule`. A
+    filter added to some of them and not others gives the worst possible
+    outcome: the loan reads as over everywhere the operator LOOKS, and is still
+    live on the path that actually pushes messages.
+
+    That is the shape of the durability defect that destroyed three seats'
+    memory — a property read off a declaration that nothing enforced. So the
+    deadline is enforced by DELETING the row, once, at every entry point that
+    is about to read it. After this returns, every reader in the process sees
+    the same truth without having to remember a predicate.
+
+    ⚠️ THE CHEAP CHECK IS LOAD-BEARING, not an optimisation. The first version
+    issued the DELETE unconditionally, which takes a WRITE lock — so every
+    `list_squads`, every catch-up and every broadcast fan-out started competing
+    for the write lock on a database whose other connection was mid-read. It
+    surfaced immediately as `database is locked` in the API suite; on the live
+    hub it would have serialized broadcast delivery behind a statement that
+    almost always matches nothing. A read path must stay a read path. The
+    SELECT touches the same index and takes no lock.
+
+    Granularity is "within one read", not "to the second": if the write lock is
+    held right now the purge is skipped and the next reader does it. A loan
+    lapsing a few seconds late is not worth a second mechanism — the deadline
+    is an operator convenience measured in days, not a security boundary. It is
+    NOT a filter, so it can never be half-applied.
+    """
+    now = time.time() if now is None else now
+    if not conn.execute(
+        "SELECT 1 FROM squad_members WHERE expires > 0 AND expires <= ? LIMIT 1",
+        (now,),
+    ).fetchone():
+        return 0
+    try:
+        cur = conn.execute(
+            "DELETE FROM squad_members WHERE expires > 0 AND expires <= ?",
+            (now,),
+        )
+        if cur.rowcount:
+            conn.commit()
+        return cur.rowcount or 0
+    except sqlite3.OperationalError:
+        return 0  # locked — the next read does it
 
 
 def _log_bind_diagnostic(source: str, name: str, session: Any) -> None:
@@ -1372,6 +1441,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         each call site, where one of the two delivery paths would eventually
         forget it.
         """
+        purge_expired_memberships(conn)
         sql = "SELECT squad FROM squad_members WHERE agent = ?"
         if not include_muted:
             sql += " AND muted = 0"
@@ -1981,6 +2051,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             agent: Optional — show only this agent's squads, with mute state.
         """
         conn = _get_db(db_path)
+        purge_expired_memberships(conn)
         if agent:
             rows = conn.execute(
                 "SELECT squad, muted FROM squad_members WHERE agent = ? "
@@ -2434,6 +2505,10 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # or "muted" would only mean "delayed".
         recipients = [a for a in registry.names() if a != from_agent]
         if audience:
+            # THE path this feature is actually about: a lapsed loan must stop
+            # a broadcast reaching the borrowed agent. Every other call site
+            # only changes what the operator is told.
+            purge_expired_memberships(conn)
             listening = {
                 r["agent"]
                 for r in conn.execute(
@@ -4032,6 +4107,7 @@ _CLI_SUBCOMMANDS = {
     "seats",
     "placements",
     "capsules",
+    "squads",
     "machines",
     "focus",
     "seat-entry",

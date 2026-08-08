@@ -253,6 +253,42 @@ class OperatorApi:
             json={"name": name, "description": description},
         ).json()
 
+    def delete_api_squad(self, name: str, purge: bool = False) -> dict[str, Any]:
+        """Archive a squad. `purge` additionally drops its memberships.
+
+        Message history is never removed either way — the fleet treats history
+        as the record (2026-07-29), so a retired squad's conversations stay
+        readable under its name.
+        """
+        q = "?purge=true" if purge else ""
+        return self._request("DELETE", f"/api/v1/squads/{name}{q}").json()
+
+    def rename_api_squad(self, name: str, new_name: str) -> dict[str, Any]:
+        """Rename in place. The hub cascades memberships AND queued broadcast
+        audiences in one transaction, so nobody loses unread items."""
+        return self._request(
+            "PATCH", f"/api/v1/squads/{name}", json={"name": new_name},
+        ).json()
+
+    def list_squad_members(self, name: str) -> list[dict[str, Any]]:
+        return self._request(
+            "GET", f"/api/v1/squads/{name}/members"
+        ).json()["members"]
+
+    def add_squad_member(self, name: str, seat: str, expires: float = 0.0,
+                         source: str = "api") -> dict[str, Any]:
+        """Put a seat in a squad. `expires` (unix time, 0 = permanent) makes it
+        a LOAN that ends by itself — see server.purge_expired_memberships."""
+        return self._request(
+            "PUT", f"/api/v1/squads/{name}/members/{seat}",
+            json={"expires": expires, "source": source},
+        ).json()
+
+    def remove_squad_member(self, name: str, seat: str) -> dict[str, Any]:
+        return self._request(
+            "DELETE", f"/api/v1/squads/{name}/members/{seat}"
+        ).json()
+
     def list_capsules(self) -> list[dict[str, Any]]:
         return self._request("GET", "/api/v1/capsules").json()["capsules"]
 
@@ -267,11 +303,21 @@ class OperatorApi:
             "POST", "/api/v1/capsules", json={"squad": squad}
         ).json()
 
-    def place_capsule(self, cid: str, machine: str) -> dict[str, Any]:
+    def place_capsule(self, cid: str, machine: str,
+                      as_label: str = "") -> dict[str, Any]:
         """One docker placement PER SEAT on `machine`. Nothing runs yet —
-        that machine's edge realizes them on its next pass."""
+        that machine's edge realizes them on its next pass.
+
+        `as_label` places a SECOND copy of the squad under fresh identities
+        (`<seat>-<label>`, and every pod inhabitant likewise). Without it the
+        hub REFUSES to place a capsule whose seats are already placed, because
+        two containers sharing one identity is the duplicate-agent collapse.
+        """
+        body: dict[str, Any] = {"machine": machine}
+        if as_label:
+            body["as"] = as_label
         return self._request(
-            "POST", f"/api/v1/capsules/{cid}/place", json={"machine": machine}
+            "POST", f"/api/v1/capsules/{cid}/place", json=body
         ).json()
 
     def delete_capsule(self, cid: str) -> dict[str, Any]:

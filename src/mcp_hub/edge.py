@@ -527,6 +527,20 @@ class DockerExecutor:
             )]
         else:
             argv += ["-e", f"SEAT_IDENTITY={seat}"]
+        # WHAT THIS SEAT IS FOR, and the material for it. Both shapes: a brief
+        # is a file every inhabitant reads, so unlike SEAT_PROMPT it is
+        # meaningful for a pod (see seat.parse_pod_manifest).
+        #
+        # Carried as env rather than a bind mount on purpose — the spec has to
+        # survive a trip through the hub to a machine that has never seen the
+        # operator's filesystem, and a host path would name a file that does
+        # not exist there. It is the same reason the repo is cloned rather
+        # than mounted.
+        if spec.get("brief"):
+            argv += ["-e", f"SEAT_BRIEF={spec['brief']}"]
+        if spec.get("inputs"):
+            argv += ["-e", "SEAT_INPUTS=" + json.dumps(
+                spec["inputs"], separators=(",", ":"))]
         # SECRETS: the hub stores the NAME, this machine supplies the VALUE.
         #
         # A seat spec lives in the hub's SQLite and anything holding the

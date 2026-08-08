@@ -40,9 +40,13 @@ class FakeApi:
             ]},
         }
 
-    def place_capsule(self, cid, machine):
-        self.calls.append(("place_capsule", cid, machine))
-        return {"placements": ["pl-1", "pl-2"]}
+    def place_capsule(self, cid, machine, as_label=""):
+        # Signature tracks OperatorApi.place_capsule deliberately: a double
+        # that lags the real method turns a caller change into a test-only
+        # TypeError, which reads as a bug in the caller.
+        self.calls.append(("place_capsule", cid, machine, as_label))
+        return {"placements": ["pl-1", "pl-2"],
+                "seats": ["seat-a", "seat-b"]}
 
 
 def _args(**kw):
@@ -97,7 +101,8 @@ def test_placing_a_capsule_reports_one_placement_per_seat(capsys):
     rc = cli.capsules_command(
         _args(action="place", target="cap-abc123", machine="dev-vm-1"), api=api)
     assert rc == 0
-    assert api.calls[0] == ("place_capsule", "cap-abc123", "dev-vm-1")
+    # Empty label = place the squad ITSELF, not a second copy of it.
+    assert api.calls[0] == ("place_capsule", "cap-abc123", "dev-vm-1", "")
     out = capsys.readouterr().out
     assert "2 placement" in out
     # The honest caveat the whole runtime is built on.

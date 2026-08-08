@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import datetime as _dt
 import hashlib
 import json
 import os
@@ -1878,6 +1879,68 @@ def machines_command(args: argparse.Namespace, api: Any = None) -> int:
     return 0
 
 
+# A brief travels through the hub's database as text, so it has a size the
+# operator should hear about rather than discover. Docker's own env limit is
+# the real ceiling (~128KB for the whole environment); this leaves generous
+# room for it plus everything else the seat carries.
+MAX_BRIEF_BYTES = 64 * 1024
+MAX_INPUT_BYTES = 256 * 1024
+
+
+def _read_brief_and_inputs(
+    args: argparse.Namespace,
+) -> tuple[str, dict[str, str], str]:
+    """`--brief`/`--input` → (brief, {name: content}, error).
+
+    ⚠️ THE CONTROL PLANE HOLDS NO SECRETS. Everything here is stored in the
+    hub's SQLite in plaintext and readable by anything holding the operator
+    token — the same reason `--env-from-host` passes a NAME and never a value.
+    A brief is meant to be a question and a spec; it must never be a place
+    someone pastes a key, so the refusal below is worth its false positives.
+    """
+    brief = getattr(args, "brief", "") or ""
+    if brief.startswith("@"):
+        path = pathlib.Path(brief[1:]).expanduser()
+        try:
+            brief = path.read_text(encoding="utf-8")
+        except OSError as e:
+            return "", {}, f"cannot read brief from {path}: {e}"
+    if len(brief.encode("utf-8")) > MAX_BRIEF_BYTES:
+        return "", {}, (
+            f"brief is {len(brief.encode('utf-8'))} bytes, over the "
+            f"{MAX_BRIEF_BYTES} limit — put the bulk in `--input` files and "
+            f"keep the brief the instruction that points at them"
+        )
+
+    inputs: dict[str, str] = {}
+    for raw in (getattr(args, "input", None) or []):
+        path = pathlib.Path(raw).expanduser()
+        try:
+            content = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return "", {}, (
+                f"{path} is not UTF-8 text. Inputs travel as text through the "
+                f"hub; ship binary material by mounting a volume instead."
+            )
+        except OSError as e:
+            return "", {}, f"cannot read input {path}: {e}"
+        if len(content.encode("utf-8")) > MAX_INPUT_BYTES:
+            return "", {}, (
+                f"{path} is over the {MAX_INPUT_BYTES}-byte input limit — "
+                f"mount a volume for material this size"
+            )
+        if path.name in inputs:
+            # Two files of one name would silently become one, and the agent
+            # would work from whichever won without ever knowing the other
+            # existed.
+            return "", {}, (
+                f"two inputs are both named '{path.name}' — they land in one "
+                f"directory, so rename one"
+            )
+        inputs[path.name] = content
+    return brief, inputs, ""
+
+
 def seats_command(args: argparse.Namespace, api: Any = None) -> int:
     """Seats — WHAT may run. `mcp-hub seats list|add|rm`."""
     from mcp_hub.operator_api import ApiUnavailable, OperatorApi, api_base
@@ -1942,6 +2005,14 @@ def seats_command(args: argparse.Namespace, api: Any = None) -> int:
                     spec["agents"] = _parse_pod_agents(args.agent)
                     if getattr(args, "pod_squad", ""):
                         spec["squad"] = args.pod_squad
+                brief, inputs, err = _read_brief_and_inputs(args)
+                if err:
+                    print(err, file=sys.stderr)
+                    return 1
+                if brief:
+                    spec["brief"] = brief
+                if inputs:
+                    spec["inputs"] = inputs
             rec = api.create_seat(args.repo, machine, args.folder,
                                   args.want_identity, args.launch_args,
                                   args.klass, spec)
@@ -1952,6 +2023,9 @@ def seats_command(args: argparse.Namespace, api: Any = None) -> int:
                   f"mcp-hub placements set --seat {rec['identity']} "
                   f"--machine {rec.get('machine', '')}")
             return 0
+
+        if args.action == "logs":
+            return _seat_logs(args, api, machine)
 
         if not args.identity:
             print("name the seat to archive", file=sys.stderr)
@@ -1967,6 +2041,58 @@ def seats_command(args: argparse.Namespace, api: Any = None) -> int:
                   "gone", file=sys.stderr)
             return 1
         print(msg, file=sys.stderr)
+        return 1
+
+
+def _seat_logs(args: argparse.Namespace, api: Any, machine: str) -> int:
+    """What a seat has printed. `mcp-hub seats logs <identity>`.
+
+    🔴 The dead end this closes: a seat could be declared, placed, realized and
+    reclaimed without the operator ever having a way to READ WHAT IT SAID. For
+    an interactive seat you could attach; for a headless one — the whole point
+    of which is that nobody is watching — the output existed only in the
+    container's log and the container was then destroyed by reclaim. Work with
+    no retrievable result is work that did not happen.
+
+    Machine-local by necessity and it SAYS SO. `docker logs` can only be run
+    where the container is, and the honest failure is "that seat is on
+    dev-vm-1, run it there" — not an empty result that reads like a seat which
+    printed nothing. Guessing would be worse than refusing: an operator who
+    believes a seat produced no output stops looking.
+    """
+    if not args.identity:
+        print("name the seat (mcp-hub seats list)", file=sys.stderr)
+        return 1
+    placements = [p for p in api.list_placements()
+                  if p.get("seat") == args.identity]
+    if not placements:
+        print(f"{args.identity} has no placement — it was declared but never "
+              f"placed, so nothing has ever run and there is no output.\n"
+              f"  mcp-hub placements set --seat {args.identity} "
+              f"--machine {machine}", file=sys.stderr)
+        return 1
+    here = [p for p in placements if p.get("machine") == machine]
+    if not here:
+        where = sorted({p.get("machine", "?") for p in placements})
+        print(f"{args.identity} runs on {', '.join(where)}, not {machine}. "
+              f"Logs come from docker on the machine that holds the "
+              f"container, so run this there:\n"
+              f"  ssh {where[0]} mcp-hub seats logs {args.identity}",
+              file=sys.stderr)
+        return 1
+    argv = ["docker", "logs"]
+    if str(args.tail).lower() != "all":
+        argv += ["--tail", str(args.tail)]
+    if args.follow:
+        argv.append("--follow")
+    argv.append(args.identity)
+    try:
+        # Streamed, not captured: --follow must reach the operator live, and a
+        # long log should not be buffered whole before its first line shows.
+        return subprocess.run(argv).returncode
+    except FileNotFoundError:
+        print("docker is not on PATH here — this is the machine that holds "
+              "the container, so it should be", file=sys.stderr)
         return 1
 
 
@@ -2221,6 +2347,319 @@ def _capsule_attach(args: argparse.Namespace, api: Any) -> int:
     return 0
 
 
+def parse_until(spec: str, now: float | None = None) -> float:
+    """`+7d` / `+12h` / `+90m` / `2026-09-01` → a unix deadline. 0 for empty.
+
+    Relative forms exist because that is how the need is actually expressed —
+    "lend me Alice for the week" — and a wrong absolute date is silent where a
+    wrong relative one is not. Raises ValueError with the accepted forms named,
+    so a typo cannot be read as "no deadline": defaulting a malformed deadline
+    to 0 would turn a loan into a permanent membership, which is the exact
+    outcome the deadline exists to prevent.
+    """
+    spec = (spec or "").strip()
+    if not spec:
+        return 0.0
+    now = time.time() if now is None else now
+    if spec.startswith("+"):
+        unit, body = spec[-1].lower(), spec[1:-1]
+        mult = {"m": 60, "h": 3600, "d": 86400, "w": 604800}.get(unit)
+        if mult is None or not body.strip():
+            raise ValueError(
+                f"cannot read '{spec}' as a duration — use +90m, +12h, +7d "
+                f"or +2w"
+            )
+        try:
+            n = float(body)
+        except ValueError:
+            raise ValueError(
+                f"cannot read '{spec}' as a duration — '{body}' is not a "
+                f"number"
+            ) from None
+        if n <= 0:
+            raise ValueError(f"'{spec}' is not in the future")
+        return now + n * mult
+    try:
+        # Midnight ENDING that day, so `--until 2026-09-01` includes the 1st.
+        # The other reading silently shortens every loan by a day, and the
+        # operator only finds out when someone stops hearing a squad.
+        d = _dt.datetime.strptime(spec, "%Y-%m-%d")
+    except ValueError:
+        raise ValueError(
+            f"cannot read '{spec}' as a deadline — use +7d, +12h, +90m or "
+            f"YYYY-MM-DD"
+        ) from None
+    return d.timestamp() + 86400
+
+
+def _fmt_until(expires: float, now: float | None = None) -> str:
+    """A deadline as time REMAINING. An absolute timestamp makes the reader do
+    the subtraction, and the question is always 'how long left'."""
+    if not expires:
+        return ""
+    left = expires - (time.time() if now is None else now)
+    if left <= 0:
+        return "expired"
+    for n, unit in ((86400, "d"), (3600, "h"), (60, "m")):
+        if left >= n:
+            return f"{left / n:.0f}{unit} left"
+    return "<1m left"
+
+
+def squads_command(args: argparse.Namespace, api: Any = None) -> int:
+    """Squads — WHO a team is. `mcp-hub squads list|create|fork|merge|...`.
+
+    🔴 The gap this closes, found by the operator asking the seven
+    team-assembly scenarios against the CLI: five of them needed to read or
+    change squad membership, and NONE of them could. `/api/v1/squads` and its
+    members routes had been complete since the runtime shipped; the only CLI
+    door was a side-effect flag on `capsules compose --register`. Membership
+    was otherwise something only an agent could do TO ITSELF, via the MCP
+    `set_squads` — so the operator's own team structure was the one thing the
+    operator's CLI could not touch.
+    """
+    from mcp_hub.operator_api import ApiUnavailable, OperatorApi, api_base
+
+    if api is None:
+        api = OperatorApi(api_base(args.hub_url))
+    act = args.action
+
+    # The two spellings converge here, so nothing downstream learns there were
+    # ever two. Order preserved, duplicates dropped — naming a seat twice is a
+    # typo, not a request to add it twice.
+    named = list(args.members or [])
+    named += [s.strip() for s in (getattr(args, "members_flag", "") or "")
+              .split(",") if s.strip()]
+    seen: set[str] = set()
+    args = argparse.Namespace(**{**vars(args), "members": [
+        s for s in named if not (s in seen or seen.add(s))]})
+
+    def _need(value: str, what: str) -> bool:
+        if not value:
+            print(what, file=sys.stderr)
+            return True
+        return False
+
+    try:
+        if act == "list":
+            rows = api.list_api_squads()
+            if args.json:
+                print(json.dumps(rows, indent=2))
+                return 0
+            if not rows:
+                print("no squads registered for management.\n"
+                      "  mcp-hub squads create <name>")
+                return 0
+            for s in rows:
+                print(f"{s['name']:<24} {s.get('member_count', 0):>3} member(s)"
+                      f"  {s.get('description', '')}")
+            return 0
+
+        if act == "create":
+            if _need(args.name, "name the squad to create"):
+                return 1
+            if args.dry_run:
+                print(f"would create squad '{args.name}'")
+                return 0
+            api.create_api_squad(args.name, args.description)
+            print(f"squad '{args.name}' created — it has no members yet:\n"
+                  f"  mcp-hub squads add {args.name} <seat> [<seat>...]")
+            return 0
+
+        if act == "members":
+            if _need(args.name, "name the squad"):
+                return 1
+            rows = api.list_squad_members(args.name)
+            if args.json:
+                print(json.dumps(rows, indent=2))
+                return 0
+            if not rows:
+                print(f"'{args.name}' has no members — a broadcast to it "
+                      f"reaches nobody")
+                return 0
+            for m in rows:
+                flags = [x for x in (
+                    "muted" if m.get("muted") else "",
+                    _fmt_until(m.get("expires") or 0),
+                ) if x]
+                suffix = f"  ({', '.join(flags)})" if flags else ""
+                print(f"{m['seat']:<34} {m.get('source', ''):<10}{suffix}")
+            return 0
+
+        if act in ("add", "remove"):
+            if _need(args.name, "name the squad"):
+                return 1
+            if not args.members:
+                print(f"name the seat(s) to {act}", file=sys.stderr)
+                return 1
+            expires = parse_until(args.until) if act == "add" else 0.0
+            if args.dry_run:
+                until = f" until {_fmt_until(expires)}" if expires else ""
+                print(f"would {act} {', '.join(args.members)} "
+                      f"{'to' if act == 'add' else 'from'} "
+                      f"'{args.name}'{until}")
+                return 0
+            for seat in args.members:
+                if act == "add":
+                    api.add_squad_member(
+                        args.name, seat, expires,
+                        source="loan" if expires else "cli")
+                    note = f" ({_fmt_until(expires)})" if expires else ""
+                    print(f"{seat} → {args.name}{note}")
+                else:
+                    api.remove_squad_member(args.name, seat)
+                    print(f"{seat} ✗ {args.name}")
+            if act == "add" and expires:
+                # Said out loud because a deadline that is merely RECORDED is
+                # the failure mode this feature was built to avoid.
+                print("\nthe loan ends by itself — after that they stop "
+                      "hearing this squad on every delivery path, with no "
+                      "action from you")
+            return 0
+
+        if act == "rename":
+            if _need(args.name, "name the squad") or _need(
+                    args.to, "--to <new-name> required"):
+                return 1
+            if args.dry_run:
+                print(f"would rename '{args.name}' → '{args.to}'")
+                return 0
+            api.rename_api_squad(args.name, args.to)
+            print(f"'{args.name}' → '{args.to}' — memberships and queued "
+                  f"broadcasts moved with it")
+            return 0
+
+        if act == "rm":
+            if _need(args.name, "name the squad to archive"):
+                return 1
+            if args.dry_run:
+                print(f"would archive '{args.name}'"
+                      + (" and drop its memberships" if args.purge else ""))
+                return 0
+            api.delete_api_squad(args.name, args.purge)
+            print(f"squad '{args.name}' archived — its message history is "
+                  f"KEPT and stays readable under that name")
+            if not args.purge:
+                print("memberships were left in place (--purge drops them)")
+            return 0
+
+        if act == "fork":
+            return _squads_fork(args, api)
+        return _squads_merge(args, api)
+    except ValueError as e:            # a bad --until
+        print(str(e), file=sys.stderr)
+        return 1
+    except ApiUnavailable as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+
+def _squads_fork(args: argparse.Namespace, api: Any) -> int:
+    """A topic splits: take some of a squad into a NEW one.
+
+    THE SPIKE TEAM, as an operator actually describes it — "pull three of
+    dreamteam onto this question". Naming no members forks the whole squad,
+    which is the other real case (a squad splitting in two).
+
+    The source is left ALONE. A fork that also removed the members would make
+    'lend three people to a spike' impossible to express, and that is the more
+    common need by far; leaving is a separate, deliberate `squads remove`.
+    """
+    if not args.name:
+        print("name the squad to fork FROM", file=sys.stderr)
+        return 1
+    if not args.to:
+        print("--to <new-squad> required — a fork needs somewhere to go",
+              file=sys.stderr)
+        return 1
+    existing = {m["seat"] for m in api.list_squad_members(args.name)}
+    if not existing:
+        print(f"'{args.name}' has no members to fork", file=sys.stderr)
+        return 1
+    chosen = list(args.members) if args.members else sorted(existing)
+    # Refuse rather than silently fork a subset of what was asked for: a
+    # mistyped identity would otherwise produce a spike team quietly missing
+    # the one person it was assembled for.
+    unknown = [s for s in chosen if s not in existing]
+    if unknown:
+        print(f"not in '{args.name}': {', '.join(unknown)}\n"
+              f"members are: {', '.join(sorted(existing))}", file=sys.stderr)
+        return 1
+    expires = parse_until(args.until)
+    if args.dry_run:
+        print(f"would fork {len(chosen)} of {len(existing)} member(s) from "
+              f"'{args.name}' into '{args.to}':")
+        for s in chosen:
+            print(f"  {s}")
+        if expires:
+            print(f"  ...as a loan, {_fmt_until(expires)}")
+        print(f"'{args.name}' would keep all {len(existing)} — a fork COPIES")
+        return 0
+    from mcp_hub.operator_api import ApiUnavailable
+    try:
+        api.create_api_squad(args.to, f"forked from {args.name}")
+    except ApiUnavailable as e:
+        if "409" not in str(e):
+            raise
+    for s in chosen:
+        api.add_squad_member(args.to, s, expires,
+                             source=f"fork:{args.name}")
+    print(f"'{args.to}': {len(chosen)} member(s) forked from '{args.name}'"
+          + (f", {_fmt_until(expires)}" if expires else ""))
+    for s in chosen:
+        print(f"  {s}")
+    print(f"\n'{args.name}' is unchanged — a fork COPIES. Freeze and run the "
+          f"new one with:\n"
+          f"  mcp-hub capsules compose --squad {args.to} --register")
+    return 0
+
+
+def _squads_merge(args: argparse.Namespace, api: Any) -> int:
+    """Two threads converge: fold one squad into another.
+
+    The source is archived by default, because a merge that leaves both
+    running is how a fleet ends up broadcasting to a squad nobody remembers is
+    still alive. `--keep-source` is there for the case where it IS deliberate.
+    """
+    if not args.name:
+        print("name the squad to merge FROM", file=sys.stderr)
+        return 1
+    if not args.into:
+        print("--into <squad> required — name the squad that SURVIVES",
+              file=sys.stderr)
+        return 1
+    if args.into == args.name:
+        print("a squad cannot be merged into itself", file=sys.stderr)
+        return 1
+    src = {m["seat"] for m in api.list_squad_members(args.name)}
+    dst = {m["seat"] for m in api.list_squad_members(args.into)}
+    moving = sorted(src - dst)
+    already = sorted(src & dst)
+    if args.dry_run:
+        print(f"would move {len(moving)} member(s) from '{args.name}' into "
+              f"'{args.into}'")
+        for s in moving:
+            print(f"  {s}")
+        for s in already:
+            print(f"  {s}  (already there)")
+        print(f"'{args.name}' would be "
+              + ("KEPT" if args.keep_source else "archived"))
+        return 0
+    for s in moving:
+        api.add_squad_member(args.into, s, 0.0, source=f"merge:{args.name}")
+    # Deliberately permanent (expires=0): a loan that survived into the merged
+    # squad would end there too, silently removing someone from a squad they
+    # were merged into rather than lent to.
+    if not args.keep_source:
+        api.delete_api_squad(args.name, purge=True)
+    print(f"'{args.into}': {len(moving)} moved in, {len(already)} already "
+          f"there ({len(dst | src)} total)")
+    print(f"'{args.name}': "
+          + ("kept as-is" if args.keep_source
+             else "archived — its history stays readable under that name"))
+    return 0
+
+
 def capsules_command(args: argparse.Namespace, api: Any = None) -> int:
     """Capsules — a whole SQUAD on docker. `mcp-hub capsules list|compose|place`.
 
@@ -2325,17 +2764,37 @@ def capsules_command(args: argparse.Namespace, api: Any = None) -> int:
             print("--machine required — placing a squad is not a guess",
                   file=sys.stderr)
             return 1
-        rec = api.place_capsule(args.target, args.machine)
+        label = getattr(args, "as_label", "")
+        rec = api.place_capsule(args.target, args.machine, label)
         ids = rec.get("placements") or []
+        seats = rec.get("seats") or []
         print(f"{args.target}: {len(ids)} placement(s) written on "
               f"{args.machine}")
-        for pid in ids:
-            print(f"  {pid}")
+        for pid, seat in zip(ids, seats or [""] * len(ids)):
+            print(f"  {pid}  {seat}")
+        if label:
+            # The label as the HUB sanitized it, not as it was typed: it is
+            # lowercased and stripped of anything tmux would read as a
+            # separator, so echoing the input would send the operator looking
+            # for `-takeB` when the seats are named `-takeb`.
+            actual = seats[0].rsplit("-", 1)[-1] if seats else label
+            print(f"\nfresh identities under '-{actual}' — this is a SECOND "
+                  f"squad, not the same one moved. Every pod inhabitant was "
+                  f"re-identified too, so nothing collides on the hub.")
         print("\nnothing has happened yet — that machine's `edge apply` "
               "realizes them and reports what it OBSERVED.")
         return 0
     except ApiUnavailable as e:
-        print(str(e), file=sys.stderr)
+        msg = str(e)
+        if "409" in msg and args.action == "place" and not getattr(
+                args, "as_label", ""):
+            # The refusal already names the flag; repeating the whole command
+            # saves the operator composing it from the prose.
+            print(msg, file=sys.stderr)
+            print(f"\n  mcp-hub capsules place {args.target} --machine "
+                  f"{args.machine} --as <label>", file=sys.stderr)
+            return 1
+        print(msg, file=sys.stderr)
         return 1
 
 
@@ -4353,9 +4812,53 @@ def _seat_prepare(contract: Any, workdir: pathlib.Path) -> tuple[Any, int | None
         json.dumps(mcp_json_content(contract), indent=2), encoding="utf-8"
     )
 
+    # The BRIEF and its material. Written before launch so the first turn can
+    # tell the agent to read a file that is already there.
+    #
+    # NEVER overwritten: a seat restarts (container restart, `edge apply`
+    # re-realizing it) and re-runs this whole function. Clobbering BRIEF.md
+    # would be tolerable; clobbering an INPUT the agent has been editing all
+    # session would destroy work with no trace, which is why both go through
+    # the same skip-if-present rule rather than only the one that obviously
+    # matters.
+    from mcp_hub.seat import brief_files
+
+    for rel, content in brief_files(contract).items():
+        path = workdir / rel
+        if path.exists():
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
     # Folder trust — the placement is the operator's explicit trust act.
     seed_first_launch(str(workdir))
     return contract, None
+
+
+def _seat_headless(contract: Any, workdir: pathlib.Path) -> int:
+    """One-shot `claude -p`, output to stdout, exit code passed through.
+
+    ⚠️ UNVERIFIED END TO END at the time of writing: the refusal this replaced
+    said headless was "reserved but not yet shipped", and that was honest —
+    no container has ever run this path. The decision logic is unit-tested;
+    the actual run is not, and will not be until a headless seat is built and
+    placed. Anyone reading a green test suite should not conclude otherwise.
+
+    Output goes to STDOUT and nowhere else, which is what makes `mcp-hub seats
+    logs` the way to read it. Not written to a file inside the container: a
+    reclaim destroys the container, so a file there is a result that exists
+    only until someone tidies up.
+    """
+    from mcp_hub.seat import launch_argv
+
+    print(f"seat-entry: headless — one turn, then exit ({contract.identity})",
+          flush=True)
+    # No capture: the operator reads this through `docker logs`, and buffering
+    # it here would mean a long-running turn shows nothing until it finishes.
+    proc = subprocess.run(launch_argv(contract, str(workdir)), cwd=str(workdir))
+    print(f"seat-entry: headless turn finished rc={proc.returncode}",
+          flush=True)
+    return proc.returncode
 
 
 def _seat_launch(contract: Any, workdir: pathlib.Path, session: str) -> int | None:
@@ -5069,19 +5572,6 @@ def seat_entry_command(args: argparse.Namespace) -> int:
         pod = parse_pod_manifest(os.environ)
         if pod is None:
             contract = parse_seat_contract(os.environ)
-            if contract.mode == "headless":
-                # Reserved, deliberately unshipped: the structure exists so
-                # the factory merge is a flag not a fork, but shipping it
-                # untested would let a placement claim a mode nothing has
-                # ever run.
-                print(
-                    "seat-entry: REFUSED (contract): SEAT_MODE=headless is "
-                    "reserved but not yet shipped — run interactive, or build "
-                    "the headless leg first (docs/seat-image.md, Modes).",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                return EXIT_CONTRACT
             # A single seat is a pod of one; `seat` stays its session name so
             # the attach affordance and the launch dance are unchanged.
             plan = [(contract, pathlib.Path(
@@ -5142,6 +5632,20 @@ def seat_entry_command(args: argparse.Namespace) -> int:
     if args.prepare_only:
         print("seat-entry: --prepare-only — not launching claude", flush=True)
         return 0
+
+    # HEADLESS: one turn, no tmux, exit code passed through. The solo errand.
+    #
+    # Everything above this line is shared with the interactive path, which is
+    # the whole reason the mode is a flag and not a fork — the credential
+    # check, the clone, the marker, .mcp.json and the brief are identical, and
+    # only the launch differs.
+    #
+    # Deliberately BEFORE _seat_voice: a headless seat has nobody to talk to,
+    # and starting an audio client for it would be a running process serving
+    # no one. It is also the launch dance's only true exception — there is no
+    # TUI to show a dialog, so there is nothing to answer.
+    if prepared[0][1].mode == "headless":
+        return _seat_headless(prepared[0][1], prepared[0][2])
 
     # /voice, once per CONTAINER, before any agent starts. Detached and
     # deliberately unchecked: audio is a convenience and MUST NOT be able to
@@ -5619,10 +6123,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     seats.add_argument(
-        "action", choices=["list", "add", "rm"],
-        help="list · add: declare a seat · rm: archive it (placements first)",
+        "action", choices=["list", "add", "rm", "logs"],
+        help=("list · add: declare a seat · rm: archive it (placements "
+              "first) · logs: what it has printed"),
     )
-    seats.add_argument("identity", nargs="?", default=None, help="rm: which seat")
+    seats.add_argument("identity", nargs="?", default=None,
+                       help="rm/logs: which seat")
     seats.add_argument("--repo", default="", help="add: <org>/<repo>")
     seats.add_argument("--machine", default=None,
                        help="add: which machine (default: this one)")
@@ -5675,6 +6181,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Hub base URL (default: $MCP_HUB_URL or built-in)",
     )
     seats.add_argument("--json", action="store_true", help="Machine-readable output")
+    seats.add_argument(
+        "--brief", default="",
+        help=("add: what this seat is FOR. `@path` reads a file. Lands as "
+              "BRIEF.md in the workdir and the seat's first turn is told to "
+              "read it — a brief nothing points at is never opened"),
+    )
+    seats.add_argument(
+        "--input", action="append", default=None, metavar="PATH",
+        help=("add: a UTF-8 file the seat should work from (repeatable). "
+              "Lands in ./inputs/. Travels through the hub as text, so it is "
+              "NOT for secrets and not for binaries — mount a volume for "
+              "those"),
+    )
+    seats.add_argument(
+        "--tail", default="200",
+        help="logs: how many lines (default 200; `all` for everything)",
+    )
+    seats.add_argument("--follow", action="store_true",
+                       help="logs: stream until interrupted")
 
     placements = sub.add_parser(
         "placements",
@@ -5802,6 +6327,82 @@ def build_parser() -> argparse.ArgumentParser:
     )
     capsules.add_argument("--json", action="store_true",
                           help="Machine-readable output")
+    capsules.add_argument(
+        "--as", dest="as_label", default="",
+        help=("place: place a SECOND copy under fresh identities "
+              "(<seat>-<label>). Without it, placing an already-placed "
+              "capsule is REFUSED — one identity, two containers"),
+    )
+
+    squads = sub.add_parser(
+        "squads",
+        help="Squads — WHO a team is: create, fork, merge, lend, retire",
+        description=(
+            "A squad is the team; a capsule is that team frozen; a placement "
+            "is where a member runs. This verb owns the first of the three, "
+            "and it is the one that had no CLI at all — membership was "
+            "reachable only from inside an agent (the MCP set_squads) or by "
+            "curl with the operator token, so the operator could not answer "
+            "'who is in dreamteam' without asking an agent to answer it for "
+            "them.\n\n"
+            "Membership drives DELIVERY, never confidentiality: it decides "
+            "who is woken and whose catch-up a broadcast lands in. Anyone can "
+            "still read any squad's broadcasts by asking."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    squads.add_argument(
+        "action",
+        choices=["list", "create", "rm", "rename", "members",
+                 "add", "remove", "fork", "merge"],
+        help=("list · create · rm: archive · rename · members · add/remove: "
+              "one seat · fork: subset into a NEW squad · merge: fold into "
+              "another"),
+    )
+    squads.add_argument("name", nargs="?", help="which squad")
+    # ⚠️ POSITIONAL SEATS MUST COME BEFORE ANY FLAG. argparse cannot bind a
+    # trailing `nargs="*"` positional that appears AFTER an optional, in any
+    # arrangement (measured: both `[name][members...]` and a single combined
+    # list fail identically). So `squads fork dt --to spike alice bob` — the
+    # order that reads most naturally, and the one this very file documented
+    # first — dies with "unrecognized arguments". `--members` exists so that
+    # phrasing has a working form rather than a footgun; found by smoke-testing
+    # the verb against a live hub, which 1543 green unit tests did not.
+    squads.add_argument("members", nargs="*",
+                        help=("add/remove/fork: seat identities. Must come "
+                              "BEFORE any flag — or use --members"))
+    squads.add_argument(
+        "--members", dest="members_flag", default="",
+        help=("add/remove/fork: seat identities, comma-separated. The form "
+              "that works after other flags"),
+    )
+    squads.add_argument("--to", dest="to", default="",
+                        help="rename/fork: the new squad's name")
+    squads.add_argument("--into", dest="into", default="",
+                        help="merge: the squad to fold INTO (it survives)")
+    squads.add_argument("--description", default="", help="create: what it is for")
+    squads.add_argument(
+        "--until", default="",
+        help=("add/fork: make it a LOAN that ends by itself — `+7d`, `+12h`, "
+              "`+90m` or `YYYY-MM-DD`. The deadline is enforced on every "
+              "delivery path, not merely recorded"),
+    )
+    squads.add_argument(
+        "--purge", action="store_true",
+        help="rm: also drop memberships (message history is kept regardless)",
+    )
+    squads.add_argument(
+        "--keep-source", action="store_true",
+        help="merge: leave the source squad in place instead of archiving it",
+    )
+    squads.add_argument("--dry-run", action="store_true",
+                        help="print what would change; write nothing")
+    squads.add_argument(
+        "--hub-url", default=DEFAULT_HUB_URL,
+        help="Hub base URL (default: $MCP_HUB_URL or built-in)",
+    )
+    squads.add_argument("--json", action="store_true",
+                        help="Machine-readable output")
 
     voice_client = sub.add_parser(
         "voice-client",
@@ -5932,6 +6533,8 @@ def main(argv: list[str] | None = None) -> int:
         return placements_command(args)
     if args.subcommand == "capsules":
         return capsules_command(args)
+    if args.subcommand == "squads":
+        return squads_command(args)
     if args.subcommand == "machines":
         return machines_command(args)
     if args.subcommand == "focus":

@@ -312,7 +312,17 @@ def test_entry_no_identity_exits_43(monkeypatch, tmp_path, capsys):
     assert "SEAT_IDENTITY" in capsys.readouterr().err
 
 
-def test_entry_headless_is_refused_as_reserved(monkeypatch, tmp_path, capsys):
+def test_entry_headless_is_now_SHIPPED_and_prepares_like_any_seat(
+        monkeypatch, tmp_path, capsys):
+    """Was: refused as "reserved but not yet shipped". That refusal was honest
+    while nothing ran the mode — but it left the operator's SOLO ERRAND
+    scenario with no implementation at all (2026-08-08 gap review).
+
+    It is a flag, not a fork: the credential check, the clone, the marker,
+    .mcp.json and the brief are the same code as interactive, and only the
+    launch differs. So the claim under test is that headless reaches
+    preparation rather than dying at the door.
+    """
     rc = _entry(
         ["--prepare-only", "--workdir", str(tmp_path / "work")],
         {"SEAT_IDENTITY": "s1", "MCP_HUB_URL": "http://hub/mcp",
@@ -321,8 +331,11 @@ def test_entry_headless_is_refused_as_reserved(monkeypatch, tmp_path, capsys):
         monkeypatch,
         tmp_path,
     )
-    assert rc == EXIT_CONTRACT
-    assert "reserved" in capsys.readouterr().err
+    assert rc == 0, capsys.readouterr().err
+    out = capsys.readouterr().out
+    assert "mode=headless" in out
+    assert (tmp_path / "work" / ".mcp.json").exists(), (
+        "headless got past the door but was not prepared like a real seat")
 
 
 def test_entry_prepare_only_writes_the_contract_files(

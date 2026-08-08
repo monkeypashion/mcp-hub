@@ -17,6 +17,7 @@ error itself.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -143,6 +144,56 @@ class SeatContract:
     prompt: str
     squads: str
     repo: str
+    # What this seat was STOOD UP TO DO, and the material to do it with.
+    # Both default empty, which is every seat placed before they existed.
+    brief: str = ""
+    inputs: tuple[tuple[str, str], ...] = ()
+
+
+# The brief and its material, as they land inside the container. Relative to
+# the agent's workdir so a pod's inhabitants each get their own copy and can
+# never read each other's — the alternative (one shared /seat/brief.md) makes
+# "give these two agents different jobs" unexpressible.
+BRIEF_FILE = "BRIEF.md"
+INPUTS_DIR = "inputs"
+
+
+def _parse_inputs(raw: str) -> tuple[tuple[str, str], ...]:
+    """`SEAT_INPUTS` (JSON {filename: content}) → ordered pairs.
+
+    Names are checked HERE rather than trusted: the edge writes this value
+    from a seat spec that lives in the hub's database, so a `../` in a
+    filename would let anything able to write a spec drop a file anywhere the
+    container user can reach — including `~/.claude/settings.json`, which
+    would be arbitrary hook execution on the next launch.
+    """
+    if not raw.strip():
+        return ()
+    try:
+        doc = json.loads(raw)
+    except ValueError as e:
+        raise SeatContractError(
+            f"SEAT_INPUTS is not valid JSON ({e}). The edge generates it from "
+            f"the seat spec's `inputs`; a hand-edited value is the usual cause."
+        ) from e
+    if not isinstance(doc, dict):
+        raise SeatContractError(
+            f"SEAT_INPUTS must be a JSON object of filename → content, got "
+            f"{type(doc).__name__}."
+        )
+    out = []
+    for name, content in doc.items():
+        clean = str(name).strip()
+        if (not clean or clean != os.path.basename(clean)
+                or clean.startswith(".") or "\\" in clean):
+            raise SeatContractError(
+                f"SEAT_INPUTS filename '{name}' is not a plain filename. "
+                f"Paths, parent references and dotfiles are refused: an input "
+                f"is material to read, and anything that can escape the "
+                f"inputs directory could overwrite the seat's own config."
+            )
+        out.append((clean, str(content)))
+    return tuple(out)
 
 
 def parse_seat_contract(
@@ -174,11 +225,12 @@ def parse_seat_contract(
             f"headless."
         )
     prompt = environ.get("SEAT_PROMPT", "")
-    if mode == "headless" and not prompt.strip():
+    brief = environ.get("SEAT_BRIEF", "")
+    if mode == "headless" and not prompt.strip() and not brief.strip():
         raise SeatContractError(
-            "SEAT_MODE=headless requires SEAT_PROMPT — a one-shot claude "
-            "with no prompt does nothing and exits, which the edge would "
-            "read as a crash."
+            "SEAT_MODE=headless requires SEAT_PROMPT or SEAT_BRIEF — a "
+            "one-shot claude with no instruction does nothing and exits, "
+            "which the edge would read as a crash."
         )
 
     project = (environ.get("SEAT_PROJECT") or "").strip()
@@ -201,6 +253,8 @@ def parse_seat_contract(
         prompt=prompt,
         squads=environ.get("SEAT_SQUADS", ""),
         repo=environ.get("SEAT_REPO", ""),
+        brief=environ.get("SEAT_BRIEF", ""),
+        inputs=_parse_inputs(environ.get("SEAT_INPUTS", "")),
     )
 
 
@@ -227,6 +281,10 @@ class PodAgent:
     project: str
     repo: str
     squads: str
+    # Empty means "take the pod's brief". Distinguishing "no brief of my own"
+    # from "briefed with nothing" matters: the second would silently strip a
+    # spike team's shared brief from one member.
+    brief: str = ""
 
 
 @dataclass(frozen=True)
@@ -235,6 +293,11 @@ class PodContract:
     hub_url: str
     mode: str
     squad: str
+    # Pod-level, and per-agent below it. A spike team is briefed as a TEAM —
+    # "here is the question, here is the material" — so the pod-level brief is
+    # the common case and `agents[].brief` refines it for one member.
+    brief: str = ""
+    inputs: tuple[tuple[str, str], ...] = ()
 
 
 def _tmux_safe(name: str) -> bool:
@@ -302,12 +365,19 @@ def parse_pod_manifest(environ: Mapping[str, str]) -> PodContract | None:
             f"headless."
         )
     if mode == "headless":
-        # One prompt cannot address N agents, and guessing which one it meant
+        # One PROMPT cannot address N agents, and guessing which one it meant
         # is exactly the kind of choice that puts work in the wrong lane.
+        #
+        # ⚠️ A BRIEF is not subject to this and must not be confused with it.
+        # A prompt is a single turn's input, consumed once, by one claude. A
+        # brief is a FILE every inhabitant reads, which is precisely what a
+        # spike team needs — so `SEAT_BRIEF` is supported for pods while
+        # `SEAT_PROMPT` stays refused.
         raise SeatContractError(
             "SEAT_MODE=headless has no meaning for a pod — SEAT_PROMPT is "
             "single-valued and a pod has several agents. Place headless seats "
-            "1:1."
+            "1:1. (A pod-wide BRIEF is a different thing and is supported: "
+            "see SEAT_BRIEF.)"
         )
 
     agents: list[PodAgent] = []
@@ -345,10 +415,14 @@ def parse_pod_manifest(environ: Mapping[str, str]) -> PodContract | None:
             project=str(r.get("project") or "").strip(),
             repo=str(r.get("repo") or "").strip(),
             squads=str(r.get("squads") or "").strip(),
+            brief=str(r.get("brief") or ""),
         ))
 
-    return PodContract(agents=tuple(agents), hub_url=hub_url, mode=mode,
-                       squad=squad)
+    return PodContract(
+        agents=tuple(agents), hub_url=hub_url, mode=mode, squad=squad,
+        brief=environ.get("SEAT_BRIEF", ""),
+        inputs=_parse_inputs(environ.get("SEAT_INPUTS", "")),
+    )
 
 
 def agent_contract(
@@ -380,6 +454,12 @@ def agent_contract(
         prompt="",
         squads=agent.squads,
         repo=agent.repo,
+        # Per-agent brief REPLACES the pod's rather than appending to it: a
+        # member given its own brief has been singled out deliberately, and
+        # concatenating would hand it two sets of instructions with no way to
+        # tell which governs.
+        brief=agent.brief or pod.brief,
+        inputs=pod.inputs,
     )
 
 
@@ -593,7 +673,17 @@ def launch_argv(contract: SeatContract, workdir: str,
     agent's identity instead, because N sessions cannot share one name.
     """
     if contract.mode == "headless":
-        return ["claude", "-p", contract.prompt]
+        # A brief STANDS IN for a prompt here. The brief is already on disk
+        # beside the seat, so pointing at it beats inlining: the text stays
+        # readable in the workdir afterwards, it can be arbitrarily long
+        # without fighting an argv limit, and it can reference ./inputs/.
+        # An explicit prompt still wins — it is the more specific instruction.
+        if contract.prompt:
+            return ["claude", "-p", contract.prompt]
+        material = (f" Your material is in ./{INPUTS_DIR}/."
+                    if contract.inputs else "")
+        return ["claude", "-p",
+                f"Read ./{BRIEF_FILE} and carry it out.{material}"]
     return [
         "tmux",
         "new-session",
@@ -711,12 +801,45 @@ def first_turn_prompt(contract: SeatContract) -> str:
     # reconnect cannot drop an agent out of its squads), which means an empty
     # string would be indistinguishable from not asking.
     squads = (f", squads=\"{contract.squads}\"" if contract.squads else "")
+    # WITHOUT this the brief is a file nobody opens. A seat's first turn is
+    # generated, not typed, so a brief written to disk and never mentioned is
+    # invisible — the agent registers, sees an empty workdir listing at best,
+    # and stands by exactly as if it had been given no job at all. Presence is
+    # not flow: writing the file is not delivering the brief.
+    if contract.brief:
+        n = len(contract.inputs)
+        material = (
+            f" Your material is in ./{INPUTS_DIR}/ ({n} file(s))." if n else ""
+        )
+        tail = (
+            f"then READ ./{BRIEF_FILE} — it is what you were stood up to do —"
+            f"{material} and begin."
+        )
+    else:
+        tail = "then stand by for instructions."
     return (
         f"You are {contract.identity}, a containerized seat on project "
         f"{contract.project}. Call register(name=\"{contract.identity}\", "
         f"project=\"{contract.project}\"{squads}) on the hub now to bind this "
-        f"session for wake, then stand by for instructions."
+        f"session for wake, {tail}"
     )
+
+
+def brief_files(contract: SeatContract) -> dict[str, str]:
+    """Relative path → content, for everything the brief puts in a workdir.
+
+    Returned as data rather than written here so the whole thing stays a pure
+    function the tests can check without a filesystem — the same reason every
+    other artifact in this module is rendered, not written.
+    """
+    out: dict[str, str] = {}
+    if contract.brief:
+        body = contract.brief if contract.brief.endswith("\n") else \
+            contract.brief + "\n"
+        out[BRIEF_FILE] = body
+    for name, content in contract.inputs:
+        out[f"{INPUTS_DIR}/{name}"] = content
+    return out
 
 
 # -------------------------------------------------------------- supervisor

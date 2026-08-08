@@ -268,10 +268,41 @@ Design record: `memory/project_interactive_factory_build_2026_08_07.md`.
 - **`interactive`** (v1): long-running claude session under tmux, registered
   on the hub, driven by hub messages and/or attach. The container's lifetime
   is the session's.
-- **`headless`** (structure reserved, not shipped in v1): `claude -p
-  "$SEAT_PROMPT"`, one shot, exit code is the verdict — the shape
-  codespace-runner runs today. Kept as a mode of the SAME image so a future
-  factory build on the edge is a flag, not a fork.
+- **`headless`**: `claude -p "$SEAT_PROMPT"`, one shot, exit code is the
+  verdict — the shape codespace-runner runs today. A mode of the SAME image, so
+  a factory build on the edge is a flag, not a fork. `SEAT_BRIEF` stands in for
+  `SEAT_PROMPT` (the launch becomes "read ./BRIEF.md and carry it out"), which
+  is how an errand gets material longer than an argv. Output goes to stdout and
+  nowhere else — read it with `mcp-hub seats logs <identity>`, on the machine
+  that holds the container.
+
+  ⚠️ **Shipped 2026-08-08, END-TO-END UNVERIFIED.** The entrypoint refused this
+  mode as "reserved but not yet shipped" until then, which was honest — nothing
+  had ever run it. The refusal was removed because it left the operator's solo
+  errand with no implementation at all, and the path is unit-tested; no
+  container has executed it. Treat the first headless placement as the test.
+
+## Brief and inputs
+
+- **`SEAT_BRIEF`** — what this seat is FOR. Lands as `BRIEF.md` in the agent's
+  workdir, and the generated first turn tells the agent to read it. That
+  pointer is load-bearing: a seat's first turn is generated, not typed, so a
+  brief written to disk and never mentioned is invisible and the agent stands
+  by as if it had no job.
+- **`SEAT_INPUTS`** — JSON `{filename: content}`, materialized under
+  `./inputs/`. Filenames are validated as plain basenames; anything that could
+  escape the directory is refused, because the value comes from a spec in the
+  hub's database and `../.claude/settings.json` would be arbitrary hook
+  execution at next launch.
+- Both travel as **env**, not mounts: the spec has to survive a trip to a
+  machine that has never seen the operator's filesystem. Same reason the repo
+  is cloned rather than mounted.
+- **Neither is a place for secrets.** The spec sits in the hub's SQLite in
+  plaintext, readable by anything holding the operator token — the same reason
+  `--env-from-host` passes a NAME and never a value.
+- Both are **never overwritten** on restart. `edge apply` re-realizes a seat
+  and re-runs preparation; clobbering an input the agent has been editing all
+  session would destroy work with no trace.
 
 ## Volumes
 

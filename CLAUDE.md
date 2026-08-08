@@ -245,6 +245,128 @@ mklink /J %USERPROFILE%\.claude\skills\memory-sync D:\Projects\code\monkeypashio
 
 **Three or more clones**: same ceremony, star-shaped. Each spoke exports **in turn** with the canonical machine importing between exports (staging is last-write-wins per filename — draining between exports means the curator sees every divergent version instead of only the last). Then one curation, one publish, all spokes force-import + verify. Linear cost, single curation point, no pairwise sync.
 
+## Assembling a team — `mcp-hub squads`
+
+A **squad** is the team; a **capsule** is that team frozen; a **placement** is
+where a member runs. This verb owns the first, and until 2026-08-08 it had no
+CLI at all — the REST routes were complete, but membership was reachable only
+from inside an agent (the MCP `set_squads`) or by curl with the operator token.
+The operator's own team structure was the one thing the operator's CLI could
+not touch.
+
+```bash
+mcp-hub squads list
+mcp-hub squads create spike-x --description "one question, three people"
+mcp-hub squads members dreamteam
+mcp-hub squads add spike-x alice bob            # permanent
+mcp-hub squads add spike-x carol --until +7d    # a LOAN
+mcp-hub squads remove spike-x alice
+mcp-hub squads rename spike-x --to spike-cache
+mcp-hub squads rm spike-x [--purge]             # archive; history is KEPT
+```
+
+**Fork** — a topic splits, or three people are pulled onto a spike:
+
+```bash
+mcp-hub squads fork dreamteam --to spike-x --members alice,bob
+mcp-hub squads fork dreamteam alice bob --to spike-x     # same thing
+mcp-hub squads fork dreamteam --to spike-x               # the whole squad
+mcp-hub squads fork dreamteam --to spike-x --members alice --until +7d
+```
+
+⚠️ **Positional seat names must come BEFORE any flag** — `fork dt --to spike-x
+alice bob` fails with "unrecognized arguments", because argparse cannot bind a
+trailing positional list that appears after an option. `--members a,b,c` is the
+form that works anywhere, and exists precisely because the broken order is the
+one that reads most naturally. (Found by smoke-testing the verb against a live
+hub; the unit suite was fully green and could not see it.)
+
+A fork **COPIES** — the source keeps everyone. A fork that also removed members
+would make "lend three people to a spike" inexpressible, which is the more
+common need by far; leaving is a separate, deliberate `squads remove`. A
+mistyped identity is **refused**, never silently skipped: a spike team quietly
+missing the one person it was assembled for is worse than an error.
+
+**Merge** — two threads converge:
+
+```bash
+mcp-hub squads merge spike-x --into dreamteam [--keep-source]
+```
+
+The source is **archived** by default, because a merge that leaves both alive
+is how a fleet ends up broadcasting to a squad nobody remembers is running.
+Members arrive permanent even if they were on loan — a loan surviving a merge
+would end inside the merged squad, silently removing someone from a team they
+were merged INTO rather than lent to.
+
+### Loans — membership that ends by itself
+
+`--until +90m | +12h | +7d | +2w | YYYY-MM-DD`. The deadline is **enforced on
+every delivery path**, not merely recorded: an expired row is purged at each
+read of `squad_members` — the live-push scope check, the Stop-hook catch-up,
+both `list_squads` branches, the broadcast recipient filter, and capsule
+composition. A capsule composed after a loan lapses does not resurrect it.
+
+A malformed `--until` **fails the command**. Defaulting an unreadable duration
+to "no deadline" would turn a typo into a permanent membership — the exact
+thing the deadline prevents. Enforcement is a purge, never a filter, so it can
+never be half-applied; granularity is "within one read", not to the second.
+
+⚠️ The purge is guarded by a cheap `SELECT` **on purpose**. The first version
+issued the `DELETE` unconditionally, which took a write lock on every read path
+and surfaced immediately as `database is locked`. A read path must stay a read
+path.
+
+### Running the same squad twice
+
+`capsules place` **refuses** when the capsule's seats are already placed:
+
+```bash
+mcp-hub capsules place cap-abc --machine dev-vm-1
+mcp-hub capsules place cap-abc --machine box-2 --as takeB   # a SECOND copy
+```
+
+Without `--as`, placing a capsule twice used to give one identity two
+containers — both registering, the last one silently owning the wake binding.
+`--as` mints fresh seats `<identity>-<label>`, **and re-identifies every pod
+inhabitant**, or the collision would simply move from `docker ps` to somewhere
+nothing can see it. Reclaim the existing placements instead if you meant to
+MOVE the squad rather than run a second one.
+
+### Briefing a team
+
+```bash
+mcp-hub seats add --image mcp-hub-seat:latest --identity spike-x \
+  --pod-squad spike-x --agent alice --agent bob \
+  --brief @./spike-brief.md --input ./api-notes.md --input ./data.csv
+```
+
+The brief lands as `BRIEF.md` in each agent's workdir and inputs land in
+`./inputs/`; the seat's **generated first turn is told to read them**. That
+pointer is the feature — a seat has no operator to type anything, so a brief
+written to disk and never mentioned is a file nobody opens.
+
+`--brief` works for a **pod** (a brief is a file every inhabitant reads), for a
+1:1 seat, and for a **headless** seat, where it stands in for `SEAT_PROMPT`.
+Per-agent briefs live in the manifest and REPLACE the pod's for that agent.
+
+**Never put a secret in a brief or an input.** Both are stored in the hub's
+SQLite in plaintext, readable by anything holding the operator token — the same
+reason `--env-from-host` passes a NAME and never a value. Inputs are UTF-8 text
+only (mount a volume for binaries), and filenames that could escape `./inputs/`
+are refused.
+
+### Reading what a seat produced
+
+```bash
+mcp-hub seats logs errand-1 [--tail 200|all] [--follow]
+```
+
+**Machine-local, and it says so** — `docker logs` only runs where the container
+is, so a seat placed elsewhere gets a refusal naming the machine and the ssh
+command, never an empty result. An operator who believes a seat printed nothing
+stops looking.
+
 ## Adding an existing folder as an agent
 
 `squad add-folder <dir>`, or **Add existing folder as agent…** in the cockpit
