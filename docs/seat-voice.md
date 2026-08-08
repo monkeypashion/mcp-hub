@@ -421,6 +421,47 @@ handshake) here; host side (the listener, the ufw PERMIT rule, non-blocking
 writes) with `mcp-hub-dev-vm-1-general`, each owner able to verify their own
 half.
 
+## 🟢 VERIFIED BY EXECUTION 2026-08-08 — and what is STILL unproven
+
+Run on dev-vm-1 by mcp-hub-dev-vm-1-general against live seat containers:
+
+```
+1. AUDIO REACHES A CONTAINER    ✅ 64000 bytes, RMS 1799, peak 4312, sample-aligned
+2. INJECTION FAILS              ✅ 0 listening sockets in any seat; duo-pod
+                                   impersonating another seat CONNECTED, then
+                                   was refused by the gate
+3. REMOVING THE PERMIT KILLS IT ✅ same container, same handshake -> TimeoutError;
+                                   re-added, audio flowing again (RMS 1624)
+```
+
+The listener log is the whole design in three lines — address-derived identity
+catching a name-based impersonation, with every refusal diagnosable:
+```
+REFUSED 172.17.0.5 ('mcp-hub-seat-dev-vm-1'): claimed 'mcp-hub-seat-dev-vm-1'
+        but 172.17.0.5 is 'duo-pod-dev-vm-1' — refused
+streaming to mcp-hub-seat-dev-vm-1 (172.17.0.2)
+```
+
+🔴 **Two things these ticks DO NOT cover. Read this before calling it done.**
+
+1. **The CONTAINER-SIDE CLIENT IS UNEXERCISED.** The seats are on the pre-audio
+   image, so `arecord` was unavailable and a `python3` reader inside the
+   container was substituted for `mcp-hub voice-client`. So the firewall hop,
+   handshake, roster authorisation, peer verification, `parec` capture and
+   `FrameSender` streaming are all proven end to end — but `voice-client`, the
+   pulse `client.conf`, the ALSA default and the image's audio packages **have
+   never run**. ⇒ *The host half is proven; the container half is untested.*
+   It needs the image rebuilt to be tested at all.
+2. **The alignment CARRY path is still only proven by unit test.** `FrameSender`
+   delivered exactly 64000 and 32000 bytes with `len(buf) % 2 == 0` in both
+   runs — but the peer drained fast, so `send()` never went partial and the
+   carry never engaged. The bug that motivated the carry needs a *slow reader
+   under sustained load*, which no run so far has produced.
+
+⭐ Keep those two separate from the ticks. Three green results describing a
+system make it very easy to believe a fourth thing that nobody measured — which
+is the failure this whole document exists to resist.
+
 ⚠️ **The acceptance test for this design is not "it works".** Three things must
 be demonstrated by execution, because every one of them has already been
 believed on the strength of a component being present:
