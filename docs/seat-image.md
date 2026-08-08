@@ -26,7 +26,8 @@ Injected by the launcher (edge `DockerExecutor` via the seat's `spec.env` /
 | `SEAT_REPO` | no | Git URL cloned into the workdir at first start when the workdir is empty. Absent → the seat runs on whatever the workdir holds (plain-folder seats are legitimate, same as `squad add-folder`). |
 | `MCP_HUB_URL` | yes | Hub endpoint. `.mcp.json` is **generated from this at start, never baked into the image** — a baked URL is the transport `.mcp.json` mistake in a new costume. |
 | `SEAT_MODE` | no | `interactive` (default) or `headless`. See modes. |
-| `SEAT_PROMPT` | headless only | The prompt for `claude -p`. |
+| `SEAT_PROMPT` | headless 1:1 | The prompt for `claude -p`. **Refused for a POD** — single-valued, and a pod has N agents. |
+| `SEAT_BRIEF` | headless pod | Every inhabitant needs an instruction; a pod-wide brief, or a per-agent `brief` in the manifest, satisfies it. |
 | `SEAT_TIMEOUT` | no | Seconds before a headless turn is killed (recorded as exit 124, partial output kept). Headless default 1800; `0` = unbounded. |
 | `SEAT_SQUADS` | no | Comma-separated squads passed to `register()`. Empty preserves, as always. |
 | `SEAT_GITHUB_TOKEN` | to clone | **How a container fetches its own code.** Same channel as the Anthropic credential — hub stores the NAME, the edge host supplies the VALUE via `--env-from-host`. Installed as a git credential HELPER, so the token is never written to disk; a token embedded in the clone URL would persist in `.git/config` as `remote.origin.url`, survive the container, and show up in `git remote -v`. Not needed when the workdir is bind-mounted from the host, which is every seat on the fleet today. |

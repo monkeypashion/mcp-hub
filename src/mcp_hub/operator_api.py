@@ -289,6 +289,37 @@ class OperatorApi:
             "DELETE", f"/api/v1/squads/{name}/members/{seat}"
         ).json()
 
+    def update_seat(self, identity: str, spec: dict[str, Any] | None = None,
+                    launch_args: str | None = None,
+                    klass: str | None = None) -> dict[str, Any]:
+        """Edit a declared seat in place. `spec` keys are MERGED (send a key
+        as None to remove it), so re-briefing does not silently drop the
+        image."""
+        body: dict[str, Any] = {}
+        if spec is not None:
+            body["spec"] = spec
+        if launch_args is not None:
+            body["launch_args"] = launch_args
+        if klass is not None:
+            body["class"] = klass
+        return self._request(
+            "PATCH", f"/api/v1/seats/{identity}", json=body).json()
+
+    def clone_seat(self, identity: str, suffix: str,
+                   machine: str = "") -> dict[str, Any]:
+        """A second seat from an existing one: `<identity>-<suffix>`, spec and
+        all, with pod inhabitants and the memory volume re-identified."""
+        body: dict[str, Any] = {"suffix": suffix}
+        if machine:
+            body["machine"] = machine
+        return self._request(
+            "POST", f"/api/v1/seats/{identity}/clone", json=body).json()
+
+    def delete_machine(self, name: str) -> dict[str, Any]:
+        """Retire a machine. The hub keeps the row archived — history stays
+        attributable — and its token stops working."""
+        return self._request("DELETE", f"/api/v1/machines/{name}").json()
+
     def list_capsules(self) -> list[dict[str, Any]]:
         return self._request("GET", "/api/v1/capsules").json()["capsules"]
 

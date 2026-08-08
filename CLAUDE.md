@@ -356,6 +356,59 @@ reason `--env-from-host` passes a NAME and never a value. Inputs are UTF-8 text
 only (mount a volume for binaries), and filenames that could escape `./inputs/`
 are refused.
 
+### Briefing a whole team to work unattended — headless pods
+
+The overnight-spike shape: *"three agents, here's the brief, come back to
+results."*
+
+```bash
+mcp-hub seats add --image mcp-hub-seat:latest --identity spike-x \
+  --mode headless --pod-squad spike-x \
+  --agent alice --agent bob --agent carol \
+  --brief @./question.md --input ./notes.md --memory-volume spike-mem
+mcp-hub placements set --seat spike-x --machine dev-vm-1 --substrate docker
+mcp-hub placements set <pid> ran        # run ONCE, never restart
+```
+
+Each agent gets its own workdir, its own `BRIEF.md` (a per-agent `brief` in the
+manifest overrides the pod-wide one), and writes its **own** result under
+`~/.claude/seat-results/<identity>/`. A pod summary lands beside them in
+`_pod/result.json`.
+
+- **Concurrent, not sequential.** The timeout is per-agent, so a sequential pod's
+  worst case would be N × timeout — not a bound anyone would recognise as one.
+- **One exit code, N outcomes.** The container exits `0` only if **every** agent
+  succeeded, and `125` (`EXIT_PARTIAL`) otherwise — disjoint from 42 (auth), 43
+  (contract) and 124 (timeout), so "partial" is never read as "crashed". The
+  failures are **named** in the summary and on stderr, never merely counted.
+- **Success needs both signals.** `claude -p` exits 0 because the CLI ran, not
+  because the task was done — so a turn whose own record says `is_error` counts
+  as a failure even at exit 0.
+- **`--prompt` is still refused for a pod** (single-valued; one prompt cannot
+  address N agents), and **every** agent needs a brief — one with none runs a
+  turn that does nothing and exits, which reads as a crash.
+
+⚠️ This was refused outright until 2026-08-08, on the grounds that "SEAT_PROMPT
+is single-valued". True of a *prompt* — and it stopped being the whole story the
+moment briefs landed, since a brief is per-agent and already worked for pods.
+**When a refusal's justification names one mechanism, check whether it still
+forbids the whole category after that mechanism changes.**
+
+### Editing and copying a seat
+
+```bash
+mcp-hub seats update spike-x --brief @./revised.md    # spec keys MERGE
+mcp-hub seats clone spike-x --as takeb                # a second seat, spec and all
+mcp-hub machines rm old-box                           # retire a box
+```
+
+`update` merges spec keys, so re-briefing cannot silently drop the image; send a
+key as `null` to remove it. It changes the **declaration** — a running container
+keeps the old brief until you reclaim and re-place it, and the CLI says so.
+`clone` re-identifies pod inhabitants **and** the memory volume, or two seats
+would write each other's memory. `machines rm` refuses without an explicit name:
+you retire a box from somewhere else, so a default would retire *this* one.
+
 ### Reading what a seat produced
 
 ```bash

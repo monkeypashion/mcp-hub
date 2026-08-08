@@ -186,6 +186,27 @@ HEADLESS_TIMEOUT_DEFAULT = 1800
 # and disjoint from EXIT_AUTH (42) / EXIT_CONTRACT (43).
 EXIT_TIMEOUT = 124
 
+# A headless POD where some agents succeeded and some did not.
+#
+# 🔴 THE WHOLE DIFFICULTY OF N-IN-ONE, IN ONE NUMBER. A container has exactly
+# one exit code and a pod has N outcomes, so SOMETHING has to be lost. What
+# must NOT be lost is the distinction between "all fine" and "not all fine":
+# reporting max(codes) would let a pod where 1 of 5 agents failed exit 0 if
+# the failure happened to be the one that returned 0-with-is_error, and
+# reporting the FIRST failure's code would hide how many there were.
+#
+# So the container's code answers only the question the edge asks — did this
+# converge — and the pod summary answers everything else. 125 is disjoint from
+# 42/43/124 and from claude's own codes, so "partial" is never confused with
+# "crashed", "timed out" or "never started".
+EXIT_PARTIAL = 125
+
+# Where the pod-level summary lives, alongside the per-agent directories. The
+# leading underscore keeps it from ever colliding with an agent identity —
+# sanitize maps everything outside [a-z0-9_-] to `-`, and no derived name
+# starts with `_`.
+POD_SUMMARY_DIR = "_pod"
+
 
 def headless_result_paths(home: str, identity: str) -> dict[str, str]:
     """Absolute paths of the three artifact files for one headless run.
@@ -225,6 +246,62 @@ def headless_verdict(exit_code: int, timed_out: bool,
     except ValueError:
         doc["unparsed"] = True
     return doc
+
+
+def headless_agent_succeeded(verdict: dict[str, Any]) -> bool:
+    """Did ONE agent's turn actually succeed?
+
+    ⚠️ The exit code alone is a WEAK signal and must not be used by itself:
+    `claude -p` exits 0 because the CLI ran, not because the task was done, so
+    a turn that errored can still exit 0. `--output-format json` gives the
+    turn's own `is_error`, which is the strong signal — and when both are
+    available BOTH must be clean, or a pod would report success for an agent
+    that told us plainly it had failed.
+
+    An unparsable record degrades to the exit code rather than being called a
+    failure: the run may well have worked, and inventing a failure is as
+    dishonest as hiding one.
+    """
+    if verdict.get("exit_code") != 0:
+        return False
+    if verdict.get("timed_out"):
+        return False
+    return not verdict.get("is_error", False)
+
+
+def headless_pod_verdict(
+    per_agent: list[dict[str, Any]],
+) -> tuple[dict[str, Any], int]:
+    """The pod summary and the container's single exit code.
+
+    Returns (summary, exit_code). The summary is the thing an operator reads;
+    the exit code is the one bit the EDGE gets, and it answers exactly one
+    question — did every agent succeed — because that is the only question a
+    converged/diverged reconciler can act on.
+
+    Named per-agent in `failed`, never just counted: the fix is per-agent, so
+    "2 of 5 failed" sends the operator hunting through five directories.
+    """
+    ok = [v for v in per_agent if headless_agent_succeeded(v)]
+    bad = [v for v in per_agent if not headless_agent_succeeded(v)]
+    summary = {
+        "agents": len(per_agent),
+        "succeeded": len(ok),
+        "failed": [v.get("identity", "?") for v in bad],
+        "timed_out": [v.get("identity", "?") for v in per_agent
+                      if v.get("timed_out")],
+        "results": per_agent,
+    }
+    if not per_agent:
+        # Nothing ran. Never 0: an empty pod reporting success is the
+        # "healthy and doing nothing" failure this codebase keeps meeting.
+        return summary, EXIT_PARTIAL
+    return summary, (0 if not bad else EXIT_PARTIAL)
+
+
+def headless_pod_summary_path(home: str) -> str:
+    return os.path.join(home, HEADLESS_RESULTS_DIR, POD_SUMMARY_DIR,
+                        "result.json")
 
 
 def _parse_inputs(raw: str) -> tuple[tuple[str, str], ...]:
@@ -452,21 +529,37 @@ def parse_pod_manifest(environ: Mapping[str, str]) -> PodContract | None:
             f"SEAT_MODE '{mode}' unknown — valid: interactive (default), "
             f"headless."
         )
-    if mode == "headless":
-        # One PROMPT cannot address N agents, and guessing which one it meant
-        # is exactly the kind of choice that puts work in the wrong lane.
+    if mode == "headless" and (environ.get("SEAT_PROMPT") or "").strip():
+        # 🔴 THE REFUSAL THAT SURVIVED ITS OWN REASON (corrected 2026-08-08).
         #
-        # ⚠️ A BRIEF is not subject to this and must not be confused with it.
-        # A prompt is a single turn's input, consumed once, by one claude. A
-        # brief is a FILE every inhabitant reads, which is precisely what a
-        # spike team needs — so `SEAT_BRIEF` is supported for pods while
-        # `SEAT_PROMPT` stays refused.
+        # This used to refuse headless for a pod OUTRIGHT, on the grounds that
+        # "SEAT_PROMPT is single-valued and a pod has several agents". That is
+        # true of a PROMPT and only of a prompt — and it stopped being the
+        # whole story the moment briefs landed, because a brief is per-agent
+        # and already worked for pods. The refusal outlived its argument by
+        # about four hours, and I re-endorsed it in a gap review in between.
+        #
+        # So the rule is narrowed to what the reason actually supports: a
+        # single-valued PROMPT cannot address N agents and is still refused.
+        # N briefed agents running one turn each is coherent, and it is the
+        # overnight-spike shape — "here is the question, come back to
+        # results".
+        #
+        # ⇒ When a refusal's justification names ONE mechanism, check whether
+        # it still forbids the whole category after that mechanism changes.
         raise SeatContractError(
-            "SEAT_MODE=headless has no meaning for a pod — SEAT_PROMPT is "
-            "single-valued and a pod has several agents. Place headless seats "
-            "1:1. (A pod-wide BRIEF is a different thing and is supported: "
-            "see SEAT_BRIEF.)"
+            "SEAT_PROMPT is single-valued and this container holds several "
+            "agents — one prompt cannot address them all, and guessing which "
+            "one it meant is how work lands in the wrong lane. Give each "
+            "agent its own `brief` in the manifest (or one pod-wide "
+            "SEAT_BRIEF), which IS supported headless."
         )
+    if mode == "headless":
+        # Every inhabitant needs something to do. A pod where one agent was
+        # briefed and the rest were not would start N turns, N-1 of them with
+        # no instruction — each exiting immediately, which the edge reads as a
+        # crash. Checked after the agents are parsed, below.
+        pass
 
     agents: list[PodAgent] = []
     seen: set[str] = set()
@@ -506,9 +599,28 @@ def parse_pod_manifest(environ: Mapping[str, str]) -> PodContract | None:
             brief=str(r.get("brief") or ""),
         ))
 
+    pod_brief = environ.get("SEAT_BRIEF", "")
+    if mode == "headless":
+        # EVERY inhabitant needs an instruction, checked here because it can
+        # only be known once the agents are parsed. A pod where one agent was
+        # briefed and the rest were not would start N turns, N-1 of them with
+        # nothing to do — each exiting instantly, which the edge reads as a
+        # crash. Naming the unbriefed agents beats "some agent has no brief":
+        # the fix is per-agent, so the message has to be too.
+        unbriefed = [a.identity for a in agents if not (a.brief or pod_brief)]
+        if unbriefed:
+            raise SeatContractError(
+                f"SEAT_MODE=headless but {', '.join(unbriefed)} "
+                f"{'has' if len(unbriefed) == 1 else 'have'} no brief. Every "
+                f"agent in a headless pod needs one — give each a `brief` in "
+                f"the manifest, or set one pod-wide SEAT_BRIEF they all read. "
+                f"An unbriefed agent runs a turn with no instruction and "
+                f"exits immediately, which reads as a crash."
+            )
+
     return PodContract(
         agents=tuple(agents), hub_url=hub_url, mode=mode, squad=squad,
-        brief=environ.get("SEAT_BRIEF", ""),
+        brief=pod_brief,
         inputs=_parse_inputs(environ.get("SEAT_INPUTS", "")),
     )
 

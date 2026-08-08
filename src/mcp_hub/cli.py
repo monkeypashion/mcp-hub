@@ -1812,6 +1812,33 @@ def machines_command(args: argparse.Namespace, api: Any = None) -> int:
             print(f"{m['name']:<20} {m.get('os', ''):<8} {when}")
         return 0
 
+    if args.action == "rm":
+        # Retiring a BOX, not a seat. The hub archives the row rather than
+        # deleting it — placements and status reports name this machine, and
+        # history that points at a machine nobody can look up is history
+        # nobody can read.
+        #
+        # Named explicitly, never defaulted to this host: `enrol` defaults to
+        # the local hostname because you can only enrol the box you are on,
+        # but you retire a machine precisely when you are NOT on it (it is
+        # dead, or being decommissioned), so a default here would retire the
+        # wrong one on a bare `machines rm`.
+        if not args.name:
+            print("name the machine to retire — no default, because you "
+                  "retire a box from somewhere else and a default would "
+                  "retire THIS one", file=sys.stderr)
+            return 1
+        try:
+            api.delete_machine(args.name)
+        except ApiUnavailable as e:
+            print(str(e), file=sys.stderr)
+            return 1
+        print(f"machine {args.name} retired — its token no longer works, and "
+              f"its history stays readable under that name")
+        print("any placements on it are NOT destroyed: reclaim them first if "
+              "the box is gone, or they will sit pending-edge forever")
+        return 0
+
     if args.action == "rotate":
         # The recovery path for a token that was never saved. Overwrites by
         # design — the whole point is that the file on disk is stale or
@@ -1987,11 +2014,26 @@ def seats_command(args: argparse.Namespace, api: Any = None) -> int:
                 if not args.image:
                     refuse = ("headless is a container mode — name an --image "
                               "(SEAT_MODE means nothing to a worktree seat)")
-                elif getattr(args, "agent", None):
-                    refuse = ("headless has no meaning for a pod — "
-                              "SEAT_PROMPT is single-valued and a pod has "
-                              "several agents. Place headless seats 1:1")
-                elif (not getattr(args, "prompt", "")
+                elif getattr(args, "agent", None) and getattr(
+                        args, "prompt", ""):
+                    # ⚠️ This used to refuse headless+pod OUTRIGHT, mirroring
+                    # the runtime door. When that door narrowed to "the PROMPT
+                    # is what cannot address N agents" (briefs are per-agent
+                    # and always worked for pods), a declaration-time check
+                    # left as-is would refuse a placement the runtime now
+                    # accepts — the mirror lying about the thing it mirrors.
+                    # Narrowed in step, deliberately, not by coincidence.
+                    refuse = ("--prompt is single-valued and this is a pod — "
+                              "one prompt cannot address several agents. Use "
+                              "--brief, which every inhabitant reads")
+                elif getattr(args, "agent", None) and not getattr(
+                        args, "brief", ""):
+                    refuse = ("a headless pod needs --brief — every agent "
+                              "needs an instruction, and one with none runs a "
+                              "turn that does nothing and exits, which reads "
+                              "as a crash")
+                elif (not getattr(args, "agent", None)
+                        and not getattr(args, "prompt", "")
                         and not getattr(args, "brief", "")):
                     refuse = ("headless needs --prompt or --brief — a "
                               "one-shot claude with no instruction does "
@@ -2061,6 +2103,65 @@ def seats_command(args: argparse.Namespace, api: Any = None) -> int:
 
         if args.action == "logs":
             return _seat_logs(args, api, machine)
+
+        if args.action == "update":
+            if not args.identity:
+                print("name the seat to update", file=sys.stderr)
+                return 1
+            brief, inputs, err = _read_brief_and_inputs(args)
+            if err:
+                print(err, file=sys.stderr)
+                return 1
+            spec: dict[str, Any] = {}
+            if brief:
+                spec["brief"] = brief
+            if inputs:
+                spec["inputs"] = inputs
+            for flag, key in (("prompt", "SEAT_PROMPT"),):
+                if getattr(args, flag, ""):
+                    spec.setdefault("env", {})[key] = getattr(args, flag)
+            if getattr(args, "timeout", None) is not None:
+                spec.setdefault("env", {})["SEAT_TIMEOUT"] = str(args.timeout)
+            if not spec and not args.launch_args:
+                print("nothing to change — pass --brief, --input, --prompt, "
+                      "--timeout or --launch-args", file=sys.stderr)
+                return 1
+            if args.dry_run:
+                print(f"would update {args.identity}: "
+                      f"{', '.join(sorted(spec)) or 'launch args'}")
+                return 0
+            api.update_seat(args.identity, spec or None,
+                            args.launch_args or None)
+            changed = ", ".join(sorted(spec)) or "launch args"
+            print(f"seat {args.identity} updated ({changed})")
+            # The edit changes the DECLARATION; a running container still
+            # holds the old brief. Saying so is the difference between an
+            # operator who restarts it and one who waits for a change that
+            # will never arrive.
+            print("the running container still has the OLD brief — "
+                  "reclaim and re-place it to pick this up")
+            return 0
+
+        if args.action == "clone":
+            if not args.identity:
+                print("name the seat to clone", file=sys.stderr)
+                return 1
+            if not args.clone_suffix:
+                print("--as <suffix> required — the clone needs its own "
+                      "identity, or it would collide with the original",
+                      file=sys.stderr)
+                return 1
+            if args.dry_run:
+                print(f"would clone {args.identity} → "
+                      f"{args.identity}-{args.clone_suffix}")
+                return 0
+            rec = api.clone_seat(args.identity, args.clone_suffix,
+                                 args.machine or "")
+            print(f"seat {rec['identity']} cloned from {args.identity}")
+            print("it is a DECLARATION, not a running thing — place it:\n"
+                  f"  mcp-hub placements set --seat {rec['identity']} "
+                  f"--machine {rec.get('machine', '')}")
+            return 0
 
         if not args.identity:
             print("name the seat to archive", file=sys.stderr)
@@ -4937,7 +5038,48 @@ def _seat_prepare(contract: Any, workdir: pathlib.Path) -> tuple[Any, int | None
     return contract, None
 
 
-def _seat_headless(contract: Any, workdir: pathlib.Path) -> int:
+def _emit(chunk: bytes, prefix: str, lock: Any, pending: list[bytes],
+          final: bool = False) -> None:
+    """One agent's bytes onto the CONTAINER's shared stdout.
+
+    Two modes, and the difference is load-bearing:
+
+    * **No prefix (1:1)** — bytes go straight through, byte-exact and
+      unbuffered. This is the shipped, container-proven path and the
+      incrementality probe watches it; nothing here may add a layer.
+    * **Prefixed (pod)** — N turns share one stdout, so raw writes would
+      interleave mid-line and `docker logs` would be unreadable exactly when
+      several agents are working, which is the whole point of a pod. Lines are
+      therefore completed before they are written, tagged with the agent that
+      produced them, under a lock.
+
+    A LINE is the unit rather than a chunk: prefixing chunks would stamp the
+    identity into the middle of sentences. The per-agent `output.log` stays
+    byte-exact either way — the artifact is the clean copy, this is the
+    human-readable multiplex.
+    """
+    if not prefix:
+        if chunk:
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
+        return
+    pending[0] += chunk
+    if final:
+        lines, pending[0] = (pending[0].split(b"\n") if pending[0] else []), b""
+    else:
+        parts = pending[0].split(b"\n")
+        lines, pending[0] = parts[:-1], parts[-1]
+    out = b"".join(f"[{prefix}] ".encode() + ln + b"\n"
+                   for ln in lines if ln or not final)
+    if not out:
+        return
+    with (lock or contextlib.nullcontext()):
+        sys.stdout.buffer.write(out)
+        sys.stdout.buffer.flush()
+
+
+def _seat_headless(contract: Any, workdir: pathlib.Path, prefix: str = "",
+                   lock: Any = None) -> tuple[int, dict]:
     """One-shot `claude -p`: teed to the memory volume, bounded, then exit.
 
     Container-proven 2026-08-08 (throwaway on :latest, trivial prompt,
@@ -4979,6 +5121,7 @@ def _seat_headless(contract: Any, workdir: pathlib.Path) -> int:
     bound = f", timeout {contract.timeout}s" if contract.timeout else ""
     print(f"seat-entry: headless — one turn, then exit "
           f"({contract.identity}{bound})", flush=True)
+    pending = [b""]
 
     # stderr stays inherited (straight to docker logs): merging it into
     # stdout would corrupt the JSON record result.json is parsed from.
@@ -5018,8 +5161,8 @@ def _seat_headless(contract: Any, workdir: pathlib.Path) -> int:
                 chunks.append(chunk)
                 log.write(chunk)
                 log.flush()
-                sys.stdout.buffer.write(chunk)
-                sys.stdout.buffer.flush()
+                _emit(chunk, prefix, lock, pending)
+            _emit(b"", prefix, lock, pending, final=True)
         rc = proc.wait()
     finally:
         if timer:
@@ -5038,6 +5181,82 @@ def _seat_headless(contract: Any, workdir: pathlib.Path) -> int:
 
     print(f"seat-entry: headless turn finished rc={rc} — result at "
           f"{paths['result']}", flush=True)
+    return rc, doc
+
+
+def _seat_headless_pod(prepared: list) -> int:
+    """N briefed agents, one turn each, one container exit code.
+
+    The overnight-spike shape: "here is the question, come back to results."
+
+    CONCURRENT, not sequential. A spike team's members are working on the same
+    question independently, so serializing them would make a 3-agent pod take
+    three times as long for no gain — and the timeout is per-agent, so a
+    sequential pod's worst case is N×timeout, which is not a bound anyone
+    would recognise as one. One credential serves all N (measured 2026-08-06:
+    three concurrent seats on one OAuth token).
+
+    Each agent writes its OWN artifact; the pod writes a summary beside them.
+    The container's single exit code answers only "did every agent succeed",
+    because that is the only question the reconciler can act on — everything
+    else lives in the summary, where it can be read rather than inferred.
+    """
+    import threading
+
+    from mcp_hub.seat import (
+        EXIT_PARTIAL,
+        headless_pod_summary_path,
+        headless_pod_verdict,
+    )
+
+    lock = threading.Lock()
+    results: dict[str, dict] = {}
+    threads = []
+
+    def _one(contract: Any, workdir: pathlib.Path) -> None:
+        try:
+            _rc, doc = _seat_headless(contract, workdir,
+                                      prefix=contract.identity, lock=lock)
+        except Exception as e:  # noqa: BLE001
+            # One agent blowing up must not take the pod's OTHER results with
+            # it — they ran, their artifacts are on disk, and losing the
+            # summary would hide them. Recorded as a failure, loudly.
+            doc = {"identity": contract.identity, "exit_code": -1,
+                   "timed_out": False, "error": f"{type(e).__name__}: {e}"}
+            print(f"seat-entry: {contract.identity} raised {e}",
+                  file=sys.stderr, flush=True)
+        results[contract.identity] = doc
+
+    print(f"seat-entry: headless POD — {len(prepared)} agent(s), one turn "
+          f"each, concurrently", flush=True)
+    for _session, contract, workdir in prepared:
+        t = threading.Thread(target=_one, args=(contract, workdir))
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+
+    # Ordered by the manifest, not by finish time: a summary whose rows move
+    # between runs is one nobody can diff.
+    ordered = [results[c.identity] for _s, c, _w in prepared
+               if c.identity in results]
+    summary, rc = headless_pod_verdict(ordered)
+    path = pathlib.Path(headless_pod_summary_path(str(pathlib.Path.home())))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+
+    if rc == 0:
+        print(f"seat-entry: pod complete — {summary['succeeded']}/"
+              f"{summary['agents']} succeeded. Summary: {path}", flush=True)
+    else:
+        # NAMED, never counted. The fix is per-agent, so "2 failed" would send
+        # the operator hunting through every agent directory to find which.
+        print(f"seat-entry: pod PARTIAL (exit {EXIT_PARTIAL}) — "
+              f"{summary['succeeded']}/{summary['agents']} succeeded; failed: "
+              f"{', '.join(summary['failed']) or 'none'}"
+              + (f"; timed out: {', '.join(summary['timed_out'])}"
+                 if summary['timed_out'] else "")
+              + f". Summary: {path}", file=sys.stderr, flush=True)
     return rc
 
 
@@ -5825,11 +6044,10 @@ def seat_entry_command(args: argparse.Namespace) -> int:
     # no one. It is also the launch dance's only true exception — there is no
     # TUI to show a dialog, so there is nothing to answer.
     #
-    # ⚠️ `prepared[0]` ONLY is safe here, but the safety is NON-LOCAL: it
-    # lives in seat.py's parse_pod_manifest, which refuses SEAT_MODE=headless
-    # for pods at the door — so a headless container always holds exactly one
-    # agent. If pods ever gain a headless mode, this line becomes a real bug
-    # (agents 2..N silently never run).
+    # Pods DID gain a headless mode (2026-08-08), exactly as the previous
+    # comment here warned — so the first-agent-only dispatch it flagged has
+    # become the real bug it predicted, and is fixed rather than re-annotated:
+    # every agent runs, and the pod's own runner aggregates them.
     if prepared[0][1].mode == "headless":
         # The result artifact only survives reclaim if ~/.claude is a MOUNT
         # (the memory volume). Without one the result provably dies with the
@@ -5848,7 +6066,9 @@ def seat_entry_command(args: argparse.Namespace) -> int:
                 file=sys.stderr, flush=True,
             )
             return EXIT_CONTRACT
-        return _seat_headless(prepared[0][1], prepared[0][2])
+        if len(prepared) > 1:
+            return _seat_headless_pod(prepared)
+        return _seat_headless(prepared[0][1], prepared[0][2])[0]
 
     # /voice, once per CONTAINER, before any agent starts. Detached and
     # deliberately unchecked: audio is a convenience and MUST NOT be able to
@@ -6232,9 +6452,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     machines.add_argument(
-        "action", choices=["list", "enrol", "rotate"],
+        "action", choices=["list", "enrol", "rotate", "rm"],
         help="list: enrolled machines · enrol: add this machine · "
-             "rotate: issue a new token, invalidating the old one",
+             "rotate: issue a new token, invalidating the old one · "
+             "rm: retire a machine (its token stops working)",
     )
     machines.add_argument(
         "name", nargs="?", default=None,
@@ -6326,13 +6547,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     seats.add_argument(
-        "action", choices=["list", "add", "rm", "logs"],
+        "action", choices=["list", "add", "rm", "logs", "update", "clone"],
         help=("list · add: declare a seat · rm: archive it (placements "
               "first) · logs: what it has printed (container gone → reads "
-              "the headless result artifact from the memory volume)"),
+              "the headless result artifact from the memory volume) · "
+              "update: edit it in place · clone: a second seat from it"),
     )
     seats.add_argument("identity", nargs="?", default=None,
-                       help="rm/logs: which seat")
+                       help="rm/logs/update/clone: which seat")
+    seats.add_argument(
+        "--as", dest="clone_suffix", default="",
+        help=("clone: the new seat is <identity>-<suffix>, with its pod "
+              "inhabitants and memory volume re-identified to match"),
+    )
     seats.add_argument("--repo", default="", help="add: <org>/<repo>")
     seats.add_argument("--machine", default=None,
                        help="add: which machine (default: this one)")
@@ -6423,6 +6650,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     seats.add_argument("--follow", action="store_true",
                        help="logs: stream until interrupted")
+    seats.add_argument("--dry-run", action="store_true",
+                       help="update/clone: print what would change, write nothing")
 
     placements = sub.add_parser(
         "placements",
