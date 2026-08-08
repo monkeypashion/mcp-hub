@@ -227,6 +227,14 @@ where *"this one may listen to the room"* is actually decided.
    "this is one of ours". Pods put several rows on one container name; a
    membership test only needs the set.
 
+   ⚠️ **ENROL BY CONTAINER NAME, never by id.** The authorisation check matches
+   `container.name` against this file, while the *claim* check accepts name, id
+   or short-id — so the roster side is the stricter of the two. A container
+   enrolled as `squad add-container foo /dir <id>` would therefore be refused
+   **silently**. Nothing does this today (the edge passes the agent name for
+   both), so it is recorded as a constraint rather than fixed; if that ever
+   changes, widen `is_seat` rather than discovering it as a mute seat.
+
    ⚠️ **Do NOT gate on the container IMAGE.** `squad add-container <name> <dir>
    <container>` takes the container as an argument and **never inspects its
    image** — it checks only that the folder exists and the name is not already
@@ -444,14 +452,24 @@ streaming to mcp-hub-seat-dev-vm-1 (172.17.0.2)
 
 🔴 **Two things these ticks DO NOT cover. Read this before calling it done.**
 
-1. **The CONTAINER-SIDE CLIENT IS UNEXERCISED.** The seats are on the pre-audio
-   image, so `arecord` was unavailable and a `python3` reader inside the
-   container was substituted for `mcp-hub voice-client`. So the firewall hop,
-   handshake, roster authorisation, peer verification, `parec` capture and
-   `FrameSender` streaming are all proven end to end — but `voice-client`, the
-   pulse `client.conf`, the ALSA default and the image's audio packages **have
-   never run**. ⇒ *The host half is proven; the container half is untested.*
-   It needs the image rebuilt to be tested at all.
+1. ~~**The CONTAINER-SIDE CLIENT IS UNEXERCISED.**~~ 🟢 **CLOSED — the full
+   chain now runs through the real code**, image `mcp-hub-seat:2026-08-08f`:
+   ```
+   _seat_pulse()  -> "pulse server up (sink claude_mic)"; default source
+                     claude_mic.monitor
+   _seat_voice()  -> "client started (log /tmp/voice-client.log)"
+   arecord -d 4   -> 128000 bytes  RMS=4039  peak=30171   (speech: ambient ~1700)
+   host log       -> streaming to voice-probe-dev-vm-1 (172.17.0.6)
+   ```
+   ⚠️ **It took THREE attempts to prove, and the first two were substitutions.**
+   First a `python3` reader stood in for `voice-client` (the image lacked
+   `arecord`); then the server was started by hand with `pulseaudio --start`
+   rather than by `_seat_pulse()`, whose command differs. Each substitution was
+   reasonable in the moment and each **replaced the component under test**.
+   ⭐ *A green result that routes around the thing you are testing is the
+   easiest false positive to produce and the hardest to notice* — the person
+   running it knows they substituted, and the report does not.
+   ⇒ Ask of any proof: **which component did this actually execute?**
 2. **The alignment CARRY path is still only proven by unit test.** `FrameSender`
    delivered exactly 64000 and 32000 bytes with `len(buf) % 2 == 0` in both
    runs — but the peer drained fast, so `send()` never went partial and the
