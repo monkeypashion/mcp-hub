@@ -37,6 +37,46 @@ RUN pip install --no-cache-dir /opt/mcp-hub
 
 # Non-root. claude installs per-user; PATH gains ~/.local/bin for it.
 RUN useradd -m -s /bin/bash seat
+
+# 🔴 THE SERVER THIS IMAGE INSTALLS MUST ALSO BE STARTED, AND WITH A SINK.
+# Until 2026-08-08 the package was installed, its comment above said "that
+# sink's server" — and NOTHING EVER RAN IT. Measured in a throwaway container
+# (mcp-hub-dev-vm-1-general): `pactl info`, `pacat` and `arecord` all failed
+# with "Connection refused". Every piece present, nothing running: a comment
+# asserting a component is not a component.
+#
+# `autospawn = no` (set below) stays deliberately. Autospawn would start a
+# server from the DEFAULT script, which hunts for hardware a container does not
+# have and creates NO null sink — so `pacat` would still have nowhere to play,
+# and would fail more confusingly than it does now. seat-entry starts the
+# server explicitly instead, in a known order, with this script.
+#
+# `-n --file=` means ONLY these modules load: no udev, no hardware detection,
+# no bluetooth. A container has no devices, so the default script is all
+# failure modes and no benefit.
+#
+# ⚠️ ROOT-OWNED PATHS, SO THIS MUST PRECEDE `USER seat` — and follow `useradd`,
+# because the chown resolves `seat:seat`. Placed after the USER switch first
+# time round, and the build died at step 12/16 with "cannot create
+# /etc/pulse/seat-voice.pa: Permission denied".
+RUN mkdir -p /etc/pulse && printf '%s\n' \
+        '# The container half of the /voice chain, mirroring the host rig:' \
+        '# a null sink to play the host stream INTO, and its monitor as the' \
+        '# default source, so arecord (and therefore /voice) reads it back.' \
+        'load-module module-native-protocol-unix' \
+        'load-module module-null-sink sink_name=claude_mic rate=16000 channels=1 sink_properties=device.description=claude_mic' \
+        'set-default-sink claude_mic' \
+        'set-default-source claude_mic.monitor' \
+        > /etc/pulse/seat-voice.pa
+
+# XDG_RUNTIME_DIR must EXIST and be owned by the seat, because client.conf
+# (below) names `/run/user/1000/pulse/native` by absolute path and the server
+# creates its socket under $XDG_RUNTIME_DIR. Created at build time: /run is a
+# plain image directory here, so this persists into every container.
+ENV XDG_RUNTIME_DIR=/run/user/1000
+RUN mkdir -p /run/user/1000 && chown seat:seat /run/user/1000 \
+    && chmod 700 /run/user/1000
+
 USER seat
 ENV PATH="/home/seat/.local/bin:${PATH}"
 RUN curl -fsSL https://claude.ai/install.sh | bash \
@@ -75,23 +115,10 @@ RUN mkdir -p /home/seat/.config/pulse && printf '%s\n' \
 # `-n --file=` means ONLY these modules load: no udev, no hardware detection,
 # no bluetooth. A container has no devices, so the default script is all
 # failure modes and no benefit.
-RUN mkdir -p /etc/pulse && printf '%s\n' \
-        '# The container half of the /voice chain, mirroring the host rig:' \
-        '# a null sink to play the host stream INTO, and its monitor as the' \
-        '# default source, so arecord (and therefore /voice) reads it back.' \
-        'load-module module-native-protocol-unix' \
-        'load-module module-null-sink sink_name=claude_mic rate=16000 channels=1 sink_properties=device.description=claude_mic' \
-        'set-default-sink claude_mic' \
-        'set-default-source claude_mic.monitor' \
-        > /etc/pulse/seat-voice.pa
-
-# XDG_RUNTIME_DIR must EXIST and be owned by the seat, because client.conf
-# above names `/run/user/1000/pulse/native` by absolute path and the server
-# creates its socket under $XDG_RUNTIME_DIR. Created at build time: /run is a
-# plain image directory here, so this persists into every container.
-ENV XDG_RUNTIME_DIR=/run/user/1000
-RUN mkdir -p /run/user/1000 && chown seat:seat /run/user/1000 \
-    && chmod 700 /run/user/1000
+# ⚠️ The two root-owned pieces of this (`/etc/pulse/seat-voice.pa` and
+# `/run/user/1000`) live ABOVE the `USER seat` line, not here — see there. They
+# were written here first and the build died at step 12/16 with
+# "cannot create /etc/pulse/seat-voice.pa: Permission denied".
 
 WORKDIR /home/seat/work
 

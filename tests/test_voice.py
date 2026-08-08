@@ -430,6 +430,47 @@ def test_the_IMAGE_STARTS_the_pulse_server_it_installs():
         "the server must load the null-sink script, not the hardware default"
 
 
+def test_no_ROOT_OWNED_path_is_written_after_the_image_drops_privilege():
+    """🔴 The second defect in the same fix, and it never reached a container.
+
+    The pulse-server steps above were written BELOW `USER seat`, so they ran
+    unprivileged and the build died at step 12/16 with "cannot create
+    /etc/pulse/seat-voice.pa: Permission denied". A Dockerfile can only be
+    proven by building it — but *this particular* class is decidable by reading,
+    and there is no docker on the machine the image is authored on, which is
+    exactly why it needs to be caught here.
+
+    The property is general to the seat image, not to /voice: after the USER
+    switch, nothing may write outside the seat's own home.
+    """
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    lines = (root / "seat" / "Dockerfile").read_text(encoding="utf-8").splitlines()
+
+    # Join continuations so a multi-line RUN is inspected as one command.
+    steps, buf, dropped_at = [], "", None
+    for i, raw in enumerate(lines):
+        ln = raw.split("#")[0].rstrip() if not raw.lstrip().startswith("#") else ""
+        if re.match(r"^\s*USER\s+seat\s*$", raw) and dropped_at is None:
+            dropped_at = i
+        if buf or re.match(r"^\s*RUN\b", ln):
+            buf += " " + ln.rstrip("\\")
+            if not ln.endswith("\\"):
+                steps.append((i, buf))
+                buf = ""
+    assert dropped_at is not None, "the image no longer drops privilege at all"
+
+    bad = re.compile(r"(>\s*|mkdir\s+-?\w*\s*|chown\s+\S+\s+|chmod\s+\S+\s+|tee\s+)"
+                     r"(/etc/|/run/|/usr/|/opt/|/var/)")
+    offenders = [(n + 1, s.strip()[:90]) for n, s in steps
+                 if n > dropped_at and bad.search(s)]
+    assert not offenders, (
+        "RUN step(s) after `USER seat` write to a root-owned path and will fail "
+        f"the build with Permission denied: {offenders}")
+
+
 def test_the_voice_client_never_fails_when_there_is_no_identity_or_route(tmp_path):
     """Every 'no audio' path returns 0. A non-zero here would propagate into
     the seat's own exit status."""
