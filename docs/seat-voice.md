@@ -80,6 +80,20 @@ dropping is CORRECT.
 
 ## The wire contract — both halves build against exactly this
 
+> **CONTRACT LAST CHANGED AT `c6205fb`** (the handshake charset). If the commit
+> you built against is older than that, **you are contract-compliant against a
+> contract that no longer exists.**
+>
+> 🔴 This line is here because that happened, live. The host half was pinned to
+> `57d1c4a` and its running listener **refused dotted container names at the
+> wire, silently**, while being a faithful implementation of the contract as it
+> stood when it was written. Nothing told it. Both halves share
+> `src/mcp_hub/voice.py`, so a widening on one side is *invisible* to the other
+> until it rebases — a shared document is not a shared build.
+>
+> ⇒ Update this SHA in the same commit that changes anything in the block
+> below. A contract that cannot tell you it moved is not doing the job.
+
 ```
 listen    172.17.0.1:6981/tcp   ← the DOCKER GATEWAY ADDRESS, never 0.0.0.0
 audio     raw PCM s16le, 16000 Hz, 1 channel (no header, no framing)
