@@ -216,6 +216,44 @@ def send_or_drop(sock: Any, chunk: bytes, carry: bytes = b"",
     return sent, data[sent:sent + (frame_size - phase_after)]
 
 
+class FrameSender:
+    """The API the host side should USE. Holds the carry so it cannot be lost.
+
+    `send_or_drop` stays public because it is the pure, directly-assertable
+    primitive — but it returns a carry the caller MUST thread into the next
+    call, and a caller that drops it silently reintroduces the byte-shift bug
+    **while every test still passes**. "Explicit" and "easy to misuse" are the
+    same property here.
+
+    So: the carry lives in the object, one per connection, and there is no way
+    to hold it wrong.
+
+    ⚠️ This is NOT a buffer and NOT a queue. It holds at most `frame_size - 1`
+    bytes — the tail of a single frame the peer is mid-way through — and that
+    bound is asserted. Everything else is still dropped, so the stream stays
+    lossy and non-blocking, which is what realtime audio requires.
+    """
+
+    __slots__ = ("_sock", "_carry", "_frame")
+
+    def __init__(self, sock: Any, frame_size: int = VOICE_FRAME_BYTES) -> None:
+        self._sock = sock
+        self._frame = frame_size
+        self._carry = b""
+
+    def send(self, chunk: bytes) -> int:
+        """Write what fits, drop whole frames, never block. Returns bytes sent."""
+        sent, self._carry = send_or_drop(
+            self._sock, chunk, self._carry, self._frame,
+        )
+        return sent
+
+    @property
+    def carry(self) -> bytes:
+        """Exposed for assertions only — never for the caller to manage."""
+        return self._carry
+
+
 def connect_argv(gateway: str, port: int = VOICE_PORT) -> tuple[str, int]:
     """Where the container dials. Separated so the caller can be asserted."""
     return (gateway, port)

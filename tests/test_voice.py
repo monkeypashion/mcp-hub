@@ -334,3 +334,39 @@ def test_the_voice_client_never_fails_when_there_is_no_identity_or_route(tmp_pat
     args = argparse.Namespace(seat="", port=6981)
     rc = cli.voice_client_command(args)
     assert rc == 0
+
+
+# ---- the API the host side actually uses -----------------------------------
+
+def test_the_frame_sender_keeps_alignment_across_odd_writes():
+    """Same stream property as the raw primitive, but the caller cannot lose
+    the carry — because the caller never holds it. `send_or_drop` returning a
+    tuple is correct and easy to misuse: drop the second element and the
+    byte-shift bug is back with every test still green."""
+    received = bytearray()
+
+    class _OddSock:
+        def send(self, data):
+            n = min(len(data), 5)
+            received.extend(data[:n])
+            return n
+
+    sender = voice.FrameSender(_OddSock())
+    for _ in range(20):
+        sender.send(b"\x01\x02" * 8)
+        assert len(sender.carry) < voice.VOICE_FRAME_BYTES
+
+    assert set(received[0::2]) == {0x01} and set(received[1::2]) == {0x02}, \
+        "the stream is byte-shifted through the object API"
+
+
+def test_the_frame_senders_carry_is_bounded():
+    """It must never become the buffer we spent this design avoiding."""
+    class _Trickle:
+        def send(self, data):
+            return 1
+
+    sender = voice.FrameSender(_Trickle())
+    for _ in range(50):
+        sender.send(b"\x01\x02" * 64)
+        assert len(sender.carry) <= voice.VOICE_FRAME_BYTES - 1
