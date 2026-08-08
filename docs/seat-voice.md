@@ -156,6 +156,36 @@ something injected at create time.
      **outlives a retirement**, and a container still receiving the operator's
      microphone after being retired is precisely the one nobody goes looking
      for. Same reason the docker map is fetched per connection.
+
+   🔴 **THE ROSTER IS `~/.config/squad/squad.conf` — NOT the hub's seat list.**
+   `mcp-hub seats list` goes through `OperatorApi.list_seats()`, an **HTTP call**
+   (found by mcp-hub-dev-vm-1-general while implementing this). Authorising
+   against it would make the operator's microphone depend on the hub being
+   reachable — breaking the no-external-dependency rule outright — and let a
+   slow hub stall the accept loop. So "LOCAL" does not describe *how* to read
+   the seat list; it **excludes** it. Stated here as a refusal because the seat
+   list is the obvious thing to reach for.
+
+   The squad roster is the right list and needs no new machinery:
+   ```
+   ~/.config/squad/squad.conf     5-field pipe format, one row per agent
+   name|worktree|?|@docker:<container>[:<session>]|class
+                     ^^^^^^^^^^^^^^^^ field 4 — this row is a CONTAINER seat
+   ```
+   It is local, plain text, bounded, and — the load-bearing part — it is what
+   **enrolment itself writes**, so it covers BOTH creation paths with no special
+   case: the edge shells out to `squad add-container` (`cli.py`), and adoption
+   *is* `squad add-container`. Membership in that file is the literal act of
+   "this is one of ours". Pods put several rows on one container name; a
+   membership test only needs the set.
+
+   ⚠️ **Do NOT gate on the container IMAGE.** `squad add-container <name> <dir>
+   <container>` takes the container as an argument and **never inspects its
+   image** — it checks only that the folder exists and the name is not already
+   enrolled. So an adopted seat may legitimately run anything at all, and an
+   image gate refuses it *silently*. The image happens to be `mcp-hub-seat:*`
+   on every seat alive today, which is exactly what makes it a convincing and
+   wrong signal.
 6. **Cap pending handshakes.** Any container can connect; N silent connections
    must not tie up the accept path.
 7. **Retry the bind.** `docker0` may not exist at boot or across a docker
