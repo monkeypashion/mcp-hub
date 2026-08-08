@@ -74,6 +74,27 @@ def test_anything_that_is_not_our_greeting_is_dropped():
         assert voice.parse_handshake(junk) == "", junk
 
 
+def test_a_DOTTED_container_name_is_accepted_because_docker_allows_one():
+    """The narrow charset refused a correctly-configured container.
+
+    `docker create --name voice.dotcheck.tmp` succeeds — measured on a live
+    daemon, not inferred from docker's docs. Refusing the dot here rejected
+    such a container at the WIRE, before any authorisation ran, and said
+    nothing about why. The charset is not a security boundary; the roster is.
+    """
+    for good in ("voice.dotcheck.tmp", "my.seat_2", "a.b.c-d_e"):
+        assert voice.parse_handshake(voice.handshake_line(good)) == good, good
+
+
+def test_a_name_may_not_START_with_a_dot_or_dash():
+    """Docker's own rule is `[a-zA-Z0-9][a-zA-Z0-9_.-]*`, and mirroring it is
+    what keeps `..`, `.hidden` and `-flag`-shaped strings out of a name that
+    later reaches a log line and a roster lookup."""
+    for bad in (b"MCPHUBVOICE1 .hidden\n", b"MCPHUBVOICE1 ..\n",
+                b"MCPHUBVOICE1 -rf\n", b"MCPHUBVOICE1 _leading\n"):
+        assert voice.parse_handshake(bad) == "", bad
+
+
 def test_a_name_that_could_not_be_a_seat_is_refused():
     """The name is matched against the roster, so anything that could not be
     an agent identity is refused before it gets there — and the refusal keeps

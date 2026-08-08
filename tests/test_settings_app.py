@@ -80,6 +80,33 @@ def _detail_text(app) -> str:
     return " ".join(str(w.render()) for w in pane.walk_children())
 
 
+# How long "nothing happened" has to be observed before it counts. Only the
+# NEGATIVE assertions need this — see the note there for why a number is
+# defensible in that one place and nowhere else.
+_SETTLE = 25
+
+
+async def _ran(pilot, ran, tries: int = 200) -> list:
+    """Wait for the command to be RECORDED, not for a fixed number of frames.
+
+    ⚠️ `_apply` is dispatched with `run_worker(thread=True)`, so the append
+    happens on a WORKER THREAD. Two `await pilot.pause()` calls — the shape
+    these tests used to have — are a SCHEDULE standing in for a CONDITION:
+    they pass on an idle box and can lose the race when the whole suite is
+    loading the machine, which is how this file produced a test that passed
+    in isolation and failed in the suite (mcp-hub-dev-vm-1-general, 2026-08-08).
+
+    Not claimed as a proven cure: that failure has not been reproduced here
+    (40 targeted runs under load and a full green suite). It is the weakness
+    that was actually demonstrable by reading, fixed on its own merits.
+    """
+    for _ in range(tries):
+        if ran:
+            return ran
+        await pilot.pause()
+    return ran
+
+
 @pytest.mark.asyncio
 async def test_walking_the_whole_tree_does_not_crash():
     """THE crash the operator hit: moving from one no-settings agent to another
@@ -154,8 +181,7 @@ async def test_changing_a_dropdown_runs_the_command_the_model_named():
         await pilot.pause()
         sel = app.query("Select").last()      # Comms, currently "off"
         sel.value = "on"
-        await pilot.pause()
-        await pilot.pause()
+        await _ran(pilot, ran)
     assert ran == [("/usr/bin/SQUAD", ["comms", "on", "real"])], ran
 
 
@@ -167,8 +193,7 @@ async def test_a_mute_goes_to_the_hub_binary_not_squad():
         await pilot.pause()
         sel = app.query("Select").first()     # the dreamteam squad row
         sel.value = "muted"
-        await pilot.pause()
-        await pilot.pause()
+        await _ran(pilot, ran)
     assert ran and ran[0][0] == "/usr/bin/HUB", ran
     assert ran[0][1][0] == "mute" and ran[0][1][-1] == "muted", ran
 
@@ -176,15 +201,26 @@ async def test_a_mute_goes_to_the_hub_binary_not_squad():
 @pytest.mark.asyncio
 async def test_selecting_the_value_already_set_runs_nothing():
     """Not a safety property — every verb is idempotent. It is about not
-    reporting a change that did not happen."""
+    reporting a change that did not happen.
+
+    The second half is the instrument proving ITSELF. An empty `ran` only
+    means "nothing ran" if this test would have SEEN something that did, and
+    what it is waiting on is a worker thread — so a slow enough box passes the
+    first assertion for entirely the wrong reason. Changing the same widget to
+    a real value afterwards shows the window was wide enough to catch one.
+    """
     ran: list = []
     app = _app(ran)
     async with app.run_test(size=(110, 30)) as pilot:
         await pilot.pause()
         sel = app.query("Select").last()
         sel.value = "off"                     # already off
-        await pilot.pause()
-    assert ran == []
+        for _ in range(_SETTLE):
+            await pilot.pause()
+        assert ran == [], ran
+        sel.value = "on"                      # a real change, same widget
+        assert await _ran(pilot, ran), (
+            "the settle above could not have seen a command anyway")
 
 
 @pytest.mark.asyncio

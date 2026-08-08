@@ -124,17 +124,27 @@ def parse_handshake(line: bytes) -> str:
     if magic != VOICE_MAGIC:
         return ""
     name = name.strip()
-    # A seat name is an agent identity: letters, digits, dash, underscore —
-    # matching the wire contract's [A-Za-z0-9_-]. Anything else is not a name
-    # we could match against the roster anyway.
+    # Mirror DOCKER'S OWN container-name rule: first character alphanumeric,
+    # then alphanumerics, `_`, `.` or `-`.
+    #
+    # 🔴 The DOT is the load-bearing part and it was missing. Docker accepts
+    # `voice.dotcheck.tmp` — measured on a live daemon, not read off the docs
+    # (mcp-hub-dev-vm-1-general, 2026-08-08) — so the narrower charset refused
+    # a LEGALLY NAMED container here at the wire, before the host's
+    # authorisation ever ran. And it refused it SILENTLY, because this function
+    # deliberately does not explain itself to the peer: no audio, no reason, on
+    # a container that was configured correctly. Widening costs nothing, since
+    # the roster (not the charset) is what actually decides.
     #
     # ⚠️ `isalnum()` is Unicode-aware ('٣'.isalnum() is True), so this is only
-    # ASCII-safe because of the strict ASCII decode two lines up. That is
-    # correctness by a neighbouring line rather than by this one — do not
-    # "simplify" the decode without replacing this check.
+    # ASCII-safe because of the strict ASCII decode above. That is correctness
+    # by a neighbouring line rather than by this one — do not "simplify" the
+    # decode without replacing this check.
     if not name or len(name) > 128:
         return ""
-    if not all(c.isalnum() or c in "-_" for c in name):
+    if not name[0].isalnum():
+        return ""
+    if not all(c.isalnum() or c in "-_." for c in name):
         return ""
     return name
 

@@ -84,12 +84,25 @@ dropping is CORRECT.
 listen    172.17.0.1:6981/tcp   ← the DOCKER GATEWAY ADDRESS, never 0.0.0.0
 audio     raw PCM s16le, 16000 Hz, 1 channel (no header, no framing)
 handshake container sends ONE line then never writes again:
-              "MCPHUBVOICE1 <seat-name>\n"   (ASCII, ≤128, [A-Za-z0-9_-])
+              "MCPHUBVOICE1 <seat-name>\n"   (ASCII, ≤128, docker's own rule:
+                                             [a-zA-Z0-9][a-zA-Z0-9_.-]*)
 host      read the line (5s timeout) -> verify -> stream one-way, NEVER read
 ```
 
-Anything malformed: **drop silently.** This listens where any container can
-reach it; do not explain yourself to whoever knocked.
+Anything malformed: **drop silently** *to the peer* — but **log it host-side**,
+with the address, the claim and the reason. This listens where any container can
+reach it, so explaining yourself to whoever knocked is not on; being unable to
+explain it to the OPERATOR is a different thing, and every failure here presents
+identically as "no audio". Fail-closed is correct; fail-closed and
+undiagnosable is how a correctly-configured seat stays silent for a week.
+
+⚠️ **The charset mirrors docker's container-name rule for a measured reason.**
+It was `[A-Za-z0-9_-]`, and `docker create --name voice.dotcheck.tmp` succeeds
+(measured on a live daemon, mcp-hub-dev-vm-1-general 2026-08-08) — so a
+legally-named container was refused **at the wire, before authorisation ever
+ran**, and silently. The first character stays alphanumeric so `..`, `.hidden`
+and `-rf`-shaped strings cannot become a name that reaches a log line or an
+argv. The charset is not the security boundary; the roster is.
 
 ### 🔴 BIND THE GATEWAY ADDRESS, NEVER `0.0.0.0`
 
@@ -130,9 +143,19 @@ something injected at create time.
    and *"the seat is gone"* are indistinguishable.
 4. **Newest connection wins.** A restart can leave a half-open stream; without
    this we fan one microphone into two sockets and nobody knows which is live.
-5. **The roster lookup is LOCAL, bounded and cached.** Network I/O here makes
-   audio inherit the hub's availability — breaking the no-external-dependency
-   requirement — and a hung lookup blocks the accept loop.
+5. **The roster lookup is LOCAL and bounded — and read PER CONNECTION, not
+   cached.** ⚠️ This clause previously said "cached", which conflated two
+   different concerns and would have produced exactly the divergence it exists
+   to prevent (caught 2026-08-08, after I advised the host author of the
+   opposite of what this line said).
+   - **LOCAL** is the real requirement: network I/O here makes audio inherit
+     the hub's availability — breaking the no-external-dependency rule — and a
+     hung lookup blocks the accept loop.
+   - **Not cached** is a separate property, and reading a local file per
+     connection costs nothing. A roster cached for the process lifetime
+     **outlives a retirement**, and a container still receiving the operator's
+     microphone after being retired is precisely the one nobody goes looking
+     for. Same reason the docker map is fetched per connection.
 6. **Cap pending handshakes.** Any container can connect; N silent connections
    must not tie up the accept path.
 7. **Retry the bind.** `docker0` may not exist at boot or across a docker
