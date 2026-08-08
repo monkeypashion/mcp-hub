@@ -85,13 +85,29 @@ def collect_workspaces(
             if rows[key]["registered"] is None:
                 rows[key]["registered"] = d.get("registered", False)
         else:
+            # 🔴 `on_disk` MUST NOT be inherited from the hub for THIS machine.
+            # The hub's `discovered` list is what machines reported at some
+            # earlier moment, so a file deleted since is still in it — and
+            # taking True from that record made the manager assert a file that
+            # was not there. Measured 2026-08-08: `showcase.code-workspace` was
+            # deleted, `find ~` confirmed no copy anywhere, and the row still
+            # read `✔ disk`.
+            #
+            # The clause above already says local enumeration of this machine
+            # is fresher than the hub's copy — but it only got to say so when
+            # the file still EXISTED. Absence fell through to here, which is
+            # exactly the case where freshness matters most.
+            #
+            # For a REMOTE machine the hub's record is the best evidence we
+            # have (we cannot stat another box's disk), so it stands.
+            local_authoritative = d["machine"] == this_machine
             rows[key] = {
                 "name": _name_of(d["path"]),
                 "machine": d["machine"],
                 "path": d["path"],
                 "folders": d.get("folders"),
                 "error": d.get("error", ""),
-                "on_disk": True,
+                "on_disk": not local_authoritative,
                 "open_now": d.get("open_now", False),
                 "registered": d.get("registered", False),
                 "squad": "",
