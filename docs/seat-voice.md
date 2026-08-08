@@ -390,7 +390,11 @@ regression.
 ```
 docker exec <seat> arecord -d 3 -f S16_LE -r 16000 -c 1 /tmp/v.wav
 ```
-then check RMS/peak is non-zero **while someone speaks**.
+⚠️ **Do NOT check "non-zero" — see acceptance criterion 1.** A live noise floor
+measures ~1800 RMS with peaks into five figures, so non-zero is satisfied by an
+empty room. Capture a QUIET floor and a SPEAKING sample in the same run on the
+same box, and require the second to be at least 3× the first. Record both
+numbers.
 
 ⭐ **Health checks that assert PRESENCE will pass through every failure in this
 system.** Sink exists, receptor alive, emitter running, no error returned — all
@@ -421,8 +425,30 @@ half.
 be demonstrated by execution, because every one of them has already been
 believed on the strength of a component being present:
 
-1. **Audio flows** — `arecord` in the container, RMS non-zero while someone
-   speaks. Not "the sink exists".
+1. **Audio flows** — and 🔴 **NOT "RMS non-zero", which this criterion said
+   until 2026-08-08 and which the noise floor satisfies on its own.** Measured
+   on dev-vm-1 with **nobody speaking**: RMS 1765 / 2101 / 1781 across three
+   captures, peaks to 12304. So `RMS > 0` is met continuously, by silence, and
+   the test would pass on a rig where the operator's voice never arrives.
+
+   It still distinguishes **dead** from **connected** — that is what caught the
+   2026-08-08 outage, where the wire carried exactly-zero samples — but that is
+   not what this criterion claims.
+
+   ⇒ Make it a **comparison against a floor measured in the same run on the same
+   box**, never an absolute threshold:
+   ```
+   floor  = RMS of N seconds of QUIET
+   signal = RMS of N seconds while the operator speaks
+   require signal >= 3 x floor        # and record both numbers, not a boolean
+   ```
+   ⚠️ **The margin is thinner than 3× sounds.** Speech measured 6638 RMS against
+   a 1800 floor — **3.7×**. So the pass is real but not comfortable, and a
+   quietly-spoken phrase could fail honestly. Record the numbers; a boolean
+   discards the only evidence that would explain a marginal result.
+
+   ⇒ Per-box, per-run: floors differ between machines and move with input gain,
+   so a floor measured yesterday or elsewhere proves nothing today.
 2. **Injection has no path** — run the attack from a second container and show
    it fails. Not "the rule is installed".
 3. **Removing the PERMIT rule kills audio** — proving the control is the thing
