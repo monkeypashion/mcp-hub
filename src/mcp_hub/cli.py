@@ -4541,20 +4541,82 @@ def _parse_pod_agents(specs: list[str]) -> list[dict[str, str]]:
     return out
 
 
+_VOICE_LOG = "/tmp/voice-client.log"  # noqa: S108 — in-container, readable by exec
+
+
+def _seat_pulse() -> bool:
+    """Start the container's OWN pulse server + null sink. Fail-open.
+
+    🔴 WHY THIS EXISTS: the image installed `pulseaudio` and never ran it, so
+    `voice-client` connected to the host, received audio, and had **nowhere to
+    put it** — `pacat` and `arecord` both died with "Connection refused"
+    (measured in a throwaway container, mcp-hub-dev-vm-1-general 2026-08-08).
+    The client half was fail-open and silent, so a seat with completely broken
+    audio started, registered and looked healthy.
+
+    Deliberately EXPLICIT rather than via `autospawn`: this runs before the
+    client, in a known order, from `/etc/pulse/seat-voice.pa` — which loads a
+    null sink, because a container has no hardware and therefore no sink at
+    all. Autospawn would produce a running server with nothing to play into.
+
+    Returns whether a server is answering. Never raises: audio must not be able
+    to fail a seat.
+    """
+    try:
+        # Idempotent: seat-entry can run again in a recreated container, and a
+        # second server would fail to bind rather than replace the first.
+        if subprocess.run(["pactl", "info"], capture_output=True,
+                          timeout=10).returncode == 0:
+            return True
+        subprocess.run(
+            ["pulseaudio", "--daemonize=yes", "--exit-idle-time=-1",
+             "-n", "--file=/etc/pulse/seat-voice.pa"],
+            capture_output=True, timeout=30, check=False,
+        )
+        r = subprocess.run(["pactl", "info"], capture_output=True, timeout=10)
+        if r.returncode == 0:
+            print("seat-entry: /voice pulse server up (sink claude_mic)",
+                  flush=True)
+            return True
+        # LOUD about a broken audio stack, while still not failing the seat.
+        # Silence here is what turned a one-line diagnosis into a container
+        # teardown; the seat survives either way.
+        print("seat-entry: /voice UNAVAILABLE — pulse server did not start; "
+              f"pactl says: {(r.stderr or b'').decode('utf-8', 'replace').strip()[:160]}",
+              file=sys.stderr, flush=True)
+        return False
+    except Exception as exc:  # noqa: BLE001 — audio never fails a seat
+        print(f"seat-entry: /voice UNAVAILABLE — pulse not started ({exc})",
+              file=sys.stderr, flush=True)
+        return False
+
+
 def _seat_voice() -> None:
     """Start the container's /voice client, detached, fail-open.
 
     Every failure mode here resolves to "no audio": no binary, no gateway, no
     host listening. None of them may touch the seat's exit path, which is why
     nothing is awaited and every exception is swallowed.
+
+    ⚠️ The client's stderr goes to a LOG, never to DEVNULL. It used to be
+    discarded, so `voice-client`'s own "Connection refused" — the message that
+    would have identified the missing pulse server immediately — was thrown
+    away at the moment it was produced. Fail-open must not mean fail-silent.
     """
+    if not _seat_pulse():
+        # No server means the client has nowhere to play. Starting it anyway
+        # would spin a process that can only fail, and say so nowhere.
+        print("seat-entry: /voice client NOT started (no pulse server)",
+              file=sys.stderr, flush=True)
+        return
     try:
+        log = open(_VOICE_LOG, "ab", buffering=0)  # noqa: SIM115 — outlives us
         subprocess.Popen(
             [sys.executable, "-m", "mcp_hub.cli", "voice-client"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True,
+            stdout=log, stderr=log, start_new_session=True,
         )
-        print("seat-entry: /voice client started", flush=True)
+        print(f"seat-entry: /voice client started (log {_VOICE_LOG})",
+              flush=True)
     except Exception as exc:  # noqa: BLE001 — audio never fails a seat
         print(f"seat-entry: /voice not started ({exc})", file=sys.stderr, flush=True)
 

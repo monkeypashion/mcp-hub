@@ -325,9 +325,16 @@ def test_the_container_name_is_injected_for_BOTH_shapes():
     assert not any(e.startswith("SEAT_IDENTITY=") for e in pod)
 
 
-def test_seat_entry_starts_voice_WITHOUT_letting_it_fail_the_seat():
+def test_seat_entry_starts_voice_WITHOUT_letting_it_fail_the_seat(monkeypatch):
     """Audio is a convenience. A seat with no microphone is a working seat; a
-    seat that will not start because the audio host is down is not."""
+    seat that will not start because the audio host is down is not.
+
+    ⚠️ `_seat_pulse` is stubbed rather than left real. Unstubbed, this test
+    passes only on a machine that happens to have a working pulse server (this
+    dev box does), and silently stops reaching Popen anywhere else — the
+    `assert boom` guard would then fail for an environmental reason that has
+    nothing to do with what the test is named for.
+    """
     import mcp_hub.cli as cli
 
     boom = []
@@ -336,13 +343,91 @@ def test_seat_entry_starts_voice_WITHOUT_letting_it_fail_the_seat():
         boom.append(a)
         raise OSError("no such binary")
 
-    orig = cli.subprocess.Popen
-    cli.subprocess.Popen = explode
-    try:
-        cli._seat_voice()          # must not raise
-    finally:
-        cli.subprocess.Popen = orig
+    monkeypatch.setattr(cli, "_seat_pulse", lambda: True)
+    monkeypatch.setattr(cli.subprocess, "Popen", explode)
+    cli._seat_voice()              # must not raise
     assert boom, "the fixture never reached Popen — this test proves nothing"
+
+
+def test_a_seat_with_no_pulse_server_says_so_and_does_not_spin_a_client(monkeypatch):
+    """🔴 The 2026-08-08 defect, as a test. The image installed `pulseaudio`
+    and nothing ever ran it, so `voice-client` connected to the host, received
+    audio and had nowhere to put it — `pacat` and `arecord` both died with
+    "Connection refused". It was fail-open AND silent, so a seat with entirely
+    broken audio started, registered and looked healthy.
+
+    Two properties, and the second is the one that cost the time: don't start a
+    client that can only fail, and SAY the audio stack is unavailable.
+    """
+    import mcp_hub.cli as cli
+
+    started = []
+    monkeypatch.setattr(cli, "_seat_pulse", lambda: False)
+    monkeypatch.setattr(cli.subprocess, "Popen",
+                        lambda *a, **k: started.append(a))
+    cli._seat_voice()              # must not raise
+    assert not started, "spun a voice client with no server for it to play into"
+
+
+def test_the_pulse_server_start_can_never_fail_the_seat(monkeypatch):
+    """Fail-open, but not fail-silent: returns False, does not raise."""
+    import mcp_hub.cli as cli
+
+    def explode(*a, **k):
+        raise OSError("pulseaudio: not found")
+
+    monkeypatch.setattr(cli.subprocess, "run", explode)
+    assert cli._seat_pulse() is False
+
+
+def test_a_second_seat_entry_does_not_start_a_SECOND_pulse_server(monkeypatch):
+    """A recreated container re-runs seat-entry. Starting a second server would
+    fail to bind rather than replace the first, so the check comes first."""
+    import mcp_hub.cli as cli
+
+    calls = []
+
+    class _Ok:
+        returncode = 0
+        stderr = b""
+
+    def fake_run(argv, **k):
+        calls.append(argv[0])
+        return _Ok()
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    assert cli._seat_pulse() is True
+    assert calls == ["pactl"], f"started a server despite one answering: {calls}"
+
+
+def test_the_IMAGE_STARTS_the_pulse_server_it_installs():
+    """🔴 THE TEST THAT WOULD HAVE CAUGHT IT. An assertion that the image
+    INSTALLS `pulseaudio` passed throughout the outage — the package was there,
+    the comment described its purpose, and nothing invoked it. Installing and
+    running are different claims and only one of them was true.
+
+    So this asserts the whole chain exists as *behaviour*: a pa script with a
+    NULL SINK (a container has no hardware, so without one `pacat` has nowhere
+    to play even with a server up), its monitor as the default source (what
+    `arecord`, and therefore /voice, reads back), and code that actually
+    launches the daemon.
+    """
+    import pathlib
+
+    import mcp_hub.cli as cli
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    dockerfile = (root / "seat" / "Dockerfile").read_text(encoding="utf-8")
+    for needed in ("module-null-sink", "sink_name=claude_mic",
+                   "set-default-source claude_mic.monitor",
+                   "seat-voice.pa", "XDG_RUNTIME_DIR"):
+        assert needed in dockerfile, f"seat image lacks {needed!r}"
+
+    src = pathlib.Path(cli.__file__).read_text(encoding="utf-8")
+    assert '"pulseaudio", "--daemonize=yes"' in src, \
+        "nothing in the cli STARTS the pulse server the image installs"
+    assert "--file=/etc/pulse/seat-voice.pa" in src, \
+        "the server must load the null-sink script, not the hardware default"
 
 
 def test_the_voice_client_never_fails_when_there_is_no_identity_or_route(tmp_path):
