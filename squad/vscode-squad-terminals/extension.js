@@ -353,6 +353,39 @@ function withAgents(args, fn) {
   fn(agents);
 }
 
+// For actions that are SINGULAR BY NATURE — one courier, one seat to read, one
+// thing to copy. The clicked tab wins.
+//
+// ⚠️ WHY THIS EXISTS RATHER THAN A `when` CLAUSE HIDING THE ITEM. VSCode
+// exposes no terminal-SELECTION api and no selection-change event: a `when`
+// clause can only read a context key, and a key can only be refreshed from an
+// event, so any "is multi-selected" key would be stale at the moment the menu
+// is drawn. The selection is knowable ONLY here, at invocation (args[1]) —
+// which is why every menu item has to be safe under multi-select rather than
+// filtered out of it, and why singular actions must say what they did with
+// the rest of the selection instead of silently picking one.
+function withOneAgent(args, what, fn) {
+  cancelPendingToasts();
+  const agents = resolveAgents(args);
+  if (!agents.length) {
+    vscode.window.showWarningMessage("Squad: no squad agent in the selection.");
+    return;
+  }
+  const chosen = resolveAgent(args[0]) || agents[0];
+  if (agents.length > 1) {
+    // Named, not counted, and stated BEFORE the action: silently using one of
+    // several highlighted tabs is the kind of thing an operator only notices
+    // when the wrong agent has already spoken.
+    const others = agents.filter((a) => a !== chosen);
+    vscode.window.showInformationMessage(
+      `${what}: using ${shortLabel(chosen)} only — ${others.length} other ` +
+      `selected tab(s) ignored (${others.map(shortLabel).join(", ")}). ` +
+      "This action has a single subject by nature."
+    );
+  }
+  fn(chosen);
+}
+
 const labels = (agents) => agents.map(shortLabel).join(", ");
 
 // The model from `mcp-hub settings --json`, as quick-pick rows.
@@ -656,25 +689,33 @@ function activate(context) {
       })
     ),
     vscode.commands.registerCommand("squad.broadcast", (...args) =>
-      withAgents(args, async (agents) => {
+      // 🔴 ONE COURIER, and it must stay that way. This used to fan out over
+      // the whole selection, so three highlighted tabs sent the SAME broadcast
+      // three times — and if they share a squad, that squad received three
+      // copies of one message. A broadcast has exactly one sender by nature;
+      // fanning it out is not "doing it for each agent", it is duplicating it.
+      //
+      // The clicked tab is the courier (args[0]), matching dmVia. Anything
+      // else in the selection is ignored DELIBERATELY, and the prompt says
+      // whose voice it goes out in so the choice is visible before sending.
+      withOneAgent(args, "Broadcast", async (sender) => {
         const prefix = "Please broadcast a message to the team saying: ";
         const text = await vscode.window.showInputBox({
-          prompt: `Broadcast via ${labels(agents)}`,
+          prompt: `Broadcast via ${shortLabel(sender)} (one sender)`,
           value: prefix,
           valueSelection: [prefix.length, prefix.length],
         });
         if (text && text.trim() !== prefix.trim())
-          agents.forEach((a) => squadExec(["cmd", a, text], a));
+          squadExec(["cmd", sender, text], sender);
       })
     ),
-    vscode.commands.registerCommand("squad.dmVia", (...args) => {
-      cancelPendingToasts();
-      // sender = the clicked tab (multi-select doesn't apply: one courier)
-      const sender = resolveAgent(args[0]);
-      if (!sender) {
-        vscode.window.showWarningMessage("Squad: this terminal isn't a squad agent.");
-        return;
-      }
+    vscode.commands.registerCommand("squad.dmVia", (...args) =>
+      // One courier, as before — but the ignored tabs are now NAMED rather
+      // than silently dropped. Recipients are chosen in the pick list below,
+      // so a multi-selection here is almost certainly the operator meaning
+      // "these are the recipients", and saying nothing let that misread
+      // stand.
+      withOneAgent(args, "Message via", (sender) => {
       (async () => {
         const others = rosterAgents()
           .filter((a) => a !== sender)
@@ -695,7 +736,8 @@ function activate(context) {
           sender
         );
       })();
-    }),
+      })
+    ),
     // ---- settings: READ-ONLY, and deliberately so ----
     // Nothing in this panel DOES anything: no restart, no transport, no retire.
     // A settings panel that can destroy an agent is one you open carefully, and
@@ -893,11 +935,25 @@ function activate(context) {
   function refreshLaunchContext() {
     const t = vscode.window.activeTerminal;
     const a = t ? agentOf.get(t) : null;
-    const s = a ? launchStateOf(a) : { comms: false, resume: false };
-    vscode.commands.executeCommand("setContext", "squad.hasComms", s.comms);
-    vscode.commands.executeCommand("setContext", "squad.hasResume", s.resume);
-    // Only meaningful for a roster agent; without this both "turn on" entries
-    // would show on the operator's own board/shell tabs.
+    // 🔴 `squad.hasComms` / `squad.hasResume` USED TO LIVE HERE and gated the
+    // launch toggles, so only the state-changing half of each pair was shown.
+    // That is correct for one tab and WRONG for a selection: the keys are read
+    // from the ACTIVE terminal, so selecting agent A (comms on) and agent B
+    // (comms off) offered whichever half suited A — hiding the very action B
+    // needed, while the visible one fanned out to both.
+    //
+    // It cannot be fixed by computing the key across the selection, because
+    // VSCode exposes no terminal-selection api and no selection-change event
+    // (see withOneAgent). A key that cannot be refreshed when the selection
+    // changes is a key that lies.
+    //
+    // So both halves are always shown. `squad comms on/off` is idempotent and
+    // toasts what it did — a menu that occasionally offers a no-op is strictly
+    // better than one that hides the action you came for.
+    //
+    // Only `isAgent` survives, and only because it is a property of the tab
+    // itself rather than of the selection: without it the toggles would appear
+    // on the operator's own board and shell tabs.
     vscode.commands.executeCommand("setContext", "squad.isAgent", !!a);
   }
   context.subscriptions.push(
@@ -1118,6 +1174,145 @@ function activate(context) {
       // onDidChangeWorkspaceFolders, which already rebuilds.
     }
   };
+
+  // ---- the seat, as opposed to the session ----
+  //
+  // Everything above acts on the RUNNING claude in this tab. These three act
+  // on the SEAT DECLARATION behind it — what the hub says should exist. The
+  // split is why they are their own submenu rather than sprinkled among the
+  // session actions: re-briefing a seat changes nothing in the tab you are
+  // looking at until it is re-placed, and saying otherwise would be a lie the
+  // menu tells by omission.
+  //
+  // All three are SINGULAR BY NATURE. `seats logs` reads one seat's output;
+  // a re-brief needs one brief; a clone needs one source and one new name.
+  // They use withOneAgent, which names the tabs it is ignoring — the only
+  // honest option, since the menu cannot be filtered on selection size.
+  const runInTerminal = (name, icon, cmd) => {
+    const t = vscode.window.createTerminal({
+      name,
+      iconPath: new vscode.ThemeIcon(icon),
+      color: new vscode.ThemeColor("terminal.ansiCyan"),
+    });
+    t.show(true);
+    sendWhenReady(t, cmd);
+  };
+
+  context.subscriptions.push(
+    // Read what a seat produced. A headless errand's whole point is that
+    // nobody watched it, so this is the only way to see what it did — and
+    // after reclaim it comes off the memory volume rather than docker logs.
+    vscode.commands.registerCommand("squad.seatLogs", (...args) =>
+      withOneAgent(args, "Show result", (agent) =>
+        runInTerminal(`logs · ${shortLabel(agent)}`, "output",
+          `${MCP_HUB} seats logs ${agent} --tail 200`)
+      )
+    ),
+    // Re-brief: edit the DECLARATION. The toast is not decoration — a brief
+    // changed while a container is running has no effect until it is
+    // re-placed, and an operator who does not know that waits for a change
+    // that never arrives.
+    vscode.commands.registerCommand("squad.seatRebrief", (...args) =>
+      withOneAgent(args, "Re-brief", async (agent) => {
+        const text = await vscode.window.showInputBox({
+          prompt: `New brief for ${shortLabel(agent)} — what this seat is FOR`,
+          placeHolder: "or paste a path beginning with @ to read a file",
+        });
+        if (!text) return;
+        runInTerminal(`re-brief · ${shortLabel(agent)}`, "edit",
+          `${MCP_HUB} seats update ${agent} --brief ${JSON.stringify(text)}`);
+        vscode.window.showInformationMessage(
+          `Squad: ${shortLabel(agent)} re-briefed — a RUNNING container keeps ` +
+          "the old brief until it is reclaimed and re-placed."
+        );
+      })
+    ),
+    // Clone the seat, not the tab: a second declaration from this one, spec
+    // and all, under its own identity. The suffix is required by the hub for
+    // the reason every clone path here learns — two seats sharing an identity
+    // is the collapse the runtime exists to prevent.
+    vscode.commands.registerCommand("squad.seatClone", (...args) =>
+      withOneAgent(args, "Clone seat", async (agent) => {
+        const suffix = await vscode.window.showInputBox({
+          prompt: `Clone ${shortLabel(agent)} as ${shortLabel(agent)}-…`,
+          placeHolder: "a short label, e.g. takeb",
+          validateInput: (v) =>
+            !v || !v.trim() ? "a label is required — the clone needs its own identity"
+            : /[.:]/.test(v) ? "no dots or colons: tmux reads them as separators and the agent would be unaddressable"
+            : null,
+        });
+        if (!suffix) return;
+        runInTerminal(`clone · ${shortLabel(agent)}`, "files",
+          `${MCP_HUB} seats clone ${agent} --as ${JSON.stringify(suffix.trim())}`);
+      })
+    )
+  );
+
+  // ---- squad management: FLEET-level, deliberately not a per-tab menu ----
+  //
+  // create/fork/merge/members, machine retirement and capsule placement are
+  // about the TEAM, not about the tab that was right-clicked. Putting them in
+  // the agent context menu would have made that menu longer and less true —
+  // every entry there should be an answer to "do this to this agent".
+  //
+  // A quick-pick instead: one entry, reachable from the palette too, and the
+  // one surface where multi-select is irrelevant by construction because
+  // there is no selection involved.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("squad.manage", async () => {
+      cancelPendingToasts();
+      const items = [
+        { label: "$(organization) Squads — list", cmd: "squads list" },
+        { label: "$(person-add) Squad members — list", cmd: "squads members", needs: "squad" },
+        { label: "$(git-branch) Fork a squad…", cmd: "fork" },
+        { label: "$(git-merge) Merge a squad…", cmd: "merge" },
+        { label: "$(server) Seats — list", cmd: "seats list" },
+        { label: "$(rocket) Placements — list", cmd: "placements list" },
+        { label: "$(package) Capsules — list", cmd: "capsules list" },
+        { label: "$(vm) Machines — list", cmd: "machines list" },
+      ];
+      const pick = await vscode.window.showQuickPick(items, {
+        placeHolder: "Squad management — fleet-level, not this tab",
+      });
+      if (!pick) return;
+      if (pick.cmd === "fork" || pick.cmd === "merge") {
+        const from = await vscode.window.showInputBox({
+          prompt: `${pick.cmd === "fork" ? "Fork" : "Merge"} which squad?`,
+        });
+        if (!from) return;
+        const to = await vscode.window.showInputBox({
+          prompt: pick.cmd === "fork"
+            ? "Into which NEW squad? (the source keeps every member — a fork COPIES)"
+            : "Into which squad? (it survives; the source is archived)",
+        });
+        if (!to) return;
+        const members = pick.cmd === "fork"
+          ? await vscode.window.showInputBox({
+              prompt: "Which members? comma-separated, or empty for all",
+              placeHolder: "alice,bob   (empty = the whole squad)",
+            })
+          : "";
+        // --members, not positionals: argparse cannot bind a trailing
+        // positional list after an option, so `fork dt --to x alice bob`
+        // fails outright. Measured 2026-08-08.
+        const flag = pick.cmd === "fork"
+          ? `--to ${JSON.stringify(to)}` + (members && members.trim()
+              ? ` --members ${JSON.stringify(members.trim())}` : "")
+          : `--into ${JSON.stringify(to)}`;
+        runInTerminal(`squads ${pick.cmd}`, "organization",
+          `${MCP_HUB} squads ${pick.cmd} ${JSON.stringify(from)} ${flag}`);
+        return;
+      }
+      if (pick.needs === "squad") {
+        const squad = await vscode.window.showInputBox({ prompt: "Which squad?" });
+        if (!squad) return;
+        runInTerminal("squad members", "organization",
+          `${MCP_HUB} ${pick.cmd} ${JSON.stringify(squad)}`);
+        return;
+      }
+      runInTerminal(pick.cmd, "list-unordered", `${MCP_HUB} ${pick.cmd}`);
+    })
+  );
 
   const runTransport = (label, cmd) => {
     const t = vscode.window.createTerminal({
