@@ -960,8 +960,19 @@ add_folder() {  # squad add-folder <dir> — enrol an EXISTING folder as an agen
 
   # Already enrolled? Report the existing name rather than adding a second row —
   # two rows for one worktree makes field() pick one arbitrarily.
+  #
+  # 🔴 UNTILDE THE ROSTER SIDE BEFORE COMPARING. `$dir` was made absolute
+  # above, but roster rows routinely store `~/Projects/x` — every hand-written
+  # row does, and `untilde` exists precisely because the rest of squad expects
+  # it. A raw string compare therefore MISSED the existing row, fell through to
+  # name derivation, and then refused with "already names a different
+  # worktree" — naming the very folder it had just failed to match. Found on
+  # the live roster 2026-08-09; every sandbox test had used absolute paths, so
+  # nothing caught it.
   local owner
-  owner="$(awk -F'|' -v d="$dir" '$2==d{print $1; exit}' "$CONF" 2>/dev/null || true)"
+  owner="$(awk -F'|' -v d="$dir" -v h="$HOME" \
+    '{p=$2; if (substr(p,1,1)=="~") p=h substr(p,2)} p==d{print $1; exit}' \
+    "$CONF" 2>/dev/null || true)"
   if [ -n "$owner" ]; then
     # Enrolled under a DIFFERENT name than the caller asked for. Saying
     # "already enrolled" here would be true and useless: the edge would call

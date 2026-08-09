@@ -369,3 +369,47 @@ def test_the_upgrade_can_be_given_an_explicit_project(env, tmp_path):
     _add_hub(env, folder, "--project", "team/shared")
     assert _marker(folder)["project"] == "team/shared"
     assert "team/shared" in _optins(env)
+
+
+def test_a_TILDE_roster_row_is_recognised_as_already_enrolled(env, tmp_path):
+    """🔴 Found on the LIVE roster, 2026-08-09, and invisible to every test
+    here because they all write absolute paths.
+
+    Roster rows routinely store `~/Projects/x` — every hand-written one does.
+    `add-folder` resolves its argument to an absolute path, so a raw string
+    compare missed the existing row, fell through to name derivation, and then
+    refused with "already names a different worktree", naming the very folder
+    it had just failed to match. `--hub` could therefore never upgrade any of
+    the agents it was built for.
+    """
+    env_, conf = env
+    folder = tmp_path / "notes"
+    folder.mkdir()
+    home = pathlib.Path(env_["HOME"])
+    # The tilde form of a path UNDER home — the shape every hand-written
+    # roster row uses, and the one the absolute-path compare missed.
+    under = home / "work"
+    under.mkdir(parents=True, exist_ok=True)
+    conf.write_text("work-box|~/work||--continue|faculty\n", encoding="utf-8")
+
+    res = _add(env, under)
+    assert res.returncode == 0, res.stderr
+    assert "already enrolled" in res.stdout, res.stdout + res.stderr
+    assert len(_rows(env)) == 1, "a tilde row must not gain a duplicate"
+
+
+def test_hub_upgrades_an_agent_whose_roster_row_uses_a_TILDE(env, tmp_path):
+    """The case that actually failed live: mindconnect's row is
+    `~/Projects/mindconnect-iot2050`, so --hub could not reach it."""
+    env_, conf = env
+    home = pathlib.Path(env_["HOME"])
+    under = home / "work"
+    under.mkdir(parents=True, exist_ok=True)
+    conf.write_text("work-box|~/work||--continue|faculty\n", encoding="utf-8")
+
+    res = _add_hub(env, under)
+    assert res.returncode == 0, res.stderr
+    assert _marker(under)["name"] == "work-box", "must reuse the roster name"
+    assert "folder/work" in _optins(env)
+    assert "server:hub" in _rows(env)[0][3]
+    assert len(_rows(env)) == 1
