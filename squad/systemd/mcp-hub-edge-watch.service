@@ -1,0 +1,40 @@
+[Unit]
+# The doorbell: hold a stream open to the hub and reconcile the moment desired
+# state changes, instead of waiting up to ~35s for mcp-hub-edge.timer.
+#
+# ⚠️ THIS UNIT IS DELIBERATELY NOT LOAD-BEARING. mcp-hub-edge.timer stays
+# enabled and unchanged; if this service is stopped, crashlooping, or quietly
+# connected to nothing, the fleet degrades to the timer's cadence and NOTHING
+# is lost. That is the whole reason it is safe to run a long-lived process
+# beside a design that deliberately chose oneshots.
+#
+# The failure being guarded against is specific and has happened on this
+# estate: vps-hetzner's egress-sync daemon died with its event stream
+# (DAEMON-EXITS-ON-EVENTS-SUBPROC-EXIT) and the system then looked exactly
+# like "nothing has changed lately" — its failure mode was indistinguishable
+# from its success mode. A dead doorbell returns silence, and so does a quiet
+# one; the timer is what makes that silence interpretable.
+Description=mcp-hub doorbell — reconcile immediately when desired state changes
+Documentation=https://github.com/monkeypashion/mcp-hub
+After=network-online.target
+
+[Service]
+Type=simple
+# Same credentials file the timer's unit loads: a doorbell-triggered pass and a
+# timer-triggered pass must be the SAME pass, and a pass whose result depends
+# on how it was invoked is not a reconcile.
+EnvironmentFile=-%h/.mcp-hub/edge-env
+# Absolute path: systemd user units get a bare PATH with no ~/.local/bin.
+ExecStart=%h/Projects/code/monkeypashion/mcp-hub/.venv/bin/mcp-hub edge watch
+# ALWAYS, not on-failure: the client reconnects internally with backoff, so a
+# process exit here means something unrecoverable happened inside it — exactly
+# when restarting matters most.
+Restart=always
+RestartSec=10
+# A crashloop must stay a crashloop and never disable the unit: the timer is
+# already covering correctness, so the only cost of retrying forever is log
+# noise, and the cost of giving up is a doorbell nobody notices is gone.
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=default.target

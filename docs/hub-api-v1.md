@@ -194,6 +194,46 @@ record, not an action.*
 | DELETE | `/placements/{id}` | **Reclaim request** = harvest + verify + destroy, in that order: memory delta exported to staging, substrate enumerated empty (with positive control), then destroyed; failure → `orphaned` + loud |
 | DELETE | `/placements/{id}?purge=true` | **Unplace**: drop the row, ask the edge for nothing, leave the substrate exactly as it is |
 | POST | `/placements/{id}/observed` | Edge reports enumerated reality (v1 stub: stored and surfaced, drives `status`) |
+| GET | `/machines/{name}/watch` | **The doorbell** — SSE, wake-only: *"something changed for you, pull now"* |
+
+### The doorbell
+
+The edge pulls on a timer, which is what makes it NAT-safe and outage-proof —
+but the interval is then the latency a UI feels. Measured 2026-08-09: a wake
+took 95s and a sleep 96s, almost entirely spent waiting for the next tick.
+`watch` lets a machine be told *now*.
+
+- **The machine opens it**, outbound, with the bearer it already uses to pull.
+  The hub never reaches a machine — the property the whole design rests on.
+- **Wake-only.** The event carries no state (`{"machine": …, "reason": …}` and
+  nothing else), so a lost event costs **latency and never work**. That is
+  cheaper here than in the designs this borrows from, because this reconciler
+  is **level-triggered**: `pull_placements` returns every row for the machine
+  and the planner diffs it against a fresh enumeration, so every pass is
+  already a full resync. No cursor, no `Last-Event-ID`, nothing to replay.
+- **Heartbeats** (`: heartbeat` comment lines, 20s) are as important as events:
+  a dead stream returns silence and so does a quiet one, and if those are the
+  same bytes a client cannot tell whether to reconnect.
+- **Rung by operator writes only** — create, PATCH desired, reclaim, unplace.
+  Deliberately **not** by `/observed`: that is the machine reporting, and
+  ringing on a report is a feedback loop with no brake.
+- **`mcp-hub edge watch`** is the client (`mcp-hub-edge-watch.service`):
+  reconnect with backoff 1s→30s, a **full pass on every (re)connect** to cover
+  the disconnected window, a read timeout equal to the silence budget, and a
+  coalescing guard so a burst of writes never starts overlapping passes while
+  a bell arriving mid-pass still earns exactly one more.
+
+⚠️ **The timer stays underneath and the doorbell must never become
+load-bearing.** `mcp-hub-edge.timer` remains at 30s; a stopped, crashlooping or
+quietly-disconnected watcher costs latency and nothing else. vps-hetzner's
+`egress-sync` daemon on this estate died with its event stream and the system
+then looked exactly like *"nothing has changed lately"* — its failure mode was
+indistinguishable from its success mode.
+
+⚠️ **In-process only.** If the hub is ever run multi-worker, a write served by
+one worker will not ring watchers held by another, and the miss is silent. The
+floor covers it; a doorbell that is ever made load-bearing must move to a
+shared bus first.
 
 **Reclaim and unplace are different intents, so they are different calls.**
 They shared one verb until 2026-08-09, which meant the only way to stop the

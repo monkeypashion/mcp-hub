@@ -19,6 +19,7 @@ principal may only pull its own placements and report observed state.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
@@ -31,7 +32,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, StreamingResponse
 
 # Safe at module level: server.py imports THIS module lazily, inside
 # create_server, precisely so the http surface stays optional for stdio runs.
@@ -40,6 +41,96 @@ from starlette.responses import JSONResponse, Response
 from mcp_hub.server import purge_expired_memberships
 
 SUBSTRATES = ("worktree", "docker")
+
+# ── The doorbell ─────────────────────────────────────────────────────────────
+#
+# The edge PULLS on a timer, which is what makes it NAT-safe and outage-proof —
+# but the interval is then the latency a UI feels, and a placement written from
+# a web front end does nothing until the next tick (measured: a wake took 95s,
+# 2026-08-09). This lets a machine be told "now" instead of waiting.
+#
+# WAKE-ONLY, deliberately. The event carries no state: the edge's next act is
+# the same full pull it always does. That is not laziness, it is what makes a
+# LOST event cost latency and never work — and it is cheaper here than in the
+# design this borrows from (`dreamteam` 0d17942), because this reconciler is
+# LEVEL-triggered: `pull_placements` returns every row for the machine and the
+# planner diffs it against a fresh enumeration, so every pass is already a full
+# resync. No cursor, no Last-Event-ID, nothing to miss.
+#
+# ⚠️ THE TIMER STAYS UNDERNEATH. A dead stream returns silence, and so does a
+# quiet one; if those are the same bytes the doorbell cannot be load-bearing —
+# not because streams are unreliable but because you cannot TELL. Heartbeats
+# below make silence interpretable to the client, and the 30s timer makes a
+# doorbell failure cost latency rather than work.
+#
+# ⚠️ IN-PROCESS ONLY. If the hub is ever run multi-worker, a write served by
+# one worker will not ring watchers held by another, and the miss is silent.
+# The floor covers it (latency, never work) — but a doorbell that is ever made
+# load-bearing must move to a shared bus first.
+WATCH_HEARTBEAT_S = 20.0
+
+# machine name -> the queues of everyone currently watching it.
+_watchers: dict[str, set[asyncio.Queue]] = {}
+
+
+async def watch_stream(machine: str, heartbeat: float | None = None):
+    """The doorbell's body: register, emit, and always deregister.
+
+    Module-level and self-contained ON PURPOSE. As a closure inside the route
+    it could only be exercised through a live HTTP stream, which needs the
+    app's lifespan running and a second thread to ring from — and an
+    `asyncio.Queue` rung from another thread does not reliably wake its waiter,
+    so the test hangs rather than fails. Here it is driven directly, in one
+    event loop, which is also exactly how production works.
+    """
+    hb = WATCH_HEARTBEAT_S if heartbeat is None else heartbeat
+    # maxsize=1: the message is wake-only and identical every time, so a
+    # backlog would be N copies of "go look". One pending bell is all the
+    # information there is.
+    q: asyncio.Queue = asyncio.Queue(maxsize=1)
+    _watchers.setdefault(machine, set()).add(q)
+    try:
+        yield b": connected\n\n"
+        while True:
+            try:
+                reason = await asyncio.wait_for(q.get(), timeout=hb)
+            except (asyncio.TimeoutError, TimeoutError):
+                # A COMMENT line, not an event — it must never be mistaken for
+                # a doorbell, only for proof of life. Without it a dead stream
+                # and a quiet one are the same bytes, and a client cannot tell
+                # whether to reconnect.
+                yield b": heartbeat\n\n"
+                continue
+            body = json.dumps({"machine": machine, "reason": reason})
+            yield f"event: wake\ndata: {body}\n\n".encode()
+    finally:
+        # Deregister on ANY exit — hang-up, cancellation, generator close.
+        # A leaked queue is a slow memory leak AND a watcher count that lies
+        # about how many edges are listening.
+        live = _watchers.get(machine)
+        if live is not None:
+            live.discard(q)
+            if not live:
+                _watchers.pop(machine, None)
+
+
+def notify_machine(machine: str, reason: str = "placement") -> int:
+    """Ring the doorbell for one machine. Returns how many watchers were told.
+
+    Best-effort and NEVER raises: a doorbell that can break a write is worse
+    than no doorbell, since the write is the thing that actually matters and
+    the timer will deliver it regardless.
+    """
+    if not machine:
+        return 0
+    rung = 0
+    for q in list(_watchers.get(machine, ())):
+        try:
+            q.put_nowait(reason)
+            rung += 1
+        except Exception:  # noqa: BLE001 — a full/closed queue must not fail a write
+            pass
+    return rung
 
 # Default settings block for rendered .code-workspace files — mirrors what
 # `squad ws-new` writes, so an API workspace opens identically to a manual one.
@@ -516,6 +607,38 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
                 p["seat_spec"] = seat_json(seat_row)
             out.append(p)
         return JSONResponse({"placements": out})
+
+    @route("/api/v1/machines/{name}/watch", methods=["GET"])
+    async def machine_watch(request: Request) -> Response:
+        """SSE doorbell: 'something changed for you, pull now'.
+
+        The machine opens this OUTBOUND, with the bearer it already uses for
+        the pull — the hub never reaches a machine, which is the property the
+        whole edge design rests on.
+
+        Heartbeats matter as much as events: without them a dead stream and a
+        quiet one look identical, and a client cannot tell whether to reconnect.
+        """
+        got = auth(request)
+        if isinstance(got, JSONResponse):
+            return got
+        principal, mname = got
+        name = request.path_params["name"]
+        if principal == "machine" and mname != name:
+            return _err(403, "machine token may only watch its own placements")
+
+        # The body lives in watch_stream() rather than here, so it can be
+        # driven directly by a test instead of only through a live HTTP stream.
+        return StreamingResponse(
+            watch_stream(name),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                # Proxies that buffer would defeat the entire point.
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
+        )
 
     @route("/api/v1/machines/{name}/status", methods=["POST"])
     async def machine_status(request: Request) -> Response:
@@ -1466,6 +1589,7 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             )
             ids.append(pid)
         db().commit()
+        notify_machine(machine)
         return JSONResponse(
             {"placements": ids, "seats": targets}, status_code=201
         )
@@ -1508,6 +1632,7 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             (pid, seat, machine, substrate, body.get("desired", "running"), _now()),
         )
         db().commit()
+        notify_machine(machine)
         row = db().execute(
             "SELECT * FROM api_placements WHERE id = ?", (pid,)
         ).fetchone()
@@ -1540,6 +1665,7 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
                 (desired, pid),
             )
             db().commit()
+            notify_machine(row["machine"])
             row = db().execute(
                 "SELECT * FROM api_placements WHERE id = ?", (pid,)
             ).fetchone()
@@ -1559,6 +1685,9 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
         if request.query_params.get("purge") == "true":
             db().execute("DELETE FROM api_placements WHERE id = ?", (pid,))
             db().commit()
+            # Rung even though the machine has no work to do: the row it was
+            # reconciling is gone, and a spurious pull is idempotent + cheap.
+            notify_machine(row["machine"])
             return JSONResponse({"id": pid, "purged": True})
         # DELETE = reclaim request: harvest + verify + destroy, each pending
         # until an edge executes and reports it. Never marked done here — the
@@ -1571,8 +1700,17 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             (json.dumps(reclaim), pid),
         )
         db().commit()
+        notify_machine(row["machine"])
         return JSONResponse({"id": pid, "reclaim": reclaim}, status_code=202)
 
+    # 🔴 NO DOORBELL BELOW THIS LINE, AND IT IS NOT AN OVERSIGHT.
+    #
+    # This endpoint and the reclaim-phase update inside it are the machine
+    # REPORTING to the hub. Ringing the bell on a report would be a feedback
+    # loop with no brake: edge reports observed -> hub rings -> edge pulls and
+    # reconciles -> reports again -> rings again, as fast as the network
+    # allows. The doorbell exists for changes the OPERATOR makes; a machine
+    # never needs telling about its own news.
     @route("/api/v1/placements/{pid}/observed", methods=["POST"])
     async def placement_observed(request: Request) -> Response:
         got = auth(request)
