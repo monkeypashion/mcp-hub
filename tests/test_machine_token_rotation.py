@@ -202,7 +202,10 @@ def test_the_systemd_units_point_at_the_venv_binary_not_a_bare_name():
     assert ".venv/bin/mcp-hub edge apply" in svc
     assert "\nExecStart=mcp-hub" not in svc
     timer = (root / "squad/systemd/mcp-hub-edge.timer").read_text()
-    assert "OnUnitActiveSec=2min" in timer
+    # The interval is the LATENCY A UI FEELS: a placement written from a web
+    # front end does nothing until this fires. Deliberately faster than
+    # squad-heal, which has no such caller (2026-08-09).
+    assert "OnUnitActiveSec=30s" in timer
     assert "RandomizedDelaySec" in timer      # no thundering herd after an outage
 
 
