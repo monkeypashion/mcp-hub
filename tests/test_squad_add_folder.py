@@ -158,3 +158,214 @@ def test_already_enrolled_still_lists_the_folder_in_a_workspace(env, tmp_path):
     assert "already enrolled" in second.stdout
     assert str(folder) in ws.read_text(), "already-enrolled must STILL restore the folder"
     assert len(_rows(env)) == 1, "and must not duplicate the roster row"
+
+
+# --------------------------------------------- --hub: a folder ON the hub
+#
+# 🔴 THE GAP (operator, 2026-08-09): a plain folder could be started and
+# stopped through the API but never MESSAGED by it. Hub identity is derived
+# from the git remote, so no remote meant no project, so `hub_optedin` refused,
+# so `arm_comms` never armed the channels flag. On dev-vm-1 that was 13 of the
+# 15 on-demand agents — i.e. half the roster was schedulable but unaddressable.
+#
+# ⚠️ The marker stays DEPRECATED for git repos: a committed marker is shared by
+# every clone, so they collapse into one hub identity. That needs a repo to
+# happen. A folder with no git has no clones and nothing to commit, and if it
+# later gains a remote, derived identity wins by resolution order.
+
+
+def _add_hub(env_conf, folder, *extra) -> subprocess.CompletedProcess:
+    env, _ = env_conf
+    return subprocess.run(
+        ["bash", str(SQUAD), "add-folder", str(folder), "--hub", *extra],
+        capture_output=True, text=True, timeout=60, env=env,
+    )
+
+
+def _marker(folder: pathlib.Path) -> dict:
+    import json
+    return json.loads((folder / ".claude" / "hub-agent.json").read_text())
+
+
+def _optins(env_conf) -> list[str]:
+    import json
+    env, _ = env_conf
+    cfg = pathlib.Path(env["HOME"]) / ".mcp-hub" / "config.json"
+    if not cfg.exists():
+        return []
+    return json.loads(cfg.read_text()).get("projects", [])
+
+
+def test_hub_gives_a_remoteless_folder_ALL_THREE_legs(env, tmp_path):
+    """Marker, opt-in AND comms flag. Any one alone is not enough: without the
+    marker there is no identity to register; without the opt-in `arm_comms`
+    refuses; and without the channels flag the binding is not push-deliverable,
+    so the heartbeat's deliverability check drops it after 3 beats and the
+    agent flickers offline."""
+    folder = tmp_path / "notes"
+    folder.mkdir()
+    res = _add_hub(env, folder)
+    assert res.returncode == 0, res.stderr
+
+    m = _marker(folder)
+    assert m["name"] == _rows(env)[0][0]        # marker agrees with the roster
+    assert m["project"] == "folder/notes"       # default, from the basename
+    assert "folder/notes" in _optins(env)
+    assert "server:hub" in _rows(env)[0][3], "comms flag not armed"
+
+
+def test_the_project_can_be_NAMED(env, tmp_path):
+    """With no git remote there is nothing forcing two machines to agree on a
+    project string, so anything meant to pair across machines must say so."""
+    folder = tmp_path / "notes"
+    folder.mkdir()
+    assert _add_hub(env, folder, "--project", "team/shared").returncode == 0
+    assert _marker(folder)["project"] == "team/shared"
+    assert "team/shared" in _optins(env)
+
+
+def test_without_hub_a_plain_folder_stays_OFF_the_hub(env, tmp_path):
+    """The control. --hub is opt-in: `add-folder` on its own must keep the old
+    behaviour, or every scratch directory silently joins the fleet."""
+    folder = tmp_path / "notes"
+    folder.mkdir()
+    assert _add(env, folder).returncode == 0
+    assert not (folder / ".claude" / "hub-agent.json").exists()
+    assert _optins(env) == []
+    assert "server:hub" not in _rows(env)[0][3]
+
+
+def test_hub_is_IGNORED_where_a_git_remote_already_derives_one(env, tmp_path):
+    """Derived identity wins, so a marker here would be inert — and it would
+    put the deprecated committed-marker shape inside a git repo, which is the
+    collision the deprecation exists to prevent."""
+    folder = _git(tmp_path / "repo", "git@github-x:acme/widget.git")
+    res = _add_hub(env, folder, "--project", "should/be-ignored")
+    assert res.returncode == 0, res.stderr
+    assert not (folder / ".claude" / "hub-agent.json").exists()
+    assert "acme/widget" in _optins(env)
+    assert "should/be-ignored" not in _optins(env)
+    assert "git remote" in res.stdout
+
+
+def test_rm_removes_the_marker_so_the_agent_really_goes_QUIET(env, tmp_path):
+    """🔴 `_resolve_agent_identity` reads the marker with NO opt-in gate — that
+    gate applies to DERIVED identity only. So a folder left holding a marker
+    keeps registering, heartbeating and answering DMs after `squad rm` reported
+    it removed: a silent disconnect in the direction nobody checks."""
+    env_, _conf = env
+    folder = tmp_path / "notes"
+    folder.mkdir()
+    _add_hub(env, folder)
+    agent = _rows(env)[0][0]
+
+    res = subprocess.run(["bash", str(SQUAD), "rm", agent],
+                         capture_output=True, text=True, timeout=60, env=env_)
+    assert res.returncode == 0, res.stderr
+    assert not (folder / ".claude" / "hub-agent.json").exists()
+    assert _optins(env) == [], "opt-in survived the removal"
+
+
+def test_rm_reads_the_project_OUT_of_the_marker_BEFORE_deleting_it(env, tmp_path):
+    """Ordering, which is easy to get wrong and silent when you do: the opt-out
+    looks the project up via the marker, so deleting the marker first leaves an
+    orphaned entry in config.json forever."""
+    folder = tmp_path / "notes"
+    folder.mkdir()
+    _add_hub(env, folder, "--project", "solo/thing")
+    agent = _rows(env)[0][0]
+    env_, _conf = env
+    subprocess.run(["bash", str(SQUAD), "rm", agent],
+                   capture_output=True, text=True, timeout=60, env=env_)
+    assert "solo/thing" not in _optins(env)
+
+
+def test_a_SHARED_marker_project_keeps_its_opt_in_when_one_agent_goes(env, tmp_path):
+    """The 2026-08-08 silent-disconnect rule, which must hold for marker
+    projects too: opting out is per PROJECT, removal is per AGENT."""
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    _add_hub(env, a, "--project", "team/notes")
+    _add_hub(env, b, "--project", "team/notes")
+    env_, _conf = env
+    agent_a = [r[0] for r in _rows(env) if r[1] == str(a)][0]
+    res = subprocess.run(["bash", str(SQUAD), "rm", agent_a],
+                         capture_output=True, text=True, timeout=60, env=env_)
+    assert "team/notes" in _optins(env), "sibling was silently disconnected"
+    assert "KEPT" in res.stdout
+    assert not (a / ".claude" / "hub-agent.json").exists()
+    assert (b / ".claude" / "hub-agent.json").exists(), "removed the wrong marker"
+
+
+# ------------------------------------- --hub on a folder ALREADY enrolled
+#
+# 🔴 The first cut of --hub only ran at FIRST enrolment, so it did nothing for
+# every agent already on the roster — i.e. for all 13 of the plain-folder
+# agents it was built for. `add-folder` returns early for a folder it already
+# knows, and that early return swallowed the whole feature.
+
+
+def test_hub_UPGRADES_a_folder_that_is_already_enrolled(env, tmp_path):
+    """The common case, not the exotic one."""
+    folder = tmp_path / "notes"
+    folder.mkdir()
+    assert _add(env, folder).returncode == 0          # enrolled the old way
+    agent = _rows(env)[0][0]
+    assert not (folder / ".claude" / "hub-agent.json").exists()
+
+    res = _add_hub(env, folder)
+    assert res.returncode == 0, res.stderr
+    assert _marker(folder)["name"] == agent, (
+        "marker must name the agent `squad start` will launch, not a new one")
+    assert _marker(folder)["project"] == "folder/notes"
+    assert "folder/notes" in _optins(env)
+    assert "server:hub" in _rows(env)[0][3], "comms not armed on upgrade"
+
+
+def test_the_upgrade_keeps_the_agents_other_launch_args(env, tmp_path):
+    """arm_comms is used rather than a second roster writer precisely so the
+    rest of field 4 survives — losing --continue would make `heal` refuse to
+    restart the agent, silently."""
+    folder = tmp_path / "notes"
+    folder.mkdir()
+    _add(env, folder)
+    before = _rows(env)[0][3]
+    assert "--continue" in before
+    _add_hub(env, folder)
+    assert "--continue" in _rows(env)[0][3]
+
+
+def test_the_upgrade_is_IDEMPOTENT(env, tmp_path):
+    """Re-running must not duplicate the flag or the opt-in — squad verbs are
+    re-runnable by convention and this one is aimed at a batch of agents."""
+    folder = tmp_path / "notes"
+    folder.mkdir()
+    _add(env, folder)
+    _add_hub(env, folder)
+    first = _rows(env)[0][3]
+    _add_hub(env, folder)
+    assert _rows(env)[0][3] == first
+    assert _optins(env).count("folder/notes") == 1
+    assert len(_rows(env)) == 1, "a second roster row appeared"
+
+
+def test_upgrading_an_already_enrolled_GIT_folder_is_ignored(env, tmp_path):
+    """Derived identity is authoritative there, and a marker inside a git repo
+    is the deprecated committed shape."""
+    folder = _git(tmp_path / "repo", "git@github-x:acme/widget.git")
+    _add(env, folder)
+    res = _add_hub(env, folder, "--project", "should/be-ignored")
+    assert res.returncode == 0, res.stderr
+    assert not (folder / ".claude" / "hub-agent.json").exists()
+    assert "should/be-ignored" not in _optins(env)
+    assert "git remote" in res.stdout
+
+
+def test_the_upgrade_can_be_given_an_explicit_project(env, tmp_path):
+    folder = tmp_path / "notes"
+    folder.mkdir()
+    _add(env, folder)
+    _add_hub(env, folder, "--project", "team/shared")
+    assert _marker(folder)["project"] == "team/shared"
+    assert "team/shared" in _optins(env)

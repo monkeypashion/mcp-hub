@@ -356,3 +356,93 @@ def test_comms_agents_is_the_set_that_can_go_deaf(box):
     )
     out = _helpers(box, "comms_agents").stdout.split()
     assert out == ["fac-comms", "sq-comms"], out
+
+
+# ---------------------------------------------------------------------------
+# hub_optedin via the MARKER — a folder with no git remote on the hub
+# ---------------------------------------------------------------------------
+#
+# 🔴 `hub_optedin` used to ask `worktree_project`, which needs a git remote.
+# A plain folder therefore had no project, so arm_comms refused, so the agent
+# could be started and stopped by the API but never messaged by it — 13 of
+# dev-vm-1's 15 on-demand agents (2026-08-09). It now falls back to the
+# identity marker, which is the one thing a remote-less folder CAN carry.
+#
+# ⚠️ These go through arm_comms deliberately. An earlier version of this
+# coverage asserted only on `add-folder --hub`, which sets the roster flag from
+# a LOCAL variable and never consults hub_optedin at all — so reverting the
+# fallback left it green (mutation MH2). The re-arm path is the only one that
+# actually exercises the lookup.
+
+
+def _plain(tmp_path: Path, name: str = "notes") -> Path:
+    d = tmp_path / name
+    d.mkdir()
+    return d
+
+
+def _marker(folder: Path, name: str, project: str) -> None:
+    import json
+    (folder / ".claude").mkdir(parents=True, exist_ok=True)
+    (folder / ".claude" / "hub-agent.json").write_text(
+        json.dumps({"name": name, "project": project}), encoding="utf-8")
+
+
+def test_arm_comms_ARMS_a_markered_folder_with_no_git_remote(box, tmp_path):
+    """Mutation: revert hub_optedin to worktree_project → this fails, because
+    the folder has no remote and the project can only come from the marker."""
+    home, _worktree, conf = box
+    folder = _plain(tmp_path)
+    _marker(folder, "notes-box", "folder/notes")
+    _optin(home, ["folder/notes"])
+    _roster(conf, [f"notes-box|{folder}||--continue|faculty"])
+
+    res = _helpers(box, 'arm_comms "notes-box"')
+    assert res.returncode == 0, res.stderr
+    assert FLAG in _args_of(conf, "notes-box"), (
+        f"comms not armed for a markered folder: {_args_of(conf, 'notes-box')}")
+
+
+def test_arm_comms_REFUSES_a_markered_folder_that_is_not_opted_in(box, tmp_path):
+    """The control, and the reason the marker cannot be a back door: the
+    opt-in list is still the operator's statement of intent. A marker alone
+    must not put an agent on the hub."""
+    home, _worktree, conf = box
+    folder = _plain(tmp_path)
+    _marker(folder, "notes-box", "folder/notes")
+    _optin(home, [])                       # deliberately NOT opted in
+    _roster(conf, [f"notes-box|{folder}||--continue|faculty"])
+
+    res = _helpers(box, 'arm_comms "notes-box"')
+    assert res.returncode == 0, res.stderr
+    assert FLAG not in _args_of(conf, "notes-box")
+
+
+def test_arm_comms_still_refuses_a_plain_folder_with_NO_marker(box, tmp_path):
+    """The other control: nothing to derive and nothing declared means the
+    folder is not a hub agent, and must not become one by accident."""
+    home, _worktree, conf = box
+    folder = _plain(tmp_path)
+    _optin(home, ["folder/notes"])
+    _roster(conf, [f"notes-box|{folder}||--continue|faculty"])
+
+    res = _helpers(box, 'arm_comms "notes-box"')
+    assert res.returncode == 0, res.stderr
+    assert FLAG not in _args_of(conf, "notes-box")
+
+
+def test_a_git_remote_still_WINS_over_a_marker(box):
+    """Derived identity is authoritative wherever it exists. A stale marker in
+    a git repo — the deprecated committed kind — must not redirect the project
+    that decides opt-in."""
+    home, worktree, conf = box
+    _marker(worktree, "hijack", "evil/elsewhere")
+    _optin(home, ["org/repo"])             # the DERIVED project only
+    _roster(conf, [f"a|{worktree}||--continue|faculty"])
+
+    res = _helpers(box, 'arm_comms "a"')
+    assert res.returncode == 0, res.stderr
+    assert FLAG in _args_of(conf, "a"), "derived project was not used"
+
+    out = _helpers(box, 'hub_project "%s"' % worktree).stdout.strip()
+    assert out == "org/repo", f"marker overrode the git remote: {out}"
