@@ -17,6 +17,15 @@
 Description=mcp-hub doorbell — reconcile immediately when desired state changes
 Documentation=https://github.com/monkeypashion/mcp-hub
 After=network-online.target
+# A crashloop must stay a crashloop and never disable the unit: the timer is
+# already covering correctness, so the only cost of retrying forever is log
+# noise, and the cost of giving up is a doorbell nobody notices is gone.
+#
+# ⚠️ [Unit], NOT [Service] — systemd moved this key in 229 and silently IGNORES
+# it in [Service] ("Unknown key name ... ignoring"). Caught in the journal on
+# first start, 2026-08-09, AFTER a test asserted the string was in the file:
+# presence is not effect.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -31,10 +40,6 @@ ExecStart=%h/Projects/code/monkeypashion/mcp-hub/.venv/bin/mcp-hub edge watch
 # when restarting matters most.
 Restart=always
 RestartSec=10
-# A crashloop must stay a crashloop and never disable the unit: the timer is
-# already covering correctness, so the only cost of retrying forever is log
-# noise, and the cost of giving up is a doorbell nobody notices is gone.
-StartLimitIntervalSec=0
 
 [Install]
 WantedBy=default.target

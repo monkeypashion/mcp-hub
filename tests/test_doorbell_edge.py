@@ -260,27 +260,55 @@ def test_it_watches_its_OWN_machine_only():
 # ---------------------------------------------------------- the unit file
 
 
+def _unit(name: str) -> dict[str, dict[str, str]]:
+    """Parse a unit file into {section: {key: value}}.
+
+    ⚠️ Parsed, not substring-matched, and that is the whole point. The first
+    version of this test asserted `"StartLimitIntervalSec=0" in text` — which
+    PASSED while systemd logged `Unknown key name 'StartLimitIntervalSec' in
+    section 'Service', ignoring` and the crashloop protection did nothing
+    (2026-08-09). A key in the wrong section is present in the file and absent
+    from the running system. **Presence is not effect.**
+    """
+    import configparser
+    import pathlib
+    # interpolation=None: systemd specifiers like %h are not configparser
+    # interpolation, and the default parser raises on them.
+    cp = configparser.ConfigParser(
+        strict=False, allow_no_value=True, interpolation=None)
+    cp.optionxform = str
+    cp.read(pathlib.Path(__file__).resolve().parents[1] / "squad" / "systemd" / name)
+    return {s: dict(cp[s]) for s in cp.sections()}
+
+
 def test_the_watch_unit_never_becomes_load_bearing():
     """🔴 The whole safety argument in one file. If this unit ever replaced
     the timer, a quietly-dead doorbell would look exactly like a quiet fleet —
     the failure vps-hetzner hit with egress-sync, where the failure mode was
     indistinguishable from the success mode."""
-    import pathlib
-    root = pathlib.Path(__file__).resolve().parents[1] / "squad" / "systemd"
-    watch = (root / "mcp-hub-edge-watch.service").read_text()
-    timer = (root / "mcp-hub-edge.timer").read_text()
+    watch = _unit("mcp-hub-edge-watch.service")
+    timer = _unit("mcp-hub-edge.timer")
 
-    assert "mcp-hub edge watch" in watch
-    assert "Restart=always" in watch
-    # Retrying forever is correct BECAUSE the timer covers correctness; a
-    # start limit would disable the unit and lose the doorbell silently.
-    assert "StartLimitIntervalSec=0" in watch
+    assert "edge watch" in watch["Service"]["ExecStart"]
+    assert watch["Service"]["Restart"] == "always"
     # Same credentials as the timer's pass, or the two triggers stop being
     # the same pass.
-    assert "EnvironmentFile=-%h/.mcp-hub/edge-env" in watch
-    assert ".venv/bin/mcp-hub" in watch, "bare PATH has no ~/.local/bin"
+    assert watch["Service"]["EnvironmentFile"] == "-%h/.mcp-hub/edge-env"
+    assert ".venv/bin/mcp-hub" in watch["Service"]["ExecStart"], \
+        "bare PATH has no ~/.local/bin"
     # ...and the floor is still a floor.
-    assert "OnUnitActiveSec=30s" in timer
+    assert timer["Timer"]["OnUnitActiveSec"] == "30s"
+
+
+def test_the_crashloop_guard_is_in_the_SECTION_SYSTEMD_READS():
+    """🔴 systemd moved StartLimitIntervalSec to [Unit] in 229 and SILENTLY
+    IGNORES it in [Service]. Retrying forever is correct here BECAUSE the timer
+    covers correctness — giving up would lose the doorbell with nobody
+    noticing, which is the exact failure this unit is shaped to avoid."""
+    watch = _unit("mcp-hub-edge-watch.service")
+    assert watch["Unit"].get("StartLimitIntervalSec") == "0", \
+        "not in [Unit] — systemd ignores it and the guard does nothing"
+    assert "StartLimitIntervalSec" not in watch["Service"]
 
 
 def test_edge_watch_is_reachable_through_the_parser():
