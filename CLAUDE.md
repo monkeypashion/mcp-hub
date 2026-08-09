@@ -434,6 +434,47 @@ into the hub, so comms come free — a bonus, never a gate. A plain folder gets
 `--continue` but **not** the comms flag, since that flag is inert without a hub
 identity and implying comms it cannot have would make the roster lie.
 
+### Putting a REMOTE-LESS folder on the hub — `--hub`
+
+```bash
+squad add-folder ~/Projects/my-notes --hub                      # project: folder/my-notes
+squad add-folder ~/Projects/my-notes --hub --project team/notes # name it yourself
+```
+
+**It UPGRADES a folder that is already on the roster**, in place and
+idempotently — which is the common case, since every plain-folder agent is
+already enrolled. It reuses the existing roster name (the marker must name the
+agent `squad start` will actually launch) and arms comms via `arm_comms`, so
+the rest of the launch args survive; losing `--continue` would make `heal`
+refuse to restart the agent, silently.
+
+Without this, a plain folder can be **started and stopped through the API but
+never messaged by it** — hub identity is derived from the git remote, so no
+remote meant no project, so `hub_optedin` refused and `arm_comms` never armed
+the channels flag. On dev-vm-1 that was **13 of the 15 on-demand agents**.
+
+`--hub` supplies all three legs, and all three are required: an identity
+**marker** (`.claude/hub-agent.json`) to register under, the **opt-in** so
+`arm_comms` will act, and the **channels flag** so the binding is
+push-deliverable — without the last one the heartbeat's deliverability check
+drops the binding after 3 beats and the agent flickers offline.
+
+⚠️ **The marker stays deprecated for git repos, and `--hub` is ignored there.**
+A *committed* marker is shared by every clone, which collapses them into one
+hub identity — that needs a repo to happen. A folder with no git has no clones
+and nothing to commit, and if it later gains a remote, derived identity wins by
+the resolution order in `_resolve_agent_identity`, so it self-heals.
+
+⚠️ **The project is invented, not derived.** With no remote there is nothing
+making two machines agree on the string, so twin-pairing and `memory-export` /
+`memory-import` are only as good as the name you chose. Default `folder/<dir>`
+for local-only; pass `--project` explicitly for anything meant to pair.
+
+`squad rm` deletes the marker — **after** reading the project out of it for the
+opt-out. `_resolve_agent_identity` reads a marker with **no opt-in gate** (that
+gate applies to derived identity only), so a folder left holding one keeps
+registering and answering DMs after `rm` said it was gone.
+
 **Removing is two different acts, so it is two verbs.** `squad ws-remove <agent>
 --from <ws>` drops the folder entry from that workspace only — the agent stays
 enrolled and still appears in any other workspace listing it. `squad rm <agent>`

@@ -766,13 +766,75 @@ worktree_project() {
     | awk '{ if (match($0, "://")) { sub(".*://[^/]*/", "") } else if (match($0, ":")) { sub("[^:]*:", "") } n=split($0, p, "/"); if (n>=2) print p[n-1] "/" p[n] }'
 }
 
+# The project recorded in a folder's identity MARKER, if it has one.
+#
+# Identity is normally DERIVED from the git remote, and that is still what wins
+# wherever a remote exists. But a plain folder has no remote to derive from, so
+# it could never join the hub at all: no project, so `hub_optedin` refused, so
+# `arm_comms` never armed the channels flag, so the agent could be started and
+# stopped through the API but never MESSAGED by it. On dev-vm-1 that was 13 of
+# 15 on-demand agents (2026-08-09).
+#
+# ⚠️ The marker was deprecated for git repos and MUST stay deprecated there:
+# a COMMITTED marker is shared by every clone, so all clones collapse into one
+# hub identity and the last register() hijacks the wake binding. That failure
+# needs a repo to happen — a folder with no git has no clones and nothing to
+# commit, so it cannot occur. And if such a folder later gains a remote,
+# derived identity wins over the marker by the resolution order in
+# `_resolve_agent_identity`, so it self-heals rather than dragging anything
+# back.
+# Write (or update) a folder's identity marker. One writer, because both the
+# first-enrolment path and the upgrade-in-place path need it and a second copy
+# is a second chance to disagree about the shape.
+write_hub_marker() {  # <dir> <name> <project>
+  mkdir -p "$1/.claude"
+  python3 - "$1/.claude/hub-agent.json" "$2" "$3" <<'PYEOF'
+import json, pathlib, sys
+path, name, proj = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert isinstance(data, dict)
+except Exception:
+    data = {}
+data["name"], data["project"] = name, proj
+path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+PYEOF
+}
+
+marker_project() {  # <dir> -> project, or nothing
+  python3 - "$1/.claude/hub-agent.json" <<'PYEOF'
+import json, pathlib, sys
+try:
+    d = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+    p = d.get("project")
+    if isinstance(p, str) and p:
+        print(p)
+except Exception:
+    pass
+PYEOF
+}
+
+# Which HUB PROJECT a worktree belongs to: the git remote's <org>/<repo>, or
+# the marker's project for a folder with no remote.
+#
+# Deliberately NOT folded into worktree_project(), which answers a different
+# question — "what repo is this?" — and feeds transport's destination
+# resolution, where an invented project would send a clone to the wrong path.
+# Two questions, two functions.
+hub_project() {
+  local p
+  p="$(worktree_project "$1")"
+  if [ -n "$p" ]; then printf '%s\n' "$p"; return 0; fi
+  marker_project "$1"
+}
+
 # Is this agent's repo opted into the hub? ~/.mcp-hub/config.json's projects
 # list is the operator's own statement of intent, so it — not roster class — is
 # what decides whether an agent should be able to hear a wake.
 hub_optedin() {
   local proj cfg="$HOME/.mcp-hub/config.json"
   [ -f "$cfg" ] || return 1
-  proj="$(worktree_project "$(untilde "$(field "$1" 2)")")"
+  proj="$(hub_project "$(untilde "$(field "$1" 2)")")"
   [ -n "$proj" ] || return 1
   python3 - "$cfg" "$proj" <<'PYEOF'
 import json, pathlib, sys
@@ -887,8 +949,11 @@ add_folder() {  # squad add-folder <dir> — enrol an EXISTING folder as an agen
   # the placement asks `squad start <seat identity>`, and the two need not
   # agree. Identity is assigned, never re-derived at the far end — the same
   # rule transport follows.
-  local dir="$1" wsfile="${2:-}" want="${3:-}" name proj
-  [ -n "$dir" ] || { echo "usage: $CMD add-folder <dir> [--to <file.code-workspace>] [--name <agent>]" >&2; return 1; }
+  # $4 = "hub" to give a REMOTE-LESS folder a real hub identity; $5 = the
+  # project to use (default folder/<basename>). Ignored where a git remote
+  # exists — that path already derives identity and arms comms.
+  local dir="$1" wsfile="${2:-}" want="${3:-}" wanthub="${4:-}" wantproj="${5:-}" name proj
+  [ -n "$dir" ] || { echo "usage: $CMD add-folder <dir> [--to <ws>] [--name <agent>] [--hub] [--project <p>]" >&2; return 1; }
   dir="$(untilde "$dir")"
   [ -d "$dir" ] || { echo "!! no such directory: $dir" >&2; return 1; }
   dir="$(cd "$dir" && pwd)"                       # absolute + symlink-free
@@ -906,6 +971,28 @@ add_folder() {  # squad add-folder <dir> — enrol an EXISTING folder as an agen
       echo "!! $dir is already enrolled as '$owner', not '$want'" >&2
       echo "   Place the seat under '$owner', or rename the roster entry." >&2
       return 1
+    fi
+    # --hub UPGRADES a folder that is already on the roster, in place. This is
+    # the COMMON case, not the exotic one: every plain-folder agent on the box
+    # is already enrolled, so a --hub that only worked at first enrolment would
+    # be unusable for precisely the agents it exists for (13 of dev-vm-1's 15
+    # on-demand agents, 2026-08-09). Uses the EXISTING roster name — the marker
+    # must name the agent `squad start` will actually launch.
+    if [ -n "$wanthub" ]; then
+      if [ -n "$(worktree_project "$dir")" ]; then
+        echo "note: $dir has a git remote, so identity is derived — --hub/--project ignored"
+      else
+        local upproj
+        upproj="${wantproj:-$(marker_project "$dir")}"
+        [ -n "$upproj" ] || upproj="folder/$(sanitize_ident "$(basename "$dir")")"
+        write_hub_marker "$dir" "$owner" "$upproj"
+        optin_project add "$upproj" >/dev/null 2>&1 || true
+        # arm_comms rather than a second roster writer: it is the one place
+        # that knows how to add the flag without disturbing the other args,
+        # and it re-checks the opt-in we just wrote.
+        arm_comms "$owner"
+        echo "hub identity: $owner  (project $upproj, via marker)"
+      fi
     fi
     echo "$owner (already enrolled)"
     # Enrolment and workspace membership are INDEPENDENT: an agent can be
@@ -937,6 +1024,24 @@ add_folder() {  # squad add-folder <dir> — enrol an EXISTING folder as an agen
     echo "     $(field "$name" 2)" >&2
     echo "   Rename the folder or enrol it by hand with a distinct name." >&2
     return 1
+  fi
+
+  # --hub on a REMOTE-LESS folder: give it a real hub identity via the marker.
+  # Order matters — the marker must exist before the roster line is written,
+  # because `proj` below is what decides whether the comms flag goes on, and an
+  # agent armed for comms with no identity to register under would show up as a
+  # permanently-offline row.
+  if [ -n "$wanthub" ] && [ -z "$proj" ]; then
+    proj="${wantproj:-folder/$(sanitize_ident "$(basename "$dir")")}"
+    write_hub_marker "$dir" "$name" "$proj"
+    optin_project add "$proj" >/dev/null 2>&1 || true
+    echo "hub identity: $name  (project $proj, via marker — no git remote to derive from)"
+  elif [ -n "$wanthub" ]; then
+    # A remote exists, so identity is DERIVED and comms are already armed
+    # above. Writing a marker here would be inert (derived wins) and would put
+    # a file in a git repo that must never be committed — the collision the
+    # marker was deprecated for.
+    echo "note: $dir has a git remote, so identity is derived — --hub/--project ignored"
   fi
 
   # faculty: never auto-started by `up`, shown on who/board only while running.
@@ -999,7 +1104,7 @@ rm_agent() {   # squad rm [agent] — exact inverse of add: session, roster, opt
   # The roster row is already gone by this point (above), so "any remaining
   # row" is exactly the right question to ask.
   if [ -d "$dir" ]; then
-    proj="$(worktree_project "$dir")"
+    proj="$(hub_project "$dir")"
     if [ -n "$proj" ]; then
       local sib="" n w d2
       while IFS='|' read -r n w _rest; do
@@ -1007,7 +1112,7 @@ rm_agent() {   # squad rm [agent] — exact inverse of add: session, roster, opt
         case "$n" in \#*) continue ;; esac
         d2="$(untilde "$w")"
         [ -d "$d2" ] || continue
-        if [ "$(worktree_project "$d2")" = "$proj" ]; then sib="$n"; break; fi
+        if [ "$(hub_project "$d2")" = "$proj" ]; then sib="$n"; break; fi
       done < "$CONF"
       if [ -n "$sib" ]; then
         echo "hub opt-in KEPT: $proj — still used by '$sib'"
@@ -1016,6 +1121,20 @@ rm_agent() {   # squad rm [agent] — exact inverse of add: session, roster, opt
         optin_project remove "$proj"
       fi
     fi
+  fi
+  # A MARKER identity survives everything else this verb does, so it has to go
+  # too — and only AFTER the opt-out above, which reads the project OUT of it.
+  # `_resolve_agent_identity` reads the marker with NO opt-in gate (that gate
+  # applies to DERIVED identity only), so a folder left holding one keeps
+  # registering, heartbeating and answering DMs after `squad rm` reported the
+  # agent removed: the silent-disconnect failure, in the direction nobody
+  # checks. Only ever for a REMOTE-LESS folder — a marker inside a git repo is
+  # the deprecated committed kind and is not this verb's to delete.
+  if [ -d "$dir" ] && [ -z "$(worktree_project "$dir")" ] \
+     && [ -f "$dir/.claude/hub-agent.json" ]; then
+    rm -f "$dir/.claude/hub-agent.json"
+    rmdir "$dir/.claude" 2>/dev/null || true
+    echo "  removed hub identity marker ($dir/.claude/hub-agent.json)"
   fi
   # retire daemon + state files
   safe="$(printf '%s' "$a" | sed 's/[^A-Za-z0-9_-]/_/g')"
@@ -1993,12 +2112,12 @@ PYEOF
 # Is any REMAINING roster row on this project? Teardown must not opt the repo
 # out of the hub while an original clone of it still lives here — that would
 # silence the hooks for an agent it never touched.
-project_still_present() {
+project_still_present() {  # any OTHER enrolled agent still in this hub project?
   local proj="$1" a d
   for a in $(agents); do
     d="$(untilde "$(field "$a" 2)")"
     [ -d "$d" ] || continue
-    [ "$(worktree_project "$d")" = "$proj" ] && return 0
+    [ "$(hub_project "$d")" = "$proj" ] && return 0
   done
   return 1
 }
@@ -3755,17 +3874,21 @@ print("\n".join(r[2] for r in rows))
             # tmux server: it prints EXACTLY what up/restart would type.
             a="$(need_agent "${2:-}")" || exit 1; launch_line "$a" ;;
   add-folder) # squad add-folder <dir> [--to <file.code-workspace>] [--name <agent>]
-            shift; d_arg="${1:-}"; ws_arg=""; name_arg=""
+            shift; d_arg="${1:-}"; ws_arg=""; name_arg=""; hub_arg=""; proj_arg=""
             while [ $# -gt 0 ]; do case "$1" in
               --to)   ws_arg="${2:-}"; shift 2 ;;
               # --name: the hub's ASSIGNED seat identity, passed by the edge
               # when it materializes a repo-less placement. Without it the
               # roster name is derived here and need not match the placement.
               --name) name_arg="${2:-}"; shift 2 ;;
-              -*)     echo "!! unknown add-folder flag '$1' (valid: --to, --name)" >&2; exit 1 ;;
+              # --hub: give a folder with NO git remote a real hub identity, so
+              # it can be DM'd and woken and not merely started and stopped.
+              --hub)     hub_arg="hub"; shift ;;
+              --project) proj_arg="${2:-}"; hub_arg="hub"; shift 2 ;;
+              -*)     echo "!! unknown add-folder flag '$1' (valid: --to, --name, --hub, --project)" >&2; exit 1 ;;
               *)      shift ;;
             esac; done
-            add_folder "$d_arg" "$(untilde "$ws_arg")" "$name_arg" ;;
+            add_folder "$d_arg" "$(untilde "$ws_arg")" "$name_arg" "$hub_arg" "$proj_arg" ;;
   duplicate) # squad duplicate <agent> [--to <file.code-workspace>] [--dry-run]
             # A second seat on one repo, landing in the workspace the agent
             # already lives in. --to is optional BECAUSE the common case has one
@@ -3891,9 +4014,13 @@ interact
   $CMD handoff [agent]          commit WIP to wip/<agent>-<date> + push (before switching machines)
 
 workspaces (a "workspace" is a .code-workspace file; the cockpit shows a tab per folder in it)
-  $CMD add-folder <dir> [--to <ws>] [--name <agent>]
+  $CMD add-folder <dir> [--to <ws>] [--name <agent>] [--hub] [--project <p>]
                                 enrol an EXISTING folder as an agent. git optional — where a
                                 remote exists identity is derived and comms come free.
+                                --hub gives a REMOTE-LESS folder a real hub identity (marker +
+                                opt-in + channels flag) so it can be DM'd and woken, not merely
+                                started and stopped. --project names it (default folder/<dir>);
+                                ignored where a git remote already derives one.
   $CMD ws-new <ws>              create an empty target workspace (transport creates it too)
   $CMD ws-add <agent> --to <ws>       list an enrolled agent's folder in a workspace
   $CMD ws-remove [agent] --from <ws>
