@@ -1536,6 +1536,22 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
                 "SELECT * FROM api_placements WHERE id = ?", (pid,)
             ).fetchone()
             return JSONResponse(placement_json(row))
+        # ?purge=true = UNPLACE: forget the row, ask the edge for nothing.
+        # Reclaim and unplace are different intents that were sharing one
+        # verb — DELETE meant "destroy the substrate", so the only way to stop
+        # scheduling a seat was to demolish the agent behind it (for a
+        # worktree seat, `squad rm`). A row written against a real roster
+        # agent could therefore never be tidied away (2026-08-09).
+        #
+        # Nothing is asked of the edge because nothing needs to be: the row is
+        # the whole of what the hub contributes, and `plan()` only ever acts
+        # on placements it is served. A deleted row is served to nobody, so
+        # the machine simply stops hearing about that seat — the substrate
+        # keeps whatever state it was in, which is precisely the point.
+        if request.query_params.get("purge") == "true":
+            db().execute("DELETE FROM api_placements WHERE id = ?", (pid,))
+            db().commit()
+            return JSONResponse({"id": pid, "purged": True})
         # DELETE = reclaim request: harvest + verify + destroy, each pending
         # until an edge executes and reports it. Never marked done here — the
         # hub asserting completion would be the exact self-assertion the

@@ -1775,6 +1775,42 @@ def _workspace_listings(path: pathlib.Path) -> list[str]:
         return []
 
 
+def refuse_unhonoured_dry_run(
+    args: argparse.Namespace, honoured: tuple[str, ...]
+) -> bool:
+    """True when --dry-run was passed to an action that does not implement it.
+
+    🔴 A --dry-run that is silently IGNORED is worse than one that does not
+    exist. Measured against PRODUCTION 2026-08-09: `seats add --dry-run`
+    really created the seat and printed the SAME success line a real add
+    prints, so nothing in the output said a write had happened — the next
+    command failed with 409 and that was the only signal. `seats rm --dry-run`
+    DELETED by the identical omission.
+
+    These parsers share one --dry-run across every action, so scoping it in a
+    help string ("update/clone: …") is documentation, not a guard. This is the
+    guard, and it is fail-CLOSED: an action absent from `honoured` refuses,
+    so a NEW write verb added later cannot inherit the silent-write bug — the
+    worst it can do is decline a flag it never implemented.
+
+    Read-only actions belong in `honoured`: for `list`, a dry run and a real
+    run are the same act, so the flag is honoured trivially rather than
+    ignored.
+    """
+    if not getattr(args, "dry_run", False):
+        return False
+    action = getattr(args, "action", "") or ""
+    if action in honoured:
+        return False
+    print(
+        f"--dry-run is not implemented for '{action}' — it is honoured for: "
+        f"{', '.join(honoured)}.\nRefusing rather than writing: a dry run "
+        "that performs the real act is the worst of both.",
+        file=sys.stderr,
+    )
+    return True
+
+
 def machines_command(args: argparse.Namespace, api: Any = None) -> int:
     """Machine enrolment — `mcp-hub machines list|enrol`.
 
@@ -1975,6 +2011,9 @@ def seats_command(args: argparse.Namespace, api: Any = None) -> int:
     if api is None:
         api = OperatorApi(api_base(args.hub_url))
     machine = args.machine or _sanitize_ident(platform.node() or "unknown-host")
+    if refuse_unhonoured_dry_run(args, ("list", "logs", "add", "rm",
+                                        "update", "clone")):
+        return 1
 
     try:
         if args.action == "list":
@@ -2090,10 +2129,31 @@ def seats_command(args: argparse.Namespace, api: Any = None) -> int:
                     spec["brief"] = brief
                 if inputs:
                     spec["inputs"] = inputs
+            what = f"docker ({args.image})" if args.image else "worktree"
+            if args.dry_run:
+                # The identity is deliberately NOT predicted here. The hub
+                # ASSIGNS it (runtime design: a container's hostname must
+                # never name a seat), so re-deriving it client-side would be a
+                # second implementation free to disagree with the first — and
+                # a dry run that prints a name the real add then does not use
+                # is its own small lie.
+                print(f"would declare a seat on {machine} [{what}]")
+                for label, val in (("repo", args.repo),
+                                   ("folder", args.folder),
+                                   ("identity", args.want_identity),
+                                   ("class", args.klass),
+                                   ("launch args", args.launch_args)):
+                    if val:
+                        print(f"  {label:<12} {val}")
+                if spec:
+                    print(f"  {'spec keys':<12} {', '.join(sorted(spec))}")
+                if not args.want_identity:
+                    print("  identity is ASSIGNED by the hub, so it is not "
+                          "predicted here")
+                return 0
             rec = api.create_seat(args.repo, machine, args.folder,
                                   args.want_identity, args.launch_args,
                                   args.klass, spec)
-            what = f"docker ({args.image})" if args.image else "worktree"
             print(f"seat {rec['identity']} declared on {rec.get('machine', '')}"
                   f"  [{what}]")
             print("it will not run until it is PLACED: "
@@ -2166,6 +2226,14 @@ def seats_command(args: argparse.Namespace, api: Any = None) -> int:
         if not args.identity:
             print("name the seat to archive", file=sys.stderr)
             return 1
+        if args.dry_run:
+            # This branch used to fall straight through to delete_seat, so
+            # `seats rm --dry-run` ARCHIVED the seat. A dry run that deletes
+            # is the worst instance of the whole class.
+            print(f"would archive seat {args.identity} "
+                  "(the worktree is untouched; refused if it still has "
+                  "active placements)")
+            return 0
         api.delete_seat(args.identity)
         print(f"seat {args.identity} archived (the worktree is untouched)")
         return 0
@@ -2344,6 +2412,59 @@ def _report_leftovers(api: Any, seat: str, machine: str) -> None:
         print(f"    {line}")
 
 
+def _placements_unplace(args: argparse.Namespace, api: Any) -> int:
+    """Drop a placement row and touch NOTHING on the machine.
+
+    🔴 The gap this closes: a placement could not be un-made. `DELETE` on the
+    API means *reclaim* — harvest, verify, destroy — which for a worktree seat
+    runs `squad rm`, unenrolling the agent and opting its repo out of the hub.
+    So the only way to stop the hub scheduling a seat was to demolish the
+    agent, and a test placement written against a real roster agent could not
+    be tidied away at all (2026-08-09).
+
+    They are different intents and now they are different verbs:
+      reclaim  — "this seat is finished"      → substrate destroyed
+      unplace  — "the hub should stop caring" → substrate untouched
+
+    Unplacing does NOT stop a running agent — it removes the policy, not the
+    process — so a seat last observed RUNNING is refused without --yes. That
+    leaves it alive and unmanaged, which is a legitimate thing to want (it is
+    how you hand an agent back to `squad`) but never a thing to do by
+    accident.
+    """
+    if not args.target:
+        print("name the placement to unplace (mcp-hub placements list)",
+              file=sys.stderr)
+        return 1
+    row = next((p for p in (api.list_placements() or [])
+                if p.get("id") == args.target), None)
+    if row is None:
+        print(f"no placement '{args.target}'", file=sys.stderr)
+        return 1
+    seat = row.get("seat", "")
+    machine = row.get("machine", "")
+    observed = (row.get("observed") or {}).get("state") or "unknown"
+    if args.dry_run:
+        print(f"would unplace {args.target} ({seat} on {machine}) — the hub "
+              f"forgets it; the substrate is untouched (last seen {observed})")
+        return 0
+    if observed == "running" and not args.yes:
+        print(f"{seat} was last observed RUNNING on {machine}. Unplacing "
+              "removes the policy, not the process — it would keep running "
+              "with nothing scheduling it.\nStop it first:\n"
+              f"  mcp-hub placements set {args.target} stopped\n"
+              "or re-run with --yes to abandon it deliberately.",
+              file=sys.stderr)
+        return 1
+    api.unplace_placement(args.target)
+    print(f"{args.target} unplaced — {seat} is no longer scheduled on "
+          f"{machine}; nothing there was changed")
+    if observed == "running":
+        print(f"⚠️  it was last seen RUNNING and is now unmanaged — "
+              f"`squad stop {seat}` on {machine} if that is not what you want")
+    return 0
+
+
 def placements_command(args: argparse.Namespace, api: Any = None) -> int:
     """Placements — WHERE a seat runs. `mcp-hub placements list|set|reclaim`.
 
@@ -2355,6 +2476,8 @@ def placements_command(args: argparse.Namespace, api: Any = None) -> int:
 
     if api is None:
         api = OperatorApi(api_base(args.hub_url))
+    if refuse_unhonoured_dry_run(args, ("list", "set", "reclaim", "unplace")):
+        return 1
 
     try:
         if args.action == "list":
@@ -2405,8 +2528,40 @@ def placements_command(args: argparse.Namespace, api: Any = None) -> int:
             _report_leftovers(api, seat_name, machine)
             return 0
 
+        if args.action == "unplace":
+            return _placements_unplace(args, api)
+
         # -- set --------------------------------------------------------
-        desired = args.desired or "running"
+        # `--seat` (create) and a placement id (amend) are two different
+        # modes, and the id used to WIN SILENTLY: `set running --seat X`
+        # bound "running" to `target`, so it read as "amend the placement
+        # whose id is 'running'" and dropped --seat/--machine on the floor
+        # without a word (measured 2026-08-09).
+        # ORDER MATTERS: the mis-bind is a strict sub-case of "both modes
+        # given", so the generic refusal would fire first and hide the one
+        # message that actually explains what happened.
+        if args.target in ("running", "stopped", "ran"):
+            print(f"'{args.target}' is a desired state, not a placement id — "
+                  f"argparse bound it to the id because it followed the "
+                  f"action.\nUse:  mcp-hub placements set --seat <seat> "
+                  f"--machine <machine> --desired {args.target}",
+                  file=sys.stderr)
+            return 1
+        if args.target and args.seat:
+            print("pass a placement id OR --seat, not both — an id amends an "
+                  "existing placement, --seat creates a new one",
+                  file=sys.stderr)
+            return 1
+        # Both spellings converge; disagreement is refused rather than
+        # resolved by precedence, because picking one silently is how the
+        # wrong state gets written. getattr: callers build this Namespace by
+        # hand (the API tests do) and predate the flag.
+        desired_flag = getattr(args, "desired_flag", None)
+        if desired_flag and args.desired and desired_flag != args.desired:
+            print(f"--desired {desired_flag} contradicts the positional "
+                  f"'{args.desired}' — pass one", file=sys.stderr)
+            return 1
+        desired = desired_flag or args.desired or "running"
         if desired not in ("running", "stopped", "ran"):
             print("desired must be running, stopped, or ran — `ran` is the "
                   "headless ask: run ONCE, ever, and never restart (reclaim "
@@ -2879,6 +3034,13 @@ def capsules_command(args: argparse.Namespace, api: Any = None) -> int:
 
     if api is None:
         api = OperatorApi(api_base(args.hub_url))
+    # compose and place are NOT honoured: neither can be previewed without
+    # asking the hub what it would freeze/place, and inventing a local guess
+    # would be the second implementation this file keeps refusing to write.
+    # Refusing is the honest half — `capsules compose --dry-run` used to
+    # compose for real.
+    if refuse_unhonoured_dry_run(args, ("list", "rm", "attach")):
+        return 1
 
     try:
         if args.action == "list":
@@ -3016,6 +3178,8 @@ def workspaces_command(args: argparse.Namespace, api: Any = None) -> int:
         api = OperatorApi(api_base(args.hub_url))
     scan_dirs = [pathlib.Path(d) for d in (getattr(args, "scan_dir", None) or [])] \
         or _workspace_scan_dirs()
+    if refuse_unhonoured_dry_run(args, ("list", "register", "remove")):
+        return 1
 
     if args.action == "remove":
         return _workspaces_remove(args, api, machine)
@@ -6651,7 +6815,9 @@ def build_parser() -> argparse.ArgumentParser:
     seats.add_argument("--follow", action="store_true",
                        help="logs: stream until interrupted")
     seats.add_argument("--dry-run", action="store_true",
-                       help="update/clone: print what would change, write nothing")
+                       help="add/rm/update/clone: print what would change, "
+                            "write nothing. An action that does not implement "
+                            "it REFUSES rather than acting")
 
     placements = sub.add_parser(
         "placements",
@@ -6667,14 +6833,25 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     placements.add_argument(
-        "action", choices=["list", "set", "reclaim"],
-        help="list · set: running|stopped|ran · reclaim: harvest then destroy",
+        "action", choices=["list", "set", "reclaim", "unplace"],
+        help="list · set: running|stopped|ran · reclaim: harvest then DESTROY "
+             "· unplace: drop the row, leave the substrate alone",
     )
     placements.add_argument("target", nargs="?", default=None,
-                            help="set/reclaim: placement id")
+                            help="set/reclaim/unplace: placement id")
     placements.add_argument("desired", nargs="?", default=None,
                             help="set: running|stopped|ran (ran = headless: "
-                                 "run once, never restart)")
+                                 "run once, never restart). Reachable only "
+                                 "with a placement id — use --desired when "
+                                 "creating with --seat")
+    placements.add_argument(
+        "--desired", dest="desired_flag", default=None,
+        choices=["running", "stopped", "ran"],
+        help="set: desired state as a FLAG. argparse cannot bind a trailing "
+             "positional that follows an option, so `set --seat X ran` either "
+             "errors or silently binds `ran` to the placement id — which made "
+             "`ran` unreachable at creation time (measured 2026-08-09)",
+    )
     placements.add_argument("--seat", default="", help="set: create for this seat")
     placements.add_argument("--machine", default=None, help="set: on this machine")
     placements.add_argument("--substrate", default="worktree",
@@ -6682,7 +6859,8 @@ def build_parser() -> argparse.ArgumentParser:
                             help="set: worktree (tmux seat) or docker (container)")
     placements.add_argument(
         "--yes", action="store_true",
-        help="reclaim: skip the confirmation — it DESTROYS the substrate",
+        help="reclaim: skip the confirmation — it DESTROYS the substrate. "
+             "unplace: confirm abandoning a seat last observed RUNNING",
     )
     placements.add_argument("--dry-run", action="store_true",
                             help="print what would change; write nothing")
@@ -6762,7 +6940,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     capsules.add_argument(
         "--dry-run", action="store_true",
-        help="attach: print what would be enrolled; write nothing",
+        help="rm/attach: print what would change; write nothing. compose and "
+             "place REFUSE it — neither can be previewed without asking the "
+             "hub, and a local guess would be a second implementation",
     )
     capsules.add_argument("--squad", default=None, help="compose: which squad")
     capsules.add_argument(

@@ -169,7 +169,27 @@ record, not an action.*
 | GET | `/placements/{id}` | One placement: desired, observed (timestamped enumeration), status, history of transitions |
 | PATCH | `/placements/{id}` | Change desired state (`running` → `stopped`) |
 | DELETE | `/placements/{id}` | **Reclaim request** = harvest + verify + destroy, in that order: memory delta exported to staging, substrate enumerated empty (with positive control), then destroyed; failure → `orphaned` + loud |
+| DELETE | `/placements/{id}?purge=true` | **Unplace**: drop the row, ask the edge for nothing, leave the substrate exactly as it is |
 | POST | `/placements/{id}/observed` | Edge reports enumerated reality (v1 stub: stored and surfaced, drives `status`) |
+
+**Reclaim and unplace are different intents, so they are different calls.**
+They shared one verb until 2026-08-09, which meant the only way to stop the
+hub scheduling a seat was to *demolish the agent behind it* — for a worktree
+seat, `squad rm`, unenrolling it and opting its repo out of the hub. A
+placement written against a real roster agent could therefore never be tidied
+away.
+
+- `reclaim` — "this seat is finished" → substrate destroyed.
+- `?purge=true` — "the hub should stop caring" → substrate untouched.
+
+Purge asks the edge for nothing because nothing needs asking: the row is the
+whole of the hub's contribution, and `plan()` only ever acts on placements it
+is served. A deleted row is served to nobody. It is **opt-in** (`purge=true`
+exactly — `purge=1` still reclaims), so every existing DELETE in the fleet
+keeps destroying, and it is **operator-only**, so an edge cannot quietly drop
+its own policy. CLI: `mcp-hub placements unplace <id>`, which refuses without
+`--yes` when the seat was last observed `running` — unplacing removes the
+policy, not the process.
 
 **v1 stub semantics:** POST/PATCH/DELETE write desired state and return
 `status: pending-edge`. The interim realizer is a human (or cron) running
