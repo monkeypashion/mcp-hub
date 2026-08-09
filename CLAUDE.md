@@ -847,7 +847,22 @@ per machine:
 ln -sfn ~/Projects/code/monkeypashion/mcp-hub/squad/systemd/mcp-hub-edge.service ~/.config/systemd/user/
 ln -sfn ~/Projects/code/monkeypashion/mcp-hub/squad/systemd/mcp-hub-edge.timer   ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now mcp-hub-edge.timer
+
+# ...and the DOORBELL, which turns ~35s into ~1s. Separate unit, separate
+# enable — a machine that installs only the timer above is CORRECT but slow,
+# and nothing warns you, so install both together.
+ln -sfn ~/Projects/code/monkeypashion/mcp-hub/squad/systemd/mcp-hub-edge-watch.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now mcp-hub-edge-watch.service
 ```
+
+**The doorbell** (`mcp-hub edge watch`) holds an SSE stream to
+`/api/v1/machines/{m}/watch` and runs the same pass the timer runs the moment
+desired state changes — measured 1s vs 95s before it existed. It is
+**deliberately not load-bearing**: the timer stays, so a stopped or
+quietly-disconnected watcher costs latency and never work. Check it with
+`journalctl --user -u mcp-hub-edge-watch.service` — a healthy one logs
+`doorbell: connected` and an `edge apply (doorbell)` per change. Full design:
+`docs/hub-api-v1.md` → The doorbell.
 
 Every **30 seconds** — deliberately faster than `squad-heal`, which this once
 matched. The interval IS the latency an operator feels: a placement written
