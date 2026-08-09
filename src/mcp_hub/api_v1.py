@@ -681,9 +681,17 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
         # unit needs only a machine and, when its identity is not given, a
         # repo to build a name from. Demanding a repo of nginx forces an
         # operator to invent a field the roster then carries forever.
-        required = ["machine"] if spec.get("image") \
-            else ["repo", "machine", "folder"]
-        if spec.get("image") and not body.get("identity"):
+        # ...and a WORKTREE unit need not have a remote either. Most of the
+        # on-demand roster is plain folders — `squad add-folder` exists
+        # precisely because "a folder that already exists becomes an agent",
+        # git optional. Demanding a repo excluded 13 of dev-vm-1's 15 faculty
+        # agents from ever being placed, i.e. the API could start almost none
+        # of the agents worth starting from a UI (measured 2026-08-09).
+        #
+        # So `repo` is now ONE thing in both branches: the source of a derived
+        # name. Give an identity and it is not needed at all.
+        required = ["machine"] if spec.get("image") else ["machine", "folder"]
+        if not body.get("identity"):
             required.append("repo")  # only as the source of a derived name
         for field in required:
             if not body.get(field):

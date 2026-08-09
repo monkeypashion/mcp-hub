@@ -366,3 +366,53 @@ def test_unplace_without_a_target_is_refused(capsys):
 def test_unplace_is_reachable_through_the_parser():
     ns = cli.build_parser().parse_args(["placements", "unplace", "pl-1"])
     assert ns.action == "unplace" and ns.target == "pl-1"
+
+
+# ----------------------------------------- 4. repo-less folders are placeable
+#
+# 🔴 `mindconnect-iot2050` — a plain folder, already a roster agent, sitting in
+# the operator's cockpit — could not be woken through the API at all, because
+# declaring a seat demanded a git remote. Measured on dev-vm-1 2026-08-09:
+# 13 of 15 FACULTY (on-demand) agents are plain folders, i.e. the API could
+# start 2 of the 15 agents most worth starting from a UI.
+#
+# `repo` is now one thing only, in both branches: the source of a derived NAME.
+
+
+def test_a_plain_folder_seat_is_accepted_when_NAMED(capsys):
+    api = FakeApi()
+    rc = cli.seats_command(
+        _args(action="add", folder="/home/x/Projects/mindconnect",
+              want_identity="mindconnect-iot2050-dev-vm-1",
+              machine="dev-vm-1", klass="faculty"),
+        api=api)
+    assert rc == 0
+    assert any(c[0] == "create_seat" and c[1] == "" for c in api.calls), (
+        f"a repo-less seat was not created: {api.calls}")
+
+
+def test_a_plain_folder_seat_with_NO_name_is_refused_not_guessed(capsys):
+    """The basename is NOT a safe fallback: deriving identity from it while
+    the cli derives from the git remote is what makes a clone's statusline
+    read `hub ?`. Refuse and say what to pass."""
+    api = FakeApi()
+    rc = cli.seats_command(
+        _args(action="add", folder="/home/x/Projects/mindconnect",
+              machine="dev-vm-1"),
+        api=api)
+    assert rc == 1
+    assert api.calls == []
+    err = capsys.readouterr().err
+    assert "--repo or --identity" in err
+    assert "derived NAME" in err, "the refusal must say WHY repo is optional"
+
+
+def test_folder_is_STILL_required_for_a_worktree_seat(capsys):
+    """The control: relaxing repo must not relax everything. Without a folder
+    there is nothing on disk to enrol."""
+    api = FakeApi()
+    rc = cli.seats_command(
+        _args(action="add", repo="org/x", machine="box"), api=api)
+    assert rc == 1
+    assert api.calls == []
+    assert "--folder" in capsys.readouterr().err

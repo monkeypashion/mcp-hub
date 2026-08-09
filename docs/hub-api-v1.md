@@ -91,6 +91,29 @@ and derivation rules.*
 | POST | `/seats/{name}/clone` | **The transport as API**: body names target machine/workspace/suffix; hub composes the artifact set (repo ref, memory export, re-keyed history spec, marker); realization = placement |
 | GET | `/seats/{name}/status` | Presence detail: binding age, last heartbeat, idle flag — what the statusline reads, as JSON |
 
+**`repo` is the source of a derived NAME, and nothing else** — in both the
+worktree and the docker branch. Give an `identity` and it is not needed at
+all. A worktree seat needs `machine` + `folder`; a docker seat needs
+`machine` + an image.
+
+This matters more than it sounds: a folder with **no git remote is a
+first-class agent** here (`squad add-folder` — *"git optional"*), and most of
+the on-demand roster is exactly that. On dev-vm-1, **13 of 15 faculty agents
+are plain folders**, so requiring a repo meant the API could start almost none
+of the agents a UI would exist to start (measured 2026-08-09). The edge picks
+its materialize verb from what the seat has:
+
+| seat has | edge runs |
+|---|---|
+| `repo` | `squad add <org>/<repo>` — clone/pull, then enrol |
+| `folder` only | `squad add-folder <dir> --name <identity>` — enrol what is already there |
+| neither | `skip`, with a reason — never a guess |
+
+`--name` carries the hub's **assigned** identity. Without it `add-folder`
+derives `<basename>-<hostname>`, which need not equal the seat — materialize
+would "succeed" and the next `squad start <seat>` would fail on a name that is
+not in the roster. Identity is assigned, never re-derived at the far end.
+
 **Identity rule (from the runtime design):** seats created via API always get
 **assigned** identities. Derivation remains a client-side convenience for
 hand-made seats; the API never relies on a container's hostname.

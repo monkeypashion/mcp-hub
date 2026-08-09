@@ -239,6 +239,47 @@ class TestExecutor:
         SquadExecutor(r).execute({"op": "materialize", "seat": "widget-box-1"}, self._spec())
         assert ["squad", "add", "acme/widget"] in r.commands
 
+    def test_a_REPO_LESS_seat_materializes_via_add_folder(self):
+        """🔴 Most of the on-demand roster has no git remote — 13 of
+        dev-vm-1's 15 faculty agents, measured 2026-08-09 — so requiring a
+        repo meant the API could start almost none of the agents anyone would
+        want to start from a UI.
+
+        `squad add-folder` exists for exactly this ("git optional"). Passing
+        an empty repo to `squad add` would have run `squad add ""`.
+        """
+        r = _RecordingRunner()
+        spec = {"identity": "mindconnect-box-1", "repo": "",
+                "folder": "/home/x/Projects/mindconnect", "launch_args": ""}
+        SquadExecutor(r).execute(
+            {"op": "materialize", "seat": "mindconnect-box-1"}, spec)
+        assert ["squad", "add-folder", "/home/x/Projects/mindconnect",
+                "--name", "mindconnect-box-1"] in r.commands
+        assert not any(c[:2] == ["squad", "add"] for c in r.commands)
+
+    def test_the_ASSIGNED_identity_is_passed_not_left_to_derivation(self):
+        """add-folder derives <basename>-<hostname> when not told otherwise,
+        which need not equal the seat. Materialize would then 'succeed' and
+        the very next `squad start <seat>` would fail on a name that is not in
+        the roster — so the hub's assignment travels with the command."""
+        r = _RecordingRunner()
+        spec = {"identity": "custom-name-box-1", "repo": "",
+                "folder": "/home/x/Projects/totally-different", "launch_args": ""}
+        SquadExecutor(r).execute(
+            {"op": "materialize", "seat": "custom-name-box-1"}, spec)
+        cmd = next(c for c in r.commands if c[1] == "add-folder")
+        assert cmd[cmd.index("--name") + 1] == "custom-name-box-1"
+
+    def test_a_seat_with_NEITHER_repo_nor_folder_runs_nothing(self):
+        """Fail-closed: guessing a materialize source is how `squad add ""`
+        got run in the first place."""
+        r = _RecordingRunner()
+        out = SquadExecutor(r).execute(
+            {"op": "materialize", "seat": "nowhere-box-1"},
+            {"identity": "nowhere-box-1", "repo": "", "folder": ""})
+        assert r.commands == []
+        assert out["skipped"] and "neither repo nor folder" in out["reason"]
+
     def test_start_stop_map_to_squad_verbs(self):
         r = _RecordingRunner()
         ex = SquadExecutor(r)

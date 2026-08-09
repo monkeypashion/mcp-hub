@@ -2034,13 +2034,29 @@ def seats_command(args: argparse.Namespace, api: Any = None) -> int:
             # folder on this host — or a repo. Demanding either of nginx would
             # be a lie: an inference server or a web app has no git remote,
             # and the image IS the thing that says what will run.
-            need = []
+            # EVERY missing requirement at once. Reporting them one at a time
+            # makes the operator fix one to discover the next, which for a
+            # two-field refusal is two round trips for no reason.
+            problems = []
             if not args.image:
-                need = [("--repo", args.repo), ("--folder", args.folder)]
-            missing = [f for f, v in need if not v]
-            if missing:
-                print(f"{' and '.join(missing)} required — a seat without them "
-                      "cannot be materialized anywhere", file=sys.stderr)
+                if not args.folder:
+                    problems.append(
+                        "--folder — the path on that machine; without it there "
+                        "is nothing to enrol")
+                # A folder with NO git remote is a first-class agent here
+                # (`squad add-folder`), so a repo is not required — but the
+                # name has to come from somewhere, and deriving it from a
+                # basename is the drift that makes a clone's statusline read
+                # `hub ?`. Name it explicitly instead.
+                if not args.repo and not args.want_identity:
+                    problems.append(
+                        "--repo or --identity — repo is only the source of a "
+                        "derived NAME, so a folder with no git remote just "
+                        "needs naming")
+            if problems:
+                print("cannot declare this seat:", file=sys.stderr)
+                for p in problems:
+                    print(f"  {p}", file=sys.stderr)
                 return 1
             # HEADLESS as a first-class flag, not tribal --env knowledge. The
             # checks mirror the runtime gates (seat-entry's door, the edge's
