@@ -823,6 +823,47 @@ class TestPlacements:
         got = client.get(f"/api/v1/placements/{pid}", headers=H).json()
         assert got["desired"] == "reclaimed"
 
+    def test_a_REPO_LESS_worktree_seat_is_accepted_when_named(self, client):
+        """🔴 Most of the on-demand roster has no git remote (13 of
+        dev-vm-1's 15 faculty agents, 2026-08-09), so demanding one meant the
+        API could not start the agents most worth starting from a UI.
+        `squad add-folder` has always treated a plain folder as a first-class
+        agent; the seat contract now agrees."""
+        _machine(client)
+        r = client.post("/api/v1/seats", json={
+            "identity": "mindconnect-box-1", "machine": "box-1",
+            "folder": "/home/x/Projects/mindconnect", "class": "faculty",
+        }, headers=H)
+        assert r.status_code == 201, r.text
+        assert r.json()["identity"] == "mindconnect-box-1"
+        assert r.json()["repo"] == ""
+        # ...and it is placeable, which is the whole point.
+        assert client.post("/api/v1/placements", json={
+            "seat": "mindconnect-box-1", "machine": "box-1",
+            "substrate": "worktree",
+        }, headers=H).status_code == 201
+
+    def test_a_repo_less_seat_with_NO_identity_is_refused(self, client):
+        """The control. repo is the source of a derived NAME — drop both and
+        there is nothing to call the seat, so this must still 422 rather than
+        invent one from the folder's basename."""
+        _machine(client)
+        r = client.post("/api/v1/seats", json={
+            "machine": "box-1", "folder": "/home/x/Projects/mindconnect",
+        }, headers=H)
+        assert r.status_code == 422
+        assert "repo" in r.json()["detail"]
+
+    def test_folder_is_still_required_for_a_worktree_seat(self, client):
+        """Relaxing repo must not relax everything: with no image and no
+        folder there is nothing on disk to enrol."""
+        _machine(client)
+        r = client.post("/api/v1/seats", json={
+            "identity": "nowhere-box-1", "machine": "box-1",
+        }, headers=H)
+        assert r.status_code == 422
+        assert "folder" in r.json()["detail"]
+
     def test_purge_FORGETS_the_row_without_asking_for_a_reclaim(self, client):
         """🔴 Reclaim and unplace were sharing one verb. DELETE meant harvest+
         verify+DESTROY — for a worktree seat, `squad rm`, which unenrols the

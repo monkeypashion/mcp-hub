@@ -295,7 +295,15 @@ def test_both_substrates_are_realized_in_one_pass(tmp_path):
     assert any(c[:3] == ["docker", "ps", "-a"] for c in r.calls)  # docker side
     # The worktree seat is absent from `squad ls`, so it materializes there —
     # and via SQUAD, not docker.
-    assert any(c[:2] == ["squad", "add"] for c in r.calls)
+    #
+    # ⚠️ This asserted `["squad", "add"]` until 2026-08-09 — and the seat in
+    # this very fixture has NO repo, so what it actually pinned was
+    # `squad add ""`, a command that could only ever fail. A repo-less seat
+    # now materializes with the verb built for it, carrying the hub's ASSIGNED
+    # identity so the `squad start <seat>` that follows finds the name it
+    # expects in the roster.
+    assert ["squad", "add-folder", "/srv/pm", "--name", "pm-box-1"] in r.calls
+    assert not any(c[:2] == ["squad", "add"] for c in r.calls)
     assert api.observed["pl-1"]["enumeration"].get("container")
     assert api.observed["pl-2"]["enumeration"].get("tmux_session")
 

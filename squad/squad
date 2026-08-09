@@ -881,8 +881,14 @@ add_folder() {  # squad add-folder <dir> — enrol an EXISTING folder as an agen
   # scratch agents are plain directories) and neither is any prior Claude
   # history. Where a git remote DOES exist we derive the proper hub identity and
   # opt the project in, so comms come free — a bonus, never a gate.
-  local dir="$1" wsfile="${2:-}" name proj
-  [ -n "$dir" ] || { echo "usage: $CMD add-folder <dir> [--to <file.code-workspace>]" >&2; return 1; }
+  # $3 = NAME OVERRIDE. The edge passes the hub-ASSIGNED seat identity here,
+  # because a repo-less seat is placeable now and derivation at this end would
+  # be a second opinion: add-folder would enrol `<basename>-<hostname>` while
+  # the placement asks `squad start <seat identity>`, and the two need not
+  # agree. Identity is assigned, never re-derived at the far end — the same
+  # rule transport follows.
+  local dir="$1" wsfile="${2:-}" want="${3:-}" name proj
+  [ -n "$dir" ] || { echo "usage: $CMD add-folder <dir> [--to <file.code-workspace>] [--name <agent>]" >&2; return 1; }
   dir="$(untilde "$dir")"
   [ -d "$dir" ] || { echo "!! no such directory: $dir" >&2; return 1; }
   dir="$(cd "$dir" && pwd)"                       # absolute + symlink-free
@@ -892,6 +898,15 @@ add_folder() {  # squad add-folder <dir> — enrol an EXISTING folder as an agen
   local owner
   owner="$(awk -F'|' -v d="$dir" '$2==d{print $1; exit}' "$CONF" 2>/dev/null || true)"
   if [ -n "$owner" ]; then
+    # Enrolled under a DIFFERENT name than the caller asked for. Saying
+    # "already enrolled" here would be true and useless: the edge would call
+    # this a successful materialize and then `squad start <seat>` would fail
+    # on a name that is not in the roster. Refuse and name both sides.
+    if [ -n "$want" ] && [ "$owner" != "$(sanitize_ident "$want")" ]; then
+      echo "!! $dir is already enrolled as '$owner', not '$want'" >&2
+      echo "   Place the seat under '$owner', or rename the roster entry." >&2
+      return 1
+    fi
     echo "$owner (already enrolled)"
     # Enrolment and workspace membership are INDEPENDENT: an agent can be
     # enrolled and absent from a given workspace, which is exactly the state
@@ -911,6 +926,9 @@ add_folder() {  # squad add-folder <dir> — enrol an EXISTING folder as an agen
     optin_project add "$proj" >/dev/null 2>&1 || true
     name="$(mcp-hub identity --cwd "$dir" --any 2>/dev/null || true)"
   fi
+  # An explicit name WINS over both — it is the hub's assignment, and the
+  # caller that passes it already knows what it will `squad start`.
+  [ -z "$want" ] || name="$(sanitize_ident "$want")"
   [ -n "${name:-}" ] || name="$(sanitize_ident "$(basename "$dir")-$(hostname)")"
   [ -n "$name" ] || { echo "!! could not derive a name for $dir" >&2; return 1; }
 
@@ -3736,14 +3754,18 @@ print("\n".join(r[2] for r in rows))
             # Diagnostic, and the only way to test the launch path without a
             # tmux server: it prints EXACTLY what up/restart would type.
             a="$(need_agent "${2:-}")" || exit 1; launch_line "$a" ;;
-  add-folder) # squad add-folder <dir> [--to <file.code-workspace>]
-            shift; d_arg="${1:-}"; ws_arg=""
+  add-folder) # squad add-folder <dir> [--to <file.code-workspace>] [--name <agent>]
+            shift; d_arg="${1:-}"; ws_arg=""; name_arg=""
             while [ $# -gt 0 ]; do case "$1" in
-              --to) ws_arg="${2:-}"; shift 2 ;;
-              -*)   echo "!! unknown add-folder flag '$1' (valid: --to)" >&2; exit 1 ;;
-              *)    shift ;;
+              --to)   ws_arg="${2:-}"; shift 2 ;;
+              # --name: the hub's ASSIGNED seat identity, passed by the edge
+              # when it materializes a repo-less placement. Without it the
+              # roster name is derived here and need not match the placement.
+              --name) name_arg="${2:-}"; shift 2 ;;
+              -*)     echo "!! unknown add-folder flag '$1' (valid: --to, --name)" >&2; exit 1 ;;
+              *)      shift ;;
             esac; done
-            add_folder "$d_arg" "$(untilde "$ws_arg")" ;;
+            add_folder "$d_arg" "$(untilde "$ws_arg")" "$name_arg" ;;
   duplicate) # squad duplicate <agent> [--to <file.code-workspace>] [--dry-run]
             # A second seat on one repo, landing in the workspace the agent
             # already lives in. --to is optional BECAUSE the common case has one
@@ -3869,7 +3891,7 @@ interact
   $CMD handoff [agent]          commit WIP to wip/<agent>-<date> + push (before switching machines)
 
 workspaces (a "workspace" is a .code-workspace file; the cockpit shows a tab per folder in it)
-  $CMD add-folder <dir> [--to <ws>]
+  $CMD add-folder <dir> [--to <ws>] [--name <agent>]
                                 enrol an EXISTING folder as an agent. git optional — where a
                                 remote exists identity is derived and comms come free.
   $CMD ws-new <ws>              create an empty target workspace (transport creates it too)

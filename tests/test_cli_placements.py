@@ -396,11 +396,32 @@ def test_an_image_unit_needs_no_repo_either(capsys):
     assert api.calls[0][7]["image"] == "nginx:alpine"
 
 
-def test_a_worktree_unit_still_demands_repo_AND_folder(capsys):
-    """The relaxation is for image units ONLY — a tmux seat with neither
-    cannot be materialized anywhere."""
+def test_a_worktree_unit_names_EVERY_missing_requirement_at_once(capsys):
+    """A tmux seat with nothing given cannot be materialized anywhere — and
+    both reasons are reported together, so fixing one does not just reveal the
+    other.
+
+    ⚠️ REWRITTEN 2026-08-09. This used to assert `--repo AND --folder`, which
+    pinned the rule that excluded plain folders: 13 of dev-vm-1's 15 faculty
+    agents have no git remote, so the API could not place them at all. `repo`
+    is now only the source of a derived NAME — supply an `--identity` instead
+    and a remote is never needed.
+    """
     api = FakeApi()
     rc = cli.seats_command(_args(action="add", machine="box"), api=api)
     assert rc == 1
     err = capsys.readouterr().err
-    assert "--repo" in err and "--folder" in err
+    assert "--folder" in err
+    assert "--repo or --identity" in err
+    assert api.calls == []
+
+
+def test_a_folder_seat_needs_no_repo_when_it_is_NAMED():
+    """The relaxation itself, at the CLI door."""
+    api = FakeApi()
+    rc = cli.seats_command(
+        _args(action="add", machine="box", folder="/srv/thing",
+              want_identity="thing-box"),
+        api=api)
+    assert rc == 0
+    assert api.calls[0][0] == "create_seat" and api.calls[0][1] == ""

@@ -468,7 +468,33 @@ class SquadExecutor:
             # would be self-assertion.
             return {**base, "deferred": "verified by re-enumeration"}
         if op == "materialize":
-            cmd = ["squad", "add", seat_spec.get("repo", "")]
+            # TWO materialize verbs, picked by what the seat HAS — not by a
+            # flag, because the seat already says which it is.
+            #
+            #   repo   -> `squad add <org/repo>`   clone/pull, then enrol
+            #   folder -> `squad add-folder <dir>` enrol what is already there
+            #
+            # The second is why plain folders are placeable at all. Most of
+            # the on-demand roster has no git remote, and `squad add-folder`
+            # was built for exactly them ("git optional"). Passing an empty
+            # repo to `squad add` would have run `squad add ""` — a failure
+            # reported as a materialize that did not work, rather than the
+            # enrolment that was actually meant.
+            repo = seat_spec.get("repo", "")
+            folder = seat_spec.get("folder", "")
+            if repo:
+                cmd = ["squad", "add", repo]
+            elif folder:
+                # --name carries the hub's ASSIGNED identity. Without it
+                # add-folder derives <basename>-<hostname>, which need not
+                # equal the seat — materialize would "succeed" and the very
+                # next `squad start <seat>` would fail on a name that is not
+                # in the roster.
+                cmd = ["squad", "add-folder", folder, "--name", seat]
+            else:
+                return {**base, "skipped": True,
+                        "reason": "seat has neither repo nor folder — nothing "
+                                  "to materialize from"}
         elif op == "start":
             if action.get("fresh"):
                 cmd = ["squad", "restart", seat, "--fresh"]

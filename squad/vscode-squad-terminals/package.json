@@ -2,7 +2,7 @@
   "name": "squad-terminals",
   "displayName": "Squad Terminals",
   "description": "Auto-opens one plain terminal per squad agent (squad attach) with icon+color, and adds per-agent squad actions to the terminal tab context menu.",
-  "version": "0.33.0",
+  "version": "0.34.0",
   "publisher": "monkeypashion",
   "engines": {
     "vscode": "^1.90.0"
@@ -640,6 +640,11 @@
             "Never auto-start; use the tab context menu (Squad \u2192 Start & attach)."
           ],
           "description": "What happens when you focus the terminal of an agent that is down."
+        },
+        "squadTerminals.autoAttach": {
+          "type": "boolean",
+          "default": false,
+          "description": "Attach a tab automatically when its agent is started from OUTSIDE this window \u2014 over ssh, by a cron, or by the hub's edge realizing a placement. Without it the agent runs but its tab stays a bare shell until you reload or right-click, because the extension only attaches at window-open. Fires once per time the agent comes up, never re-attaching a tab you deliberately detached, and waits ~30s so it cannot land in the middle of the startup-dialog dance."
         }
       }
     }

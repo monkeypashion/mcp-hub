@@ -108,6 +108,142 @@ function canon(p) {
   }
 }
 
+// ---- auto-attach: agents started from OUTSIDE this window ------------------
+//
+// An agent can be started by anything: `squad start` over ssh, a cron, or the
+// hub's edge realizing a placement a web app wrote. None of that touches this
+// window — and the extension only attaches at WINDOW-OPEN — so the tab for a
+// freshly-woken agent sits as a bare shell while the agent runs happily behind
+// it. That gap is the whole reason this exists.
+//
+// It fires on the DOWN -> UP transition, deliberately NOT as a "keep it
+// attached" loop. An operator who pressed Ctrl-b d meant it, and a poller that
+// re-attached them 8s later would be unusable. One attach per time the agent
+// comes up, and never for an agent already being watched.
+//
+// SETTLE_MS: tmux sizes a session to its SMALLEST attached client, so
+// attaching mid-launch narrows the pane while squad's startup-dialog dance is
+// grepping it — the 2026-07-25 bug where a 35-col client re-wrapped a dialog
+// mid-word and blinded the match. pane_flat() heals the wrapping now, but the
+// dance also SENDS KEYSTROKES, and a human watching a dialog answer itself is
+// a race not worth starting. The dance gives up at 25s.
+const AUTO_ATTACH_POLL_MS = 8000;
+const AUTO_ATTACH_SETTLE_MS = 30000;
+// terminal -> the up-stamp we attached for. WeakMap so a closed terminal needs
+// no cleanup pass of its own.
+const autoAttached = new WeakMap();
+
+function autoAttachEnabled() {
+  return vscode.workspace
+    .getConfiguration("squadTerminals")
+    .get("autoAttach", false);
+}
+
+// Agent names with a live pane, or null when we COULD NOT LOOK. Never an empty
+// set on failure: "nothing is up" would make every agent look like it had just
+// gone down, and the next successful poll would read as a fresh start for the
+// whole roster.
+function parseUpAgents(stdout) {
+  const up = new Set();
+  for (const line of String(stdout).split("\n")) {
+    const f = line.trim().split(/\s+/);
+    if (f.length >= 2 && f[1] === "up") up.add(f[0]);
+  }
+  return up;
+}
+
+// PURE. The same brain/execution split the edge realizer uses: this decides,
+// the caller runs the commands. Exported so it can be driven directly — the
+// alternative is asserting on source text, which passes just as happily
+// against logic that is subtly wrong.
+//
+// `state` is the memory across passes and IS mutated: {upSince, seeded}.
+// `tabs` is [{agent, attachedStamp}]. Returns the tabs to attach, each with
+// the up-stamp it is being attached FOR, so the caller can record it and not
+// do it twice.
+function planAutoAttach(state, up, tabs, now, settleMs) {
+  for (const a of up) if (!state.upSince.has(a)) state.upSince.set(a, now);
+  for (const a of [...state.upSince.keys()]) {
+    if (!up.has(a)) {
+      state.upSince.delete(a);        // down: next up is a NEW stamp
+      state.preexisting.delete(a);    // ...and no longer a startup leftover
+    }
+  }
+  if (!state.seeded) {
+    // Window-open already ran `squad attach --no-start` for every tab, so the
+    // agents live at startup are accounted for. Attaching them again would
+    // double up on the operator's first seconds.
+    //
+    // ⚠️ Returning [] here is NOT enough, and a mutation proved it: the seed
+    // pass still stamps those agents, so the settle window expires ~30s later
+    // and they attach anyway. Skipping the first PASS is not the same as
+    // skipping the agents that first pass saw — they have to be remembered
+    // until they actually go down and come back.
+    state.seeded = true;
+    for (const a of up) state.preexisting.add(a);
+    return [];
+  }
+  const out = [];
+  for (const t of tabs) {
+    if (!up.has(t.agent)) continue;
+    if (state.preexisting.has(t.agent)) continue;  // up before we started
+    const stamp = state.upSince.get(t.agent);
+    if (stamp === undefined) continue;
+    if (now - stamp < settleMs) continue;          // mid-dance; wait
+    if (t.attachedStamp === stamp) continue;       // already did this one
+    out.push({ agent: t.agent, stamp });
+  }
+  return out;
+}
+
+function startAutoAttach(context) {
+  const state = { upSince: new Map(), seeded: false, preexisting: new Set() };
+  let busy = false;
+
+  const tick = () => {
+    if (busy) return;            // a slow `squad ls` must not stack passes
+    if (!autoAttachEnabled()) {
+      state.upSince.clear();
+      state.preexisting.clear();
+      state.seeded = false;      // re-seed on enable, so turning it on mid
+      return;                    // session does not attach every live agent
+    }
+    busy = true;
+    cp.execFile(SQUAD, ["ls"], { timeout: 10000 }, (err, stdout) => {
+      busy = false;
+      if (err && !stdout) return;          // could not look — not a verdict
+      const terms = [...agentOf];
+      const due = planAutoAttach(
+        state,
+        parseUpAgents(stdout),
+        terms.map(([term, agent]) => ({
+          agent,
+          attachedStamp: autoAttached.get(term),
+        })),
+        Date.now(),
+        AUTO_ATTACH_SETTLE_MS
+      );
+      for (const { agent, stamp } of due) {
+        const entry = terms.find(([, a]) => a === agent);
+        if (!entry) continue;
+        const term = entry[0];
+        // Someone is already watching — this tab, another window, or a
+        // `squad dash` pane. Leave it alone and do NOT mark it done: if that
+        // viewer detaches, this tab is a fair candidate again.
+        cp.execFile(SQUAD, ["attached", agent], { timeout: 10000 }, (e) => {
+          if (!e) return;                       // exit 0 = a viewer exists
+          if (autoAttached.get(term) === stamp) return;
+          autoAttached.set(term, stamp);
+          sendWhenReady(term, `clear && squad attach ${agent} && clear`);
+        });
+      }
+    });
+  };
+
+  const timer = setInterval(tick, AUTO_ATTACH_POLL_MS);
+  context.subscriptions.push({ dispose: () => clearInterval(timer) });
+}
+
 // Type into a terminal only once its shell is actually reading. sendText at
 // creation races bash init: the tty echoes the raw line before the prompt,
 // then readline echoes it again — every cockpit tab opened with a doubled
@@ -2200,6 +2336,11 @@ function activate(context) {
     })
   );
 
+  // Pick up agents woken from outside this window (ssh, cron, or the hub's
+  // edge realizing a placement). Off by default — a tab that attaches itself
+  // while you are reading something else is a surprise worth opting into.
+  startAutoAttach(context);
+
   // keep the maps tidy as terminals close
   context.subscriptions.push(
     vscode.window.onDidCloseTerminal((t) => {
@@ -2216,4 +2357,4 @@ function activate(context) {
 
 function deactivate() {}
 
-module.exports = { activate, deactivate, shortLabel };
+module.exports = { activate, deactivate, shortLabel, planAutoAttach, parseUpAgents };

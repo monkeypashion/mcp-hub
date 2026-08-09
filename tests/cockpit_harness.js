@@ -321,14 +321,54 @@ const extPath = process.env.HARNESS_EXT || path.join(
   __dirname, "..", "squad", "vscode-squad-terminals", "extension.js"
 );
 const ext = require(extPath);
-ext.activate({ subscriptions: [] });
+// Keep the context: activate() registers disposables, and any of them holding
+// a TIMER keeps node's event loop alive forever — the harness prints its JSON
+// and then hangs until the test's timeout, which looks exactly like a broken
+// extension. (auto-attach's poll interval did this, 2026-08-09.) Disposing in
+// a finally covers every mode and every early return, including future ones.
+const harnessCtx = { subscriptions: [] };
+ext.activate(harnessCtx);
 
+const disposeAll = () => {
+  for (const d of harnessCtx.subscriptions) {
+    try {
+      d && typeof d.dispose === "function" && d.dispose();
+    } catch { /* a disposal failure must not mask the result */ }
+  }
+};
 
 (async () => {
   if (mode === "shortlabel") {
     // The display rule is mirrored in squad's short_label(); this exposes the JS
     // side so a test can prove the two agree instead of hoping.
     console.log(JSON.stringify({ label: ext.shortLabel(target) }));
+    return;
+  }
+  if (mode === "autoattach") {
+    // Drive the auto-attach BRAIN over a scripted sequence of passes, so the
+    // transition rules are tested as behaviour rather than as source text.
+    // HARNESS_PASSES: [{up: [agent...], now: ms, tabs: [{agent, attachedStamp}]}]
+    // Each pass returns what it would attach; `attached` records the stamps
+    // the way the real caller does, so "once per up" is actually exercised.
+    const passes = JSON.parse(process.env.HARNESS_PASSES || "[]");
+    const state = { upSince: new Map(), seeded: false, preexisting: new Set() };
+    const settle = Number(process.env.HARNESS_SETTLE_MS || 30000);
+    const stamps = new Map();          // agent -> stamp we last attached for
+    const out = [];
+    for (const p of passes) {
+      const tabs = (p.tabs || []).map((t) => ({
+        agent: t.agent,
+        attachedStamp: "attachedStamp" in t ? t.attachedStamp : stamps.get(t.agent),
+      }));
+      const due = ext.planAutoAttach(state, new Set(p.up || []), tabs, p.now, settle);
+      if (!p.noRecord) for (const d of due) stamps.set(d.agent, d.stamp);
+      out.push(due.map((d) => d.agent));
+    }
+    console.log(JSON.stringify({ passes: out }));
+    return;
+  }
+  if (mode === "parseup") {
+    console.log(JSON.stringify({ up: [...ext.parseUpAgents(process.env.HARNESS_LS || "")] }));
     return;
   }
   if (mode === "commands") {
@@ -399,4 +439,4 @@ ext.activate({ subscriptions: [] });
   }
   console.log(JSON.stringify({ error: `unknown mode: ${mode}` }));
   process.exitCode = 2;
-})();
+})().finally(disposeAll);
