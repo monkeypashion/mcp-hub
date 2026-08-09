@@ -229,8 +229,9 @@ mcp-hub memory-import            # --dry-run to preview, --force to overwrite
 
 **Install per machine as a LINK, never a copy** (the repo is the single version; `git pull` updates every machine — no drift). User-scope, so `/memory-sync` is available in every project on the box:
 ```bash
-# Linux
-ln -sfn ~/Projects/code/monkeypashion/mcp-hub/skills/memory-sync ~/.claude/skills/memory-sync
+# Linux — run from anywhere inside the clone; ~/.claude/skills/ may not exist yet
+mkdir -p ~/.claude/skills
+ln -sfn "$(git rev-parse --show-toplevel)/skills/memory-sync" ~/.claude/skills/memory-sync
 # Windows (no admin needed — directory junction)
 mklink /J %USERPROFILE%\.claude\skills\memory-sync D:\Projects\code\monkeypashion\mcp-hub\skills\memory-sync
 ```
@@ -844,16 +845,49 @@ Desired state is inert until something reconciles it. Install the units once
 per machine:
 
 ```bash
-ln -sfn ~/Projects/code/monkeypashion/mcp-hub/squad/systemd/mcp-hub-edge.service ~/.config/systemd/user/
-ln -sfn ~/Projects/code/monkeypashion/mcp-hub/squad/systemd/mcp-hub-edge.timer   ~/.config/systemd/user/
+TREE=$(git rev-parse --show-toplevel)     # run from anywhere inside the clone
+ln -sfn "$TREE/squad/systemd/mcp-hub-edge.service" ~/.config/systemd/user/
+ln -sfn "$TREE/squad/systemd/mcp-hub-edge.timer"   ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now mcp-hub-edge.timer
 
 # ...and the DOORBELL, which turns ~35s into ~1s. Separate unit, separate
 # enable — a machine that installs only the timer above is CORRECT but slow,
 # and nothing warns you, so install both together.
-ln -sfn ~/Projects/code/monkeypashion/mcp-hub/squad/systemd/mcp-hub-edge-watch.service ~/.config/systemd/user/
+ln -sfn "$TREE/squad/systemd/mcp-hub-edge-watch.service" ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now mcp-hub-edge-watch.service
 ```
+
+⚠️ **If the clone is NOT at `~/Projects/code/monkeypashion/mcp-hub`, the
+symlinks are not enough.** Every unit's `ExecStart` is
+`%h/Projects/code/monkeypashion/mcp-hub/...` — an absolute path, because
+systemd user units get a bare `PATH` and will not expand a variable in the
+executable position. Linking a unit from a tree somewhere else gives you a unit
+that loads and cannot run. Add a machine-local drop-in per service:
+
+```bash
+for u in mcp-hub-edge squad-heal squad-who; do
+  mkdir -p ~/.config/systemd/user/$u.service.d
+  printf '[Service]\nExecStart=\nExecStart=%s\n' "<the right command>" \
+    > ~/.config/systemd/user/$u.service.d/override.conf
+done
+systemctl --user daemon-reload
+```
+
+The empty `ExecStart=` first is required — it clears the inherited value
+instead of appending a second command. Keep the symlink pointing at the repo so
+`git pull` still updates the unit; the drop-in overrides only the path. Do NOT
+"fix" the path in the unit file itself: it is correct for every machine whose
+clone is in the conventional place, and a commit to master redeploys the hub
+and drops every binding.
+
+⚠️ **`enabled` and `firing` are not `working`.** A timer stays loaded in the
+running manager after its unit file disappears, so `systemctl --user
+list-timers` keeps showing a healthy `NEXT`/`LAST` while every run dies
+`status=203/EXEC`. Two checks that actually distinguish them:
+`systemctl --user list-unit-files` (a dangling symlink reads `bad`) and
+`systemctl --user start <unit>` followed by the journal. fireblade-wsl ran five
+units this way for five days after its second tree was deleted — no edge
+passes, no heal — with every surface reporting normal.
 
 **The doorbell** (`mcp-hub edge watch`) holds an SSE stream to
 `/api/v1/machines/{m}/watch` and runs the same pass the timer runs the moment
