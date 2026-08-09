@@ -1817,7 +1817,7 @@ class SettingsApp(App):
                 out.append((
                     f"{verb} on {where} — {agent}",
                     f"writes desired={want} to the hub; {where}'s edge "
-                    "realizes it on its next pass (~2 min)",
+                    "realizes it on its next pass (~35s)",
                     (lambda w=want, pid=pl.get("id", ""): self.run_verb(
                         self.hub_bin, ["placements", "set", pid, w],
                         f"{agent} -> {w}", w)),

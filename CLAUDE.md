@@ -849,10 +849,13 @@ ln -sfn ~/Projects/code/monkeypashion/mcp-hub/squad/systemd/mcp-hub-edge.timer  
 systemctl --user daemon-reload && systemctl --user enable --now mcp-hub-edge.timer
 ```
 
-Every 2 minutes, matching `squad-heal`'s cadence — and **its own unit**, not
+Every **30 seconds** — deliberately faster than `squad-heal`, which this once
+matched. The interval IS the latency an operator feels: a placement written
+from a UI does nothing until this fires (a wake measured 95s on 2026-08-09,
+almost all of it waiting). heal has no such caller. It is also **its own unit**, not
 folded into `squad-heal.service`: heal keeps live agents reachable and must not
 stop doing that because a reconcile pass failed (a `oneshot` that fails takes
-its whole ExecStart chain with it). `RandomizedDelaySec=20` so the fleet does
+its whole ExecStart chain with it). `RandomizedDelaySec=5` (scaled with the interval) so the fleet does
 not reconcile on the same second after a shared outage, which is the one moment
 the hub is least able to serve it. `ExecStart` names the venv binary
 absolutely — systemd user units get a bare PATH with no `~/.local/bin`, the

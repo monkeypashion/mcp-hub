@@ -866,6 +866,167 @@ def resolve_image_id(runner: Any, image: str) -> str | None:
     return out.strip().splitlines()[0].strip() if out.strip() else None
 
 
+# ── The doorbell, machine side ───────────────────────────────────────────────
+#
+# The timer stays. This only ACCELERATES it: the hub says "something changed
+# for you" and the edge runs the same pass it would have run at the next tick.
+# A lost bell therefore costs latency and never work, which is the property
+# that lets the stream be simple.
+#
+# Shape borrowed (read, not guessed) from `dreamteam` 0d17942 and vps-hetzner's
+# independently-built egress-sync — but hub-native: the edge dials the hub it
+# already holds a bearer for, and no other estate is in the runtime path.
+
+WATCH_SILENCE_S = 60.0        # no event AND no heartbeat for this long = dead
+WATCH_BACKOFF_MIN_S = 1.0
+WATCH_BACKOFF_MAX_S = 30.0
+
+
+def next_backoff(current: float,
+                 minimum: float = WATCH_BACKOFF_MIN_S,
+                 maximum: float = WATCH_BACKOFF_MAX_S) -> float:
+    """Double, bounded. Pure so the schedule can be asserted, not observed."""
+    return min(max(current * 2.0, minimum), maximum)
+
+
+def is_wake(line: str) -> bool:
+    """True for a doorbell, False for a heartbeat, blank or comment.
+
+    The heartbeat is a COMMENT line (`: heartbeat`) precisely so it can never
+    be mistaken for a bell — it proves the stream is alive and nothing more.
+    """
+    return line.startswith("event: wake")
+
+
+class Coalescer:
+    """One pass at a time; a bell during a pass earns exactly ONE more after.
+
+    Both halves matter and each has a failure of its own:
+
+    · Without the guard, a burst of writes starts overlapping passes that
+      enumerate and act on the same substrate concurrently — two `squad start`
+      for one agent, and a report built from a half-finished pass.
+    · Without the trailing re-run, a bell that lands mid-pass is SWALLOWED:
+      the pass already read its placements before that write existed, so the
+      change waits for the timer and the doorbell silently did nothing.
+    """
+
+    def __init__(self) -> None:
+        self.running = False
+        self.pending = False
+
+    def request(self) -> bool:
+        """A bell rang. True if the caller should start a pass NOW."""
+        if self.running:
+            self.pending = True
+            return False
+        self.running = True
+        return True
+
+    def finished(self) -> bool:
+        """A pass ended. True if another must run immediately."""
+        if self.pending:
+            self.pending = False
+            return True          # stays running — the caller loops
+        self.running = False
+        return False
+
+
+def watch_once(lines: Any, coalesce: Coalescer, run_pass: Any,
+               log: Any = None) -> None:
+    """Consume ONE connection's lines, running a pass per bell.
+
+    `lines` is any iterable of decoded SSE lines — an httpx response's
+    `iter_lines()` in production, a list in a test. Returns when the stream
+    ends, which the caller treats as a disconnect.
+    """
+    log = log or (lambda _m: None)
+    for raw in lines:
+        line = (raw or "").rstrip("\r")
+        if not is_wake(line):
+            continue            # heartbeat, comment, data line, blank
+        if not coalesce.request():
+            log("doorbell mid-pass — queued one trailing pass")
+            continue
+        while True:
+            try:
+                run_pass("doorbell")
+            except Exception as e:  # noqa: BLE001
+                # 🔴 A failed pass must NEVER kill the stream. The timer floor
+                # and the next bell both catch up; dropping the connection
+                # because one reconcile threw would turn a transient error
+                # into a silently deaf edge.
+                log(f"doorbell pass failed (non-fatal, timer floor covers): {e}")
+            if not coalesce.finished():
+                break
+
+
+def watch_forever(base_url: str, token: str, machine: str, run_pass: Any,
+                  log: Any = None, sleeper: Any = None,
+                  silence_s: float = WATCH_SILENCE_S,
+                  connect: Any = None, max_connects: int | None = None) -> None:
+    """Hold the doorbell open, reconnecting forever.
+
+    A full pass runs on EVERY (re)connect, before any event is read. That
+    covers whatever happened while disconnected — and here it is nearly free,
+    because the pass is a full resync regardless: there is no cursor to resume
+    and no backlog to replay.
+
+    `connect`, `sleeper` and `max_connects` are injected for tests; production
+    passes none of them.
+    """
+    import time as _time
+
+    log = log or (lambda m: print(m, flush=True))
+    sleeper = sleeper or _time.sleep
+    coalesce = Coalescer()
+    backoff = WATCH_BACKOFF_MIN_S
+    connects = 0
+
+    if connect is None:
+        import httpx
+
+        def connect(url: str, headers: dict, timeout: float):  # noqa: F811
+            client = httpx.Client(base_url=base_url, timeout=timeout)
+            return client.stream("GET", url, headers=headers)
+
+    while max_connects is None or connects < max_connects:
+        connects += 1
+        try:
+            # read=silence_s makes a SILENT stream fail instead of hanging:
+            # without it a dead-but-open socket looks exactly like a quiet one
+            # and the edge waits forever, deaf, with nothing to log.
+            ctx = connect(
+                f"/api/v1/machines/{machine}/watch",
+                {"Authorization": f"Bearer {token}",
+                 "Accept": "text/event-stream"},
+                silence_s,
+            )
+            with ctx as response:
+                if getattr(response, "status_code", 200) >= 400:
+                    raise RuntimeError(
+                        f"watch refused: HTTP {response.status_code}")
+                log(f"doorbell: connected to {base_url} as {machine}")
+                backoff = WATCH_BACKOFF_MIN_S   # a healthy connect resets it
+                # Resync FIRST, before reading a single event.
+                if coalesce.request():
+                    while True:
+                        try:
+                            run_pass("reconnect-resync")
+                        except Exception as e:  # noqa: BLE001
+                            log(f"doorbell resync failed (non-fatal): {e}")
+                        if not coalesce.finished():
+                            break
+                watch_once(response.iter_lines(), coalesce, run_pass, log)
+            log("doorbell: stream ended")
+        except Exception as e:  # noqa: BLE001 — reconnecting IS the handler
+            log(f"doorbell: {type(e).__name__}: {e}")
+        if max_connects is not None and connects >= max_connects:
+            break
+        sleeper(backoff)
+        backoff = next_backoff(backoff)
+
+
 class EnumerationFailed(RuntimeError):
     """The substrate could not be enumerated, so nothing may be claimed.
 

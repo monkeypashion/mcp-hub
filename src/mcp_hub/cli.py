@@ -1659,6 +1659,31 @@ def edge_command(args: argparse.Namespace) -> int:
         Path.home(),
     ]
 
+    if args.action == "watch":
+        # The doorbell runs THE SAME PASS the timer runs — one dispatch path,
+        # two triggers. A second implementation here could drift from the one
+        # that actually reconciles, and the drift would only show under load.
+        from mcp_hub.edge import EnumerationFailed as _EF
+        from mcp_hub.edge import watch_forever
+
+        def one_pass(reason: str) -> None:
+            try:
+                summary = edge_apply(
+                    api, machine=machine, runner=runner, scan_dirs=scan_dirs
+                )
+            except _EF as e:
+                print(f"edge: {e}", file=sys.stderr, flush=True)
+                return
+            print(
+                f"edge apply ({reason}): {summary['placements']} placement(s), "
+                f"{len(summary['actions'])} action(s)", flush=True
+            )
+
+        print(f"edge watch: {machine} — doorbell open; the timer remains the "
+              "floor, so a dead stream costs latency, never work", flush=True)
+        watch_forever(base, token, machine, one_pass)
+        return 0
+
     if args.dry_run:
         placements = api.pull_placements(machine)
         rc, out = runner(["squad", "ls"])
@@ -6902,7 +6927,11 @@ def build_parser() -> argparse.ArgumentParser:
             "reconciliation."
         ),
     )
-    edge.add_argument("action", choices=["apply"], help="apply: one reconcile pass")
+    edge.add_argument(
+        "action", choices=["apply", "watch"],
+        help="apply: one reconcile pass · watch: hold the hub's doorbell "
+             "open and run a pass the moment desired state changes "
+             "(the timer stays underneath as the floor)")
     edge.add_argument(
         "--hub-url",
         default=DEFAULT_HUB_URL,

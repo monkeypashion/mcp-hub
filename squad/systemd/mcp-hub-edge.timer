@@ -1,16 +1,31 @@
 [Unit]
-Description=Run mcp-hub edge apply every 2 minutes
+Description=Run mcp-hub edge apply every 30 seconds
 
 [Timer]
-# Matches squad-heal's cadence: both are convergence loops and there is no
-# reason for the fleet to have two different notions of "soon". 2 minutes is
-# also the number the placements CLI quotes when it explains what happens
-# after you write desired state — change one, change the other.
-OnBootSec=2min
-OnUnitActiveSec=2min
+# 🔴 DELIBERATELY FASTER THAN squad-heal, which is the opposite of what this
+# file said until 2026-08-09 ("both are convergence loops and there is no
+# reason for the fleet to have two different notions of soon"). There is now a
+# reason, and it is not tidiness: THIS loop sits on a USER-VISIBLE path.
+#
+# A placement written from a UI — "wake that agent" — does nothing at all until
+# this timer fires, so the interval IS the latency an operator feels. Measured
+# on 2026-08-09: a wake took 95s and a sleep 96s, almost entirely spent waiting
+# here. heal has no such caller; nobody is watching it, so making it four times
+# noisier would buy nothing.
+#
+# 30s + 5s jitter puts worst case at ~35s before the pass starts, ~40s to
+# converge. Still not instant — a doorbell (the hub notifying an edge that its
+# desired state changed) is the real fix, and this stays the FLOOR under it:
+# if a doorbell connection dies we degrade to this, never to nothing.
+#
+# Cost is four times the requests from a two-machine fleet, which is nothing.
+# Revisit if the fleet grows an order of magnitude.
+OnBootSec=30s
+OnUnitActiveSec=30s
 # Without this the whole fleet reconciles on the same second after a shared
-# outage, which is the one moment the hub is least able to serve it.
-RandomizedDelaySec=20
+# outage, which is the one moment the hub is least able to serve it. Scaled
+# with the interval — 20s of jitter on a 30s timer would swamp the gain.
+RandomizedDelaySec=5
 
 [Install]
 WantedBy=timers.target
