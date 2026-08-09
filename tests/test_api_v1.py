@@ -823,6 +823,61 @@ class TestPlacements:
         got = client.get(f"/api/v1/placements/{pid}", headers=H).json()
         assert got["desired"] == "reclaimed"
 
+    def test_purge_FORGETS_the_row_without_asking_for_a_reclaim(self, client):
+        """🔴 Reclaim and unplace were sharing one verb. DELETE meant harvest+
+        verify+DESTROY — for a worktree seat, `squad rm`, which unenrols the
+        agent and opts its repo out of the hub. So the only way to stop the
+        hub scheduling a seat was to demolish the agent behind it, and a row
+        written against a real roster agent could never be tidied away
+        (measured on production 2026-08-09).
+
+        Purge asks the edge for NOTHING: the row is the whole of the hub's
+        contribution, and `plan()` only acts on placements it is served.
+        """
+        pid = self._placed(client)
+        r = client.delete(f"/api/v1/placements/{pid}?purge=true", headers=H)
+        assert r.status_code == 200, r.text
+        assert r.json()["purged"] is True
+        # GONE, not tombstoned as reclaimed — a reclaimed row would still be
+        # served to the edge, which is the destroy this exists to avoid.
+        assert client.get(
+            f"/api/v1/placements/{pid}", headers=H).status_code == 404
+        assert not [p for p in client.get(
+            "/api/v1/placements", headers=H).json()["placements"]
+            if p["id"] == pid]
+
+    def test_purge_is_OPT_IN_so_a_plain_delete_still_destroys(self, client):
+        """The control: if purge were the default, every existing DELETE in
+        the fleet would silently stop reclaiming and leak containers."""
+        pid = self._placed(client)
+        assert client.delete(
+            f"/api/v1/placements/{pid}", headers=H).status_code == 202
+        got = client.get(f"/api/v1/placements/{pid}", headers=H).json()
+        assert got["desired"] == "reclaimed"
+        # ...and a value that is not exactly "true" must not purge either.
+        seat2 = _seat(client, name="widget-2")
+        pid2 = client.post(
+            "/api/v1/placements",
+            json={"seat": seat2["identity"], "machine": "box-1",
+                  "substrate": "worktree"},
+            headers=H,
+        ).json()["id"]
+        assert client.delete(
+            f"/api/v1/placements/{pid2}?purge=1", headers=H).status_code == 202
+        assert client.get(
+            f"/api/v1/placements/{pid2}", headers=H).status_code == 200
+
+    def test_purge_needs_the_operator_token(self, client):
+        """A machine principal must not be able to drop its own policy —
+        that would let an edge quietly stop being managed."""
+        pid = self._placed(client)
+        token = _machine(client, "box-purge")["token"]
+        r = client.delete(f"/api/v1/placements/{pid}?purge=true",
+                          headers={"Authorization": f"Bearer {token}"})
+        assert r.status_code == 403
+        assert client.get(
+            f"/api/v1/placements/{pid}", headers=H).status_code == 200
+
     def test_machine_token_reports_own_placement_only(self, client):
         token = _machine(client)["token"]
         foreign = _machine(client, "box-other")["token"]

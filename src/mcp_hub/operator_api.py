@@ -234,6 +234,14 @@ class OperatorApi:
         the intent, and the machine's edge does the work on its next pass."""
         return self._request("DELETE", f"/api/v1/placements/{pid}").json()
 
+    def unplace_placement(self, pid: str) -> dict[str, Any]:
+        """Forget the row; ask the edge for nothing. The substrate is left
+        exactly as it is — the opposite of `reclaim_placement`, which
+        destroys it. 200, not 202: there is no pending work to report."""
+        return self._request(
+            "DELETE", f"/api/v1/placements/{pid}?purge=true"
+        ).json()
+
     # -- capsules: a whole SQUAD, frozen and placeable ------------------------
 
     def list_api_squads(self) -> list[dict[str, Any]]:
