@@ -470,6 +470,20 @@ making two machines agree on the string, so twin-pairing and `memory-export` /
 `memory-import` are only as good as the name you chose. Default `folder/<dir>`
 for local-only; pass `--project` explicitly for anything meant to pair.
 
+**It also PRE-APPROVES the hub tools** for that folder, merging into
+`<dir>/.claude/settings.local.json` under `permissions.allow` — the same file
+Claude Code writes when you answer "don't ask again". Registering is the first
+thing a hub agent does each session, and in a folder that has never used the
+hub it raises an approval dialog, then another for `get_history`, then another
+for `send` — each one **blocking the turn**. Nobody watches an agent woken by a
+placement, so without this it sits there looking started and being deaf.
+
+The grant is deliberately partial: come online, notice a message, read it,
+answer it, take part in a squad. **Left to prompt:** `unregister` (goes
+offline), `set_squads` / `mute_squad` (changes who hears whom), `memory_*`
+(moves work product between machines). Those are decisions, not plumbing.
+Transport does the equivalent via `seed_first_launch`, for the same reason.
+
 `squad rm` deletes the marker — **after** reading the project out of it for the
 opt-out. `_resolve_agent_identity` reads a marker with **no opt-in gate** (that
 gate applies to derived identity only), so a folder left holding one keeps

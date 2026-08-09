@@ -801,6 +801,61 @@ path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 PYEOF
 }
 
+# The hub tools an agent needs to PARTICIPATE with nobody watching: come
+# online, notice a message, read it, answer it, and take part in its squad.
+#
+# Deliberately NOT the whole server. Left to prompt: unregister (takes an agent
+# offline), set_squads / mute_squad (changes who hears whom), memory_* (moves
+# work product between machines). Those are decisions, not plumbing, and an
+# agent should have to ask.
+HUB_SEED_TOOLS="mcp__hub__register mcp__hub__get_messages mcp__hub__get_history
+mcp__hub__send mcp__hub__list_agents mcp__hub__ping mcp__hub__post
+mcp__hub__broadcast mcp__hub__get_broadcasts mcp__hub__get_channel_messages
+mcp__hub__list_channels mcp__hub__list_squads mcp__hub__update_bio"
+
+# Pre-approve those tools for ONE folder, in the file Claude Code itself writes
+# when you answer "don't ask again" — <dir>/.claude/settings.local.json, under
+# permissions.allow, as bare tool names. (Verified by reading what the client
+# recorded after answering the dialog by hand, rather than guessing a schema.)
+#
+# 🔴 Why this is needed at all: registering is the FIRST thing a hub agent does
+# each session, and in a folder that has never used the hub it raises an
+# approval dialog — then another for get_history, then another for send. Each
+# one BLOCKS the turn. Nobody is watching an agent woken by a placement, so
+# without this it just sits there, looking started and being deaf.
+#
+# ⚠️ This is a real permission grant, made on the operator's behalf, which is
+# why it is scoped to one folder, to one server, and to a named list — and why
+# it is printed rather than done quietly. Transport already does the same thing
+# for the same reason (seed_first_launch: hasTrustDialogAccepted +
+# enabledMcpjsonServers), because a landed agent that stalls on a dialog is
+# indistinguishable from a broken one.
+seed_hub_tool_permissions() {  # <dir>
+  mkdir -p "$1/.claude"
+  python3 - "$1/.claude/settings.local.json" $HUB_SEED_TOOLS <<'PYEOF'
+import json, pathlib, sys
+path, tools = pathlib.Path(sys.argv[1]), sys.argv[2:]
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert isinstance(data, dict)
+except Exception:
+    data = {}
+# MERGE, never replace: this file is the operator's own approvals for the
+# folder (28 unrelated entries on the first real one), and clobbering it would
+# silently re-prompt for everything they had already allowed.
+perms = data.setdefault("permissions", {})
+allow = perms.get("allow")
+if not isinstance(allow, list):
+    allow = []
+added = [t for t in tools if t not in allow]
+allow.extend(added)
+perms["allow"] = allow
+data["permissions"] = perms
+path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+print(len(added))
+PYEOF
+}
+
 marker_project() {  # <dir> -> project, or nothing
   python3 - "$1/.claude/hub-agent.json" <<'PYEOF'
 import json, pathlib, sys
@@ -998,6 +1053,8 @@ add_folder() {  # squad add-folder <dir> — enrol an EXISTING folder as an agen
         [ -n "$upproj" ] || upproj="folder/$(sanitize_ident "$(basename "$dir")")"
         write_hub_marker "$dir" "$owner" "$upproj"
         optin_project add "$upproj" >/dev/null 2>&1 || true
+        n_seeded="$(seed_hub_tool_permissions "$dir")"
+        [ "${n_seeded:-0}" = 0 ] || echo "pre-approved $n_seeded hub tool(s) for $dir/.claude/settings.local.json — a woken agent must not stall on an approval dialog"
         # arm_comms rather than a second roster writer: it is the one place
         # that knows how to add the flag without disturbing the other args,
         # and it re-checks the opt-in we just wrote.
@@ -1046,6 +1103,8 @@ add_folder() {  # squad add-folder <dir> — enrol an EXISTING folder as an agen
     proj="${wantproj:-folder/$(sanitize_ident "$(basename "$dir")")}"
     write_hub_marker "$dir" "$name" "$proj"
     optin_project add "$proj" >/dev/null 2>&1 || true
+    n_seeded="$(seed_hub_tool_permissions "$dir")"
+    [ "${n_seeded:-0}" = 0 ] || echo "pre-approved $n_seeded hub tool(s) for $dir/.claude/settings.local.json — a woken agent must not stall on an approval dialog"
     echo "hub identity: $name  (project $proj, via marker — no git remote to derive from)"
   elif [ -n "$wanthub" ]; then
     # A remote exists, so identity is DERIVED and comms are already armed
