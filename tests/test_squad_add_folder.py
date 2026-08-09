@@ -413,3 +413,86 @@ def test_hub_upgrades_an_agent_whose_roster_row_uses_a_TILDE(env, tmp_path):
     assert "folder/work" in _optins(env)
     assert "server:hub" in _rows(env)[0][3]
     assert len(_rows(env)) == 1
+
+
+# ------------------------------------ --hub pre-approves the hub TOOLS
+#
+# 🔴 Found by running the real thing (2026-08-09): a folder newly given a hub
+# identity raised an approval dialog for `register` — the FIRST thing a hub
+# agent does each session — then another for get_history, then another for
+# send. Each one BLOCKS the turn. Nobody watches an agent woken by a placement,
+# so it just sits there looking started and being deaf.
+#
+# The file and the shape are not guessed: they were read back out of what
+# Claude Code itself wrote after the dialog was answered by hand.
+
+
+def _perms(folder: pathlib.Path) -> list:
+    import json
+    f = folder / ".claude" / "settings.local.json"
+    if not f.exists():
+        return []
+    return json.loads(f.read_text()).get("permissions", {}).get("allow", [])
+
+
+def test_hub_pre_approves_the_tools_an_agent_needs_to_PARTICIPATE(env, tmp_path):
+    folder = tmp_path / "notes"
+    folder.mkdir()
+    assert _add_hub(env, folder).returncode == 0
+    allow = _perms(folder)
+    # register is the load-bearing one: without it the agent cannot even come
+    # online, and every later tool is moot.
+    for tool in ("mcp__hub__register", "mcp__hub__get_messages",
+                 "mcp__hub__send", "mcp__hub__get_history"):
+        assert tool in allow, f"{tool} not pre-approved: {allow}"
+
+
+def test_it_does_NOT_pre_approve_the_tools_that_are_DECISIONS(env, tmp_path):
+    """Scope matters — this is consent granted on the operator's behalf.
+    Going offline, changing who hears whom, and moving work product between
+    machines are decisions an agent should have to ask about."""
+    folder = tmp_path / "notes"
+    folder.mkdir()
+    _add_hub(env, folder)
+    allow = _perms(folder)
+    for tool in ("mcp__hub__unregister", "mcp__hub__set_squads",
+                 "mcp__hub__mute_squad", "mcp__hub__memory_put",
+                 "mcp__hub__memory_get"):
+        assert tool not in allow, f"{tool} should not be pre-approved"
+
+
+def test_seeding_MERGES_and_never_clobbers_existing_approvals(env, tmp_path):
+    """That file is the operator's own approvals for the folder — 28 unrelated
+    entries on the first real one. Replacing it would silently re-prompt for
+    everything they had already allowed."""
+    import json
+    folder = tmp_path / "notes"
+    (folder / ".claude").mkdir(parents=True)
+    (folder / ".claude" / "settings.local.json").write_text(json.dumps(
+        {"permissions": {"allow": ["Bash(ls)", "mcp__hub__send"]},
+         "other": {"kept": True}}), encoding="utf-8")
+
+    assert _add_hub(env, folder).returncode == 0
+    allow = _perms(folder)
+    assert "Bash(ls)" in allow, "an unrelated approval was lost"
+    assert allow.count("mcp__hub__send") == 1, "duplicated an existing entry"
+    body = json.loads((folder / ".claude" / "settings.local.json").read_text())
+    assert body.get("other") == {"kept": True}, "unrelated settings were lost"
+
+
+def test_seeding_is_idempotent(env, tmp_path):
+    folder = tmp_path / "notes"
+    folder.mkdir()
+    _add_hub(env, folder)
+    first = _perms(folder)
+    _add_hub(env, folder)
+    assert _perms(folder) == first
+
+
+def test_a_folder_added_WITHOUT_hub_gets_no_pre_approval(env, tmp_path):
+    """The control: a permission grant must follow the explicit flag, never
+    ride along with plain enrolment."""
+    folder = tmp_path / "notes"
+    folder.mkdir()
+    assert _add(env, folder).returncode == 0
+    assert _perms(folder) == []
