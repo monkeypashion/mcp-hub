@@ -196,11 +196,22 @@ class OperatorApi:
             body["identity"] = identity
         return self._request("POST", "/api/v1/seats", json=body).json()
 
-    def delete_seat(self, identity: str) -> dict[str, Any]:
-        """Archive a seat. Refused by the hub while it still has active
-        placements — reclaim those first, or the fleet would be left with
-        placements naming a seat that no longer exists."""
-        return self._request("DELETE", f"/api/v1/seats/{identity}").json()
+    def delete_seat(self, identity: str, purge: bool = False) -> dict[str, Any]:
+        """Archive a seat — or, with purge, DELETE the row (the death-fact
+        survives in api_seat_events). Archive is refused while the seat has
+        active placements; purge is refused while ANY placement row still
+        references it."""
+        suffix = "?purge=true" if purge else ""
+        return self._request(
+            "DELETE", f"/api/v1/seats/{identity}{suffix}"
+        ).json()
+
+    def restore_seat(self, identity: str) -> dict[str, Any]:
+        """The inverse of archive. The hub re-runs create validation —
+        the world may have changed while the seat was archived."""
+        return self._request(
+            "POST", f"/api/v1/seats/{identity}/restore"
+        ).json()
 
     # -- placements: WHERE a seat runs, and whether it should ----------------
 

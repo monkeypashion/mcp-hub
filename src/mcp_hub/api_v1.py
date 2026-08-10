@@ -298,6 +298,24 @@ def init_api_tables(conn: sqlite3.Connection) -> None:
         )
     except sqlite3.OperationalError:
         pass
+    # Seat lifecycle events — APPEND-ONLY provenance for every existence
+    # transition (W1.1). A bare `archived` flag answers "is it archived now"
+    # and destroys when/by-whom/why — FDM's estate marked a live healthy
+    # backend `failed` from a buggy poll and the terminal flag made it
+    # unhealable by design. And purge must leave a DEATH-FACT that survives
+    # the row: "did this ever exist, and what happened to it" is the question
+    # people ask during the incident, when the row is already gone.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS api_seat_events (
+            identity TEXT NOT NULL,
+            event    TEXT NOT NULL,   -- archived | restored | purged
+            ts       REAL NOT NULL,
+            actor    TEXT NOT NULL DEFAULT '',
+            reason   TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
     conn.commit()
 
 
@@ -452,6 +470,44 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             args,
         ).fetchone()["n"]
 
+    def seat_event(identity: str, event: str, actor: str, reason: str = "") -> None:
+        """Append one existence-transition to the seat's provenance trail.
+
+        APPEND, never update: current state is the flag, but the HISTORY is
+        the trail — and for a purged seat the trail is all that survives
+        (the death-fact). Committed by the caller alongside its own write, so
+        a transition and its record cannot be split by a crash between them.
+        """
+        db().execute(
+            "INSERT INTO api_seat_events (identity, event, ts, actor, reason)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (identity, event, _now(), actor, reason),
+        )
+
+    def seat_collision(identity: str) -> JSONResponse | None:
+        """The one honest answer to "may this identity be created?".
+
+        Pre-W1.1, three creation paths each ran an unfiltered existence
+        check and said "already exists" — a lie for an ARCHIVED row, which
+        404s on GET and cannot be inspected. The tombstone was undiagnosable
+        from the message that reported it (dev-vm-1 recovered one by hand
+        UPDATE on prod, 2026-08-10). One helper so a fourth creation path
+        cannot re-introduce the split.
+        """
+        row = db().execute(
+            "SELECT archived FROM api_seats WHERE identity = ?", (identity,)
+        ).fetchone()
+        if not row:
+            return None
+        if row["archived"]:
+            return _err(
+                409,
+                f"archived seat '{identity}' holds this name — restore it "
+                f"with `mcp-hub seats restore {identity}` or free the name "
+                f"with `mcp-hub seats rm {identity} --purge --yes`",
+            )
+        return _err(409, f"seat '{identity}' already exists")
+
     # -- machines -----------------------------------------------------------
 
     @route("/api/v1/machines", methods=["GET", "POST"])
@@ -603,7 +659,16 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             seat_row = db().execute(
                 "SELECT * FROM api_seats WHERE identity = ?", (r["seat"],)
             ).fetchone()
-            if seat_row:
+            # An archived seat's spec is withheld — the edge must stop
+            # materializing a seat the hub considers gone — EXCEPT for
+            # reclaimed placements. The exception is for HARVEST, not
+            # destroy: destroy is by name, but docker harvest reads
+            # spec.memory_volume and worktree harvest reads the folder;
+            # withholding the spec would turn harvest into a clean-looking
+            # skip, i.e. silent memory loss. Do not "simplify" this away.
+            if seat_row and (
+                not seat_row["archived"] or r["desired"] == "reclaimed"
+            ):
                 p["seat_spec"] = seat_json(seat_row)
             out.append(p)
         return JSONResponse({"placements": out})
@@ -824,10 +889,9 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
         identity = body.get("identity") or (
             f"{body['repo'].rsplit('/', 1)[-1]}-{body['machine']}"
         )
-        if db().execute(
-            "SELECT 1 FROM api_seats WHERE identity = ?", (identity,)
-        ).fetchone():
-            return _err(409, f"seat '{identity}' already exists")
+        collided = seat_collision(identity)
+        if collided is not None:
+            return collided
         db().execute(
             "INSERT INTO api_seats (identity, repo, machine, folder, launch_args,"
             " class, created, spec) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -865,6 +929,16 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             "SELECT * FROM api_seats WHERE identity = ? AND archived = 0",
             (identity,),
         ).fetchone()
+        if (
+            not row
+            and request.method == "DELETE"
+            and request.query_params.get("purge") == "true"
+        ):
+            # Purge is precisely for rows the live-only lookup cannot see —
+            # an archived seat owning a name forever is the tombstone.
+            row = db().execute(
+                "SELECT * FROM api_seats WHERE identity = ?", (identity,)
+            ).fetchone()
         if not row:
             return _err(404, f"no seat '{identity}'")
         if request.method == "GET":
@@ -906,13 +980,85 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
                 "SELECT * FROM api_seats WHERE identity = ?", (identity,)
             ).fetchone()
             return JSONResponse(seat_json(row))
+        if request.query_params.get("purge") == "true":
+            # Raw count, deliberately NOT active_placements: that helper
+            # excludes desired='reclaimed' rows, and a purge gated on it
+            # would delete a seat whose reclaimed placement row still
+            # references it — a dangling pointer minted by the delete verb.
+            n = db().execute(
+                "SELECT COUNT(*) AS n FROM api_placements WHERE seat = ?",
+                (identity,),
+            ).fetchone()["n"]
+            if n:
+                return _err(
+                    409,
+                    f"{n} placement row(s) still reference '{identity}' — "
+                    "nothing dies unnamed; drop them first with "
+                    "`mcp-hub placements unplace <id> --yes`",
+                )
+            db().execute(
+                "DELETE FROM api_seats WHERE identity = ?", (identity,)
+            )
+            # The death-fact outlives the row it describes.
+            seat_event(identity, "purged", "operator-api")
+            db().commit()
+            return JSONResponse({"identity": identity, "purged": True})
         if active_placements("seat = ?", (identity,)):
             return _err(409, "seat has active placements; reclaim them first")
         db().execute(
             "UPDATE api_seats SET archived = 1 WHERE identity = ?", (identity,)
         )
+        seat_event(identity, "archived", "operator-api")
         db().commit()
+        # After the commit: a doorbell that can break a write is worse than
+        # no doorbell. The edge reconciles the disappearance promptly instead
+        # of at the next timer tick.
+        notify_machine(row["machine"], "seat-archived")
         return JSONResponse({"identity": identity, "archived": True})
+
+    @route("/api/v1/seats/{identity}/restore", methods=["POST"])
+    async def seat_restore(request: Request) -> Response:
+        """The inverse of archive — the verb whose absence made archived
+        identities unrecoverable (the only restore path was a hand UPDATE on
+        prod, 2026-08-10). Archive FREEZES (one axis, nothing else mutated),
+        so restore reconstructs nothing — but it must RE-RUN create
+        validation: the invariant that held at archive time may not hold in
+        the changed world (FDM's scoped-uniqueness lesson)."""
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        identity = request.path_params["identity"]
+        row = db().execute(
+            "SELECT * FROM api_seats WHERE identity = ?", (identity,)
+        ).fetchone()
+        if not row:
+            return _err(404, f"no seat '{identity}'")
+        if not row["archived"]:
+            return _err(
+                409, f"seat '{identity}' is not archived — nothing to restore"
+            )
+        if not db().execute(
+            "SELECT 1 FROM api_machines WHERE name = ? AND archived = 0",
+            (row["machine"],),
+        ).fetchone():
+            return _err(
+                409,
+                f"machine '{row['machine']}' is gone or archived — a seat "
+                "cannot return to a machine that no longer exists; declare "
+                "it afresh with `mcp-hub seats add`",
+            )
+        db().execute(
+            "UPDATE api_seats SET archived = 0 WHERE identity = ?", (identity,)
+        )
+        seat_event(identity, "restored", "operator-api")
+        db().commit()
+        # Symmetric with archive: an asymmetric doorbell is how observers
+        # drift out of sync with the record.
+        notify_machine(row["machine"], "seat-restored")
+        row = db().execute(
+            "SELECT * FROM api_seats WHERE identity = ?", (identity,)
+        ).fetchone()
+        return JSONResponse(seat_json(row))
 
     @route("/api/v1/seats/{identity}/clone", methods=["POST"])
     async def seat_clone(request: Request) -> Response:
@@ -932,10 +1078,9 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
         if not suffix:
             return _err(422, "suffix required")
         new_identity = f"{identity}-{suffix}"
-        if db().execute(
-            "SELECT 1 FROM api_seats WHERE identity = ?", (new_identity,)
-        ).fetchone():
-            return _err(409, f"seat '{new_identity}' already exists")
+        collided = seat_collision(new_identity)
+        if collided is not None:
+            return collided
         # 🔴 THE SPEC MUST TRAVEL. This INSERT omitted `spec` entirely, so
         # cloning a DOCKER seat produced a row with no image, no volumes, no
         # env and no brief — a worktree seat wearing the original's name. It
@@ -1491,9 +1636,16 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
                     "there is nothing to copy. Declare it with `mcp-hub seats "
                     "add` and re-compose, or place this capsule as-is.",
                 )
-            if db().execute(
-                "SELECT 1 FROM api_seats WHERE identity = ?", (new_id,)
-            ).fetchone():
+            collided = seat_collision(new_id)
+            if collided is not None:
+                # The archived branch keeps seat_collision's message (naming
+                # restore/purge — pre-W1.1 this path claimed "that label has
+                # been used for this capsule before", equally a lie for a
+                # tombstone); a LIVE collision keeps the capsule-specific
+                # advice, which is genuinely better here.
+                body = json.loads(bytes(collided.body))
+                if "archived" in body.get("detail", ""):
+                    return [], collided
                 return [], _err(
                     409,
                     f"seat '{new_id}' already exists — that label has been "

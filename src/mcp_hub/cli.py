@@ -2264,19 +2264,47 @@ def seats_command(args: argparse.Namespace, api: Any = None) -> int:
                   f"--machine {rec.get('machine', '')}")
             return 0
 
+        if args.action == "restore":
+            if not args.identity:
+                print("name the seat to restore", file=sys.stderr)
+                return 1
+            rec = api.restore_seat(args.identity)
+            print(f"seat {rec['identity']} restored — exactly as archived "
+                  "(archive freezes; restore reconstructs nothing)")
+            return 0
+
         if not args.identity:
             print("name the seat to archive", file=sys.stderr)
+            return 1
+        purge = getattr(args, "purge", False)
+        if purge and not getattr(args, "yes", False):
+            # Nothing dies unnamed: the destructive verb states what it will
+            # destroy and waits for the explicit confirmation.
+            print(f"--purge DELETES seat '{args.identity}' outright (the "
+                  "event trail keeps the death-fact; the declaration is "
+                  "gone). Re-run with --yes to confirm.", file=sys.stderr)
             return 1
         if args.dry_run:
             # This branch used to fall straight through to delete_seat, so
             # `seats rm --dry-run` ARCHIVED the seat. A dry run that deletes
             # is the worst instance of the whole class.
-            print(f"would archive seat {args.identity} "
-                  "(the worktree is untouched; refused if it still has "
-                  "active placements)")
+            if purge:
+                print(f"would PURGE seat {args.identity} — row deleted, "
+                      "death-fact kept; refused while any placement row "
+                      "still references it")
+            else:
+                print(f"would archive seat {args.identity} "
+                      "(the worktree is untouched; refused if it still has "
+                      "active placements)")
+            return 0
+        if purge:
+            api.delete_seat(args.identity, purge=True)
+            print(f"seat {args.identity} purged — the death-fact survives "
+                  "in its event trail")
             return 0
         api.delete_seat(args.identity)
-        print(f"seat {args.identity} archived (the worktree is untouched)")
+        print(f"seat {args.identity} archived (the worktree is untouched; "
+              f"`mcp-hub seats restore {args.identity}` undoes this)")
         return 0
     except ApiUnavailable as e:
         msg = str(e)
@@ -6752,9 +6780,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     seats.add_argument(
-        "action", choices=["list", "add", "rm", "logs", "update", "clone"],
+        "action",
+        choices=["list", "add", "rm", "restore", "logs", "update", "clone"],
         help=("list · add: declare a seat · rm: archive it (placements "
-              "first) · logs: what it has printed (container gone → reads "
+              "first; --purge deletes the row outright) · restore: the "
+              "inverse of rm — an archived seat returns exactly as it was · "
+              "logs: what it has printed (container gone → reads "
               "the headless result artifact from the memory volume) · "
               "update: edit it in place · clone: a second seat from it"),
     )
@@ -6859,6 +6890,17 @@ def build_parser() -> argparse.ArgumentParser:
                        help="add/rm/update/clone: print what would change, "
                             "write nothing. An action that does not implement "
                             "it REFUSES rather than acting")
+    seats.add_argument(
+        "--purge", action="store_true",
+        help=("rm: DELETE the row instead of archiving. The death-fact "
+              "survives in the seat's event trail, but the declaration is "
+              "gone — needs --yes, and is refused while any placement row "
+              "still references the seat"),
+    )
+    seats.add_argument(
+        "--yes", action="store_true",
+        help="rm --purge: confirm the deletion (nothing dies unnamed)",
+    )
 
     placements = sub.add_parser(
         "placements",
