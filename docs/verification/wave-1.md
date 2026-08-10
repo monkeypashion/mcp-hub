@@ -18,7 +18,7 @@ blind state).
 | # | Item | Status |
 |---|---|---|
 | I1 | `tests/conftest.py` autouse guards: state-dir redirect + daemon-spawn no-op + `api_v1._watchers` clear — full suite green with them global | **MET** — 1810 green with global guards (full suite, wave close) |
-| I2 | `.github/workflows/ci.yml` runs pytest + ruff on branches/PRs; green on `wave-1` before merge. Residual recorded: Coolify deploys on master push regardless — CI is a pre-merge gate, not a deploy gate | pending — CI run on `wave-1` in flight; required before merge |
+| I2 | `.github/workflows/ci.yml` runs pytest + ruff on branches/PRs; green on `wave-1` before merge. Residual recorded: Coolify deploys on master push regardless — CI is a pre-merge gate, not a deploy gate | **MET** — CI green on fb70574 (and its first run caught 17 real environment couplings, fixed at the seams) |
 | I3 | This document committed before W1.1–W1.3 code | **MET** — committed 7acd2dd, before W1.1–W1.3 code |
 
 ## W1.1 seat lifecycle
