@@ -29,7 +29,7 @@ blind state).
 | A2 | `seats restore` round-trips (archive → restore → identical in `seats list`, placements accepted); restoring a live seat and a nonexistent seat are distinct tested refusals | **MET** — TestRestore (round-trip, live/nonexistent refusals, changed-world re-validation) |
 | A3 | Machine pull (`:604`): archived seat's spec absent EXCEPT for `desired='reclaimed'` placements (harvest needs the spec — destroy is by name). Archived+non-reclaimed state constructed via direct DB writes (API-unreachable, stated in docstring); archive-mid-reclaim scenario tested as the reachable case. Exclusion test fails pre-fix | **MET** — TestMachinePull (direct-DB construction + archive-mid-reclaim; exclusion failed pre-fix) |
 | A4 | Archive fires `notify_machine`; `rm --purge` refused while ANY placement row references the seat (not `active_placements` — it excludes reclaimed rows) | **MET** — TestDoorbellsAndPurge (symmetric doorbells; raw-count purge; event trail + death-fact) |
-| L1 | Live (post-deploy, settled): `/health` sha matches push; the 6 orphaned prod placements resolve to named states; tombstone symptom reproduced-then-cleared via `seats restore` on a test seat | pending deploy — run after merge settles, never through our own deploy |
+| L1 | Live (post-deploy, settled): `/health` sha matches push; the 6 orphaned prod placements resolve to named states; tombstone symptom reproduced-then-cleared via `seats restore` on a test seat | **MET** — /health = f1e9549; all 8 prod placements named states; tombstone reproduced (honest 409) then cleared via restore; purge death-fact verified, live |
 
 Named residual (deliberate): an archived seat already materialized with
 `desired='running'` keeps being started by name — state is API-unreachable,
@@ -43,7 +43,7 @@ legacy-only; the doorbell + `:604` fix stop new instances forming.
 | B2 | BLIND: producer stopped → edge-age reads not-reporting within window; heartbeat staleness and edge staleness are DISTINCT phrases, tested to disagree in both directions | **MET** — TestDerivedState (instruments disagree both directions; local machine shows own dead edge) |
 | B3 | A failing pass — including `EnumerationFailed`, today stderr-only — reaches the hub as `result: failed` via the except-path POST (both `apply` and `watch`; reporter cannot die of its own report). Fails pre-fix | **MET** — TestFailurePath (apply AND watch except paths; reporter cannot die of its own report; failed pre-fix) |
 | B4 | No silent drops on the status route: the already-sent `"seats"` key is handled or explicitly logged; unknown keys logged. Named after the shape that hid this channel | **MET** — test_unstored_payload_keys_are_named_never_silently_dropped |
-| L2 | Live: fireblade + dev-vm-1 render edge health truthfully; one deliberately broken unit shows as broken | pending deploy |
+| L2 | Live: fireblade + dev-vm-1 render edge health truthfully; one deliberately broken unit shows as broken | **MET** — dev-vm-1's old edge honestly reads "no edge yet" (version-skew as designed); fireblade's stopped edge rendered "⚠ edge not reporting" on its OWN board within the window, recovered clean on restart |
 
 ## W1.3 from_agent
 
