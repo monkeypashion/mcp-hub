@@ -22,6 +22,7 @@ import pathlib
 import subprocess
 
 import pytest
+import shutil
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SQUAD = ROOT / "squad" / "squad"
@@ -82,6 +83,19 @@ def test_a_brand_new_machine_reports_not_ready_and_names_the_fix(tmp_path):
     assert "hooks" in out, "no stop-hook ⇒ the agent lands mute on the hub"
 
 
+# The remote-leg tests drive the REAL preflight against a shimmed far
+# host — which is this machine. On a box without Claude Code the
+# preflight HONESTLY refuses ("✗ claude — agents land but cannot
+# start"), which is the behavior working, not failing. Skipped rather
+# than stubbed: a preflight taught to ignore a missing claude in tests
+# is a preflight nobody can trust. Found by the first bare-runner CI.
+_needs_claude = pytest.mark.skipif(
+    shutil.which("claude") is None,
+    reason="remote leg needs Claude Code on the (shimmed) far host",
+)
+
+
+@_needs_claude
 def test_bootstrap_makes_it_ready(tmp_path):
     home = _fresh_home(tmp_path)
     _prepared_repo(home)

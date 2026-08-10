@@ -31,6 +31,17 @@ SQUAD = pathlib.Path(__file__).resolve().parents[1] / "squad" / "squad"
 
 pytestmark = pytest.mark.skipif(not SQUAD.exists(), reason="squad script not present")
 
+# The remote-leg tests drive the REAL preflight against a shimmed far
+# host — which is this machine. On a box without Claude Code the
+# preflight HONESTLY refuses ("✗ claude — agents land but cannot
+# start"), which is the behavior working, not failing. Skipped rather
+# than stubbed: a preflight taught to ignore a missing claude in tests
+# is a preflight nobody can trust. Found by the first bare-runner CI.
+_needs_claude = pytest.mark.skipif(
+    shutil.which("claude") is None,
+    reason="remote leg needs Claude Code on the (shimmed) far host",
+)
+
 FAKE_SSH = """#!/bin/sh
 # Pretends to be ssh: drops the host argument and runs the command locally.
 shift
@@ -198,6 +209,7 @@ def test_a_non_empty_destination_is_refused(env, tmp_path):
 
 # ---- the workspace's own declaration ------------------------------------
 
+@_needs_claude
 def test_a_workspace_declaring_comms_off_lands_the_clone_without_them(env, tmp_path):
     """dev-vm-1's general workspace states "no comms" in a COMMENT, which nothing
     can read, so a comms-armed agent transported there arrived comms-armed and
@@ -438,6 +450,7 @@ def test_the_clone_inherits_the_sources_class(env, tmp_path):
 
 # ---- the remote leg, exercised locally ----------------------------------
 
+@_needs_claude
 def test_the_whole_remote_leg_runs_end_to_end(env, tmp_path):
     """Previously only reachable with a second machine, i.e. untestable.
 
@@ -535,6 +548,7 @@ def test_a_source_level_with_origin_is_not_reported_as_pinned(env, tmp_path):
     assert "pinned" not in res.stdout, res.stdout
 
 
+@_needs_claude
 def test_the_remote_leg_pins_the_clone_too(env, tmp_path):
     """Same rule across the network — and this branch is the one quoting breaks.
 
@@ -616,6 +630,7 @@ def test_an_existing_workspace_is_told_about_it_never_rewritten(env, tmp_path):
     assert TAB_TITLE not in text, "it edited settings it was only asked to report on"
 
 
+@_needs_claude
 def test_the_far_side_generates_the_same_settings(env, tmp_path):
     """transport-recv creates the workspace on the REMOTE, from its own copy of
     the skeleton — two writers, one convention, and only a test keeps them in

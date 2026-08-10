@@ -16,6 +16,8 @@ accusation, and drift still outranks both open states.
 
 from __future__ import annotations
 
+import pathlib
+
 import pytest
 from textual.widgets import Tree
 
@@ -27,7 +29,12 @@ AGENTS = [{"agent": "alpha", "worktree": "/a", "klass": "squad"}]
 def _row(name, machine, **kw):
     base = {
         "name": name, "machine": machine,
-        "path": f"/home/monke/Projects/{name}.code-workspace",
+        # Under the REAL home, not a literal one: the detail pane
+        # shortens $HOME -> ~, and a hardcoded /home/monke asserted an
+        # environment coincidence — green on the dev box, red on the
+        # first bare CI runner (HOME=/home/runner), while testing
+        # nothing about the mechanism either way.
+        "path": f"{pathlib.Path.home()}/Projects/{name}.code-workspace",
         "folders": 1, "error": "", "on_disk": True, "open_now": False,
         "registered": True, "squad": "", "listings": [],
     }
@@ -188,7 +195,7 @@ async def test_the_path_moves_to_the_detail_pane_home_shortened():
 @pytest.mark.asyncio
 async def test_the_workspace_this_board_is_looking_at_is_marked_HERE():
     rows = [_row("mine", "here", open_now=True), _row("other", "here", open_now=True)]
-    app = _app(rows, scoped_to="/home/monke/Projects/mine.code-workspace")
+    app = _app(rows, scoped_to=f"{pathlib.Path.home()}/Projects/mine.code-workspace")
     async with app.run_test(size=(120, 30)) as pilot:
         await _ready(app, pilot)
         mine, other = _ws(app, "mine"), _ws(app, "other")
@@ -216,7 +223,7 @@ async def test_drift_outranks_both_open_states():
     beats status, or the colour that means 'fix me' is the one you lose."""
     app = _app(
         [_row("mine", "here", open_now=True, registered=False)],
-        scoped_to="/home/monke/Projects/mine.code-workspace",
+        scoped_to=f"{pathlib.Path.home()}/Projects/mine.code-workspace",
     )
     async with app.run_test(size=(120, 30)) as pilot:
         await _ready(app, pilot)

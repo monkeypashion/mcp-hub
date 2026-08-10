@@ -5742,13 +5742,20 @@ def _seat_onboarding() -> None:
             raise ValueError("not an object")
     except (OSError, ValueError):
         state = {}
-    ver = subprocess.run(
-        ["claude", "--version"], capture_output=True, text=True
-    )
     # "2.1.221 (Claude Code)" -> "2.1.221"; unknown version still marks
     # onboarding done (a wrong-but-present version re-onboards once, an
-    # absent key blocks forever).
-    version = (ver.stdout.strip().split() or ["0.0.0"])[0]
+    # absent key blocks forever). A MISSING binary is the extreme case of
+    # unknown — tolerated for the same reason, and it opens no silent path:
+    # in a container the claude launch itself fails loudly moments later,
+    # while on a claude-less machine (CI runner) this function must not be
+    # the thing that dies. Found by the first-ever bare-runner CI run.
+    try:
+        ver = subprocess.run(
+            ["claude", "--version"], capture_output=True, text=True
+        )
+        version = (ver.stdout.strip().split() or ["0.0.0"])[0]
+    except FileNotFoundError:
+        version = "0.0.0"
     state.update(onboarding_state(version))
     claude_json.parent.mkdir(parents=True, exist_ok=True)
     claude_json.write_text(json.dumps(state, indent=2), encoding="utf-8")
