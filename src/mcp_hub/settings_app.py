@@ -502,6 +502,17 @@ class SettingsApp(App):
             bits.append("no snapshot yet")
         elif m["stale"]:
             bits.append("not reporting")
+        # The EDGE is a separate instrument from the snapshot, with its own
+        # vocabulary — one shared phrase is how a dead reconciler read as a
+        # quiet box for five days. `ok` and no-claim (None) render nothing:
+        # the label carries only exceptional facts.
+        edge_state = m.get("edge_state")
+        if edge_state == "failed":
+            bits.append("edge FAILING")
+        elif edge_state == "stale":
+            bits.append("edge not reporting")
+        elif edge_state == "never":
+            bits.append("no edge yet")
         colour = p["primary"] if m["local"] else p["secondary"]
         label = f"[b {colour}]{escape(head)}[/]"
         return f"{label}  [dim]{escape(' · '.join(bits))}[/]" if bits else label

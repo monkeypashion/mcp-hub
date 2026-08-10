@@ -201,6 +201,34 @@ def _remote_state(entry: dict[str, Any], stale: bool) -> str:
     return "idle" if entry.get("idle", True) else "working"
 
 
+EDGE_STALE_SECONDS = 120.0  # 4 missed 30s timer passes — deliberately tighter
+# than FLEET_STALE_SECONDS; the edge has a doorbell AND a timer behind it.
+
+
+def _edge_state(info: dict | None, now: float) -> str | None:
+    """One derived verdict from the edge's self-report.
+
+    None    — no machine record at all (hub unreachable / unknown machine):
+              NO CLAIM, which must never render as either healthy or broken.
+    never   — enrolled machine, no edge has ever reported. After enrolment
+              this is the ordinary first state, not an alarm.
+    stale   — the instrument stopped being written; the LAST result may still
+              ride in edge_info but a stopped instrument must not be read as
+              a measurement.
+    failed  — a fresh pass reported its own failure.
+    ok      — a fresh pass reported success.
+    """
+    if not info:
+        return None
+    ts = info.get("edge_last_run")
+    if not ts:
+        return "never"
+    if (now - float(ts)) > EDGE_STALE_SECONDS:
+        return "stale"
+    result = (info.get("edge_result") or {}).get("result")
+    return "failed" if result == "failed" else "ok"
+
+
 def build_tree(
     *,
     roster: list[dict[str, Any]],
@@ -607,6 +635,18 @@ def build_tree(
             "unknown": m == UNKNOWN_MACHINE,
             "stale": stale and m != this_machine,
             "never": never and m != this_machine,
+            # The edge's own report, a SEPARATE instrument from the fleet
+            # snapshot above: `stale`/`never` describe the heartbeat DAEMON,
+            # edge_state describes the RECONCILER — a dead daemon and a dead
+            # edge are different failures, and one shared "not reporting"
+            # phrase is exactly how five days of 203/EXEC read as a quiet
+            # healthy box. Unlike the snapshot fields this applies to the
+            # LOCAL machine too: a box's own dead edge must show on its own
+            # board.
+            "edge_state": _edge_state(
+                (workspaces.get("machine_info") or {}).get(m), now
+            ),
+            "edge_info": (workspaces.get("machine_info") or {}).get(m),
             "workspaces": wss,
             "containers": cts,
             "loose": lo,

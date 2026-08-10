@@ -298,6 +298,17 @@ def init_api_tables(conn: sqlite3.Connection) -> None:
         )
     except sqlite3.OperationalError:
         pass
+    # The edge's self-report (W1.2): when did a pass last run HERE, and what
+    # was its own verdict. Nullable on purpose — NULL is "no edge has ever
+    # reported", which must stay distinguishable from both ok and failed.
+    for _sql in (
+        "ALTER TABLE api_machines ADD COLUMN edge_last_run REAL",
+        "ALTER TABLE api_machines ADD COLUMN edge_result TEXT",
+    ):
+        try:
+            conn.execute(_sql)
+        except sqlite3.OperationalError:
+            pass
     # Seat lifecycle events — APPEND-ONLY provenance for every existence
     # transition (W1.1). A bare `archived` flag answers "is it archived now"
     # and destroys when/by-whom/why — FDM's estate marked a live healthy
@@ -376,6 +387,13 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             "os": row["os"],
             "capabilities": json.loads(row["capabilities"]),
             "last_seen": row["last_seen"],
+            # ABSENT-AS-NULL, never defaulted: a machine whose edge has
+            # never reported is "no instrument", not "healthy" and not
+            # "failed" — the reader renders the distinction (W1.2).
+            "edge_last_run": row["edge_last_run"],
+            "edge_result": (
+                json.loads(row["edge_result"]) if row["edge_result"] else None
+            ),
         }
         if token is not None:
             out["token"] = token
@@ -790,11 +808,29 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
                 " DO UPDATE SET last_open_ping = excluded.last_open_ping",
                 (name, body["workspace_open"], now, now),
             )
+        # The edge's report on ITSELF (W1.2). Until this key existed the only
+        # machine fact was last_seen — a machine whose edge died 203/EXEC for
+        # five days read exactly like a healthy quiet one. `result` is the
+        # edge's own verdict; the failure path posts it from the except
+        # branch, since a raise before push_status otherwise means no report.
+        edge = body.get("edge")
+        if isinstance(edge, dict) and edge.get("ts"):
+            db().execute(
+                "UPDATE api_machines SET edge_last_run = ?, edge_result = ?"
+                " WHERE name = ?",
+                (float(edge["ts"]), json.dumps(edge), name),
+            )
         db().execute(
             "UPDATE api_machines SET last_seen = ? WHERE name = ?", (now, name)
         )
         db().commit()
-        return JSONResponse({"ok": True})
+        # Keys received but not stored are NAMED in the response — the
+        # "seats" key was silently dropped here for a month, which is how a
+        # working reporting channel stayed invisible (W1.2 B4). A payload key
+        # must be handled, or its drop must be observable; never neither.
+        handled = {"workspaces", "agents", "workspace_open", "edge"}
+        ignored = sorted(k for k in body if k not in handled)
+        return JSONResponse({"ok": True, "ignored": ignored})
 
     OPEN_NOW_WINDOW = 180.0  # seconds; board polls far faster than this
 

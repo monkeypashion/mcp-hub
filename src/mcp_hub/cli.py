@@ -1664,7 +1664,7 @@ def edge_command(args: argparse.Namespace) -> int:
         # two triggers. A second implementation here could drift from the one
         # that actually reconciles, and the drift would only show under load.
         from mcp_hub.edge import EnumerationFailed as _EF
-        from mcp_hub.edge import watch_forever
+        from mcp_hub.edge import push_failure, watch_forever
 
         def one_pass(reason: str) -> None:
             try:
@@ -1672,6 +1672,10 @@ def edge_command(args: argparse.Namespace) -> int:
                     api, machine=machine, runner=runner, scan_dirs=scan_dirs
                 )
             except _EF as e:
+                # The failure must reach the hub, not just this journal —
+                # a pass that dies before push_status otherwise reads as a
+                # quiet healthy machine (the five-day shape).
+                push_failure(api, machine, str(e))
                 print(f"edge: {e}", file=sys.stderr, flush=True)
                 return
             print(
@@ -1716,12 +1720,15 @@ def edge_command(args: argparse.Namespace) -> int:
             print("  nothing — desired state already holds")
         return 0
 
-    from mcp_hub.edge import EnumerationFailed
+    from mcp_hub.edge import EnumerationFailed, push_failure
     try:
         summary = edge_apply(
             api, machine=machine, runner=runner, scan_dirs=scan_dirs
         )
     except EnumerationFailed as e:
+        # Same rule as the watch path: the failure reaches the hub, or a
+        # dead edge reads as a quiet healthy machine.
+        push_failure(api, machine, str(e))
         print(f"edge: {e}", file=sys.stderr)
         return 1
     print(
@@ -3269,11 +3276,24 @@ def workspaces_command(args: argparse.Namespace, api: Any = None) -> int:
         name_w = min(max((len(r["name"]) for r in data["rows"]), default=8), 22)
         here = data.get("this_machine")
         machine = object()
+        from mcp_hub.fleet_tree import _edge_state
+        now = time.time()
         for r in data["rows"]:
             if r["machine"] != machine:
                 machine = r["machine"]
                 suffix = "  · this machine" if machine == here else "  · remote"
-                print(f"{machine or '(machine unknown)'}{suffix}")
+                # The edge's self-report (W1.2) — its own vocabulary, never
+                # shared with daemon-snapshot staleness. `ok`/no-claim render
+                # nothing; the header carries only exceptional facts.
+                estate = _edge_state(
+                    (data.get("machine_info") or {}).get(machine), now
+                )
+                edge_bit = {
+                    "failed": "  ⚠ edge FAILING",
+                    "stale": "  ⚠ edge not reporting",
+                    "never": "  · no edge yet",
+                }.get(estate or "", "")
+                print(f"{machine or '(machine unknown)'}{suffix}{edge_bit}")
             reg = {True: "✔ hub", False: "✗ hub", None: "? hub"}[r["registered"]]
             disk = "✔ disk" if r["on_disk"] else "✗ disk"
             open_now = "● open" if r["open_now"] else "      "

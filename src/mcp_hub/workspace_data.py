@@ -154,11 +154,17 @@ def collect_workspaces(
     # agents would fall into "(machine unknown)" — visible, but wrong.
     machines = {r["machine"] for r in rows.values() if r["machine"]}
     machines.add(this_machine)
+    # The full enrolment record per machine, not just the name — this fetch
+    # used to keep m["name"] and throw the rest away, which is why the edge's
+    # self-report (edge_last_run/edge_result, W1.2) had no path to any
+    # surface even after the hub stored it.
+    machine_info: dict[str, dict] = {}
     if hub_reachable:
         try:
-            machines.update(
-                m["name"] for m in api.list_machines() if m.get("name")
-            )
+            for m in api.list_machines():
+                if m.get("name"):
+                    machines.add(m["name"])
+                    machine_info[m["name"]] = m
         except Exception:  # noqa: BLE001 — enrolment is a bonus source, not a gate
             pass
 
@@ -166,6 +172,7 @@ def collect_workspaces(
         "hub_reachable": hub_reachable,
         "note": note,
         "machines": sorted(machines),
+        "machine_info": machine_info,
         # Returned rather than re-derived by the view: the caller already
         # resolved it, and a second derivation is a second chance to disagree
         # (squad deriving from basename while the cli derives from the git

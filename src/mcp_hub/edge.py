@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -1188,6 +1189,18 @@ def edge_apply(
             "seats": [
                 {"seat": s, **v} for s, v in sorted(local.items())
             ],
+            # The pass reports on ITSELF (W1.2). Until this key existed the
+            # hub's only machine fact was last_seen, so a machine whose edge
+            # died 203/EXEC for five days read exactly like a healthy quiet
+            # one — the summary below went to stdout and the journal, i.e.
+            # to the one place nothing was watching.
+            "edge": {
+                "ts": time.time(),
+                "result": "ok",
+                "placements": len(placements),
+                "actions": len(results),
+                "errors": [],
+            },
         },
     )
     return {
@@ -1196,3 +1209,27 @@ def edge_apply(
         "observed_reported": reported,
         "workspaces_reported": len(workspaces),
     }
+
+
+def push_failure(api: HubAPI, machine: str, error: str) -> None:
+    """Report a FAILED pass to the hub — from the except path, because
+    push_status is the LAST step of a successful pass and a raise anywhere
+    earlier means no status ever posts (the failure mode that kept
+    EnumerationFailed on stderr only).
+
+    Wrapped so the failure-reporter cannot die of its own report:
+    push_status raises on HTTP error, and an exception here would replace
+    the real error with the reporting error at exactly the moment the real
+    one matters most.
+    """
+    try:
+        api.push_status(
+            machine,
+            {"edge": {
+                "ts": time.time(),
+                "result": "failed",
+                "errors": [str(error)[:500]],
+            }},
+        )
+    except Exception:  # noqa: BLE001 — see docstring
+        pass
