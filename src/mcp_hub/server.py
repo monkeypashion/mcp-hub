@@ -1874,6 +1874,34 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # now; the exposure (an ephemeral/headless session calling register
         # as an agent) is accepted and kept honest by wake-ack strikes.
         if ctx is not None:
+            # W1.3 C4 — VISIBILITY, not prevention (prevention needs
+            # per-agent credentials, a named deferred decision). Ordinary
+            # reconnects displace a DEAD binding and stay silent; what gets
+            # recorded is the suspicious shape: a register that displaces a
+            # binding which is still push-deliverable RIGHT NOW. The notice
+            # is a low-prio inbox row under the agent's own name, so
+            # whichever session next drains the inbox — including the
+            # legitimate owner reclaiming — sees that the interval happened.
+            displaced = registry.get(name)
+            if (
+                displaced is not None
+                and displaced is not ctx.session
+                and _can_deliver_push(displaced)
+            ):
+                conn.execute(
+                    "INSERT INTO messages (ts, from_agent, to_agent, body,"
+                    " priority) VALUES (?, 'hub', ?, ?, 'low')",
+                    (now, name,
+                     f"⚠ wake-binding DISPLACED at "
+                     f"{time.strftime('%H:%M:%S', time.localtime(now))}: a "
+                     f"new session registered as '{name}' while a LIVE, "
+                     "deliverable session held the binding. A reconnect "
+                     "after a dead session never triggers this notice. If "
+                     "this was not you, another session received your wakes "
+                     "from that moment — re-register to reclaim, and treat "
+                     "the interval as unattended."),
+                )
+                conn.commit()
             _log_bind_diagnostic("register", name, ctx.session)
             registry.bind(name, ctx.session)
 
@@ -2649,7 +2677,10 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     # -- Channels (topical, named, posted-to via `post`) ---------------------
 
     @mcp.tool()
-    def create_channel(name: str, created_by: str, description: str = "") -> str:
+    def create_channel(
+        name: str, created_by: str, description: str = "",
+        ctx: Context | None = None,
+    ) -> str:
         """Create a named channel for topical posts.
 
         Channels are for grouping conversation by topic (e.g. "deploys",
@@ -2666,6 +2697,12 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             created_by: Your agent name.
             description: What this channel is for.
         """
+        # W1.3: created_by is provenance AND an auto-subscription target — a
+        # bound session claiming another agent's name would subscribe THAT
+        # agent to wakes it never asked for.
+        _grade, attr_err = _attribution(ctx, created_by)
+        if attr_err:
+            return attr_err
         if name == _BROADCAST_CHANNEL:
             return (
                 f"'{_BROADCAST_CHANNEL}' is reserved as the global broadcast "
@@ -2692,7 +2729,10 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             return f"Channel '{name}' already exists."
 
     @mcp.tool()
-    def subscribe_channel(name: str, channel: str, subscribed: bool = True) -> str:
+    def subscribe_channel(
+        name: str, channel: str, subscribed: bool = True,
+        ctx: Context | None = None,
+    ) -> str:
         """Opt in or out of a channel's WAKES (posts at normal/urgent).
 
         Subscription controls delivery only: an unsubscribed agent can still
@@ -2705,6 +2745,12 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             channel: Channel to change.
             subscribed: True to receive wakes, False to stop them.
         """
+        # W1.3: `name` decides WHOSE wakes change — a bound session claiming
+        # another agent's name could silently unsubscribe that agent from a
+        # channel it relies on (a silencer nobody can see).
+        _grade, attr_err = _attribution(ctx, name)
+        if attr_err:
+            return attr_err
         conn = _get_db(db_path)
         if not conn.execute(
             "SELECT 1 FROM channels WHERE name = ?", (channel,)
@@ -3821,6 +3867,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         Args:
             from_agent: Your agent name.
         """
+        # Verify-when-bound BEFORE touch_session — same order and same
+        # reason as send(): without it, a session bound to A could
+        # ping(from_agent=B) and the touch would rebind B's wake target to
+        # A's session (W1.3; the quietest impersonation primitive there was).
+        _grade, attr_err = _attribution(ctx, from_agent)
+        if attr_err:
+            return attr_err
         now = time.time()
         conn = _get_db(db_path)
         touch_session(from_agent, ctx)
@@ -3908,7 +3961,10 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         return "\n".join(r["name"] for r in rows)
 
     @mcp.tool()
-    def memory_put(project: str, filename: str, content: str, from_agent: str = "") -> str:
+    def memory_put(
+        project: str, filename: str, content: str, from_agent: str = "",
+        ctx: Context | None = None,
+    ) -> str:
         """Stage one Claude memory file for transfer to this project's twins.
 
         The hub is a TRANSFER store, not the system of record — the file's
@@ -3924,6 +3980,14 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         """
         if not project or not filename:
             return "memory_put requires project and filename"
+        # W1.3: provenance may be OMITTED (empty stays legal — the export
+        # path predates the field), but a bound session may not FORGE it.
+        # Gating the empty assertion would refuse every provenance-less
+        # export from a bound agent, which is a regression, not a control.
+        if from_agent:
+            _grade, attr_err = _attribution(ctx, from_agent)
+            if attr_err:
+                return attr_err
         if "/" in filename or "\\" in filename or filename in (".", ".."):
             return f"invalid filename '{filename}' — bare names only"
         conn = _get_db(db_path)
