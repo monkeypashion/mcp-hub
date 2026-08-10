@@ -1,0 +1,33 @@
+# CI — the pre-MERGE gate, deliberately not a deploy gate.
+#
+# Coolify deploys on any master push immediately, regardless of this
+# workflow's outcome — so running on master would only ever report on code
+# already deployed. The process rule (docs/verification/wave-N.md): each wave
+# lands as a branch, CI green on the branch is part of the wave's bar, THEN
+# the merge-push deploys. A direct master push bypasses this gate; that
+# residual is recorded there rather than hidden here.
+#
+# Before this file existed, every "N tests green, ruff clean" commit-trailer
+# claim was a self-report with no machine backing it.
+
+name: ci
+on:
+  push:
+    branches-ignore: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install -e . && pip install pytest pytest-asyncio starlette httpx
+      - name: Ruff
+        run: pip install ruff && ruff check src
+      - name: Tests
+        run: pytest -q
