@@ -151,6 +151,11 @@ def validate_spec(spec: dict, *, keys: set[str] | None = None) -> str | None:
         if bad:
             return bad
 
+    if _wanted("repo_mount"):
+        bad = check_repo_mount(spec.get("repo_mount"))
+        if bad:
+            return bad
+
     return None
 
 
@@ -175,6 +180,40 @@ _SENSITIVE_PREFIXES = (
     "/var/run",
     "/run",
 )
+
+# 🔴 THE GAP THE ABOVE LIST DID NOT COVER, and why it is separate.
+#
+# The prefix list refuses SYSTEM paths. `/home` was not on it, so a spec could
+# mount the operator's entire home directory — ssh keys, `~/.claude` (hooks and
+# credentials cache), `~/.mcp-hub/edge-env` (every seat credential on the box) —
+# into a container running in bypassPermissions. Found 2026-08-11 while
+# designing `repo_mount` (docs/seat-repo-access.md).
+#
+# It was DORMANT only because no seat mounted a host path at all. The moment
+# host mounts become a deliberate feature, it stops being dormant — which is
+# why it closes in the same change rather than being filed.
+#
+# Host-independent by construction: the hub validating a spec and the edge
+# re-validating it before materialize run with DIFFERENT homes, so a rule
+# phrased as "$HOME" would mean two different things. These are shapes.
+_HOME_ROOTS = ("/home", "/Users")
+
+# A path COMPONENT with one of these names carries credentials or the
+# configuration that executes code on someone's behalf. Matching on the
+# component (not the prefix) refuses `/home/me/.ssh` and any parent that would
+# contain it. Deliberately blunt, in the same spirit as the secret scanner: a
+# false positive costs one reworded mount, a false negative costs the estate.
+_SENSITIVE_COMPONENTS = frozenset({
+    ".ssh", ".claude", ".mcp-hub", ".aws", ".gnupg", ".docker", ".kube",
+    ".config", ".gitconfig", ".netrc", ".npmrc",
+})
+
+# Where a seat's claude state lives INSIDE the container. Defined here rather
+# than in edge.py because BOTH the guard and the executor need it and there
+# must be one of it: a `repo_mount` landing on this path would shadow the
+# memory volume, which is exactly the durability bug of 2026-08-06 rebuilt
+# from new parts. edge.py imports it from here.
+SEAT_STATE_DIR = "/home/seat/.claude"
 
 
 def check_volumes(volumes: object) -> str | None:
@@ -202,5 +241,98 @@ def check_volumes(volumes: object) -> str | None:
                 f"REFUSED: '{src}' is a host system path; mounting it "
                 "breaks the containment the seat's permission mode assumes. "
                 "Mount a named volume, or the seat's own workdir."
+            )
+        parts = [p for p in norm.split("/") if p]
+        # `/home`, `/Users` — every account on the box — and `/home/<user>`,
+        # one whole account. A path DEEPER than that is a normal project
+        # directory and stays allowed; refusing those would forbid the
+        # legitimate case this guard exists to make safe.
+        if norm in _HOME_ROOTS or (len(parts) == 2
+                                   and "/" + parts[0] in _HOME_ROOTS):
+            return (
+                f"REFUSED: '{src}' is a whole home directory. It carries ssh "
+                "keys, ~/.claude (hooks the seat could rewrite) and "
+                "~/.mcp-hub/edge-env (every seat credential on this host) — "
+                "mounting it hands the container the operator's identity. "
+                "Mount the specific project directory instead, or declare "
+                "`repo_mount` and let the edge place the checkout."
+            )
+        hit = next((p for p in parts if p in _SENSITIVE_COMPONENTS), None)
+        if hit:
+            return (
+                f"REFUSED: '{src}' contains '{hit}', which holds credentials "
+                "or configuration that runs code on the operator's behalf. "
+                "A seat runs in bypassPermissions on the premise that the "
+                "container contains it; this mount would make that false."
+            )
+    return None
+
+
+# --- repo_mount: the operator names a REPO, never a path -------------------
+
+# The allowlist is structural rather than a list: the operator supplies an
+# `org/repo`, and the EDGE derives the host directory under its own managed
+# root. There is no operator-supplied host path to escape from, so "resolves
+# outside the managed root" is unreachable by construction instead of being
+# a rule that has to hold. Everything below guards the two things that DO
+# travel: the repo name (which becomes a path component) and the container
+# destination.
+_REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def check_repo_mount(repo_mount: object) -> str | None:
+    """Validate `spec.repo_mount`. Returns a refusal, or None."""
+    if repo_mount is None:
+        return None
+    if not isinstance(repo_mount, dict):
+        return (
+            "REFUSED: spec.repo_mount must be an object like "
+            '{"repo": "org/name", "ref": "main", "dest": "/home/seat/work"}'
+        )
+    repo = str(repo_mount.get("repo") or "").strip()
+    if not repo:
+        return "REFUSED: spec.repo_mount needs a 'repo' (org/name)"
+    if not _REPO_RE.match(repo):
+        # `..` and `/` are the path-traversal shapes; a leading `-` would be
+        # read as a flag by the git argv the edge builds.
+        return (
+            f"REFUSED: repo '{repo}' is not a plain 'org/name'. The name "
+            "becomes a directory under the edge's managed root, so anything "
+            "that could climb out of it is refused rather than sanitized."
+        )
+    if any(part in (".", "..") for part in repo.split("/")):
+        return f"REFUSED: repo '{repo}' contains a path-traversal component"
+
+    ref = str(repo_mount.get("ref") or "").strip()
+    if ref:
+        if ref.startswith("-"):
+            # Not shell injection — the edge uses argv, no shell. A ref
+            # beginning with `-` is read by git as an OPTION, which is its own
+            # way of making the command do something else entirely.
+            return (
+                f"REFUSED: ref '{ref}' starts with '-', which git would read "
+                "as an option rather than a revision"
+            )
+        if any(c.isspace() for c in ref):
+            return f"REFUSED: ref '{ref}' contains whitespace"
+
+    dest = str(repo_mount.get("dest") or "").strip()
+    if dest:
+        if not dest.startswith("/"):
+            return (
+                f"REFUSED: repo_mount dest '{dest}' must be an absolute path "
+                "inside the container"
+            )
+        norm = dest.rstrip("/") or "/"
+        if norm == "/":
+            return "REFUSED: repo_mount dest may not be the container root"
+        state = SEAT_STATE_DIR.rstrip("/")
+        if norm == state or norm.startswith(state + "/"):
+            return (
+                f"REFUSED: repo_mount dest '{dest}' is inside the seat's "
+                f"state directory ({SEAT_STATE_DIR}), where the memory volume "
+                "is mounted. A checkout there would shadow the seat's memory "
+                "and transcripts — the durability failure of 2026-08-06 in a "
+                "new costume."
             )
     return None

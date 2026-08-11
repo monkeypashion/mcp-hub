@@ -24,7 +24,12 @@ from starlette.testclient import TestClient
 
 from mcp_hub.cli import _read_brief_and_inputs
 from mcp_hub.server import create_server
-from mcp_hub.spec_guard import check_volumes, scan_secret, validate_spec
+from mcp_hub.spec_guard import (
+    check_repo_mount,
+    check_volumes,
+    scan_secret,
+    validate_spec,
+)
 
 OP = {"Authorization": "Bearer op-token"}
 
@@ -171,6 +176,96 @@ class TestVolumes:
         assert check_volumes(None) is None
 
 
+class TestHomeDirectoryMounts:
+    """The gap the prefix list did not cover, found 2026-08-11 while designing
+    `repo_mount`: `/home` was absent, so a spec could mount the operator's
+    whole account into a bypassPermissions container.
+
+    Every test here FAILS against the pre-fix guard — that list refused
+    /etc, /root, /boot, /sys, /proc, /var/run, /run and nothing else.
+    """
+
+    def test_a_whole_home_directory_is_refused(self):
+        """Mutation: drop the _HOME_ROOTS branch → this passes silently."""
+        out = check_volumes(["/home/monke:/host-home"])
+        assert out is not None
+        assert "home directory" in out
+        # Names WHY, not merely that: the reader has to know what they were
+        # about to hand over.
+        assert "edge-env" in out and "ssh" in out
+
+    def test_every_account_on_the_box_is_refused(self):
+        assert check_volumes(["/home:/all"]) is not None
+        assert check_volumes(["/Users:/all"]) is not None
+        assert check_volumes(["/Users/timmy:/mac-home"]) is not None
+
+    @pytest.mark.parametrize("path", [
+        "/home/monke/.ssh",
+        "/home/monke/.claude",
+        "/home/monke/.mcp-hub",
+        "/home/monke/.aws",
+        "/home/monke/.config/gh",
+        "/srv/deploy/.ssh",          # not under a home at all
+    ])
+    def test_credential_bearing_components_are_refused(self, path):
+        """Matching a COMPONENT, not a prefix — `/srv/deploy/.ssh` is a real
+        shape and lives under no home directory."""
+        out = check_volumes([f"{path}:/mounted"])
+        assert out is not None
+        assert "credentials" in out
+
+    def test_a_project_directory_under_a_home_still_passes(self):
+        """Positive control, and the load-bearing one: this design EXISTS to
+        mount host directories. A guard that refused everything under /home
+        would pass every test above and forbid the feature."""
+        assert check_volumes(["/home/monke/Projects/thing:/work"]) is None
+        assert check_volumes(
+            ["/home/monke/.mcp-hub-not-really/x:/work"]) is None
+
+
+class TestRepoMount:
+    def test_a_plain_org_repo_is_accepted(self):
+        """Positive control before any refusal below is trusted."""
+        assert check_repo_mount(
+            {"repo": "dreamteam-ai-labs/browser-agent-test-fixture"}) is None
+        assert check_repo_mount(
+            {"repo": "a/b", "ref": "main", "dest": "/home/seat/work"}) is None
+        assert check_repo_mount(None) is None
+
+    @pytest.mark.parametrize("repo", [
+        "../../etc", "org/../../etc", "/abs/path", "no-slash",
+        "org/repo/extra", "-oProxyCommand=x/y", "org/..",
+    ])
+    def test_anything_that_could_climb_out_is_refused(self, repo):
+        """Mutation: relax _REPO_RE to `.+/.+` → the traversal cases pass.
+
+        The repo name becomes a directory component under the managed root,
+        so this is the boundary that makes 'outside the root' unreachable.
+        """
+        assert check_repo_mount({"repo": repo}) is not None
+
+    def test_a_ref_that_git_would_read_as_an_option_is_refused(self):
+        out = check_repo_mount({"repo": "a/b", "ref": "--upload-pack=evil"})
+        assert out is not None and "option" in out
+
+    def test_dest_inside_the_state_dir_is_refused_naming_the_shadowing(self):
+        """A checkout at ~/.claude would shadow the memory volume — the
+        durability failure of 2026-08-06 rebuilt from new parts."""
+        out = check_repo_mount({"repo": "a/b", "dest": "/home/seat/.claude"})
+        assert out is not None and "memory volume" in out
+        assert check_repo_mount(
+            {"repo": "a/b", "dest": "/home/seat/.claude/x"}) is not None
+
+    def test_dest_must_be_absolute_and_not_root(self):
+        assert check_repo_mount({"repo": "a/b", "dest": "work"}) is not None
+        assert check_repo_mount({"repo": "a/b", "dest": "/"}) is not None
+
+    def test_a_missing_repo_is_refused(self):
+        assert check_repo_mount({}) is not None
+        assert check_repo_mount({"ref": "main"}) is not None
+        assert check_repo_mount("a/b") is not None
+
+
 # ---------------------------------------------------------------------------
 # C1/C3/C4 — all four seat-writing routes, and what they do NOT re-check
 # ---------------------------------------------------------------------------
@@ -227,6 +322,34 @@ class TestRoutesEnforce:
                  volumes=["/var/run/docker.sock:/var/run/docker.sock"])
         assert r.status_code == 422
         assert "docker daemon" in r.json()["detail"]
+
+    def test_POST_refuses_a_whole_home_directory(self, rig):
+        """The gap found 2026-08-11: `/home` was on no list, so this was
+        accepted. Mutation: drop the _HOME_ROOTS branch → 201."""
+        r = _add(rig, "s5", image="x:1", volumes=["/home/monke:/host"])
+        assert r.status_code == 422
+        assert "home directory" in r.json()["detail"]
+
+    def test_POST_refuses_a_traversing_repo_mount(self, rig):
+        r = _add(rig, "s6", image="x:1", repo_mount={"repo": "../../etc"})
+        assert r.status_code == 422
+        assert "org/name" in r.json()["detail"]
+
+    def test_POST_accepts_a_well_formed_repo_mount(self, rig):
+        """Positive control — the feature has to be usable, not merely safe."""
+        r = _add(rig, "s7", image="x:1",
+                 repo_mount={"repo": "dreamteam-ai-labs/fixture",
+                             "ref": "main"})
+        assert r.status_code == 201
+
+    def test_PATCH_reassigning_the_repo_is_validated(self, rig):
+        """The repo is assigned PER BUILD, so PATCH is the hot path for this
+        key — not POST."""
+        _add(rig, "p9", image="x:1", repo_mount={"repo": "org/first"})
+        r = rig.patch("/api/v1/seats/p9",
+                      json={"spec": {"repo_mount": {"repo": "org/../../etc"}}},
+                      headers=OP)
+        assert r.status_code == 422
 
     def test_PATCH_refuses_a_secret_in_a_re_brief(self, rig):
         _add(rig, "p1", brief="fine")
