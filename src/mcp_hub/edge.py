@@ -105,26 +105,40 @@ def repo_mount_argv(seat: str, repo_mount: dict[str, Any],
     cannot push, so there is no work in it that origin does not already have
     (docs/seat-repo-access.md, "Named limits").
     """
-    from mcp_hub.seat import https_repo_url
+    from mcp_hub.seat import credential_helper_value, https_repo_url
 
     repo = str(repo_mount.get("repo") or "")
     ref = str(repo_mount.get("ref") or "").strip()
     dest = repo_mount_dir(seat, repo, root)
     url = https_repo_url(repo)
+    # THE CREDENTIAL, ON THE HOST — and the reason this feature works at all.
+    #
+    # Measured 2026-08-11 against the live private repo: a bare `git clone`
+    # from the edge host fails `could not read Username`, because the host has
+    # no credential helper configured and nothing here supplied one. The
+    # design said "the host clones, where the credential already lives" and
+    # the first implementation never handed it to git — declared, not
+    # enforced, in the very change that closes an instance of that shape.
+    #
+    # `-c` rather than `git config`: nothing is written to the host's git
+    # configuration, and the helper string carries the literal `${VAR}` (see
+    # credential_helper_value), so the VALUE never appears in an argv, a log
+    # line, or an error message. Verified on the same live clone: the token
+    # appears nowhere in the resulting `.git/config`.
+    cred = ["-c", f"credential.helper={credential_helper_value()}"]
     if (dest / ".git").is_dir():
-        cmds = [["git", "-C", str(dest), "fetch", "--prune", "origin"]]
+        base = ["git", *cred, "-C", str(dest)]
+        cmds = [[*base, "fetch", "--prune", "origin"]]
         if ref:
-            cmds.append(["git", "-C", str(dest), "checkout", "--detach",
-                         f"origin/{ref}"])
+            cmds.append([*base, "checkout", "--detach", f"origin/{ref}"])
         else:
-            cmds.append(["git", "-C", str(dest), "reset", "--hard",
-                         "origin/HEAD"])
+            cmds.append([*base, "reset", "--hard", "origin/HEAD"])
         return cmds
-    argv = ["git", "clone", url, str(dest)]
+    argv = ["git", *cred, "clone", url, str(dest)]
     if ref:
         # `--branch` takes a branch or a tag, which is what a `ref` is in
         # every case this feature has: an operator assigning a build.
-        argv[2:2] = ["--branch", ref]
+        argv[-2:-2] = ["--branch", ref]
     return [argv]
 
 # The image's WORKDIR, and the root a pod hangs its per-agent workdirs under
@@ -639,13 +653,29 @@ class DockerExecutor:
                 f"could not create the managed checkout root {dest.parent}: "
                 f"{exc}"
             )}
+        from mcp_hub.seat import SEAT_GITHUB_TOKEN
+
         for argv in repo_mount_argv(seat, rm):
             rc, out = self._run(argv)
             if rc != 0:
+                # The likeliest cause, named rather than left in a git error.
+                # A hand-run `edge apply` does not load ~/.mcp-hub/edge-env
+                # (the systemd unit does, via EnvironmentFile), so the same
+                # command clones from the timer and fails from a terminal —
+                # the identical trap the credentials gate above documents.
+                hint = ""
+                if not self._environ.get(SEAT_GITHUB_TOKEN):
+                    hint = (
+                        f" {SEAT_GITHUB_TOKEN} is not set in this edge's "
+                        f"environment, which is almost certainly why: the "
+                        f"host does the cloning now, so the token has to be "
+                        f"HERE. If this is a hand-run: "
+                        f"`set -a; . ~/.mcp-hub/edge-env; set +a`"
+                    )
                 return {"skipped": True, "reason": (
-                    f"repo_mount: `{' '.join(argv[:3])} …` failed rc={rc} — "
-                    f"refusing to start a seat over an incomplete checkout. "
-                    f"{out[-200:]}"
+                    f"repo_mount: `git … {argv[-2] if len(argv) > 2 else ''}` "
+                    f"failed rc={rc} — refusing to start a seat over an "
+                    f"incomplete checkout.{hint} {out[-200:]}"
                 )}
         return None
 

@@ -724,6 +724,21 @@ def https_repo_url(url: str) -> str:
     return _GITHUB_HTTPS.format(org=parsed[0], repo=parsed[1])
 
 
+def credential_helper_value(token_var: str = SEAT_GITHUB_TOKEN) -> str:
+    """The helper EXPRESSION itself — one definition, two call sites.
+
+    It contains the literal `${VAR}`, never the value: the expansion happens
+    in the shell git spawns when it asks for credentials, reading whichever
+    process's environment git is running in. That is what lets the same string
+    serve the container-side clone (where the edge injected the variable) and
+    the HOST-side `repo_mount` clone (where the edge already has it) — and why
+    an argv carrying this string is safe to log or print in an error.
+    """
+    return (
+        f'!f() {{ echo username=x-access-token; echo "password=${token_var}"; }}; f'
+    )
+
+
 def credential_helper_argv(token_var: str = SEAT_GITHUB_TOKEN) -> list[str]:
     """`git config --global` argv installing an ENV-READING credential helper.
 
@@ -737,10 +752,8 @@ def credential_helper_argv(token_var: str = SEAT_GITHUB_TOKEN) -> list[str]:
     `x-access-token` is the username GitHub expects for token auth; the
     password field carries the token.
     """
-    helper = (
-        f'!f() {{ echo username=x-access-token; echo "password=${token_var}"; }}; f'
-    )
-    return ["git", "config", "--global", "credential.helper", helper]
+    return ["git", "config", "--global", "credential.helper",
+            credential_helper_value(token_var)]
 
 
 # ------------------------------------------------------------ file contents

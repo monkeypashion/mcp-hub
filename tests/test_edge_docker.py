@@ -844,7 +844,7 @@ class TestRepoMount:
             {"op": "materialize", "seat": "s1"}, {"spec": self.SPEC})
         kinds = [c[0] for c in r.calls]
         assert kinds == ["git", "docker"], kinds
-        assert r.calls[0][:2] == ["git", "clone"]
+        assert "clone" in r.calls[0]
 
     def test_a_failed_clone_STOPS_the_materialize(self, tmp_path, monkeypatch):
         """Mutation: ignore the rc from _prepare_repo_mount → a container is
@@ -879,8 +879,13 @@ class TestRepoMount:
         (tmp_path / "s1" / "org" / "thing" / ".git").mkdir(parents=True)
         cmds = repo_mount_argv("s1", {"repo": "org/thing", "ref": "topic"},
                                root=tmp_path)
-        assert cmds[0][:3] == ["git", "-C", str(tmp_path / "s1/org/thing")]
-        assert cmds[0][3] == "fetch"
+        # Asserted by position RELATIVE to -C rather than by index: the argv
+        # gained a `-c credential.helper=…` prefix and an index-based
+        # assertion breaks on a change that is not a defect.
+        assert "clone" not in cmds[0]
+        at = cmds[0].index("-C")
+        assert cmds[0][at + 1] == str(tmp_path / "s1/org/thing")
+        assert "fetch" in cmds[0]
         assert "origin/topic" in cmds[-1]
 
     def test_a_bad_repo_mount_is_refused_at_the_edge_too(self, tmp_path,
@@ -895,3 +900,95 @@ class TestRepoMount:
             {"op": "materialize", "seat": "s1"}, {"spec": spec})
         assert out["skipped"] is True
         assert not r.calls
+
+
+class TestRepoMountCredential:
+    """The host does the cloning, so the credential has to reach git THERE.
+
+    The first implementation of `repo_mount` built a bare `git clone` and
+    shipped. Measured against the live private repo on 2026-08-11: `fatal:
+    could not read Username`. The design sentence "the host clones, where the
+    credential already lives" was declared and not enforced — inside the very
+    change that closes another instance of that shape.
+    """
+
+    RM = {"repo": "dreamteam-ai-labs/dreamteam"}
+
+    def test_the_clone_carries_a_credential_helper(self, tmp_path):
+        """Mutation: drop `cred` from the argv → this fails, and the feature
+        cannot fetch any private repo."""
+        from mcp_hub.edge import repo_mount_argv
+
+        argv = repo_mount_argv("s1", self.RM, root=tmp_path)[0]
+        assert "-c" in argv
+        assert any(a.startswith("credential.helper=") for a in argv)
+
+    def test_the_fetch_path_carries_it_too(self, tmp_path):
+        """A private repo needs auth to FETCH, not only to clone — and the
+        fetch path is the one every re-assignment takes."""
+        from mcp_hub.edge import repo_mount_argv
+
+        (tmp_path / "s1" / "org" / "thing" / ".git").mkdir(parents=True)
+        for argv in repo_mount_argv("s1", {"repo": "org/thing"},
+                                    root=tmp_path):
+            assert any(a.startswith("credential.helper=") for a in argv)
+
+    def test_the_argv_carries_the_VARIABLE_never_the_value(self, tmp_path):
+        """The helper holds the literal `${SEAT_GITHUB_TOKEN}`, expanded by
+        the shell git spawns. So an argv is safe to log, print in an error, or
+        record in a journal — which the failure path above does."""
+        from mcp_hub.edge import repo_mount_argv
+
+        argv = repo_mount_argv("s1", self.RM, root=tmp_path)[0]
+        joined = " ".join(argv)
+        assert "$SEAT_GITHUB_TOKEN" in joined
+        assert "ghp_" not in joined and "github_pat_" not in joined
+
+    def test_the_ref_still_lands_beside_the_credential(self, tmp_path):
+        """The `--branch` splice is positional; adding `-c …` in front moved
+        the anchor it counted from."""
+        from mcp_hub.edge import repo_mount_argv
+
+        argv = repo_mount_argv("s1", dict(self.RM, ref="topic"),
+                               root=tmp_path)[0]
+        assert argv[-4:-2] == ["--branch", "topic"]
+        assert argv[-2].endswith(".git") and argv[-1].endswith("dreamteam")
+
+    def test_a_missing_token_is_NAMED_not_left_in_a_git_error(self, tmp_path,
+                                                              monkeypatch):
+        """A hand-run `edge apply` does not load edge-env; the systemd unit
+        does. Same trap the credentials gate already documents, now reachable
+        by a second route."""
+        monkeypatch.setattr("mcp_hub.edge.SEAT_REPOS_ROOT", tmp_path)
+
+        class FailingGit(Runner):
+            def __call__(self, cmd, cwd=None):
+                if cmd[0] == "git":
+                    self.calls.append(list(cmd))
+                    return 128, "could not read Username for 'https://github.com'"
+                return super().__call__(cmd, cwd)
+
+        spec = {"image": "i", "repo_mount": self.RM}
+        out = DockerExecutor(FailingGit(), {}).execute(
+            {"op": "materialize", "seat": "s1"}, {"spec": spec})
+        assert "SEAT_GITHUB_TOKEN is not set" in out["reason"]
+        assert "edge-env" in out["reason"]
+
+    def test_a_token_that_IS_set_gets_no_misleading_hint(self, tmp_path,
+                                                         monkeypatch):
+        """Positive control: the hint must not fire on every failure, or it
+        sends the reader after the wrong cause."""
+        monkeypatch.setattr("mcp_hub.edge.SEAT_REPOS_ROOT", tmp_path)
+
+        class FailingGit(Runner):
+            def __call__(self, cmd, cwd=None):
+                if cmd[0] == "git":
+                    self.calls.append(list(cmd))
+                    return 128, "fatal: repository not found"
+                return super().__call__(cmd, cwd)
+
+        spec = {"image": "i", "repo_mount": self.RM}
+        out = DockerExecutor(FailingGit(), {"SEAT_GITHUB_TOKEN": "x"}).execute(
+            {"op": "materialize", "seat": "s1"}, {"spec": spec})
+        assert "is not set" not in out["reason"]
+        assert "repository not found" in out["reason"]
