@@ -62,6 +62,64 @@ refusal rather than a best guess:
   when the document is wrong. It is therefore NOT a valid completion target at
   any row count — which is why W3.5 refuses rather than resolves.
 
+## The queries the graph must answer — written BEFORE the schema is trusted
+
+**Added by the 2026-08-11 design review (operator: "get this design absolutely
+nailed"), which found the original design had a storage shape but no query
+list — a graph not validated against its queries is a guess with good
+vocabulary.** Derived from the operator's original ask: *the flow of messages,
+decisions, status and progress between agents, visible as a lineage record.*
+
+| # | Query | Demands |
+|---|---|---|
+| Q1 | How did this decision come about? | backward walk — index on **object** |
+| Q2 | What happened as a result of X? | forward walk — index on **subject** |
+| Q3 | Show the thread containing message M | connected walk over reply edges |
+| Q4 | What did agent X contribute to Y? | index on **(predicate, subject)** |
+| Q5 | Is item W done, and how do we know? | W3.5's refusal today |
+| Q6 | How much traffic carries lineage? | the A9 coverage stat |
+| Q7 | Which hub artifacts relate to ra.feature F? | external refs as nodes |
+
+The API deliverable is shaped by these: a **bounded subgraph walk** (around a
+ref, depth-limited, direction- and predicate-filtered) — never a whole-graph
+dump, which answers none of the questions above and invites O(everything)
+reads.
+
+### Review verdicts on the five contested decisions (2026-08-11, Fable pass)
+
+1. **Node identity = ref envelope: KEPT, STRENGTHENED.** Hub-native schemes
+   (`hub.msg/1`, `hub.decision/1`, `hub.agent/1`) are registered FIRST, so the
+   hub dogfoods its own envelope on every artifact; `ra.feature/1` is the
+   fourth scheme. The mechanism demonstrably privileges nobody — the strongest
+   form of the no-regrets constraint.
+2. **`thread_id` denormalized cache: DROPPED — its justification was FALSE.**
+   "A graph walk per Stop hook would be absurd" — but the Stop hook never
+   walks the graph; no hot path does. Thread queries (Q3) are low-frequency
+   and `WITH RECURSIVE` over an indexed edge table serves them at this hub's
+   scale. The cache defended a nonexistent hot path at the price of this
+   month's most-repeated failure mode: a copy drifting from the truth.
+3. **`in_reply_to`: KEPT — but unusable as first specced.** An agent can only
+   reply to a ref IT HAS SEEN, and nothing printed refs anywhere. Adoption is
+   a property of the SURFACES, not the senders — hence A6 below.
+   `DELIVERED-BEFORE` observational edges were considered and REJECTED:
+   mechanical ordering read as causation is the feature_outcomes mirror with a
+   politer name.
+4. **RDF exporter: proposed DROPPED (operator approval pending).** The triple
+   shape answers the capability question permanently; the exporter itself has
+   no consumer today and was reviewer-invented scope.
+5. **Never-infer: SURVIVES adversarial read.** Every auto edge is an act the
+   hub itself performed. The soft spot — a DECLARED reply to a message the
+   agent was never sent — is legitimate (get_history exists), so it is not
+   refused; the edge's `source` column (`auto`|`declared`) carries the trust
+   distinction to consumers instead.
+
+Plus two items the query list forced: **edges are append-only and OUTLIVE
+their artifacts** (the `api_seat_events` death-fact pattern — a purged
+artifact's edges are history, and a dangling object ref MEANS "artifact gone");
+and **no raw edge-write API exists in this wave** — auto edges ride existing
+verbs, declared edges ride `in_reply_to` on existing verbs under the existing
+`_attribution` gate. No new write surface.
+
 ## W3.1 Lineage — a TRIPLE-shaped edge store
 
 **Design changed 2026-08-11 on the operator's question ("will it support RDF
@@ -98,14 +156,16 @@ CACHE of the edges, never the truth, and a test asserts the two agree.
 
 | # | Item | Status |
 |---|---|---|
-| A1 | Migration adds a `lineage_edges` table `(subject, predicate, object, ts, source)` plus the `thread_id` grouping column, idempotent-by-exception like every prior ALTER. An artifact with no edges reads as **lineage-blind**, never as a root | pending |
+| A1 | Migration adds a `lineage_edges` table `(subject, predicate, object, ts, source)` — **no `thread_id` column anywhere** (review verdict 2: the cache defended a nonexistent hot path). Indexes serve Q1/Q2/Q4: subject, object, (predicate, subject). Idempotent-by-exception like every prior ALTER | pending |
 | A2 | Positive control first: a normal send/post/broadcast still delivers unchanged, with the incident suite (`test_broadcast_scope.py`, 27 tests) passing **UNCHANGED** — no edits to that file permitted by this wave | pending |
 | A3 | Auto-inference tested per artifact type; a type that sets NO edges is reported `lineage_blind: true` in the API, never silently defaulted to a root node | pending |
-| A4 | Subjects and objects are REFS using W3.2's envelope — the same identity mechanism, asserted by a test that a `test.dummy/1` ref can be a graph node with zero core changes | pending |
-| A5 | An unknown predicate is REFUSED naming the registered vocabulary; a dangling object ref and a self-edge are refused at WRITE time, not returned to the caller to trip over | pending |
-| A6 | `thread_id` is a cache, not the truth: a test asserts it agrees with the edges, and disagreement is detectable rather than silently trusted | pending |
-| A7 | Backfill honesty: existing rows are NOT invented into a thread. "No edge recorded" and "edge is the root" are distinguishable in the API | pending |
-| A8 | RDF/JSON-LD export of a subgraph round-trips subject/predicate/object without loss — serialization only; no SPARQL, no ontology, no IRI resolution in this wave (stated limit, not a gap) | pending |
+| A4 | Subjects and objects are REFS in **canonical string form** (sorted-key compact JSON, one encoder, used everywhere). Deliberate negative: the same ref serialized with two field orders lands as ONE node, not two — a graph that silently splits nodes lies about connectivity | pending |
+| A5 | An unknown predicate is REFUSED naming the registered vocabulary; a self-edge is refused at WRITE time. A dangling object ref is legal ONLY as the death-fact of a purged artifact — edges are APPEND-ONLY and outlive their artifacts (`api_seat_events` precedent); purging an artifact never cascades into the graph | pending |
+| A6 | 🔴 Refs are VISIBLE where messages are read — the rendered `<channel>` tag, `get_messages`, `get_history` each carry the message's ref. Deliberate negative: an agent replies with `in_reply_to` copied from its own rendered tag, and the edge lands. Without this the declared path is a parameter with no discoverable values, and the graph stays sparse by construction | pending |
+| A7 | Backfill honesty: existing rows are NOT invented into threads. "No edge recorded" and "edge is the root" are distinguishable in the API; thread membership (Q3) is DERIVED at query time via a bounded recursive walk — cycle-free by A5's write refusals, depth-capped defensively anyway | pending |
+| A8 | The read API is a bounded subgraph walk — around a ref, depth-limited, direction- and predicate-filterable. A whole-graph dump is not offered; it answers none of Q1–Q7 and invites O(everything) reads | pending |
+| A11 | No raw edge-write API exists: auto edges ride existing verbs, declared edges ride `in_reply_to` on send/post/broadcast under `_attribution`. Test: the route table exposes no standalone edge writer | pending |
+| A-RDF | RDF/JSON-LD exporter — **DROP PROPOSED (review verdict 4), operator approval PENDING**: the triple shape answers the capability question permanently; the exporter has no consumer and was reviewer-invented scope. Not built unless the operator wants it kept | pending decision |
 
 ### How edges get POPULATED — the three paths, and the one that stays unbuilt
 
@@ -152,6 +212,8 @@ The operator's no-regrets constraint, and RA endorsed it from the far side:
 | B2 | 🔴 THE NO-REGRETS TEST, asserted in CI rather than intended: a dummy `test.dummy/1` scheme registers through the adapter interface with **zero diffs to core files**. The test fails if adding a scheme requires touching core | pending |
 | B3 | An unknown scheme is REFUSED, naming the registered schemes — never resolved by a default | pending |
 | B4 | A malformed or version-less envelope is refused; `ra.feature/1` and a hypothetical `ra.feature/2` can coexist in the registry | pending |
+| B5 | ⭐ HUB-NATIVE SCHEMES FIRST (review verdict 1): `hub.msg/1`, `hub.decision/1`, `hub.agent/1` register through the SAME adapter interface before any external scheme — the hub dogfoods its own envelope on every artifact, and `ra.feature/1` arrives as the fourth scheme, demonstrably unprivileged | pending |
+| B6 | Scheme version ≠ item version pin, kept apart by construction: `ra.feature/1` names the CONTRACT version; a ref carrying a `version` field pinning the ITEM is refused (FJ rule 2). A test exercises the confusable case: envelope with scheme `ra.feature/1` AND an item `version` key → refused naming rule 2 | pending |
 
 ## W3.3 `ra.feature/1` resolver
 
@@ -167,17 +229,35 @@ Gate CLOSED by RA at `95d3cac`; contract citable as
 
 ## W3.4 FJ's six refusal rules
 
-⚠️ **BLOCKED ON INPUT, and named as such rather than started.** I have been
-saying "implement verbatim" about a document I have never read — it lives in a
-repo not on this box. Requested from FJ 2026-08-11. **No code until the exact
-wording is in hand**; implementing a summary of a refusal contract is the
-error this wave exists to prevent.
+**UNBLOCKED 2026-08-11: FJ pasted §4 verbatim, re-verified byte-identical from
+`04a4255` through current head `7b2e0eb` — cite `7b2e0eb` in every test.** The
+rules, exactly as received:
+
+1. ⛔ A ref missing either half of the pair. No key-only, no id-only.
+2. ⛔ A ref carrying `version` as a pin. Display-only or absent.
+3. ⛔ A ref resolving status against any repo copy. Intent ≠ state.
+4. ⛔ A ref that does not name which document and which status vocabulary it read.
+5. ⛔ An unknown `feature_set_key` — fail closed. Unknown means *unknown*; it
+   must never be read as *new* and must never auto-mint a lineage.
+6. ⚠️ A pair resolving to more than one feature must fail loudly, not pick one —
+   uniqueness is unenforced upstream (§1.2), so the hub is the first place that
+   can notice.
+
+⚠️ **FJ's fit-check, adopted before build: rule 4's subject is the RESOLVED
+ANSWER, not the ref.** A ref names a work item; the *resolution* is what must
+declare document + vocabulary. Rule 4 therefore lives on the **response side**
+(W3.5 E2), not in the envelope schema — building it into the ref would have
+put the rule in a place it cannot do its job. Rule 4 is also **two-part**
+(document AND vocabulary — implementable as one check that silently loses
+half) and there are **FOUR** status vocabularies, not three (`FeatureStatus`
+adds `skipped`).
 
 | # | Item | Status |
 |---|---|---|
-| D1 | All six rules implemented verbatim, each citing the contract commit in its test | pending — awaiting text |
-| D2 | One deliberate negative per rule, exercised in the state that provokes it | pending — awaiting text |
-| D3 | Rule 5 (unknown ⇒ fail closed, never infer) is the one W3.5 leans on; it gets an explicit test that inference does NOT happen | pending — awaiting text |
+| D1 | All six rules implemented verbatim, each test citing `7b2e0eb` | pending |
+| D2 | One deliberate negative per rule, exercised in the state that provokes it. Rule 4's negatives are TWO — missing document, missing vocabulary — since a single combined check can pass while enforcing half the rule | pending |
+| D3 | Rule 5 gets an explicit never-infers test: an unknown `feature_set_key` neither resolves as new NOR auto-mints lineage — both halves asserted | pending |
+| D4 | Rule 6's deliberate negative uses a document with duplicate ids planted directly (RA's `load()` now refuses them at construction, so the state is built the way W1.1 built API-unreachable states — stated in the docstring) | pending |
 
 ## W3.5 Status resolution — fails closed
 
@@ -190,7 +270,7 @@ rather than a rewrite.
 |---|---|---|
 | E1 | "Is this feature done" REFUSES while no target is registered, naming why — never infers from the authored document | pending |
 | E2 | The refusal names document AND vocabulary once a target exists; a resolution attempt lacking either is refused | pending |
-| E3 | 🔴 `feature_outcomes` is NOT registerable as a target by accident: a target whose writer derives status from the input document is refused with that reason named. Evidence on file — it inserts `COALESCE(v_feature->>'status','not_attempted')` from `p_features_json` | pending |
+| E3 | 🔴 `feature_outcomes` is NOT registerable as a target by accident: a target whose writer derives status from the input document is refused with that reason named. Evidence on file — it inserts `COALESCE(v_feature->>'status','not_attempted')` from `p_features_json`. ⚠️ Standing condition from FJ: when dt's repair repopulates the table, rows appearing is NOT the registration signal — **dt's mirror-detector passing is** | pending |
 | E4 | Registering a target is a deliberate act with a test proving an UNREGISTERED hub answers "unresolvable", not "not done" — those are different claims and conflating them is a false delivery report | pending |
 
 ## W3.6 Wave close
