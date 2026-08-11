@@ -1,9 +1,8 @@
 # Wave 3 verification bar — the intent plane
 
-**STATUS 2026-08-11: ALL BUILD ITEMS MET — W3.1+W3.2 `f041a2d`, W3.3–W3.5
-`6446573`. 17/17 mutations killed on the first run. REMAINING: W3.6 close
-(CI, operator-approved merge = deploy, then live bars). Branch `wave-3`,
-which also carries Wave 2's held-back `ca0dabe`.**
+**STATUS 2026-08-11: WAVE 3 COMPLETE — merged and deployed as `bf073e2`
+(operator-approved), all bar items MET, live bars run on prod from a
+re-registered session. Nothing outstanding.**
 
 Committed BEFORE the build (the meta-rule: the build checks against a committed
 bar; it does not write its own exam afterwards). Every item ends the wave as
@@ -283,9 +282,9 @@ rather than a rewrite.
 
 | # | Item | Status |
 |---|---|---|
-| F1 | Full suite + ruff green on the branch; CI green on the branch head before merge | pending |
-| F2 | Every named mutation applied, verified failing against its named test, reverted; ledger filled. Mutations are RUN at close, not trusted from their commits | pending |
-| F3 | Live bars after the deploy settles, from a re-registered session: lineage edges present on real hub traffic; an unknown scheme refused by prod; "is this feature done" refused by prod with no target registered | pending |
+| F1 | Full suite + ruff green on the branch; CI green on the branch head before merge | **MET** — 1974 passed (one byte-exact push-format test and one json key-set test updated to the NEW deliberate contract, named in their diffs), ruff clean, CI green on `e39be08` |
+| F2 | Every named mutation applied, verified failing against its named test, reverted; ledger filled. Mutations are RUN at close, not trusted from their commits | **MET** — 17/17 killed on the FIRST run (a first for these waves); every mutation asserted it changed the source before its verdict counted; N36 is additive |
+| F3 | Live bars after the deploy settles, from a re-registered session: lineage edges present on real hub traffic; an unknown scheme refused by prod; "is this feature done" refused by prod with no target registered | **MET** — details below |
 
 Note: this wave's deploy also carries `ca0dabe` (Wave 2's F3 statuses), held
 back deliberately so a docs-only commit did not cost the fleet a rebind.
@@ -318,3 +317,33 @@ forbidden inference and dies against the never-infer test — the strongest
 form of that gate), and every mutation asserts it actually changed the
 source before its verdict counts, because W2 produced two "survivors" that
 were broken mutations rather than gaps.
+
+### The live bars, as run (prod `bf073e2`, 2026-08-11)
+
+**Deploy verified before anything was measured**: `/health` went `156d378`
+uptime 6315s → `bf073e2` uptime 8s, `agents_bound` 13 → 0 — sha AND uptime,
+because a sha change alone cannot distinguish a redeploy from a restart. The
+rebind cost was paid once, as batched.
+
+**L1 — lineage on real traffic, ref taken from the SURFACE.** A real DM (the
+deploy notice to dev-vm-1) rendered with `⟨hub.msg/1?id=12019⟩` in
+`get_history`; the ref was copied from that rendered text — never from the
+database, per A6's discipline — and `get_lineage` on it returned
+`authored-by → hub.agent/1?name=mcp-hub-fireblade-wsl` and
+`addressed-to → hub.agent/1?name=mcp-hub-dev-vm-1`, both `source: auto`.
+
+**L2 — an unknown scheme is refused by prod, naming the registered:**
+`get_lineage("no.such/1?id=1")` → REFUSED, listing all six schemes —
+`hub.agent/1, hub.channel/1, hub.decision/1, hub.msg/1, hub.squad/1,
+ra.feature/1`.
+
+**L3 — "is this feature done" refuses on prod**, with the full reason:
+UNRESOLVABLE, not 'not done'; the instrument/measurement distinction stated;
+`7b2e0eb` cited; the attestation gate named.
+
+**And the coverage instrument told the truth on day one**:
+`{"messages": {"total": 12019, "with_lineage": 1}, "edges": 2}` — 12,018
+pre-wave messages correctly lineage-blind (A7: history is not invented), the
+single post-deploy message carrying its two auto edges. The accepted
+sparseness, visible rather than assumed — which is exactly what A9 exists to
+guarantee.
