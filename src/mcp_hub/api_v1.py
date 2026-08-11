@@ -39,6 +39,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 # The one-way edge means the loan deadline is enforced by the same function on
 # both surfaces — a second implementation here is a second chance to disagree.
 from mcp_hub.server import purge_expired_memberships
+from mcp_hub.spec_guard import validate_spec
 
 SUBSTRATES = ("worktree", "docker")
 
@@ -898,6 +899,12 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
         spec = body.get("spec") or {}
         if not isinstance(spec, dict):
             return _err(422, "spec must be an object")
+        # W2.3/W2.5 — the control plane holds no secrets, and the seat's
+        # permission mode is only sound while the container really contains
+        # it. Both are spec-write concerns, so one guard covers both.
+        bad = validate_spec(spec)
+        if bad:
+            return _err(422, bad)
         # A docker unit is named by its IMAGE, not by a folder on a host — an
         # nginx container has no worktree and never will. Requiring one would
         # make every non-agent unit lie about itself.
@@ -996,6 +1003,15 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             if incoming is not None:
                 if not isinstance(incoming, dict):
                     return _err(422, "spec must be an object")
+                # Only what the caller SENT is validated: a rule added today
+                # must not make an existing seat un-patchable because of a
+                # key it is not touching.
+                bad = validate_spec(
+                    incoming,
+                    keys={k for k, v in incoming.items() if v is not None},
+                )
+                if bad:
+                    return _err(422, bad)
                 for k, v in incoming.items():
                     if v is None:
                         spec.pop(k, None)   # explicit null REMOVES a key
@@ -1140,6 +1156,14 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             # seats writing each other's memory and results — and a reclaim of
             # either would harvest a volume the other still uses.
             spec["memory_volume"] = f"{spec['memory_volume']}-{suffix}"
+        # DELIBERATELY NOT re-validated (W2.3): the brief and inputs here are
+        # the SOURCE seat's, already accepted once. A guard added today must
+        # not make a seat declared yesterday uncloneable. Volumes ARE checked,
+        # because the sandbox premise is a property of the container this call
+        # is about to create, not of the one it copied from.
+        bad = validate_spec(spec, keys={"volumes"})
+        if bad:
+            return _err(422, bad)
         db().execute(
             "INSERT INTO api_seats (identity, repo, machine, folder, launch_args,"
             " class, cloned_from, created, spec)"
@@ -1695,6 +1719,13 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
                 ]
                 if spec.get("squad"):
                     spec["squad"] = f"{spec['squad']}-{label}"
+            # The fourth seat-writing route (W2.3) — the one the first draft
+            # of this plan missed. Same rule as clone: frozen capsule content
+            # is not re-validated, but the volumes of the container about to
+            # be created are.
+            bad = validate_spec(spec, keys={"volumes"})
+            if bad:
+                return [], _err(422, bad)
             rows.append((
                 new_id, s.get("repo", ""), machine, s.get("folder", ""),
                 s.get("launch_args", ""), s.get("class", "squad"),

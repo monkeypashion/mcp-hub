@@ -1993,6 +1993,8 @@ def _read_brief_and_inputs(
     A brief is meant to be a question and a spec; it must never be a place
     someone pastes a key, so the refusal below is worth its false positives.
     """
+    from mcp_hub.spec_guard import scan_secret
+
     brief = getattr(args, "brief", "") or ""
     if brief.startswith("@"):
         path = pathlib.Path(brief[1:]).expanduser()
@@ -2032,7 +2034,17 @@ def _read_brief_and_inputs(
                 f"two inputs are both named '{path.name}' — they land in one "
                 f"directory, so rename one"
             )
+        found = scan_secret(content, f"input '{path.name}'")
+        if found:
+            return "", {}, found
         inputs[path.name] = content
+    # THE REFUSAL THE DOCSTRING ABOVE HAS PROMISED SINCE BRIEFS SHIPPED. It
+    # did not exist: the invariant was documented and enforced nowhere (W2.3).
+    # The hub validates too — this is not the gate, it is the fast, friendly
+    # half of it, so an operator hears about a pasted key before a round trip.
+    found = scan_secret(brief, "brief")
+    if found:
+        return "", {}, found
     return brief, inputs, ""
 
 
