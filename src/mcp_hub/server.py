@@ -27,7 +27,12 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.streamable_http import GET_STREAM_KEY
 from pydantic import BaseModel
 
-from mcp_hub import lineage, refs
+from mcp_hub import (
+    lineage,
+    ra_feature,  # registers the ra.feature/1 scheme on import
+    refs,
+    status_resolution,
+)
 
 from .session_registry import SessionRegistry, live_server_sessions
 
@@ -726,6 +731,10 @@ def init_db(db_path: Path = DB_PATH) -> None:
     # W3.1: the lineage graph — how the fleet got from A to B, as data.
     # Nodes are refs (refs.py), edges are (subject, predicate, object).
     lineage.ensure_schema(conn)
+    # W3.3/W3.5: the ra.feature/1 store and the (deliberately empty until
+    # attested) status-target table.
+    ra_feature.ensure_schema(conn)
+    status_resolution.ensure_schema(conn)
 
 
 
@@ -4071,6 +4080,53 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 conn, ref, depth=depth, direction=direction,
                 predicate=predicate or None,
             ))
+        except refs.RefError as e:
+            return f"REFUSED: {e}"
+
+    @mcp.tool()
+    def resolve_ref(ref: str) -> str:
+        """Resolve a ref to the WORK ITEM it names — identity, never status.
+
+        Dispatches to the ref's scheme adapter. Status is deliberately not
+        here (rule 3 of the ref contract: an authored document carries
+        intent, and intent ≠ state) — ask `resolve_status`, which fails
+        closed until a blessed observed target exists.
+
+        Args:
+            ref: e.g. ra.feature/1?feature_set_key=analytics-service&id=f3
+        """
+        conn = _get_db(db_path)
+        try:
+            parsed = refs.parse_ref(ref)
+            scheme = refs._REGISTRY[parsed.scheme]
+            if scheme.resolve is None:
+                return (
+                    f"REFUSED: scheme {parsed.scheme!r} has no resolver "
+                    f"registered — its refs are identities (graph nodes), "
+                    f"not resolvable work items"
+                )
+            return json.dumps(scheme.resolve(conn, parsed))
+        except refs.RefError as e:
+            return f"REFUSED: {e}"
+
+    @mcp.tool()
+    def resolve_status(ref: str) -> str:
+        """Is this work item DONE? — currently answered by refusing.
+
+        No blessed status target is registered, and UNRESOLVABLE is a
+        different claim from "not done": the first says the hub has no
+        instrument; the second claims a measurement. The hub never infers
+        completion from an authored document — a store populated by copying
+        the claim agrees with the claim exactly when the claim is wrong.
+
+        Args:
+            ref: The work-item ref, e.g.
+                ra.feature/1?feature_set_key=analytics-service&id=f3
+        """
+        conn = _get_db(db_path)
+        try:
+            refs.parse_ref(ref)  # a malformed ref refuses on the ref itself
+            return json.dumps(status_resolution.resolve_status(conn, ref))
         except refs.RefError as e:
             return f"REFUSED: {e}"
 
