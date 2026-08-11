@@ -1432,6 +1432,45 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             "correct from_agent; the record was not written."
         )
 
+    def _ensure_api_squad(
+        conn: sqlite3.Connection, squad: str, source: str
+    ) -> bool:
+        """Make the runtime aware of a squad the comms side just created.
+
+        THE SPLIT THIS CLOSES (W2.1): `squad_members` is the fact — it alone
+        decides who hears a broadcast — while `api_squads` is a record
+        sidecar that gates three runtime operations (member-PUT, capsule
+        compose, the squad read routes). Nothing kept them in step, so a
+        squad created through `register`/`set_squads` was INVISIBLE to
+        `GET /api/v1/squads`, 404'd on member-PUT, and could not be composed
+        into a capsule — with its members sitting right there. Lazily
+        upserting the record on every membership write makes "exists for
+        comms, unknown to the runtime" unrepresentable.
+
+        Returns False when the squad exists but is ARCHIVED — the caller
+        decides what that means, because the two callers need opposite
+        answers: set_squads REFUSES (a deliberate act naming a retired squad
+        is a mistake worth surfacing), while register DROPS the squad with a
+        notice (refusing the whole call would break reconnects, and every
+        agent reconnects constantly).
+
+        Lives in server.py, not api_v1.py: the import direction is
+        api_v1 → server, so an api_v1-hosted helper imported here would
+        cycle. The table is created unconditionally by init_api_tables at
+        server construction, so it is always present.
+        """
+        row = conn.execute(
+            "SELECT archived FROM api_squads WHERE name = ?", (squad,)
+        ).fetchone()
+        if row is not None:
+            return not row["archived"]
+        conn.execute(
+            "INSERT INTO api_squads (name, description, board_visibility,"
+            " archived, created) VALUES (?, ?, 'shown', 0, ?)",
+            (squad, f"auto-registered from {source}", time.time()),
+        )
+        return True
+
     def _squads_of(conn: sqlite3.Connection, agent: str,
                    include_muted: bool = True) -> list[str]:
         """Squads this agent belongs to, sorted.
@@ -1853,11 +1892,21 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # Mute survives re-registration: INSERT OR IGNORE leaves an existing row
         # alone, so an agent that silenced a squad does not get un-silenced
         # every time its session restarts.
+        # W2.1: a reconnect must never fail on membership, so an ARCHIVED
+        # squad is DROPPED with a notice rather than refused — the opposite
+        # branch from set_squads, deliberately. Silently upserting it would
+        # resurrect a retired squad through the back door; refusing the whole
+        # register would take the agent offline over a bookkeeping detail.
+        dropped: list[str] = []
+        kept: list[str] = []
         for sq in wanted:
+            (kept if _ensure_api_squad(conn, sq, f"register:{name}")
+             else dropped).append(sq)
+        for sq in kept:
             conn.execute(
-                "INSERT OR IGNORE INTO squad_members (agent, squad, muted, joined) "
-                "VALUES (?, ?, 0, ?)",
-                (name, sq, now),
+                "INSERT OR IGNORE INTO squad_members (agent, squad, muted, joined,"
+                " source) VALUES (?, ?, 0, ?, ?)",
+                (name, sq, now, "register"),
             )
         conn.commit()
         _close_coverage_gap(conn, name)
@@ -1915,6 +1964,15 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         result = f"Registered as '{name}'"
         if project:
             result += f" (project: {project})"
+        if dropped:
+            # A drop nobody can see is the silent-resurrection problem in a
+            # different costume: the agent would believe it joined a squad
+            # and simply never hear it.
+            result += (
+                f"\n⚠️ NOT joined: {', '.join(sorted(dropped))} — archived "
+                "squad(s). You will not receive their broadcasts. Re-create "
+                "with `mcp-hub squads create <name>` if the team is back."
+            )
 
         # Twin pairing: clones of one repo derive the same project, so
         # "who else is this repo on another machine?" is a pure query.
@@ -1998,6 +2056,25 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             return f"Agent '{name}' not found. Register first with register()."
 
         now = time.time()
+        # W2.1: naming an ARCHIVED squad here is REFUSED — set_squads is the
+        # authoritative, deliberate form, so a caller naming a retired squad
+        # has made a mistake worth surfacing rather than silently
+        # resurrecting the name. (register() takes the opposite branch: it
+        # drops the squad with a notice, because refusing a reconnect is
+        # worse than an incomplete one.)
+        archived = [
+            sq for sq in wanted
+            if not _ensure_api_squad(conn, sq, f"set_squads:{name}")
+        ]
+        if archived:
+            conn.rollback()
+            return (
+                f"REFUSED: {', '.join(sorted(archived))} "
+                f"{'is an' if len(archived) == 1 else 'are'} archived "
+                "squad(s) — membership was NOT changed. Re-create with "
+                "`mcp-hub squads create <name>` if the team is coming back, "
+                "or drop it from the list."
+            )
         current = set(_squads_of(conn, name))
         for gone in current - set(wanted):
             conn.execute(
@@ -2005,9 +2082,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             )
         for sq in wanted:
             conn.execute(
-                "INSERT OR IGNORE INTO squad_members (agent, squad, muted, joined) "
-                "VALUES (?, ?, 0, ?)",
-                (name, sq, now),
+                "INSERT OR IGNORE INTO squad_members (agent, squad, muted, joined,"
+                " source) VALUES (?, ?, 0, ?, ?)",
+                (name, sq, now, "set_squads"),
             )
         conn.commit()
         touch_session(name, ctx)
