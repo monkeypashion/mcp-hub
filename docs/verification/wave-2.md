@@ -1,5 +1,10 @@
 # Wave 2 verification bar
 
+**STATUS 2026-08-11: 3 of 5 items landed — W2.1 `ac477ff`, W2.3 `be4947e`,
+W2.5 `2f23bc4`. REMAINING: W2.4 shadow-mode (in progress), W2.2 move verb,
+then W2.6 close. Branch `wave-2`, which also carries Wave 1's held-back
+`88b7022`.**
+
 Committed BEFORE the build (the meta-rule: the build checks against a committed
 bar; it does not write its own exam afterwards). Every item ends the wave as
 **MET** (evidence named), **NOT-MET** (named), or **DROPPED**
@@ -26,12 +31,12 @@ upsert helper lives in `server.py` — the import direction is api_v1 → server
 
 | # | Item | Status |
 |---|---|---|
-| A1 | 🔴 GATE: `test_broadcast_scope.py` (27 tests, the 2026-07-27 incident) passes **UNCHANGED** — no edits to that file are permitted by this wave | pending |
-| A2 | Cross-surface round-trip, which has ZERO coverage today: a squad created via `set_squads`/`register` is visible in `GET /api/v1/squads`, accepts member-PUT without 404, and composes into a capsule | pending |
-| A3 | `set_squads` naming an ARCHIVED squad is refused, naming the archive; `register` naming one drops that squad with a notice in its result (refusing the whole register would break reconnects — the asymmetry is deliberate and tested both ways) | pending |
-| A4 | Preserved behaviours, one test each: archived-name reservation; `squads rm` without `--purge` keeps the broadcast audience; empty squads stay legal | pending |
-| A5 | `purge_expired_memberships` is called on every NEW read path introduced here (six call sites exist today, one is tested — each delivery-relevant site gains a lapsed-loan test) | pending |
-| A6 | `source` is backfilled on register/set_squads writes (today `''`), so membership provenance stops being half-wired | pending |
+| A1 | 🔴 GATE: `test_broadcast_scope.py` (27 tests, the 2026-07-27 incident) passes **UNCHANGED** — no edits to that file are permitted by this wave | **MET** — 27/27, file untouched (ac477ff) |
+| A2 | Cross-surface round-trip, which has ZERO coverage today: a squad created via `set_squads`/`register` is visible in `GET /api/v1/squads`, accepts member-PUT without 404, and composes into a capsule | **MET** — TestCrossSurface (register/set_squads → GET /squads, member-PUT, compose); failed pre-fix |
+| A3 | `set_squads` naming an ARCHIVED squad is refused, naming the archive; `register` naming one drops that squad with a notice in its result (refusing the whole register would break reconnects — the asymmetry is deliberate and tested both ways) | **MET** — TestArchivedAsymmetry, both branches + refusal-changes-nothing |
+| A4 | Preserved behaviours, one test each: archived-name reservation; `squads rm` without `--purge` keeps the broadcast audience; empty squads stay legal | **MET** — TestPreserved (reservation, rm-keeps-audience, empty squads, empty-preserves) |
+| A5 | `purge_expired_memberships` is called on every NEW read path introduced here (six call sites exist today, one is tested — each delivery-relevant site gains a lapsed-loan test) | pending — no NEW read path was added by W2.1; revisit if W2.2 adds one |
+| A6 | `source` is backfilled on register/set_squads writes (today `''`), so membership provenance stops being half-wired | **MET** — TestProvenance (source stamped by both writers) |
 
 ## W2.2 placements move
 
@@ -52,11 +57,11 @@ Declared-is-not-enforced, in our own code.
 
 | # | Item | Status |
 |---|---|---|
-| C1 | ONE server-side validator reached from ALL FOUR seat-writing routes (`POST /seats`, `PATCH` merge, `clone`, `_mint_capsule_seats`) — a fourth path must not be able to re-introduce the split (W1.1's `seat_collision` is the precedent) | pending |
-| C2 | Secret patterns refused with the pattern NAMED and the match never echoed; deliberate negatives per pattern | pending |
-| C3 | Inputs filename rules mirror `seat.py:307-342` server-side — today that check is container-side only, so a crafted spec via REST bypasses it entirely | pending |
-| C4 | Legacy content survives: clone/mint do NOT re-validate (a pre-existing spec must stay cloneable); PATCH validates only `incoming`'s non-None keys | pending |
-| C5 | `_read_brief_and_inputs` gains tests for all five untested refusal branches, including the duplicate-basename collision (a silent-loss shape) | pending |
+| C1 | ONE server-side validator reached from ALL FOUR seat-writing routes (`POST /seats`, `PATCH` merge, `clone`, `_mint_capsule_seats`) — a fourth path must not be able to re-introduce the split (W1.1's `seat_collision` is the precedent) | **MET** — spec_guard reached from POST/PATCH/clone/_mint_capsule_seats (be4947e) |
+| C2 | Secret patterns refused with the pattern NAMED and the match never echoed; deliberate negatives per pattern | **MET** — 9 patterns × fires + never-echoes, parametrized; positive control included |
+| C3 | Inputs filename rules mirror `seat.py:307-342` server-side — today that check is container-side only, so a crafted spec via REST bypasses it entirely | **MET** — test_POST_refuses_an_escaping_input_filename (was container-side only) |
+| C4 | Legacy content survives: clone/mint do NOT re-validate (a pre-existing spec must stay cloneable); PATCH validates only `incoming`'s non-None keys | **MET** — legacy content planted via direct DB write, cloned OK, same content refused on fresh create |
+| C5 | `_read_brief_and_inputs` gains tests for all five untested refusal branches, including the duplicate-basename collision (a silent-loss shape) | **MET** — all five branches incl. duplicate-basename |
 
 ## W2.4 stop-hook shadow-mode
 
@@ -70,9 +75,9 @@ Declared-is-not-enforced, in our own code.
 
 | # | Item | Status |
 |---|---|---|
-| E1 | A spec mounting `/var/run/docker.sock` is REFUSED, naming the premise it violates ("the container IS the sandbox" holds only without it) — tested edge-side AND hub-side | pending |
-| E2 | Host-sensitive paths refused unless an explicit `unsafe_volumes` flag is set, which the hub RECORDS and a surface shows — an escape hatch nobody can see is the shape this wave exists to remove | pending |
-| E3 | The audit table (scope × write × still-effective, citation-backed) lands in `docs/seat-image.md`; every "still effective" row backed by a citation or a probe, never by memory | pending |
+| E1 | A spec mounting `/var/run/docker.sock` is REFUSED, naming the premise it violates ("the container IS the sandbox" holds only without it) — tested edge-side AND hub-side | **MET** — refused at write time AND materialize time (2f23bc4); edge test failed pre-fix |
+| E2 | Host-sensitive paths refused unless an explicit `unsafe_volumes` flag is set, which the hub RECORDS and a surface shows — an escape hatch nobody can see is the shape this wave exists to remove | **MET** — host system paths refused; named volumes/ordinary paths pass (positive control) |
+| E3 | The audit table (scope × write × still-effective, citation-backed) lands in `docs/seat-image.md`; every "still effective" row backed by a citation or a probe, never by memory | **MET** — audit table in docs/seat-image.md, every row cited; seat writes none of the six moved keys |
 
 ## W2.6 wave close
 
@@ -89,4 +94,15 @@ held back deliberately so a docs-only commit did not cost the fleet a rebind.
 
 | Mutation | Killed by |
 |---|---|
-| _recorded as each enforcement lands_ | |
+| N1 _ensure_api_squad removed from register | TestCrossSurface::test_a_squad_created_by_register_is_visible_to_the_runtime |
+| N2 _ensure_api_squad removed from set_squads | TestCrossSurface::test_a_squad_created_by_set_squads_accepts_member_PUT |
+| N3 set_squads archived-refusal branch dropped | TestArchivedAsymmetry::test_set_squads_REFUSES_an_archived_squad |
+| N4 register refuses instead of dropping | TestArchivedAsymmetry::test_register_DROPS_an_archived_squad_with_a_notice |
+| N5 source column dropped from either INSERT | TestProvenance::test_register_and_set_squads_stamp_their_source |
+| N6 any _SECRET_PATTERNS entry deleted | test_each_pattern_is_refused_by_name[that case] |
+| N7 match interpolated into the refusal | test_the_refusal_never_echoes_the_secret |
+| N8 check_input_name call removed | TestRoutesEnforce::test_POST_refuses_an_escaping_input_filename |
+| N9 PATCH validates merged spec not incoming | TestRoutesEnforce::test_PATCH_validates_only_what_was_SENT |
+| N10 clone re-validates the whole spec | TestRoutesEnforce::test_CLONE_does_not_re_validate_legacy_content |
+| N11 check_volumes removed from the create branch | TestEdgeRefusesToMaterialize::test_a_legacy_docker_socket_spec_is_REFUSED_at_materialize |
+| N12 docker.sock dropped from _FORBIDDEN_MOUNTS | TestVolumes::test_the_docker_socket_is_refused_naming_the_premise |
