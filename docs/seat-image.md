@@ -334,6 +334,51 @@ Design record: `memory/project_interactive_factory_build_2026_08_07.md`.
   it. A `SEAT_REPO` seat treats the clone as disposable — what's pushed is
   what's real (the transport gate's rule, applied to containers).
 
+### 🔴 Mounts that are REFUSED (W2.5)
+
+The permission mode above is sound *only while the container genuinely
+contains the seat*. Until 2026-08-11 nothing enforced that: `spec.volumes`
+passed verbatim to `docker create`, so a spec mounting the docker socket
+silently made the premise false while every surface still reported a healthy
+seat. Two gates now, deliberately both:
+
+| Gate | Where | Why both |
+| --- | --- | --- |
+| write-time | `spec_guard.validate_spec`, on all four seat-writing routes | stops a bad spec being stored at all |
+| materialize-time | `DockerExecutor.execute`, before `docker create` | a spec stored BEFORE the guard existed would otherwise still run — the edge is the last place that can say no |
+
+Refused: `/var/run/docker.sock` and `/run/docker.sock` (container management
+is the edge's job, from outside), and host system paths (`/etc`, `/root`,
+`/boot`, `/sys`, `/proc`, `/run`, `/var/run`). Named volumes and ordinary
+project paths are unaffected.
+
+## Settings-scope audit (2026-08-11)
+
+Every config write the seat performs, and whether it still does what it
+claims after Anthropic moved six security-relevant settings out of
+repo-writable scope (MCP trust 2.1.196, `autoMode.*` 2.1.207,
+`sandbox.network.strictAllowlist` 2.1.219, `filesystem.disabled` 2.1.216,
+credential masking 2.1.221/224, `allowAppleEvents`). **The seat writes none
+of those six.** Each row below is backed by a citation, never by memory.
+
+| Write | Scope | Still effective? |
+| --- | --- | --- |
+| `theme`, onboarding unblock (`seat.py:790`) | user `~/.claude/settings.json` | ✅ user scope, unaffected |
+| `skipDangerousModePermissionPrompt` (`seat.py:801`) | user | ✅ unaffected |
+| `enabledMcpjsonServers: ["hub"]` (`seat.py:802`) | user | ✅ **the load-bearing leg** — user scope is the correct side of the MCP-trust move |
+| `permissions.defaultMode: bypassPermissions` (`seat.py:828`) | user | ✅ unaffected; soundness now enforced by the mount gates above |
+| `permissions.allow` (15 hub tools, `seat.py:831`) | user | ✅ unaffected |
+| `hooks.Stop` / `hooks.SessionStart` (`seat.py:833-858`) | user | ✅ hooks remain the only project-scoped policy mechanism, and these are user-scoped anyway |
+| `hasCompletedOnboarding` (`seat.py:907-918`) | `~/.claude.json` | ✅ unaffected |
+| `projects[<workdir>].hasTrustDialogAccepted` + `enabledMcpjsonServers` (`edge.py:342-398`) | `~/.claude.json`, project-keyed | ⚠️ **belt-and-braces only** — measured not to survive (3 of 4 paths lost it; dev-vm-1 saw 1 of ~30 survive). Harmless, but do not rely on it |
+| `.claude/hub-agent.json` (identity marker) | project | ✅ identity, not policy |
+| `.mcp.json` with `?agent=<identity>` (`cli.py:5214-5221`) | project — **deliberately never user** | ✅ a pod shares HOME, so a user-scope `?agent=` stamp would misroute one agent's DMs into another's session (the 2026-07-27 incident) |
+| `BRIEF.md`, `inputs/*` | project | ✅ content, not policy; now secret-scanned at write time |
+
+⚠️ One known trade, recorded rather than fixed: user-scope
+`enabledMcpjsonServers: ["hub"]` approves **any** server named `hub` on that
+box. That is a per-box operator decision (`edge.py:356-359`).
+
 ## Exit codes
 
 | Code | Meaning |

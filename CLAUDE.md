@@ -818,6 +818,47 @@ own gap: **`edge apply` is a one-shot and nothing schedules it by default.**
 then DESTROYS — a destroy you can reach by typing a word into a state field is
 a destroy that happens by accident.
 
+### Moving a seat between machines
+
+```bash
+mcp-hub placements move <pid> --to dev-vm-1 --yes [--timeout 300] [--no-harvest]
+mcp-hub placements move <pid> --to dev-vm-1 --dry-run
+```
+
+`machine` is **immutable** on a placement, so the obvious move — create the
+same seat on B — is not a move at all: it is **two live placements for one
+identity**, both registering, the last one silently owning the wake binding.
+That is the collision `capsules place` refuses by name, and nothing stopped you
+reaching it one placement at a time.
+
+So `move` is an orchestration: reclaim on A → **wait until A's edge reports
+`destroy` done** → create on B. The wait is what makes the collision impossible
+*by construction* rather than by a refusal someone can be talked past, and it
+watches the edge's own absence verdict — never `desired`, which would let the
+move mark itself done by wanting to.
+
+- **Both machines' edges are pre-checked**, not just the destination. The
+  source is what actually hangs the wait: machine A offline means the reclaim
+  is never observed complete. `stale`/`never`/no-record **refuse**; `failed`
+  **warns and proceeds** — a reporting-but-failing edge is a measurement, not
+  blindness, and refusing it would make the fleet unmovable exactly when a seat
+  most needs to come off a sick box.
+- **A timeout exits `2`** — distinct from `1` (refused) and `0` (moved) —
+  because it is *resumable*, not broken: A is reclaimed, B untouched, and the
+  message spells out the two-phase path.
+- **A docker seat with no `memory_volume` is refused** without `--no-harvest`:
+  reclaim would have nothing to harvest, so the move destroys everything the
+  agent learned, silently.
+- **Leftovers are deliberately not the full report.** A seat declaration
+  outliving its placement is what makes moving machines possible at all, so
+  naming it as a leftover would invite deleting the thing the move depends on.
+  Only the source **roster row** is genuinely left behind.
+
+⚠️ The edge runs harvest → verify → destroy **unconditionally**, so a harvest
+that failed did not stop the destroy. The move names that in its output when it
+happens; gating it changes reclaim semantics for every caller and is a separate
+deferred decision.
+
 **In the board**, a seat that has a placement offers `Start on <machine>` /
 `Stop on <machine>` in the palette — a HUB write, so it drives a box you are
 not sitting at. The state it is already in is not offered. The row itself
