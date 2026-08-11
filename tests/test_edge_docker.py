@@ -757,3 +757,141 @@ def test_an_enumeration_with_NO_absence_key_never_claims_reclaimed():
         {"container": "web-box-1", "alive": False},
     )
     assert rep["state"] == "stopped"
+
+
+# ---------------------------------------------------------------------------
+# repo_mount — the host clones, the container mounts (docs/seat-repo-access.md)
+# ---------------------------------------------------------------------------
+
+
+class TestRepoMount:
+    """The credential leaves the container. The host clones — where the token
+    already lives, in this machine's own environment — and the container
+    receives a DIRECTORY.
+
+    Every assertion here reads what the container would actually RECEIVE (the
+    docker argv), never the spec. A spec still naming the token is the normal
+    case, not the failure — the drop happens at the one place the value would
+    enter the container.
+    """
+
+    SPEC = {
+        "image": "mcp-hub-seat",
+        "env_from_host": ["CLAUDE_CODE_OAUTH_TOKEN", "SEAT_GITHUB_TOKEN"],
+        "repo_mount": {"repo": "dreamteam-ai-labs/browser-agent-test-fixture"},
+        "memory_volume": "seat-memory-x",
+    }
+    ENV = {"CLAUDE_CODE_OAUTH_TOKEN": "oauth-value",
+           "SEAT_GITHUB_TOKEN": "ghp-SECRET-VALUE"}
+
+    def test_the_github_token_never_enters_the_container(self):
+        """Mutation: return `wanted` unfiltered from injected_credentials()
+        → the secret rides in and this fails.
+
+        This is the whole feature. A seat whose code is mounted has no reason
+        to hold a GitHub credential.
+        """
+        argv = DockerExecutor.create_argv("s1", self.SPEC, self.ENV)
+        assert not any("ghp-SECRET-VALUE" in a for a in argv)
+        assert not any(a.startswith("SEAT_GITHUB_TOKEN") for a in argv)
+
+    def test_the_anthropic_credential_still_arrives(self):
+        """Positive control. A change that dropped EVERY credential would pass
+        the test above while making the seat unable to run at all."""
+        argv = DockerExecutor.create_argv("s1", self.SPEC, self.ENV)
+        assert "CLAUDE_CODE_OAUTH_TOKEN=oauth-value" in argv
+
+    def test_the_checkout_is_mounted_at_the_workdir(self):
+        from mcp_hub.edge import SEAT_WORK_DIR, repo_mount_dir
+
+        argv = DockerExecutor.create_argv("s1", self.SPEC, self.ENV)
+        want = repo_mount_dir("s1", self.SPEC["repo_mount"]["repo"])
+        assert f"{want}:{SEAT_WORK_DIR}" in argv
+
+    def test_the_memory_volume_is_still_mounted_beside_it(self):
+        """The two mounts are independent; a repo mount must not cost the seat
+        its durable state — that regression would be invisible until a
+        recreate."""
+        from mcp_hub.edge import SEAT_STATE_DIR
+
+        argv = DockerExecutor.create_argv("s1", self.SPEC, self.ENV)
+        assert f"seat-memory-x:{SEAT_STATE_DIR}" in argv
+
+    def test_two_seats_on_one_repo_get_SEPARATE_checkouts(self):
+        """A shared working tree would let two seats fight over the index and
+        the checked-out ref, silently."""
+        from mcp_hub.edge import repo_mount_dir
+
+        a = repo_mount_dir("seat-a", "org/thing")
+        b = repo_mount_dir("seat-b", "org/thing")
+        assert a != b
+        assert a.name == b.name == "thing"
+
+    def test_a_seat_without_repo_mount_keeps_its_token(self):
+        """Positive control for the DROP: today's container-side clone path is
+        untouched, so existing seats keep working."""
+        from mcp_hub.edge import injected_credentials
+
+        spec = {k: v for k, v in self.SPEC.items() if k != "repo_mount"}
+        assert injected_credentials(spec) == [
+            "CLAUDE_CODE_OAUTH_TOKEN", "SEAT_GITHUB_TOKEN"]
+
+    def test_the_clone_runs_BEFORE_the_container_is_created(self, tmp_path,
+                                                            monkeypatch):
+        monkeypatch.setattr("mcp_hub.edge.SEAT_REPOS_ROOT", tmp_path)
+        r = Runner()
+        DockerExecutor(r, self.ENV).execute(
+            {"op": "materialize", "seat": "s1"}, {"spec": self.SPEC})
+        kinds = [c[0] for c in r.calls]
+        assert kinds == ["git", "docker"], kinds
+        assert r.calls[0][:2] == ["git", "clone"]
+
+    def test_a_failed_clone_STOPS_the_materialize(self, tmp_path, monkeypatch):
+        """Mutation: ignore the rc from _prepare_repo_mount → a container is
+        created over an empty directory.
+
+        `docker ps` would call that healthy and the agent would sit in an
+        empty workdir with nothing saying why.
+        """
+        monkeypatch.setattr("mcp_hub.edge.SEAT_REPOS_ROOT", tmp_path)
+
+        class FailingGit(Runner):
+            def __call__(self, cmd, cwd=None):
+                if cmd[0] == "git":
+                    self.calls.append(list(cmd))
+                    return 128, "fatal: repository not found"
+                return super().__call__(cmd, cwd)
+
+        r = FailingGit()
+        out = DockerExecutor(r, self.ENV).execute(
+            {"op": "materialize", "seat": "s1"}, {"spec": self.SPEC})
+        assert out["skipped"] is True
+        assert "repo_mount" in out["reason"] and "128" in out["reason"]
+        assert not any(c[0] == "docker" for c in r.calls)
+
+    def test_an_existing_checkout_is_MOVED_not_recloned(self, tmp_path,
+                                                       monkeypatch):
+        """The repo is assigned PER BUILD, so the second materialize has to be
+        able to change what the tree holds."""
+        from mcp_hub.edge import repo_mount_argv
+
+        monkeypatch.setattr("mcp_hub.edge.SEAT_REPOS_ROOT", tmp_path)
+        (tmp_path / "s1" / "org" / "thing" / ".git").mkdir(parents=True)
+        cmds = repo_mount_argv("s1", {"repo": "org/thing", "ref": "topic"},
+                               root=tmp_path)
+        assert cmds[0][:3] == ["git", "-C", str(tmp_path / "s1/org/thing")]
+        assert cmds[0][3] == "fetch"
+        assert "origin/topic" in cmds[-1]
+
+    def test_a_bad_repo_mount_is_refused_at_the_edge_too(self, tmp_path,
+                                                         monkeypatch):
+        """The hub refuses such a spec at write time — but a spec stored
+        BEFORE this guard existed would otherwise materialize here. Same
+        reason the volumes check is repeated at the edge."""
+        monkeypatch.setattr("mcp_hub.edge.SEAT_REPOS_ROOT", tmp_path)
+        r = Runner()
+        spec = dict(self.SPEC, repo_mount={"repo": "../../etc"})
+        out = DockerExecutor(r, self.ENV).execute(
+            {"op": "materialize", "seat": "s1"}, {"spec": spec})
+        assert out["skipped"] is True
+        assert not r.calls

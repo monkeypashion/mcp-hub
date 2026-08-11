@@ -35,7 +35,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from mcp_hub.spec_guard import check_volumes
+from mcp_hub.spec_guard import SEAT_STATE_DIR, check_repo_mount, check_volumes
 
 # Where the seat credentials live on an edge host. The systemd unit reads it
 # via `EnvironmentFile=-%h/.mcp-hub/edge-env`; the CLI reads it through
@@ -43,11 +43,89 @@ from mcp_hub.spec_guard import check_volumes
 # which is why the hub only ever stores the NAMES.
 EDGE_ENV_FILE = Path.home() / ".mcp-hub" / "edge-env"
 
-# Where a seat's claude state lives INSIDE the container — memory,
-# transcripts, credentials cache. The image's user is `seat` (seat/Dockerfile),
-# so this is that user's ~/.claude and nothing here may derive it from the
-# EDGE host's HOME. Destination for a `memory_volume` given as a bare name.
-SEAT_STATE_DIR = "/home/seat/.claude"
+# SEAT_STATE_DIR — where a seat's claude state lives INSIDE the container
+# (memory, transcripts, credentials cache). The image's user is `seat`
+# (seat/Dockerfile), so it is that user's ~/.claude and nothing here may derive
+# it from the EDGE host's HOME. Destination for a `memory_volume` given as a
+# bare name. Defined in spec_guard because the guard needs it too — a
+# `repo_mount` landing there would shadow the memory volume.
+
+# The managed root for host-side checkouts (docs/seat-repo-access.md). The
+# operator names a REPO; this machine decides the PATH. That split is what
+# makes "a checkout outside the managed root" unreachable rather than
+# forbidden — there is no operator-supplied host path anywhere in the flow.
+#
+# Per-SEAT, not per-repo: two seats assigned the same repo must not share a
+# working tree, or their index and checked-out ref fight silently.
+SEAT_REPOS_ROOT = Path.home() / ".mcp-hub" / "seat-repos"
+
+
+def repo_mount_dir(seat: str, repo: str,
+                   root: Path | None = None) -> Path:
+    """Host directory holding `repo`'s checkout for `seat`.
+
+    Both components are already validated by `check_repo_mount` before
+    anything calls this — the guard refuses a repo that is not a plain
+    `org/name`, so nothing here can climb out of the root.
+    """
+    org, _, name = repo.partition("/")
+    return (root or SEAT_REPOS_ROOT) / seat / org / name
+
+
+def injected_credentials(spec: dict[str, Any]) -> list[str]:
+    """The credential NAMES this container actually receives.
+
+    🔴 THE POINT OF `repo_mount`: a seat whose code is mounted from the host
+    has no reason to hold a GitHub credential, and holding one is the whole
+    exposure the design removes. The host clones — where the token already
+    lives, in this machine's own environment — and the container receives a
+    DIRECTORY.
+
+    Dropped here, at the one place the value would enter the container, rather
+    than asked of whoever writes the spec: a spec that still names the token
+    (every existing one does) must not be able to smuggle it back in, and
+    editing every spec would be a migration that could be half-done.
+    """
+    from mcp_hub.seat import SEAT_GITHUB_TOKEN
+
+    wanted = [str(n) for n in (spec.get("env_from_host") or [])]
+    if spec.get("repo_mount"):
+        return [n for n in wanted if n != SEAT_GITHUB_TOKEN]
+    return wanted
+
+
+def repo_mount_argv(seat: str, repo_mount: dict[str, Any],
+                    root: Path | None = None) -> list[list[str]]:
+    """Git commands that bring the host checkout to the wanted state.
+
+    Clone when absent, fetch-and-reset when present: an assigned repo changes
+    per build, so the second and later materializations of a seat must be able
+    to MOVE the checkout rather than only create it. `reset --hard` is right
+    here precisely because this tree is the edge's, not a human's — the seat
+    cannot push, so there is no work in it that origin does not already have
+    (docs/seat-repo-access.md, "Named limits").
+    """
+    from mcp_hub.seat import https_repo_url
+
+    repo = str(repo_mount.get("repo") or "")
+    ref = str(repo_mount.get("ref") or "").strip()
+    dest = repo_mount_dir(seat, repo, root)
+    url = https_repo_url(repo)
+    if (dest / ".git").is_dir():
+        cmds = [["git", "-C", str(dest), "fetch", "--prune", "origin"]]
+        if ref:
+            cmds.append(["git", "-C", str(dest), "checkout", "--detach",
+                         f"origin/{ref}"])
+        else:
+            cmds.append(["git", "-C", str(dest), "reset", "--hard",
+                         "origin/HEAD"])
+        return cmds
+    argv = ["git", "clone", url, str(dest)]
+    if ref:
+        # `--branch` takes a branch or a tag, which is what a `ref` is in
+        # every case this feature has: an operator assigning a build.
+        argv[2:2] = ["--branch", ref]
+    return [argv]
 
 # The image's WORKDIR, and the root a pod hangs its per-agent workdirs under
 # (`<root>/<identity>`). Harvest targets these with `docker exec -w`, because
@@ -539,6 +617,38 @@ class DockerExecutor:
         # real one. It is the ONLY place a secret value comes from.
         self._environ = environ if environ is not None else dict(os.environ)
 
+    def _prepare_repo_mount(self, seat: str,
+                            spec: dict[str, Any]) -> dict[str, Any] | None:
+        """Bring the host checkout to the wanted state. None = nothing to do
+        or done; a dict = the skip result explaining the failure.
+
+        The credential is used HERE, on the host, out of this process's own
+        environment — never passed to the container. That inversion is the
+        whole feature: `git` on this machine already knows how to authenticate
+        (the edge's `~/.mcp-hub/edge-env` is loaded by the systemd unit), so
+        the token never has to travel.
+        """
+        rm = spec.get("repo_mount")
+        if not rm:
+            return None
+        dest = repo_mount_dir(seat, str(rm.get("repo") or ""))
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return {"skipped": True, "reason": (
+                f"could not create the managed checkout root {dest.parent}: "
+                f"{exc}"
+            )}
+        for argv in repo_mount_argv(seat, rm):
+            rc, out = self._run(argv)
+            if rc != 0:
+                return {"skipped": True, "reason": (
+                    f"repo_mount: `{' '.join(argv[:3])} …` failed rc={rc} — "
+                    f"refusing to start a seat over an incomplete checkout. "
+                    f"{out[-200:]}"
+                )}
+        return None
+
     @staticmethod
     def create_argv(seat: str, spec: dict[str, Any],
                     environ: dict[str, str] | None = None) -> list[str]:
@@ -611,13 +721,22 @@ class DockerExecutor:
         # confusing 401 inside the container, where a missing one fails at the
         # door with an obvious message.
         env = environ if environ is not None else {}
-        for name in spec.get("env_from_host") or []:
+        for name in injected_credentials(spec):
             if env.get(name):
                 argv += ["-e", f"{name}={env[name]}"]
         for pub in spec.get("ports") or []:
             argv += ["-p", str(pub)]
         for vol in spec.get("volumes") or []:
             argv += ["-v", str(vol)]
+        # The host checkout (docs/seat-repo-access.md). Placed BEFORE the
+        # memory volume so that a dest colliding with the state dir would be
+        # overridden by it rather than shadowing it — belt to the guard's
+        # braces, which refuses such a dest at both write time and here.
+        rm = spec.get("repo_mount")
+        if rm:
+            dest = str(rm.get("dest") or "").strip() or SEAT_WORK_DIR
+            argv += ["-v", f"{repo_mount_dir(seat, str(rm.get('repo') or ''))}"
+                           f":{dest}"]
         # THE MEMORY VOLUME IS A MOUNT, not just a flag.
         #
         # It was declared on every seat and read in exactly one place — the
@@ -711,7 +830,7 @@ class DockerExecutor:
                     "would die with the container. Re-declare the seat with "
                     "--memory-volume <name>."
                 )}
-            wanted = list(spec.get("env_from_host") or [])
+            wanted = injected_credentials(spec)
             if wanted and not any(self._environ.get(n) for n in wanted):
                 # NONE of the named credentials is set here, so this container
                 # is guaranteed to die at its own door (exit 42) the moment it
@@ -744,6 +863,17 @@ class DockerExecutor:
             bad = check_volumes(spec.get("volumes"))
             if bad:
                 return {**base, "skipped": True, "reason": bad}
+            bad = check_repo_mount(spec.get("repo_mount"))
+            if bad:
+                return {**base, "skipped": True, "reason": bad}
+            # THE CHECKOUT HAPPENS FIRST, AND ITS FAILURE STOPS THE
+            # MATERIALIZE. A container started over a missing or half-fetched
+            # directory looks healthy to `docker ps` and gives the agent an
+            # empty workdir — the seat would sit there with nothing to do and
+            # nothing saying why. Refusing here names the git failure instead.
+            prep = self._prepare_repo_mount(seat, spec)
+            if prep is not None:
+                return {**base, **prep}
             cmd = self.create_argv(seat, spec, self._environ)
         elif op == "start":
             cmd = ["docker", "start", seat]
