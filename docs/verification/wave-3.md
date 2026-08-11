@@ -159,13 +159,13 @@ CACHE of the edges, never the truth, and a test asserts the two agree.
 | A1 | Migration adds a `lineage_edges` table `(subject, predicate, object, ts, source)` — **no `thread_id` column anywhere** (review verdict 2: the cache defended a nonexistent hot path). Indexes serve Q1/Q2/Q4: subject, object, (predicate, subject). Idempotent-by-exception like every prior ALTER | pending |
 | A2 | Positive control first: a normal send/post/broadcast still delivers unchanged, with the incident suite (`test_broadcast_scope.py`, 27 tests) passing **UNCHANGED** — no edits to that file permitted by this wave | pending |
 | A3 | Auto-inference tested per artifact type; a type that sets NO edges is reported `lineage_blind: true` in the API, never silently defaulted to a root node | pending |
-| A4 | Subjects and objects are REFS in **canonical string form** (sorted-key compact JSON, one encoder, used everywhere). Deliberate negative: the same ref serialized with two field orders lands as ONE node, not two — a graph that silently splits nodes lies about connectivity | pending |
+| A4 | Subjects and objects are REFS in **canonical string form** — amended pre-build from sorted-key JSON to a URI-style form `scheme/ver?k=v&k=v` (keys sorted, values percent-encoded): refs are COPY-PASTED by agents into tool parameters, and JSON's nested-quote escaping there is an error factory, while rendered-tag bytes multiply by fan-out. ONE encoder, one parser, used for storage, display and input alike. Deliberate negative: the same ref with two field orders lands as ONE node, not two | pending |
 | A5 | An unknown predicate is REFUSED naming the registered vocabulary; a self-edge is refused at WRITE time. A dangling object ref is legal ONLY as the death-fact of a purged artifact — edges are APPEND-ONLY and outlive their artifacts (`api_seat_events` precedent); purging an artifact never cascades into the graph | pending |
 | A6 | 🔴 Refs are VISIBLE where messages are read — the rendered `<channel>` tag, `get_messages`, `get_history` each carry the message's ref. Deliberate negative: an agent replies with `in_reply_to` copied from its own rendered tag, and the edge lands. Without this the declared path is a parameter with no discoverable values, and the graph stays sparse by construction | pending |
 | A7 | Backfill honesty: existing rows are NOT invented into threads. "No edge recorded" and "edge is the root" are distinguishable in the API; thread membership (Q3) is DERIVED at query time via a bounded recursive walk — cycle-free by A5's write refusals, depth-capped defensively anyway | pending |
 | A8 | The read API is a bounded subgraph walk — around a ref, depth-limited, direction- and predicate-filterable. A whole-graph dump is not offered; it answers none of Q1–Q7 and invites O(everything) reads | pending |
 | A11 | No raw edge-write API exists: auto edges ride existing verbs, declared edges ride `in_reply_to` on send/post/broadcast under `_attribution`. Test: the route table exposes no standalone edge writer | pending |
-| A-RDF | RDF/JSON-LD exporter — **DROP PROPOSED (review verdict 4), operator approval PENDING**: the triple shape answers the capability question permanently; the exporter has no consumer and was reviewer-invented scope. Not built unless the operator wants it kept | pending decision |
+| A-RDF | RDF/JSON-LD exporter — **DROPPED, operator-approved 2026-08-11** ("so long as we are capturing RDF triple style we can always create an exporter later" — condition holds: storage IS `(subject, predicate, object)`, so a future exporter is a serializer over existing data, no migration). Revisit when a consumer exists | **DROPPED** |
 
 ### How edges get POPULATED — the three paths, and the one that stays unbuilt
 
@@ -176,8 +176,12 @@ recorded?* The split below **is** the design, so it is part of the bar.
 change, no inference. `AUTHORED-BY` (from `from_agent`, already gated by
 `_attribution`), `ADDRESSED-TO` (the routing decision just made), `RESOLVES`
 (`decision_resolve` closes the agent's one open card — the hub owns that
-lifecycle), `SUPERSEDES` (`decision_put` upserts; the hub did the replacing),
-`DELIVERED-IN` (drain-batch wake grouping).
+lifecycle), `SUPERSEDES` (`decision_put` upserts; the hub did the replacing).
+⚠️ `DELIVERED-IN` (drain-batch grouping) is DROPPED with its reason named: a
+drain batch has no identity — no artifact exists to be the object of the edge,
+and minting a synthetic one to carry a mechanical grouping is exactly the
+dense-but-meaningless shape verdict 3 rejected. Revisit if wake events ever
+become artifacts.
 
 **② DECLARED — what only the sender knows.** An optional `in_reply_to=<ref>`
 on `send`/`post`/`broadcast`. **Omitted means lineage-blind, never root.**
