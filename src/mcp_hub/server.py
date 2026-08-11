@@ -27,6 +27,8 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.streamable_http import GET_STREAM_KEY
 from pydantic import BaseModel
 
+from mcp_hub import lineage, refs
+
 from .session_registry import SessionRegistry, live_server_sessions
 
 logger = logging.getLogger(__name__)
@@ -721,11 +723,99 @@ def init_db(db_path: Path = DB_PATH) -> None:
         except sqlite3.OperationalError:
             pass  # Column already exists
 
+    # W3.1: the lineage graph — how the fleet got from A to B, as data.
+    # Nodes are refs (refs.py), edges are (subject, predicate, object).
+    lineage.ensure_schema(conn)
+
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _msg_ref(message_id: int) -> str:
+    return refs.canonical(refs.make_ref("hub.msg/1", id=message_id))
+
+
+def _validate_reply_ref(conn: sqlite3.Connection, in_reply_to: str) -> tuple[str, str]:
+    """Validate a DECLARED reply target BEFORE the message is stored, so a
+    bad ref refuses the send loudly instead of silently dropping the edge —
+    a silently-dropped edge is a lineage record that lies by omission.
+
+    Returns (canonical_ref, "") or ("", refusal). Replies target messages:
+    every DM, post and broadcast is a `messages` row, so `hub.msg/1` covers
+    them all. A reply to a message that never existed is refused — the graph
+    records what happened, and an invented parent is an invented fact.
+    """
+    if not in_reply_to:
+        return "", ""
+    try:
+        ref = refs.parse_ref(in_reply_to)
+    except refs.RefError as e:
+        return "", (
+            f"in_reply_to refused: {e} — copy the ⟨ref⟩ shown on the message "
+            f"you are answering, e.g. hub.msg/1?id=123"
+        )
+    if ref.scheme != "hub.msg/1":
+        return "", (
+            f"in_reply_to refused: replies target messages (hub.msg/1), "
+            f"got {ref.scheme!r}"
+        )
+    row = conn.execute(
+        "SELECT 1 FROM messages WHERE id = ?", (ref.get("id"),)
+    ).fetchone()
+    if not row:
+        return "", (
+            f"in_reply_to refused: no message {refs.canonical(ref)} on this "
+            f"hub — a reply to a message that never existed would put an "
+            f"invented fact in the lineage record"
+        )
+    return refs.canonical(ref), ""
+
+
+def _record_msg_lineage(
+    conn: sqlite3.Connection,
+    message_id: int,
+    from_agent: str,
+    *,
+    to_agent: str = "",
+    channel: str = "",
+    squad: str = "",
+    reply_ref: str = "",
+) -> None:
+    """AUTO edges for a stored message, plus the DECLARED reply edge if the
+    sender named one. Fail-soft on the writes themselves: the message is
+    already committed, and lineage must never break delivery — but the
+    validation that can refuse happened BEFORE the insert, in
+    `_validate_reply_ref`, so nothing here fails for a caller-visible reason.
+    """
+    try:
+        subj = _msg_ref(message_id)
+        lineage.write_edge(
+            conn, subj, "authored-by",
+            refs.make_ref("hub.agent/1", name=from_agent), "auto",
+        )
+        if to_agent:
+            lineage.write_edge(
+                conn, subj, "addressed-to",
+                refs.make_ref("hub.agent/1", name=to_agent), "auto",
+            )
+        elif squad:
+            lineage.write_edge(
+                conn, subj, "addressed-to",
+                refs.make_ref("hub.squad/1", name=squad), "auto",
+            )
+        elif channel:
+            lineage.write_edge(
+                conn, subj, "addressed-to",
+                refs.make_ref("hub.channel/1", name=channel), "auto",
+            )
+        if reply_ref:
+            lineage.write_edge(conn, subj, "replies-to", reply_ref, "declared")
+    except Exception:  # noqa: BLE001 — see docstring
+        logger.warning("lineage write failed for msg %s", message_id,
+                       exc_info=True)
 
 
 def purge_expired_memberships(conn: sqlite3.Connection,
@@ -2278,7 +2368,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     @mcp.tool()
     async def send(
         from_agent: str, to: str, message: str, priority: str = "normal",
-        ctx: Context | None = None,
+        in_reply_to: str = "", ctx: Context | None = None,
     ) -> str:
         """Send a direct message to another agent.
 
@@ -2300,6 +2390,10 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             to: Target agent name.
             message: The message body.
             priority: One of "low" | "normal" | "urgent". Defaults to "normal".
+            in_reply_to: Optional ref of the message this ANSWERS — copy the
+                ⟨ref⟩ shown on the message you are replying to (e.g.
+                hub.msg/1?id=123). Declared lineage: the hub records the edge
+                you assert and never guesses one.
         """
         if priority not in _VALID_PRIORITIES:
             return (
@@ -2318,6 +2412,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         if attr_err:
             return attr_err
 
+        # Declared lineage validates BEFORE the insert: a malformed or
+        # nonexistent reply target refuses the send loudly, never drops the
+        # edge silently.
+        reply_ref, reply_err = _validate_reply_ref(conn, in_reply_to)
+        if reply_err:
+            return reply_err
+
         # Auto-bind sender's session — any tool call refreshes the binding
         # so drift across redeploys self-heals without explicit register().
         touch_session(from_agent, ctx)
@@ -2333,6 +2434,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         )
         message_id = cursor.lastrowid
         conn.commit()
+        _record_msg_lineage(conn, message_id, from_agent, to_agent=to,
+                            reply_ref=reply_ref)
 
         # Low-priority — Case 1 path. Check recipient's idle state.
         # is_idle=1 means the recipient's last Stop hook fired (turn-end
@@ -2374,7 +2477,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 prio = r["priority"]
                 prio_tag = f" [{prio}]" if prio != "normal" else ""
                 content_lines.append(
-                    f"[{ts}] DM from {r['from_agent']}{prio_tag}: "
+                    f"[{ts}] DM from {r['from_agent']} "
+                    f"⟨{_msg_ref(r['id'])}⟩{prio_tag}: "
                     f"{_clip_push(r['body'])}"
                 )
             content = "\n".join(content_lines)
@@ -2420,7 +2524,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 
         outcome = await push_channel(
             agent=to,
-            content=f"DM from {from_agent}: {_clip_push(message)}",
+            content=f"DM from {from_agent} ⟨{_msg_ref(message_id)}⟩: "
+                    f"{_clip_push(message)}",
             # `source` is reserved by Claude Code's channel layer (it's the
             # channel server's name, "hub"). Use `from_agent` to avoid a
             # duplicate `source=` attribute on the rendered <channel> tag.
@@ -2467,7 +2572,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     @mcp.tool()
     async def broadcast(
         from_agent: str, message: str, priority: str = "normal",
-        scope: str = "", ctx: Context | None = None,
+        scope: str = "", in_reply_to: str = "", ctx: Context | None = None,
     ) -> str:
         """Post a broadcast to your squad.
 
@@ -2531,6 +2636,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 
         # Verify-when-bound before the touch (see send() for why the order
         # matters — a mismatched assert must not rebind the named agent).
+        reply_ref, reply_err = _validate_reply_ref(conn, in_reply_to)
+        if reply_err:
+            return reply_err
         grade, attr_err = _attribution(ctx, from_agent)
         if attr_err:
             return attr_err
@@ -2580,6 +2688,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             (now, from_agent, _BROADCAST_CHANNEL, message, priority, grade, audience),
         )
         broadcast_id = cursor.lastrowid
+        _record_msg_lineage(conn, broadcast_id, from_agent, squad=audience,
+                            reply_ref=reply_ref)
 
         # Always advance the sender's broadcast cursor past their own message.
         # Without this, the sender sees their own broadcast surfaced on their
@@ -2634,7 +2744,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         async def _push_one(agent: str) -> None:
             push_results[agent] = await push_channel(
                 agent=agent,
-                content=f"BROADCAST from {from_agent}: {_clip_push(message)}",
+                content=f"BROADCAST from {from_agent} "
+                        f"⟨{_msg_ref(broadcast_id)}⟩: {_clip_push(message)}",
                 meta={
                     "from_agent": from_agent,
                     "kind": "broadcast",
@@ -2904,6 +3015,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         channel: str,
         message: str,
         priority: str = "normal",
+        in_reply_to: str = "",
         ctx: Context | None = None,
     ) -> str:
         """Post a message to a named channel.
@@ -2949,18 +3061,25 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         if attr_err:
             return attr_err
 
+        reply_ref, reply_err = _validate_reply_ref(conn, in_reply_to)
+        if reply_err:
+            return reply_err
+
         # Auto-bind sender's session for drift self-heal.
         touch_session(from_agent, ctx)
 
         conn.execute(
             "UPDATE agents SET last_seen = ? WHERE name = ?", (now, from_agent)
         )
-        conn.execute(
+        cursor = conn.execute(
             "INSERT INTO messages (ts, from_agent, channel, body, priority, "
             "attribution) VALUES (?, ?, ?, ?, ?, ?)",
             (now, from_agent, channel, message, priority, grade),
         )
+        post_id = cursor.lastrowid
         conn.commit()
+        _record_msg_lineage(conn, post_id, from_agent, channel=channel,
+                            reply_ref=reply_ref)
 
         # Posting is engagement: it (re)subscribes the poster. Silence
         # never subscribes anyone.
@@ -2998,7 +3117,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         async def _push_one(agent: str) -> None:
             push_results[agent] = await push_channel(
                 agent=agent,
-                content=f"#{channel} from {from_agent}: {_clip_push(message)}",
+                content=f"#{channel} from {from_agent} "
+                        f"⟨{_msg_ref(post_id)}⟩: {_clip_push(message)}",
                 meta={
                     "from_agent": from_agent,
                     "kind": "post",
@@ -3100,6 +3220,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             return json.dumps([
                 {
                     "id": r["id"],
+                    "ref": _msg_ref(r["id"]),
                     "ts": r["ts"],
                     "from_agent": r["from_agent"],
                     "body": r["body"],
@@ -3116,7 +3237,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             ts = time.strftime("%H:%M:%S", time.localtime(r["ts"]))
             prio = r["priority"] if r["priority"] != "normal" else ""
             prio_tag = f" [{prio}]" if prio else ""
-            lines.append(f"[{ts}] **{r['from_agent']}**{prio_tag}: {r['body']}")
+            lines.append(f"[{ts}] **{r['from_agent']}** ⟨{_msg_ref(r['id'])}⟩"
+                         f"{prio_tag}: {r['body']}")
         return "\n".join(lines)
 
     # -- Reading messages --
@@ -3258,7 +3380,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 ):
                     seen_live += 1
                     lines.append(
-                        f"[{ts}] **{r['from_agent']}**{prio_tag}: "
+                        f"[{ts}] **{r['from_agent']}** ⟨{_msg_ref(r['id'])}⟩"
+                        f"{prio_tag}: "
                         f"(already delivered live — {_summarise(body)})"
                     )
                     continue
@@ -3271,7 +3394,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 else:
                     capped += 1
                     body = _summarise(body, COMPACT_SUMMARY_CHARS)
-            lines.append(f"[{ts}] **{r['from_agent']}**{prio_tag}: {body}")
+            lines.append(f"[{ts}] **{r['from_agent']}** ⟨{_msg_ref(r['id'])}⟩"
+                         f"{prio_tag}: {body}")
         if compact and (seen_live or capped or clipped):
             # Point at get_history, NOT get_messages: this very call marked
             # these rows read, so a follow-up get_messages returns nothing.
@@ -3303,7 +3427,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         cutoff = time.time() - (since_minutes * 60)
         conn = _get_db(db_path)
         rows = conn.execute(
-            """SELECT ts, from_agent, body, priority FROM messages
+            """SELECT id, ts, from_agent, body, priority FROM messages
                WHERE channel = ? AND ts > ?
                ORDER BY ts ASC LIMIT ?""",
             (_BROADCAST_CHANNEL, cutoff, limit),
@@ -3317,7 +3441,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             ts = time.strftime("%H:%M:%S", time.localtime(r["ts"]))
             prio = r["priority"] if r["priority"] != "normal" else ""
             prio_tag = f" [{prio}]" if prio else ""
-            lines.append(f"[{ts}] **{r['from_agent']}**{prio_tag}: {r['body']}")
+            lines.append(f"[{ts}] **{r['from_agent']}** ⟨{_msg_ref(r['id'])}⟩"
+                         f"{prio_tag}: {r['body']}")
         return "\n".join(lines)
 
     @mcp.tool()
@@ -3530,7 +3655,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 else:
                     capped += 1
                     body = _summarise(body, COMPACT_SUMMARY_CHARS)
-            lines.append(f"[{ts}] **{r['from_agent']}**{prio_tag}: {body}")
+            lines.append(f"[{ts}] **{r['from_agent']}** ⟨{_msg_ref(r['id'])}⟩"
+                         f"{prio_tag}: {body}")
         if compact and (capped or clipped):
             # Point at get_history('#general'), not get_broadcasts_for_agent:
             # this very call advanced the cursor, so a repeat returns nothing.
@@ -3592,6 +3718,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             *(t.strip().lower() for t in tags.split(",") if t.strip()),
         }))
         conn = _get_db(db_path)
+        superseded_id: int | None = None
         open_row = conn.execute(
             "SELECT id, ask FROM decisions WHERE agent = ? AND status = 'open' "
             "AND source = ?",
@@ -3615,6 +3742,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                     "WHERE id=?",
                     (now, open_row["id"]),
                 )
+                superseded_id = open_row["id"]
                 open_row = None
         if open_row:
             conn.execute(
@@ -3640,6 +3768,23 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
              f["risk_score"], f["net_score"], all_tags, grade),
         )
         conn.commit()
+        # AUTO lineage: the hub itself performed both facts — it stored the
+        # card under the asker's name, and it did the superseding above.
+        try:
+            card_ref = refs.make_ref("hub.decision/1", card=cur.lastrowid)
+            lineage.write_edge(
+                conn, card_ref, "authored-by",
+                refs.make_ref("hub.agent/1", name=from_agent), "auto",
+            )
+            if superseded_id is not None:
+                lineage.write_edge(
+                    conn, card_ref, "supersedes",
+                    refs.make_ref("hub.decision/1", card=superseded_id),
+                    "auto",
+                )
+        except Exception:  # noqa: BLE001 — lineage never breaks the verb
+            logger.warning("lineage write failed for card %s", cur.lastrowid,
+                           exc_info=True)
         return f"Decision card #{cur.lastrowid} opened (net={f['net_score']})."
 
     @mcp.tool()
@@ -3713,14 +3858,32 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         if attr_err:
             return attr_err
         conn = _get_db(db_path)
-        cur = conn.execute(
+        # Select-then-update so the resolved card's ID is known — the lineage
+        # edge needs a subjectable fact, and rowcount can't name one.
+        row = conn.execute(
+            "SELECT id FROM decisions WHERE agent=? AND status='open' "
+            "AND source=?",
+            (from_agent, source),
+        ).fetchone()
+        if not row:
+            return ""
+        conn.execute(
             "UPDATE decisions SET status='decided', decided_at=?, "
-            "decision='in-pane', decision_note=? "
-            "WHERE agent=? AND status='open' AND source=?",
-            (time.time(), f"[agent-recorded] {verdict}", from_agent, source),
+            "decision='in-pane', decision_note=? WHERE id=?",
+            (time.time(), f"[agent-recorded] {verdict}", row["id"]),
         )
         conn.commit()
-        return f"Card resolved: {verdict}" if cur.rowcount else ""
+        try:
+            # AUTO: the hub owns the card lifecycle — this close is its act.
+            lineage.write_edge(
+                conn, refs.make_ref("hub.agent/1", name=from_agent),
+                "resolves", refs.make_ref("hub.decision/1", card=row["id"]),
+                "auto",
+            )
+        except Exception:  # noqa: BLE001 — lineage never breaks the verb
+            logger.warning("lineage write failed for card %s", row["id"],
+                           exc_info=True)
+        return f"Card resolved: {verdict}"
 
     @mcp.tool()
     def decision_list(status: str = "open", limit: int = 50,
@@ -3848,13 +4011,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         if agent_or_channel.startswith("#"):
             channel = agent_or_channel[1:]
             rows = conn.execute(
-                """SELECT ts, from_agent, body FROM messages
+                """SELECT id, ts, from_agent, body FROM messages
                    WHERE channel = ? ORDER BY ts DESC LIMIT ?""",
                 (channel, limit),
             ).fetchall()
         else:
             rows = conn.execute(
-                """SELECT ts, from_agent, to_agent, channel, body FROM messages
+                """SELECT id, ts, from_agent, to_agent, channel, body FROM messages
                    WHERE from_agent = ? OR to_agent = ?
                    ORDER BY ts DESC LIMIT ?""",
                 (agent_or_channel, agent_or_channel, limit),
@@ -3866,14 +4029,50 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         lines = []
         for r in rows:
             ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["ts"]))
+            ref_bit = f" ⟨{_msg_ref(r['id'])}⟩"
             if "to_agent" in r.keys() and r["to_agent"]:
-                lines.append(f"[{ts}] {r['from_agent']} → {r['to_agent']}: {r['body']}")
+                lines.append(f"[{ts}] {r['from_agent']} → {r['to_agent']}"
+                             f"{ref_bit}: {r['body']}")
             elif "channel" in r.keys() and r["channel"]:
-                lines.append(f"[{ts}] {r['from_agent']} → #{r['channel']}: {r['body']}")
+                lines.append(f"[{ts}] {r['from_agent']} → #{r['channel']}"
+                             f"{ref_bit}: {r['body']}")
             else:
-                lines.append(f"[{ts}] {r['from_agent']}: {r['body']}")
+                lines.append(f"[{ts}] {r['from_agent']}{ref_bit}: {r['body']}")
         lines.reverse()
         return "\n".join(lines)
+
+    @mcp.tool()
+    def get_lineage(
+        ref: str, depth: int = 2, direction: str = "both",
+        predicate: str = "",
+    ) -> str:
+        """How the fleet got from A to B — the lineage subgraph around a ref.
+
+        Every message carries its ref in ⟨angle brackets⟩ wherever it is
+        shown (live tags, get_messages, get_history). Feed one in here to see
+        what it answered, who wrote it, and what answered it.
+
+        Args:
+            ref: A canonical ref, e.g. hub.msg/1?id=123 or
+                hub.decision/1?card=540.
+            depth: How many hops to walk (bounded).
+            direction: 'out' (what this points at), 'in' (what points at
+                this), or 'both'.
+            predicate: Optional filter, e.g. 'replies-to' or 'authored-by'.
+
+        A node with no edges returns `lineage_blind: true` — nothing was
+        RECORDED about it, which is not the same claim as "nothing happened".
+        Edges carry `source`: 'auto' is a fact the hub itself performed;
+        'declared' is what a sender asserted via in_reply_to.
+        """
+        conn = _get_db(db_path)
+        try:
+            return json.dumps(lineage.walk(
+                conn, ref, depth=depth, direction=direction,
+                predicate=predicate or None,
+            ))
+        except refs.RefError as e:
+            return f"REFUSED: {e}"
 
     # -- Focus --
 
