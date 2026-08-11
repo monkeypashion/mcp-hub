@@ -6159,12 +6159,31 @@ def voice_client_command(args: argparse.Namespace) -> int:
          "--latency-msec=80"],
         stdin=_sp.PIPE,
     )
-    print(f"voice: streaming from {gw}:{args.port} as {seat}", file=sys.stderr)
+    # 🔴 CONNECTED IS NOT STREAMING, and saying so cost days of silence.
+    #
+    # This line used to read "streaming from …" and printed HERE, before a
+    # single byte had arrived. The host's identity gate refuses AFTER the
+    # accept, by closing the connection — so a refused seat printed a success
+    # message, exited the loop below on the first empty recv, and said nothing
+    # else. Measured 2026-08-11: every containerised seat on dev-vm-1 had been
+    # refused for days while its own log claimed it was streaming, and only
+    # the HOST journal disagreed.
+    #
+    # Same family as the hub's own push-success-is-not-receipt bugs: a sender
+    # reporting its own send is not evidence of delivery.
+    print(f"voice: connected to {gw}:{args.port} as {seat} — awaiting audio",
+          file=sys.stderr)
+    received = 0
     try:
         while True:
             chunk = sock.recv(4096)
             if not chunk:
                 break
+            if received == 0:
+                # FIRST FRAME. Only now is "streaming" a true statement.
+                print(f"voice: streaming from {gw}:{args.port} as {seat}",
+                      file=sys.stderr)
+            received += len(chunk)
             if pac.stdin is None:
                 break
             pac.stdin.write(chunk)
@@ -6173,6 +6192,20 @@ def voice_client_command(args: argparse.Namespace) -> int:
     finally:
         with contextlib.suppress(Exception):
             sock.close()
+        if received == 0:
+            # The measured cause, named — but as the likely one, not the
+            # certain one: a host restart mid-handshake looks identical from
+            # here, and only the host knows which it was.
+            print(
+                "voice: NO AUDIO — the host accepted the connection and closed "
+                "it without sending a frame. Most likely its identity gate "
+                f"refused this container: it authorises {seat!r} against this "
+                "machine's squad roster, and a seat materialized by `edge "
+                "apply` is NOT enrolled by that act. Confirm on the host with "
+                "`journalctl --user -u voice-host.service | grep REFUSED`.",
+                file=sys.stderr)
+        else:
+            print(f"voice: stream ended after {received} bytes", file=sys.stderr)
         with contextlib.suppress(Exception):
             pac.terminate()
     return 0

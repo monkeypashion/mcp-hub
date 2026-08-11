@@ -20,6 +20,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         alsa-utils libasound2-plugins pulseaudio-utils pulseaudio \
     && rm -rf /var/lib/apt/lists/*
 
+# NODE + GH — the fixture harness is a Node program, and it drives codespaces
+# through the `gh` CLI. Measured 2026-08-11 inside `mcp-hub-seat:latest`:
+# node, npm, npx and gh were ALL absent, which is runtime-not-installed rather
+# than anything configuration could fix. A seat could be handed the right repo
+# and the right credential and still not run `subphase-test.js`.
+#
+# NodeSource rather than Debian's `nodejs`: slim's archive carries an older
+# major, and a harness that needs a newer one fails in a way that reads as a
+# code fault rather than an image fault. Pinned to a MAJOR line, not a patch —
+# the image is rebuilt under a date tag, so the date is the version record.
+#
+# ⚠️ This costs ~150MB. Worth naming rather than discovering: the seat image
+# is pulled by every machine that runs a seat.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/nodesource.sh \
+    && bash /tmp/nodesource.sh \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+         -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+         > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends nodejs gh \
+    && rm -rf /var/lib/apt/lists/* /tmp/nodesource.sh
+
 # ALSA's default device IS the container's own pulse server. Baked into the
 # IMAGE, not injected per container: this is the half of /voice that is
 # automatic by construction, so a seat cannot exist without it

@@ -35,6 +35,24 @@ def _hermetic_state_and_daemons(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_squad_binary(monkeypatch):
+    """The edge's roster enrolment must not consult the real machine's PATH.
+
+    `DockerExecutor._enrol_container` resolves `squad` via `_resolve_tool`,
+    which finds `~/.local/bin/squad` when it exists. The runner is injected so
+    nothing is ever EXECUTED — but the resolution still differs per machine,
+    so a test asserting enrolment would pass on a developer box and skip on a
+    bare CI runner while reporting green. That is the env-coupling class Wave
+    1's first bare-runner CI surfaced 17 of.
+
+    Default None ⇒ "this machine has no squad", the deterministic branch.
+    Tests that exercise enrolment pin it to a fake path themselves.
+    """
+    monkeypatch.setattr("mcp_hub.edge._squad_bin", lambda: None,
+                        raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _no_watcher_leak():
     """api_v1._watchers is module-level state: never leak between tests.
 

@@ -162,7 +162,10 @@ def test_materialize_creates_but_does_not_start():
     container that is NOT running, so the two ops stay separate."""
     r = Runner()
     _ex(r).execute({"op": "materialize", "seat": "web-box-1"}, SPEC)
-    assert r.calls[-1][:2] == ["docker", "create"]
+    # By PRESENCE, not position: materialize now also enrols the container in
+    # the squad roster afterwards (so /voice authorises it), and an
+    # index-based assertion breaks on a change that is not a defect.
+    assert any(c[:2] == ["docker", "create"] for c in r.calls)
     assert not any(c[:2] == ["docker", "start"] for c in r.calls)
 
 
@@ -515,7 +518,8 @@ class TestSecretsStayOnTheMachine:
         r = Runner()
         DockerExecutor(r, {"ANTHROPIC_API_KEY": "sk-from-edge"}).execute(
             {"op": "materialize", "seat": "s"}, self.SPEC)
-        assert "ANTHROPIC_API_KEY=sk-from-edge" in r.calls[-1]
+        create = next(c for c in r.calls if c[:2] == ["docker", "create"])
+        assert "ANTHROPIC_API_KEY=sk-from-edge" in create
 
 
 def test_create_argv_injects_seat_identity_last_so_it_wins():
@@ -843,7 +847,7 @@ class TestRepoMount:
         DockerExecutor(r, self.ENV).execute(
             {"op": "materialize", "seat": "s1"}, {"spec": self.SPEC})
         kinds = [c[0] for c in r.calls]
-        assert kinds == ["git", "docker"], kinds
+        assert kinds[:2] == ["git", "docker"], kinds
         assert "clone" in r.calls[0]
 
     def test_a_failed_clone_STOPS_the_materialize(self, tmp_path, monkeypatch):
@@ -992,3 +996,109 @@ class TestRepoMountCredential:
             {"op": "materialize", "seat": "s1"}, {"spec": spec})
         assert "is not set" not in out["reason"]
         assert "repository not found" in out["reason"]
+
+
+class TestRosterEnrolment:
+    """`/voice` authorises a container by membership in this machine's squad
+    roster. `voice_host.py` states the edge shells out to `squad
+    add-container` — it did not, so every seat materialized by `edge apply`
+    was refused audio. Measured 2026-08-11 on dev-vm-1: zero streams all day,
+    both live seats recording RMS 0, three REFUSED lines naming the empty
+    roster. These tests make that sentence true.
+    """
+
+    SPEC = {"identity": "s1", "spec": {"image": "mcp-hub-seat:latest"}}
+
+    @pytest.fixture()
+    def squad(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("mcp_hub.edge._squad_bin", lambda: "/fake/squad")
+        monkeypatch.setattr("mcp_hub.edge.SEAT_REPOS_ROOT",
+                            tmp_path / "seat-repos")
+        return "/fake/squad"
+
+    def test_materialize_enrols_the_container(self, squad):
+        """Mutation: delete the _enrol_container call → this fails, and every
+        edge-created seat silently loses audio again."""
+        r = Runner()
+        out = DockerExecutor(r).execute(
+            {"op": "materialize", "seat": "s1"}, self.SPEC)
+        enrol = next(c for c in r.calls if c[0] == squad)
+        assert enrol[1] == "add-container"
+        # name, folder, CONTAINER — the third arg is what the gate matches on
+        # (voice_host.parse_squad_roster reads `@docker:<container>`).
+        assert enrol[2] == "s1" and enrol[4] == "s1"
+        assert out["enrolled"]["ok"] is True
+
+    def test_enrolment_happens_only_AFTER_a_successful_create(self, squad):
+        """A roster row for a container that failed to materialize is a lie
+        the gate would then trust."""
+        class FailCreate(Runner):
+            def __call__(self, cmd, cwd=None):
+                if cmd[:2] == ["docker", "create"]:
+                    self.calls.append(list(cmd))
+                    return 1, "no such image"
+                return super().__call__(cmd, cwd)
+
+        r = FailCreate()
+        DockerExecutor(r).execute({"op": "materialize", "seat": "s1"},
+                                  self.SPEC)
+        assert not any(c[0] == squad for c in r.calls)
+
+    def test_a_machine_without_squad_still_materializes(self, monkeypatch,
+                                                        tmp_path):
+        """BEST EFFORT, NEVER FATAL — the docker-only edge is a supported
+        shape, and a seat without audio beats a placement that refuses."""
+        monkeypatch.setattr("mcp_hub.edge._squad_bin", lambda: None)
+        r = Runner()
+        out = DockerExecutor(r).execute(
+            {"op": "materialize", "seat": "s1"}, self.SPEC)
+        assert out["rc"] == 0
+        assert out["enrolled"]["skipped"] is True
+        assert "no `squad`" in out["enrolled"]["reason"]
+
+    def test_the_skip_is_REPORTED_never_silent(self, monkeypatch, tmp_path):
+        """The bug being fixed was invisibility, so a failure to enrol must
+        not itself be invisible."""
+        monkeypatch.setattr("mcp_hub.edge._squad_bin", lambda: None)
+        out = DockerExecutor(Runner()).execute(
+            {"op": "materialize", "seat": "s1"}, self.SPEC)
+        assert "enrolled" in out and out["enrolled"].get("reason")
+
+    def test_an_already_enrolled_seat_is_not_an_error(self, squad,
+                                                      monkeypatch):
+        """A re-materialized seat (memory-volume fix, image swap) keeps the row
+        it already has — this path runs on every recreate."""
+        class Enrolled(Runner):
+            def __call__(self, cmd, cwd=None):
+                if cmd[0] == "/fake/squad":
+                    self.calls.append(list(cmd))
+                    return 1, "!! 's1' is already enrolled"
+                return super().__call__(cmd, cwd)
+
+        out = DockerExecutor(Enrolled()).execute(
+            {"op": "materialize", "seat": "s1"}, self.SPEC)
+        assert out["enrolled"] == {"ok": True, "already": True}
+
+    def test_a_repo_mount_seat_enrols_the_CHECKOUT_as_its_folder(self, squad,
+                                                                 tmp_path):
+        """The roster folder is the tab's cwd. For a repo_mount seat the right
+        one already exists — the tree the seat is working in."""
+        from mcp_hub.edge import repo_mount_dir
+
+        spec = {"identity": "s1", "spec": {
+            "image": "i", "repo_mount": {"repo": "org/thing"}}}
+        r = Runner()
+        DockerExecutor(r).execute({"op": "materialize", "seat": "s1"}, spec)
+        enrol = next(c for c in r.calls if c[0] == squad)
+        assert enrol[3] == str(repo_mount_dir("s1", "org/thing"))
+
+    def test_a_pod_is_named_not_silently_skipped(self, squad):
+        """A pod's rows are per-AGENT and name a tmux session each; one row for
+        the container would give the workspace a tab attaching to a session no
+        inhabitant uses."""
+        spec = {"identity": "p", "spec": {
+            "image": "i", "agents": [{"identity": "a"}, {"identity": "b"}]}}
+        out = DockerExecutor(Runner()).execute(
+            {"op": "materialize", "seat": "p"}, spec)
+        assert out["enrolled"]["skipped"] is True
+        assert "pod" in out["enrolled"]["reason"]

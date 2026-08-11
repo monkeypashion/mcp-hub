@@ -60,6 +60,25 @@ EDGE_ENV_FILE = Path.home() / ".mcp-hub" / "edge-env"
 SEAT_REPOS_ROOT = Path.home() / ".mcp-hub" / "seat-repos"
 
 
+def _squad_bin() -> str | None:
+    """`squad`'s absolute path, found the way every other caller finds it.
+
+    🔴 NOT `shutil.which`. `squad` on PATH is an INTERACTIVE-shell assumption:
+    systemd timers get a bare PATH with no `~/.local/bin`, and this edge is
+    meant to run from a timer — `edge apply` already died there once on a raw
+    FileNotFoundError for exactly this. Here the failure would have been worse
+    than a traceback: `which` returns None under the timer, enrolment reports a
+    tidy "no squad on this machine", and the seat silently gets no audio. That
+    is the bug this whole function exists to fix, reintroduced one layer down.
+
+    A module-level indirection so tests can pin it and never consult the real
+    machine's PATH.
+    """
+    from mcp_hub.cli import _resolve_tool
+
+    return _resolve_tool("squad")
+
+
 def repo_mount_dir(seat: str, repo: str,
                    root: Path | None = None) -> Path:
     """Host directory holding `repo`'s checkout for `seat`.
@@ -679,6 +698,59 @@ class DockerExecutor:
                 )}
         return None
 
+    def _enrol_container(self, seat: str,
+                         spec: dict[str, Any]) -> dict[str, Any] | None:
+        """Record this container in the machine's squad roster.
+
+        🔴 WHY THIS EXISTS. `voice_host.py` authorises a connecting container
+        by membership in `~/.config/squad/squad.conf`, and its comment states
+        that "the edge shells out to `squad add-container`, so both creation
+        paths land here with no special case". **The edge did no such thing.**
+        The only `add-container` call site was an operator-run enrol verb, so
+        every seat materialized by `edge apply` was refused audio — measured
+        2026-08-11: zero streams all day, both live seats recording RMS 0,
+        three REFUSED lines naming the empty roster.
+
+        This makes the sentence true rather than changing the gate. The gate is
+        right: membership is the RECORD OF A DECISION that this container is
+        one of ours, and inferring it from the image was already killed (a
+        measurement of the population mistaken for a constraint on it).
+
+        BEST EFFORT, NEVER FATAL. A machine may have no `squad` at all (the
+        docker-only edge is a supported shape), and a container that runs
+        without audio is far better than a placement that refuses to
+        materialize. The result is REPORTED either way, so a silent failure
+        here cannot masquerade as success — which is the whole bug being fixed.
+        """
+        if spec.get("agents"):
+            # A POD's rows are per-AGENT and name a tmux session each; enrolling
+            # one row for the container would give the workspace a tab that
+            # attaches to a session no inhabitant uses. Pods are enrolled by the
+            # operator verb that knows their agents. Named, not silently skipped.
+            return {"skipped": True, "reason": "pod — enrolled per agent"}
+        squad_bin = _squad_bin()
+        if not squad_bin:
+            return {"skipped": True, "reason": "no `squad` on this machine"}
+        # The row needs a real host directory: it is the tab's cwd, and
+        # add-container refuses a folder that does not exist. A repo_mount seat
+        # already has one and it is the RIGHT one — the checkout the seat is
+        # working in. Otherwise a per-seat directory, created here.
+        rm = spec.get("repo_mount")
+        if rm:
+            folder = repo_mount_dir(seat, str(rm.get("repo") or ""))
+        else:
+            folder = SEAT_REPOS_ROOT.parent / "seat-folders" / seat
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return {"skipped": True, "reason": f"folder {folder}: {exc}"}
+        rc, out = self._run([squad_bin, "add-container", seat, str(folder),
+                             seat])
+        if rc != 0 and "already enrolled" in (out or ""):
+            # Idempotent: a re-materialized seat keeps the row it already has.
+            return {"ok": True, "already": True}
+        return {"ok": rc == 0, "rc": rc, "output": (out or "")[-200:]}
+
     @staticmethod
     def create_argv(seat: str, spec: dict[str, Any],
                     environ: dict[str, str] | None = None) -> list[str]:
@@ -905,6 +977,12 @@ class DockerExecutor:
             if prep is not None:
                 return {**base, **prep}
             cmd = self.create_argv(seat, spec, self._environ)
+            rc, out = self._run(cmd)
+            enrol = self._enrol_container(seat, spec) if rc == 0 else None
+            res = {**base, "rc": rc, "output": out[-400:]}
+            if enrol:
+                res["enrolled"] = enrol
+            return res
         elif op == "start":
             cmd = ["docker", "start", seat]
         elif op == "stop":
