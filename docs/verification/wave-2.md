@@ -1,9 +1,8 @@
 # Wave 2 verification bar
 
-**STATUS 2026-08-11: all 5 build items landed — W2.1 `ac477ff`, W2.3
-`be4947e`, W2.5 `2f23bc4`, W2.4 `5559a37`, W2.2 `6749837`. REMAINING: W2.6
-close (suite + CI green, then the operator-approved merge, then the live
-bars). Branch `wave-2`, which also carries Wave 1's held-back `88b7022`.**
+**STATUS 2026-08-11: WAVE 2 COMPLETE — merged and deployed as `156d378`, all
+22 bar items MET, live bars run on prod from a re-registered session. Nothing
+outstanding.**
 
 Committed BEFORE the build (the meta-rule: the build checks against a committed
 bar; it does not write its own exam afterwards). Every item ends the wave as
@@ -101,10 +100,53 @@ which is the very thing in question.
 |---|---|---|
 | F1 | Full suite + ruff green on the branch; CI green on the branch head before merge | **MET** — 1906 passed locally (6m22s), ruff clean, CI green on the branch head. ⚠️ The first full-suite run failed **14 of 23** move tests that passed alone: `FRESH = time.time()` at module scope against a 120s staleness window and a 7-minute suite. A fixture that decays reports the clock, not the code — timestamps are built at call time now, and the parametrize list that baked them at COLLECTION time builds its machines inside the test |
 | F2 | Every named mutation applied, verified failing against its named test, reverted; ledger below filled | **MET** — all 30 applied and verified, N1–N12 included (they had been *named* in their own commits, not run here; F2 says applied, so they were run). Three genuine survivors recorded with reasons (N19, N28 defence-in-depth; N9 a vacuous test, now fixed). Two apparent survivors were **broken mutations of mine** — N12's replacement expression evaluated back to the original tuple and the first N9 attempt never switched to the merged spec. Both kill their tests once written correctly, which is its own lesson: a mutation that does not apply looks exactly like a control that does not work |
-| F3 | Live bars after the deploy settles, from a re-registered session (never through our own deploy): squad created via MCP visible to the runtime on prod; a real `placements move` between the two live machines; a brief carrying a fake secret refused by prod | pending |
+| F3 | Live bars after the deploy settles, from a re-registered session (never through our own deploy): squad created via MCP visible to the runtime on prod; a real `placements move` between the two live machines; a brief carrying a fake secret refused by prod | **MET** — all three, on prod `156d378`, from a re-registered session. Details below |
 
-Note: this wave's deploy also carries `88b7022` (Wave 1's L1/L2 bar statuses),
+Note: this wave's deploy also carried `88b7022` (Wave 1's L1/L2 bar statuses),
 held back deliberately so a docs-only commit did not cost the fleet a rebind.
+This file's own F3 update is held back for the same reason.
+
+### The live bars, as run (prod `156d378`, 2026-08-11)
+
+**Deploy verified before anything was measured**, per *never measure through
+your own deploy*: `/health` went `f1e9549` uptime 29092s → `156d378` uptime
+44s, and `agents_bound` 13 → 2. Both facts matter — a commit change alone
+would not distinguish a redeploy from a restart, and the binding drop is the
+cost this wave was batched to pay once.
+
+**L1 — a squad created via MCP is visible to the runtime.** `set_squads`
+minted `w2-live-check`, which appeared immediately in `GET /api/v1/squads`
+with `description: "auto-registered from set_squads:mcp-hub-fireblade-wsl"`
+(A6's provenance, live), and `PUT /squads/w2-live-check/members/...` returned
+**200** where it would have 404'd before. Unplanned corroboration: `dreamteam`
+was already carrying `"auto-registered from register:reliable-ai-dev-vm-1"` —
+another agent's ordinary reconnect had healed the incoherence unprompted.
+
+**L2 — a real `placements move` between the two live machines.** A disposable
+docker seat `w2-move-check` was placed on dev-vm-1 as `stopped`, then moved to
+fireblade-wsl. The verb refused without `--yes`, dry-ran its three steps, then
+requested the reclaim, printed one `reclaim in progress` poll, observed
+**dev-vm-1's real edge** report `destroy` done, and only then created on
+fireblade-wsl. Exit 0.
+⚠️ **Stated limit, not implied coverage**: the seat was `stopped`, so no
+container ever existed and the **harvest leg was a no-op**. What this proves is
+the orchestration, the pre-checks and the wait-gate against real edges — not a
+harvest of real data. Testing that destructively on the live estate was not
+worth it, and the docker-substrate path is covered by the unit suite.
+
+**L3 — a brief carrying a fake secret is refused by prod.** `POST /seats` with
+`AKIAIOSFODNN7EXAMPLE` in the brief returned **422** naming the pattern ("an
+AWS access key id"), naming the exit (`--env-from-host`), and **not echoing the
+key**. Positive control: the same route returned **201** for the same seat with
+a clean spec, so the 422 was the guard rather than a malformed payload.
+
+**Both machines' edges were reporting `ok` within 30s** throughout — W1.2's
+column doing real work, since it is what the move's pre-check reads.
+
+**The estate was restored**: both placement rows unplaced, the seat purged
+(exercising W1.1's `--purge` live — "the death-fact survives in its event
+trail"), the test squad removed, and this agent's own `dreamteam` membership
+put back. Verified after: 3 squads, 8 placements, 2 seats — the pre-test state.
 
 ## Mutation ledger (filled at wave close)
 
