@@ -99,8 +99,8 @@ which is the very thing in question.
 
 | # | Item | Status |
 |---|---|---|
-| F1 | Full suite + ruff green on the branch; CI green on the branch head before merge | pending |
-| F2 | Every named mutation applied, verified failing against its named test, reverted; ledger below filled | pending |
+| F1 | Full suite + ruff green on the branch; CI green on the branch head before merge | **MET** — 1906 passed locally (6m22s), ruff clean, CI green on the branch head. ⚠️ The first full-suite run failed **14 of 23** move tests that passed alone: `FRESH = time.time()` at module scope against a 120s staleness window and a 7-minute suite. A fixture that decays reports the clock, not the code — timestamps are built at call time now, and the parametrize list that baked them at COLLECTION time builds its machines inside the test |
+| F2 | Every named mutation applied, verified failing against its named test, reverted; ledger below filled | **MET** — all 30 applied and verified, N1–N12 included (they had been *named* in their own commits, not run here; F2 says applied, so they were run). Three genuine survivors recorded with reasons (N19, N28 defence-in-depth; N9 a vacuous test, now fixed). Two apparent survivors were **broken mutations of mine** — N12's replacement expression evaluated back to the original tuple and the first N9 attempt never switched to the merged spec. Both kill their tests once written correctly, which is its own lesson: a mutation that does not apply looks exactly like a control that does not work |
 | F3 | Live bars after the deploy settles, from a re-registered session (never through our own deploy): squad created via MCP visible to the runtime on prod; a real `placements move` between the two live machines; a brief carrying a fake secret refused by prod | pending |
 
 Note: this wave's deploy also carries `88b7022` (Wave 1's L1/L2 bar statuses),
@@ -118,7 +118,7 @@ held back deliberately so a docs-only commit did not cost the fleet a rebind.
 | N6 any _SECRET_PATTERNS entry deleted | test_each_pattern_is_refused_by_name[that case] |
 | N7 match interpolated into the refusal | test_the_refusal_never_echoes_the_secret |
 | N8 check_input_name call removed | TestRoutesEnforce::test_POST_refuses_an_escaping_input_filename |
-| N9 PATCH validates merged spec not incoming | TestRoutesEnforce::test_PATCH_validates_only_what_was_SENT |
+| N9 PATCH validates merged spec not incoming | TestRoutesEnforce::test_PATCH_validates_only_what_was_SENT — ⚠️ SURVIVED until the test was fixed: it claimed to plant a brief that would fail today's guard and planted `brief="fine"`, so clean content passed either way. Now plants legacy content by direct DB write, with a control that the same content IS refused when sent |
 | N10 clone re-validates the whole spec | TestRoutesEnforce::test_CLONE_does_not_re_validate_legacy_content |
 | N11 check_volumes removed from the create branch | TestEdgeRefusesToMaterialize::test_a_legacy_docker_socket_spec_is_REFUSED_at_materialize |
 | N12 docker.sock dropped from _FORBIDDEN_MOUNTS | TestVolumes::test_the_docker_socket_is_refused_naming_the_premise |
