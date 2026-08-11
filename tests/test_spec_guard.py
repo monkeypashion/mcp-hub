@@ -239,15 +239,39 @@ class TestRoutesEnforce:
         """A rule added today must not make an existing seat un-patchable
         because of a key the caller is not touching.
 
+        ⚠️ The first draft asserted this against a seat whose stored brief was
+        `"fine"` — clean content, so it passed whether PATCH validated
+        `incoming` or the merged spec, and the named mutation SURVIVED it.
+        Same vacuous shape as the clone test's first draft below; caught by
+        actually running the mutation instead of trusting the docstring.
+
         Mutation: validate the merged spec instead of `incoming` → fails."""
-        # A seat whose stored brief would fail today's guard (written before
-        # the guard existed — simulated by patching it in directly).
-        _add(rig, "p2", brief="fine")
-        rig.patch("/api/v1/seats/p2", json={"spec": {"image": "x:1"}},
-                  headers=OP)
-        r = rig.patch("/api/v1/seats/p2", json={"spec": {"class": "squad"}},
+        import json as _json
+        import sqlite3 as _sq
+
+        # A seat whose STORED brief would fail today's guard, exactly as a
+        # pre-guard hub left it. Planted directly because the API refuses it.
+        _add(rig, "p2", brief="ordinary")
+        con = _sq.connect(rig.db_path)
+        try:
+            con.execute(
+                "UPDATE api_seats SET spec = ? WHERE identity = 'p2'",
+                (_json.dumps({"brief": f"old key {FAKE['a GitHub token']}"}),),
+            )
+            con.commit()
+        finally:
+            con.close()
+        # Control: that content IS refused when SENT, so the 200 below is the
+        # exemption working rather than the guard being absent.
+        assert rig.patch(
+            "/api/v1/seats/p2",
+            json={"spec": {"brief": f"new key {FAKE['a GitHub token']}"}},
+            headers=OP,
+        ).status_code == 422
+        # Patching an unrelated key must still succeed despite the legacy brief
+        r = rig.patch("/api/v1/seats/p2", json={"spec": {"image": "x:1"}},
                       headers=OP)
-        assert r.status_code == 200
+        assert r.status_code == 200, r.text
 
     def test_CLONE_does_not_re_validate_legacy_content(self, rig):
         """Clone copies a spec that was already accepted. Re-checking it
