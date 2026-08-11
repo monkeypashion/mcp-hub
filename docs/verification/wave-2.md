@@ -1,9 +1,8 @@
 # Wave 2 verification bar
 
-**STATUS 2026-08-11: 3 of 5 items landed — W2.1 `ac477ff`, W2.3 `be4947e`,
-W2.5 `2f23bc4`. REMAINING: W2.4 shadow-mode (in progress), W2.2 move verb,
-then W2.6 close. Branch `wave-2`, which also carries Wave 1's held-back
-`88b7022`.**
+**STATUS 2026-08-11: 4 of 5 items landed — W2.1 `ac477ff`, W2.3 `be4947e`,
+W2.5 `2f23bc4`, W2.4 (this commit). REMAINING: W2.2 move verb, then W2.6
+close. Branch `wave-2`, which also carries Wave 1's held-back `88b7022`.**
 
 Committed BEFORE the build (the meta-rule: the build checks against a committed
 bar; it does not write its own exam afterwards). Every item ends the wave as
@@ -67,9 +66,25 @@ Declared-is-not-enforced, in our own code.
 
 | # | Item | Status |
 |---|---|---|
-| D1 | ZERO behaviour change: rendering is byte-identical with shadow-mode on (asserted, extending `test_stop_hook_compact.py`) | pending |
-| D2 | A synthetic disagreement is captured in `~/.mcp-hub/shadow-surface.jsonl`; the log caps rather than growing forever | pending |
-| D3 | No hub write, no new network call — the hook already holds `transcript_path` locally and the diagnostic stays local | pending |
+Design: the server's `(already delivered live — …)` line is an INFERENCE
+(`pushed_gen == gen_now and not wake_render_unproven`). Shadow mode observes
+the other side from the transcript the hook already holds and records
+disagreements in two directions: **false_compaction** (claimed live, no render
+— the harmful one: the body was shortened AND marked read) and
+**double_surface** (reprinted in full though it did render — the context tax
+the 2026-08-09 investigation predicted).
+
+The observation is narrow on purpose. A `<channel …>` tag appears in three
+measured record types — `queue-operation`, `attachment`, and `user`. Only
+`user` is a render; the others prove the notification reached the client,
+which is the very thing in question.
+
+| # | Item | Status |
+|---|---|---|
+| D1 | ZERO behaviour change: rendering is byte-identical with shadow-mode on (asserted, extending `test_stop_hook_compact.py`) | **MET** — differential test runs the hook shadow-on vs shadow-off, asserts identical stdout; return value discarded at the call site |
+| D2 | A synthetic disagreement is captured in `~/.mcp-hub/shadow-surface.jsonl`; the log caps rather than growing forever | **MET** — both directions captured; cap keeps the most RECENT (asserted, not just the count); positive control asserts agreement records nothing |
+| D3 | No hub write, no new network call — the hook already holds `transcript_path` locally and the diagnostic stays local | **MET** — enforced by poisoning `socket.socket`/`create_connection` and asserting the disagreement still lands (a swallowed hub call would return empty) |
+| D4 | *(added during build)* The instrument abstains where it cannot support a verdict: a handle under 12 chars records `unmatchable` rather than guessing | **MET** — a short handle would match some render on nearly any turn |
 
 ## W2.5 sandbox premise + seat audit
 
@@ -106,3 +121,25 @@ held back deliberately so a docs-only commit did not cost the fleet a rebind.
 | N10 clone re-validates the whole spec | TestRoutesEnforce::test_CLONE_does_not_re_validate_legacy_content |
 | N11 check_volumes removed from the create branch | TestEdgeRefusesToMaterialize::test_a_legacy_docker_socket_spec_is_REFUSED_at_materialize |
 | N12 docker.sock dropped from _FORBIDDEN_MOUNTS | TestVolumes::test_the_docker_socket_is_refused_naming_the_premise |
+| N13 false_compaction branch dropped from compare() | TestDisagreements::test_a_live_claim_with_no_render_is_captured |
+| N14 log trim removed from record() | TestDisagreements::test_the_log_caps |
+| N15 `rec.get("type") != "user"` check dropped | TestParsing::test_an_ASSISTANT_quoting_a_channel_tag_is_not_a_render |
+| N16 double_surface branch dropped | TestDisagreements::test_a_full_reprint_of_a_rendered_message_is_captured |
+| N17 run_shadow's try/except removed | TestZeroBehaviourChange::test_a_RAISING_shadow_cannot_break_the_hook |
+| N18 short-handle abstention removed | TestDisagreements::test_a_handle_too_short_to_match_abstains |
+| N19 message-shape check weakened (top-level `content` accepted) | ⚠️ SURVIVES ALONE — killed only in combination with N15 (verified). Not a coverage gap: the queue-record case is rejected by the type check AND the shape check independently, so neither mutation alone changes the verdict. Recorded rather than credited to either. |
+
+**Two mutations survived their first named test, and both were tests of mine
+claiming more than they proved — not code defects.** This is the half of a
+mutation gate that earns it:
+
+- **N15** first ran against the queue-plumbing test, which the shape check
+  rejects anyway, so dropping the type check changed nothing. The record that
+  actually needs the type check is an **assistant message quoting a channel
+  tag** — the agent's own words vouching for a delivery it never got. Not
+  hypothetical: the first hand-grep during this build matched this repo's own
+  `push_channel` source rather than any live push. New test added.
+- **N17** first ran against a corrupt-transcript test that never raises
+  (`observed_renders` already catches `OSError`/`ValueError`), so it never
+  exercised the guard it claimed to pin. Replaced with an injected fault; the
+  corrupt-transcript case is kept, renamed, and no longer takes the credit.

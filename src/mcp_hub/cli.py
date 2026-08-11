@@ -4291,6 +4291,14 @@ def stop_hook_command(args: argparse.Namespace) -> int:
         print(f"[mcp-hub stop-hook] hub query failed: {exc!r}", file=sys.stderr)
         return 0
 
+    # Shadow mode: compare the hub's "already delivered live" inference against
+    # what the transcript shows actually rendered. Diagnostic only — the return
+    # value is deliberately discarded, so the rendering below is byte-identical
+    # whether this runs or not. Local file reads; no hub write, no network.
+    from mcp_hub import shadow
+
+    shadow.run_shadow(name, messages_text, payload.get("transcript_path"))
+
     response = build_hook_response(
         agent_name=name,
         project=project,
