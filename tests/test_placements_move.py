@@ -26,14 +26,24 @@ import pytest
 
 from mcp_hub import cli
 
-FRESH = time.time()
-STALE = FRESH - 999_999
+# Sentinel, resolved to time.time() INSIDE _machine. 🔴 Not a module-level
+# constant: `EDGE_STALE_SECONDS` is 120s and the full suite runs ~7 minutes, so
+# a timestamp baked at import is stale by the time these tests execute — they
+# passed alone and failed 14-of-23 in the suite. A fixture that decays is an
+# instrument that reports the clock instead of the code.
+FRESH = object()
 
 
 def _machine(name, *, last_run=FRESH, result="ok"):
+    now = time.time()
     return {"name": name, "os": "linux", "capabilities": {},
-            "last_seen": FRESH, "edge_last_run": last_run,
+            "last_seen": now,
+            "edge_last_run": now if last_run is FRESH else last_run,
             "edge_result": {"result": result} if result else None}
+
+
+def _stale():
+    return time.time() - 999_999
 
 
 def _placement(pid="pl-a", seat="x-a", machine="box-a", substrate="worktree",
@@ -213,15 +223,23 @@ class TestHarvest:
 
 
 class TestEdgeHealth:
-    @pytest.mark.parametrize("state,machines", [
-        ("stale", [_machine("box-a"), _machine("box-b", last_run=STALE)]),
-        ("never", [_machine("box-a"), _machine("box-b", last_run=None)]),
-        ("absent", [_machine("box-a")]),
-    ])
+    @pytest.mark.parametrize("state", ["stale", "never", "absent"])
     def test_a_DESTINATION_whose_edge_is_not_reporting_is_refused(
-        self, capsys, state, machines
+        self, capsys, state
     ):
-        """Mutation: drop the destination edge check -> this fails."""
+        """Mutation: drop the destination edge check -> this fails.
+
+        Machines are built HERE, not in the parametrize list — that list is
+        evaluated at collection time, which is minutes before these tests run
+        in a full suite, and every `fresh` timestamp in it would be stale.
+        """
+        machines = {
+            "stale": lambda: [_machine("box-a"),
+                              _machine("box-b", last_run=_stale())],
+            "never": lambda: [_machine("box-a"),
+                              _machine("box-b", last_run=None)],
+            "absent": lambda: [_machine("box-a")],
+        }[state]()
         api = MoveApi(placements=[_placement()], machines=machines)
         assert _move(api) == 1
         err = capsys.readouterr().err
@@ -239,7 +257,7 @@ class TestEdgeHealth:
         Mutation: check only the destination -> this fails.
         """
         api = MoveApi(placements=[_placement()],
-                      machines=[_machine("box-a", last_run=STALE),
+                      machines=[_machine("box-a", last_run=_stale()),
                                 _machine("box-b")])
         assert _move(api) == 1
         assert "source edge is not reporting" in capsys.readouterr().err
