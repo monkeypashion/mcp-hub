@@ -19,10 +19,10 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 
 import pytest
-import shutil
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SQUAD = ROOT / "squad" / "squad"

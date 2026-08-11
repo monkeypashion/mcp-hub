@@ -1355,3 +1355,53 @@ async def test_a_workspace_with_no_containers_says_nothing_about_them():
         await pilot.pause()
         row = _ws_label(app, "plain")
         assert "in containers" not in row, row
+
+
+@pytest.mark.asyncio
+async def test_an_out_of_scope_workspace_starts_folded_and_counts_its_agents():
+    """A scoped board can only measure its own workspace, so every other local
+    workspace's rows are hub-presence stubs — opened by default they sprawl,
+    and two boards side by side read as contradicting each other (operator,
+    card #566). So out-of-scope nodes start FOLDED, and the folded row carries
+    its agent count: a fold that hides the only sign of life would turn
+    "not measured here" into "empty"."""
+    app = SettingsApp(
+        [], scoped_to="/w/windows.code-workspace", model_for=_model_for,
+        squad_bin="/usr/bin/SQUAD", hub_bin="/usr/bin/HUB",
+        board_for=None, dark=None, poll_seconds=3600, this_machine="thisbox",
+        workspaces_for=lambda: {
+            "machines": ["thisbox"], "this_machine": "thisbox", "note": "",
+            "rows": [
+                {"name": "windows", "machine": "thisbox",
+                 "path": "/w/windows.code-workspace", "folders": 1, "error": "",
+                 "on_disk": True, "open_now": True, "registered": True,
+                 "squad": "", "listings": ["/w/win"]},
+                {"name": "elsewhere", "machine": "thisbox",
+                 "path": "/w/elsewhere.code-workspace", "folders": 1,
+                 "error": "", "on_disk": True, "open_now": False,
+                 "registered": True, "squad": "", "listings": ["/w/el"]},
+            ]},
+    )
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        want = app._default_expansion(app.tree_model)
+        assert "w:thisbox/windows" in want, want      # own workspace opens
+        assert "w:thisbox/elsewhere" not in want, want  # out-of-scope folds
+
+
+def test_the_folded_scope_label_carries_the_agent_count():
+    """Label unit: the count is the folded row's only sign of life."""
+    app = SettingsApp(
+        [], scoped_to="/w/windows.code-workspace", model_for=_model_for,
+        squad_bin="/usr/bin/SQUAD", hub_bin="/usr/bin/HUB",
+        board_for=None, dark=None, poll_seconds=3600, this_machine="thisbox")
+    w = {"name": "elsewhere", "here": False, "open_now": False, "error": "",
+         "on_disk": True, "registered": True, "squad": "", "in_scope": False,
+         "in_containers": 0, "agents": [{"key": "a1"}, {"key": "a2"}]}
+    label = app._workspace_label(w, app._palette())
+    assert "2 agent(s) · not in this board's scope" in label, label
+    # ...and an out-of-scope workspace with NO agents does not invent a count.
+    w["agents"] = []
+    label = app._workspace_label(w, app._palette())
+    assert "not in this board's scope" in label and "agent(s)" not in label, label

@@ -551,7 +551,13 @@ class SettingsApp(App):
         # each hold a real agent and drew as bare rows. A warning already in
         # `tail` outranks it — attention beats status, as the rows below.
         if not w.get("in_scope", True) and not tail:
-            tail = "not in this board's scope"
+            # The node starts folded (see _default_expansion), so the count is
+            # the only sign of life the row gets — without it a folded
+            # workspace reads as empty, which is the absence-as-measurement
+            # mistake this label block exists to prevent.
+            n = len(w.get("agents") or [])
+            tail = (f"{n} agent(s) · not in this board's scope" if n
+                    else "not in this board's scope")
         # The same family as the scope note: this row's agents ARE measured,
         # they just hang under the containers on this machine rather than
         # here. Without it `capsule` — every member containerized — drew as a
@@ -837,7 +843,14 @@ class SettingsApp(App):
             if not m["local"]:
                 continue
             keys.add(m["key"])
-            keys.update(w["key"] for w in m["workspaces"])
+            # Out-of-scope workspaces start FOLDED: a scoped board can only
+            # measure its own workspace, so the others' rows are hub-presence
+            # stubs — opened by default they sprawl, and the sprawl reads as
+            # duplication across boards (operator, card #566). The fold is a
+            # default, not a wall: the row carries its agent count, and one
+            # keystroke (or `e`) opens it.
+            keys.update(w["key"] for w in m["workspaces"]
+                        if w.get("in_scope", True))
             keys.update(c["key"] for c in m.get("containers", []))
         return keys
 
