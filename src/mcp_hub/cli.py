@@ -2553,6 +2553,204 @@ def _placements_unplace(args: argparse.Namespace, api: Any) -> int:
     return 0
 
 
+MOVE_POLL_SECONDS = 5.0
+MOVE_TIMEOUT_SECONDS = 300
+
+
+def _placements_move(args: argparse.Namespace, api: Any) -> int:
+    """Move a seat from one machine to another.
+
+    An ORCHESTRATION, not a PATCH. `machine` is immutable on a placement and
+    deliberately so: the naive alternative — create the same seat on B — is
+    not a move at all, it is TWO live placements for one identity, both
+    registering, the last one silently owning the wake binding. That is the
+    collision `capsules place` already refuses by name, and nothing stopped
+    you reaching it one placement at a time.
+
+    So the sequence is reclaim-then-create, gated on OBSERVED completion:
+      1. refuse a second live placement for the seat (the collision above)
+      2. refuse a docker seat with no memory_volume unless --no-harvest —
+         a silent move there loses everything the agent learned
+      3. refuse a machine whose edge is not REPORTING, both ends
+      4. reclaim on A, then wait until A's edge reports destroy done
+      5. create on B only then — identity collision impossible by construction
+
+    Exit codes are distinct because the middle one is resumable: 0 moved,
+    1 refused (nothing written), 2 timed out (A was reclaimed, B was not
+    created — finish by hand, and the message says how).
+    """
+    from mcp_hub.fleet_tree import _edge_state
+
+    if not args.target:
+        print("name the placement to move (mcp-hub placements list)",
+              file=sys.stderr)
+        return 1
+    dst = getattr(args, "to", "") or ""
+    if not dst:
+        print("--to <machine> names where it should run instead",
+              file=sys.stderr)
+        return 1
+
+    rows = api.list_placements() or []
+    row = next((p for p in rows if p.get("id") == args.target), None)
+    if row is None:
+        print(f"no placement '{args.target}'", file=sys.stderr)
+        return 1
+    seat = row.get("seat", "")
+    src = row.get("machine", "")
+    substrate = row.get("substrate", "worktree")
+
+    if dst == src:
+        print(f"{seat} is already placed on {dst} — nothing to move",
+              file=sys.stderr)
+        return 1
+
+    # 1. The collision this verb exists to make unreachable.
+    others = [p for p in rows
+              if p.get("seat") == seat and p.get("id") != args.target
+              and p.get("desired") != "reclaimed"]
+    if others:
+        where = ", ".join(f"{p['id']} on {p['machine']}" for p in others)
+        print(f"{seat} already has another live placement ({where}). Two live "
+              f"placements for one identity means two containers registering, "
+              f"and the last one silently owns the wake binding.\nResolve that "
+              f"first:  mcp-hub placements reclaim <id> --yes   (or unplace)",
+              file=sys.stderr)
+        return 1
+
+    # 2. Harvest is the whole reason a move is not a delete-and-recreate.
+    spec: dict = {}
+    try:
+        spec = next((s.get("spec") or {} for s in (api.list_seats() or [])
+                     if s.get("identity") == seat), {})
+    except Exception:  # noqa: BLE001 — a missing seat is caught below
+        spec = {}
+    no_harvest = getattr(args, "no_harvest", False)
+    if substrate == "docker" and not spec.get("memory_volume") and not no_harvest:
+        print(f"{seat} is a docker seat with no memory_volume, so reclaim has "
+              f"nothing to harvest — moving it now would destroy everything "
+              f"the agent learned, silently.\nEither give it a volume first, "
+              f"or accept the loss with --no-harvest.", file=sys.stderr)
+        return 1
+
+    # 3. Edge health, BOTH ends. The bar names the destination; the source is
+    # what actually hangs the wait below — machine A offline means the reclaim
+    # is never observed complete and step 4 can only time out. Checking one
+    # would satisfy the letter of the bar and still strand the operator.
+    machines = {}
+    try:
+        machines = {m.get("name"): m for m in (api.list_machines() or [])}
+    except Exception:  # noqa: BLE001
+        machines = {}
+    now = time.time()
+    for label, name in (("destination", dst), ("source", src)):
+        state = _edge_state(machines.get(name), now)
+        if state in (None, "never", "stale"):
+            why = {
+                None: f"the hub has no machine record for '{name}'",
+                "never": f"'{name}' has never reported an edge pass",
+                "stale": f"'{name}' has not reported an edge pass recently",
+            }[state]
+            print(f"{label} edge is not reporting — {why}.\nA move is only as "
+                  f"real as the edge that realizes it; check "
+                  f"`systemctl --user status mcp-hub-edge.timer` on {name} "
+                  f"(that is nearly always where the fault is).",
+                  file=sys.stderr)
+            return 1
+    failing = [n for n in (dst, src)
+               if _edge_state(machines.get(n), now) == "failed"]
+
+    if args.dry_run:
+        print(f"would move {seat}: {src} -> {dst} ({substrate})")
+        print(f"  1. reclaim {args.target} on {src} — harvest, verify, DESTROY")
+        print(f"  2. wait for {src}'s edge to report destroy done "
+              f"(up to {args.timeout}s)")
+        print(f"  3. create a placement for {seat} on {dst}")
+        if failing:
+            print(f"  ⚠ edge is FAILING on {', '.join(failing)} — reporting, "
+                  f"but reporting failure")
+        return 0
+
+    if not args.yes:
+        print(f"moving {seat} RECLAIMS it on {src} first — harvest, verify, "
+              f"then DESTROY the substrate. Re-run with --yes", file=sys.stderr)
+        return 1
+
+    if failing:
+        print(f"⚠️  edge is FAILING on {', '.join(failing)} — it is reporting, "
+              f"so this is a measurement rather than blindness, but the move "
+              f"may not converge.")
+
+    # 4. Reclaim, then wait for the edge's own absence verdict. Never for
+    # `desired`, which would let the move mark itself done by wanting to.
+    api.reclaim_placement(args.target)
+    print(f"{args.target}: reclaim requested on {src} — waiting for its edge "
+          f"to harvest, verify and destroy (polling every "
+          f"{int(MOVE_POLL_SECONDS)}s, up to {args.timeout}s)")
+
+    deadline = time.time() + args.timeout
+    harvest_state = ""
+    while True:
+        cur = next((p for p in (api.list_placements() or [])
+                    if p.get("id") == args.target), None)
+        if cur is None:
+            # The row is gone: nothing on A still claims the seat, which is
+            # the condition step 5 needs.
+            print(f"  {args.target} is gone from the hub — treating the "
+                  f"reclaim as complete")
+            break
+        reclaim = cur.get("reclaim") or {}
+        harvest_state = reclaim.get("harvest", "") or harvest_state
+        if reclaim.get("destroy") == "done":
+            print("  destroy reported done")
+            break
+        if time.time() >= deadline:
+            print(f"\ntimed out after {args.timeout}s waiting for {src} to "
+                  f"finish the reclaim (harvest={reclaim.get('harvest','?')} "
+                  f"verify={reclaim.get('verify','?')} "
+                  f"destroy={reclaim.get('destroy','?')}).\n"
+                  f"NOTHING was created on {dst}, so this is resumable, not "
+                  f"broken — the seat is mid-reclaim on {src} and creating it "
+                  f"on {dst} now is the collision this verb refuses.\n"
+                  f"Finish by hand once {src}'s edge has run:\n"
+                  f"  mcp-hub placements list          # confirm destroy done\n"
+                  f"  mcp-hub placements set --seat {seat} --machine {dst} "
+                  f"--substrate {substrate}", file=sys.stderr)
+            return 2
+        print(f"  reclaim in progress "
+              f"(harvest={reclaim.get('harvest','?')} "
+              f"verify={reclaim.get('verify','?')} "
+              f"destroy={reclaim.get('destroy','?')})")
+        time.sleep(MOVE_POLL_SECONDS)
+
+    # 5. Only now can B be created without an identity collision.
+    rec = api.create_placement(seat, dst, substrate, "running")
+    print(f"{rec['id']}: {seat} placed on {rec['machine']} -> running")
+    print(f"moved {seat}: {src} -> {dst}")
+    print("written to the hub. Nothing has happened on the destination yet — "
+          f"{dst}'s `edge apply` realizes it and reports what it OBSERVED.")
+    if substrate == "docker" and not no_harvest:
+        print(f"  memory is staged hub-side by PROJECT, so re-attach it there:"
+              f"\n    mcp-hub memory-import      (run on {dst})")
+
+    # B6, named rather than discovered: the edge runs harvest -> verify ->
+    # destroy unconditionally, so a harvest that failed did NOT stop the
+    # destroy. Gating that changes reclaim semantics for every caller and is
+    # deferred to its own decision; until then the risk is stated here.
+    if harvest_state and harvest_state not in ("done", "pending"):
+        print(f"\n⚠️  the harvest phase reported '{harvest_state}'. The edge "
+              f"runs harvest -> verify -> destroy unconditionally, so the "
+              f"destroy went ahead regardless — check what landed before "
+              f"relying on {seat}'s memory on {dst}.")
+
+    # B5: the seat declaration and workspace SHOULD outlive a move — that is
+    # what makes moving machines possible at all. Only the source roster row
+    # is genuinely left behind, so only that is reported.
+    print(f"\n  one leftover on {src}:\n"
+          f"    roster row   squad rm {seat}   (run there)")
+    return 0
+
+
 def placements_command(args: argparse.Namespace, api: Any = None) -> int:
     """Placements — WHERE a seat runs. `mcp-hub placements list|set|reclaim`.
 
@@ -2564,7 +2762,9 @@ def placements_command(args: argparse.Namespace, api: Any = None) -> int:
 
     if api is None:
         api = OperatorApi(api_base(args.hub_url))
-    if refuse_unhonoured_dry_run(args, ("list", "set", "reclaim", "unplace")):
+    if refuse_unhonoured_dry_run(
+        args, ("list", "set", "reclaim", "unplace", "move")
+    ):
         return 1
 
     try:
@@ -2618,6 +2818,9 @@ def placements_command(args: argparse.Namespace, api: Any = None) -> int:
 
         if args.action == "unplace":
             return _placements_unplace(args, api)
+
+        if args.action == "move":
+            return _placements_move(args, api)
 
         # -- set --------------------------------------------------------
         # `--seat` (create) and a placement id (amend) are two different
@@ -6963,9 +7166,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     placements.add_argument(
-        "action", choices=["list", "set", "reclaim", "unplace"],
+        "action", choices=["list", "set", "reclaim", "unplace", "move"],
         help="list · set: running|stopped|ran · reclaim: harvest then DESTROY "
-             "· unplace: drop the row, leave the substrate alone",
+             "· unplace: drop the row, leave the substrate alone · move: "
+             "reclaim on one machine, wait, then create on another",
     )
     placements.add_argument("target", nargs="?", default=None,
                             help="set/reclaim/unplace: placement id")
@@ -6994,6 +7198,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     placements.add_argument("--dry-run", action="store_true",
                             help="print what would change; write nothing")
+    placements.add_argument(
+        "--to", default="",
+        help="move: the machine to move the seat TO",
+    )
+    placements.add_argument(
+        "--no-harvest", action="store_true",
+        help="move: proceed even though there is nothing to harvest — "
+             "accepts losing a docker seat's memory",
+    )
+    placements.add_argument(
+        "--timeout", type=int, default=MOVE_TIMEOUT_SECONDS,
+        help=f"move: seconds to wait for the source edge to finish the "
+             f"reclaim (default {MOVE_TIMEOUT_SECONDS}). Exits resumably, "
+             f"naming the manual two-phase path",
+    )
     placements.add_argument(
         "--hub-url", default=DEFAULT_HUB_URL,
         help="Hub base URL (default: $MCP_HUB_URL or built-in)",
