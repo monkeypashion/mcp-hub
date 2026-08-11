@@ -107,7 +107,10 @@ async def test_json_format_returns_structured_records(server):
     assert isinstance(records, list)
     assert len(records) == 2
     for r in records:
-        assert set(r.keys()) == {"id", "ts", "from_agent", "body", "priority"}
+        # W3 added `ref` — the canonical lineage handle, so a machine reader
+        # can build in_reply_to without deriving the encoding itself.
+        assert set(r.keys()) == {"id", "ref", "ts", "from_agent", "body",
+                                 "priority"}
         assert isinstance(r["id"], int)
         assert isinstance(r["ts"], (int, float))
         assert r["from_agent"] == "alice"

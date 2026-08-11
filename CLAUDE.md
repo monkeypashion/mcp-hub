@@ -68,6 +68,39 @@ It can still DM, `post()` to named channels, and `broadcast(scope="fleet")` — 
 - `list_twins(project, exclude_agent)` — online clones of one repo on other machines (same derived project). `register()` also announces your twins.
 - `memory_put(project, filename, content, from_agent)` / `memory_list(project)` / `memory_get(project, filename)` — the hub-side staging store behind `mcp-hub memory-export` / `memory-import` (see **Memory transfer** below). The hub stages; the files' home is each machine's Claude memory dir.
 
+**Lineage — how the fleet got from A to B, as data**
+
+Every rendered message carries its **⟨ref⟩** (e.g. `hub.msg/1?id=123`) — in
+live tags, `get_messages`, `get_history`, broadcasts and channel reads. That
+ref is the message's identity in the lineage graph.
+
+- `send`/`post`/`broadcast` accept **`in_reply_to=<ref>`** — copy the ⟨ref⟩
+  of the message you are answering. This is the DECLARED half of lineage; a
+  malformed or nonexistent target **refuses the send loudly** (a silently
+  dropped edge would lie by omission).
+- **The hub never GUESSES an edge.** Authorship, routing and the decision-card
+  lifecycle are recorded automatically (they are the hub's own acts); what a
+  DM answers is recorded only when the sender declares it. Consecutive DMs
+  with no `in_reply_to` produce NO parent edge, by design — a guessed causal
+  edge is a record that mirrors a plausible story instead of observing one.
+- `get_lineage(ref, depth, direction, predicate)` — the bounded subgraph
+  walk. Edges carry `source`: `auto` (hub-witnessed) vs `declared`
+  (sender-asserted). An edgeless node reads `lineage_blind: true`, which is
+  "nothing recorded", not "root".
+- `resolve_ref(ref)` — a work item's IDENTITY, never its status
+  (`ra.feature/1?feature_set_key=…&id=…`; the pair is scoped — never derive a
+  feature_set_key from a repo name).
+- `resolve_status(ref)` — "is it done?" **currently refuses**, by design:
+  UNRESOLVABLE ≠ "not done". No blessed observed-completion target exists
+  yet, and the hub does not infer completion from authored documents — a
+  store that copies the claim agrees with the claim exactly when it is wrong.
+- Storage is `(subject, predicate, object)` triples — RDF-shaped, so an
+  exporter later is a serializer; the RDF machinery is deliberately absent.
+- Operator plane: `GET /api/v1/lineage`, `GET /api/v1/lineage/coverage`
+  (sparse graph reads as thinly *populated*, never thinly *connected*),
+  `POST /api/v1/feature-sets` (operator-token; registering a feature set is
+  a deliberate act — no agent-writable surface).
+
 **Other**
 - `get_history(agent_or_channel)` — full history (use `#general` for the broadcast feed)
 - `ping(from_agent)` — interactive heartbeat (refreshes binding via touch_session)

@@ -366,7 +366,9 @@ async def test_short_push_render_untouched(server):
     content = await _captured_push_content(
         server, "send", {"from_agent": "alice", "to": "bob", "message": "short one"},
     )
-    assert content == "DM from alice: short one"
+    # W3: the ⟨ref⟩ is the lineage handle — a reply can only cite a ref the
+    # sender has SEEN, so every rendered message carries its own.
+    assert content == "DM from alice ⟨hub.msg/1?id=1⟩: short one"
 
 
 async def test_inbox_keeps_full_body_after_clipped_push(server):

@@ -54,9 +54,13 @@ LOG_CAP = 500
 MIN_HANDLE = 12
 MATCH_PREFIX = 60
 
-# `[15:39:03] **mcp-hub-dev-vm-1** [low]: body…` — the get_messages render.
+# `[15:39:03] **mcp-hub-dev-vm-1** ⟨hub.msg/1?id=7⟩ [low]: body…` — the
+# get_messages render. The ⟨ref⟩ segment is W3's lineage handle and OPTIONAL:
+# transcripts predating the wave carry lines without it, and a parser that
+# demanded it would go silently blind on exactly the history it audits.
 _RENDERED_RE = re.compile(
     r"^\[(?P<ts>\d{2}:\d{2}:\d{2})\] \*\*(?P<agent>[^*]+)\*\*"
+    r"(?: ⟨(?P<ref>[^⟩]+)⟩)?"
     r"(?P<prio> \[[a-z]+\])?: (?P<rest>.*)$"
 )
 # The claim this module exists to check, as the server writes it.

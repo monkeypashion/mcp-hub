@@ -1188,6 +1188,67 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
 
     # -- squads -------------------------------------------------------------
 
+    @route("/api/v1/feature-sets", methods=["GET", "POST"])
+    async def feature_sets(request: Request) -> Response:
+        """W3.3 — the ra.feature/1 identity store. Operator-only and
+        REST-only on purpose: registering a feature set is a deliberate act,
+        and no agent-writable surface is added by this wave."""
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        from mcp_hub import ra_feature
+        from mcp_hub.refs import RefError
+
+        ra_feature.ensure_schema(db())
+        if request.method == "GET":
+            return JSONResponse(
+                {"feature_sets": ra_feature.list_feature_sets(db())}
+            )
+        body = await body_of(request)
+        try:
+            out = ra_feature.register_feature_set(
+                db(), body.get("key", ""), body.get("document") or {},
+                registered_by="operator",
+            )
+        except RefError as e:
+            return _err(422, str(e))
+        return JSONResponse(out, status_code=201)
+
+    @route("/api/v1/lineage", methods=["GET"])
+    async def lineage_walk(request: Request) -> Response:
+        """W3.1 — the bounded subgraph walk, operator plane. Query params:
+        ref (required), depth, direction, predicate. A whole-graph dump is
+        deliberately not offered."""
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        from mcp_hub import lineage as _lineage
+        from mcp_hub.refs import RefError
+
+        ref = request.query_params.get("ref", "")
+        if not ref:
+            return _err(422, "ref required, e.g. ?ref=hub.msg/1%3Fid%3D123")
+        try:
+            out = _lineage.walk(
+                db(), ref,
+                depth=int(request.query_params.get("depth", "2")),
+                direction=request.query_params.get("direction", "both"),
+                predicate=request.query_params.get("predicate") or None,
+            )
+        except RefError as e:
+            return _err(422, str(e))
+        return JSONResponse(out)
+
+    @route("/api/v1/lineage/coverage", methods=["GET"])
+    async def lineage_coverage(request: Request) -> Response:
+        """A9 — what fraction of artifacts carry lineage at all, so a thin
+        graph reads as thinly POPULATED, never as thinly connected."""
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        from mcp_hub import lineage as _lineage
+        return JSONResponse(_lineage.coverage(db()))
+
     @route("/api/v1/squads", methods=["GET", "POST"])
     async def squads(request: Request) -> Response:
         got = operator_only(request)
