@@ -291,3 +291,51 @@ class TestRoutesEnforce:
         r = rig.post("/api/v1/seats/vol/clone", json={"suffix": "c1"},
                      headers=OP)
         assert r.status_code == 201  # clean volumes clone fine
+
+
+# ---------------------------------------------------------------------------
+# E1 (edge side) — the LAST gate, for specs that predate the hub's guard
+# ---------------------------------------------------------------------------
+
+
+class TestEdgeRefusesToMaterialize:
+    """The hub refuses such a spec at WRITE time — but a spec stored before
+    that guard existed would otherwise materialize anyway. The edge is the
+    only place that can still say no, and it does, rather than trusting a
+    validation that happened somewhere else at some other time."""
+
+    def _executor(self):
+        from mcp_hub.edge import DockerExecutor
+
+        ran: list[list[str]] = []
+
+        def runner(cmd):
+            ran.append(cmd)
+            return 0, ""
+
+        return DockerExecutor(runner, environ={}), ran
+
+    def test_a_legacy_docker_socket_spec_is_REFUSED_at_materialize(self):
+        """Mutation: remove the check_volumes call from the create branch →
+        this fails, and `docker create` runs with the socket mounted."""
+        ex, ran = self._executor()
+        out = ex.execute(
+            {"op": "materialize", "seat": "s1", "placement": "p1"},
+            {"spec": {"image": "x:1",
+                      "volumes": [
+                          "/var/run/docker.sock:/var/run/docker.sock"]}},
+        )
+        assert out.get("skipped") is True
+        assert "docker daemon" in out["reason"]
+        assert not any("create" in c for c in ran), "it must not have created"
+
+    def test_positive_control_a_clean_spec_still_materializes(self):
+        """Without this, an executor that refused EVERY materialize would
+        pass the test above and look correct."""
+        ex, ran = self._executor()
+        out = ex.execute(
+            {"op": "materialize", "seat": "s2", "placement": "p2"},
+            {"spec": {"image": "x:1", "volumes": ["seat-mem:/state"]}},
+        )
+        assert not out.get("skipped"), out
+        assert any("create" in c for c in ran)

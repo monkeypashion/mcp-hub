@@ -35,6 +35,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from mcp_hub.spec_guard import check_volumes
+
 # Where the seat credentials live on an edge host. The systemd unit reads it
 # via `EnvironmentFile=-%h/.mcp-hub/edge-env`; the CLI reads it through
 # load_env_file so a hand-run behaves the same way. chmod 600, VALUES inside —
@@ -732,6 +734,16 @@ class DockerExecutor:
                     f"this is a hand-run, load the same file the timer does: "
                     f"`set -a; . ~/.mcp-hub/edge-env; set +a`"
                 )}
+            # THE LAST GATE BEFORE THE PREMISE BECOMES FALSE (W2.5). The hub
+            # refuses such a spec at write time, but a spec stored BEFORE
+            # that guard existed would otherwise materialize here — and the
+            # seat runs in bypassPermissions on the sole grounds that the
+            # container contains it. The edge is the only place that can
+            # still say no, so it does, rather than trusting a validation
+            # that happened somewhere else at some other time.
+            bad = check_volumes(spec.get("volumes"))
+            if bad:
+                return {**base, "skipped": True, "reason": bad}
             cmd = self.create_argv(seat, spec, self._environ)
         elif op == "start":
             cmd = ["docker", "start", seat]
