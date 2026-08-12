@@ -841,3 +841,54 @@ def test_a_workspace_with_no_containers_carries_the_keys_anyway():
     ws = t["machines"][0]["workspaces"][0]
     assert ws["in_containers"] == 0
     assert ws["container_ids"] == []
+
+
+# ---- unmanaged sessions: the box-wide inventory -----------------------------
+#
+# Five bypassPermissions sessions sat six days at a register prompt with no
+# line anywhere the operator looks, because every view rendered the ROSTER
+# (an account of what squad started), never the BOX (dt's sweep, 2026-08-12).
+# The scrape is local by construction, so only the local machine ever carries
+# the group — a remote box with no producer shows nothing rather than a
+# fabricated clean bill.
+
+def _unm(session, socket="default", since=NOW - 86400 * 6):
+    return {"session": session, "socket": socket, "since": since}
+
+
+def test_unmanaged_sessions_hang_under_the_local_machine():
+    t = _tree(board={"agents": {}, "unmanaged": [_unm("ghost")]})
+    m = t["machines"][0]
+    assert m["local"]
+    assert [u["session"] for u in m["unmanaged"]] == ["ghost"]
+    u = m["unmanaged"][0]
+    assert u["kind"] == "unmanaged"
+    assert u["key"] == "u:here/default/ghost"
+    assert u["socket"] == "default" and u["since"] == NOW - 86400 * 6
+
+
+def test_unmanaged_never_lands_on_a_remote_machine():
+    """No producer exists for a remote box — smoothing that over is the
+    'delivered live' mistake in a new costume (the remote-seats rule)."""
+    t = _tree(machines=("here", "there"),
+              rows=[_ws("remote-ws", "there", ["/w"])],
+              board={"agents": {}, "unmanaged": [_unm("ghost")]})
+    by_name = {m["machine"]: m for m in t["machines"]}
+    assert [u["session"] for u in by_name["here"]["unmanaged"]] == ["ghost"]
+    assert by_name["there"]["unmanaged"] == []
+
+
+def test_no_unmanaged_key_still_yields_the_list():
+    """An older squad emits no key: that is 'not measured', rendered as an
+    empty list so callers never crash on the ordinary case."""
+    t = _tree(board={"agents": {}})
+    assert t["machines"][0]["unmanaged"] == []
+
+
+def test_structure_key_notices_an_unmanaged_session_appearing():
+    """A session appearing must grow a NODE. Left out of the structure key,
+    the poll would relabel forever and the banner would never paint — the
+    same trap the containers tuple already documents."""
+    quiet = _tree(board={"agents": {}})
+    haunted = _tree(board={"agents": {}, "unmanaged": [_unm("ghost")]})
+    assert structure_key(quiet) != structure_key(haunted)

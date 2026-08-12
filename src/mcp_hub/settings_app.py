@@ -762,6 +762,41 @@ class SettingsApp(App):
             return f"want running, the edge saw {saw}"
         return f"want {want}, saw {saw} — converged"
 
+    @staticmethod
+    def _age_short(seconds: float) -> str:
+        s = max(0, int(seconds))
+        if s < 3600:
+            return f"{s // 60}m"
+        if s < 86400:
+            return f"{s // 3600}h"
+        return f"{s // 86400}d"
+
+    @staticmethod
+    def _unmanaged_group_data(m: dict[str, Any]) -> dict[str, Any]:
+        """The banner node's data, derived from the machine's list — built in
+        one place so rebuild and relabel can never disagree about its key."""
+        return {
+            "kind": "unmanaged_group",
+            "key": f"ug:{m['machine']}",
+            "machine": m["machine"],
+            "local": m.get("local", False),
+            "count": len(m.get("unmanaged") or []),
+        }
+
+    def _unmanaged_group_label(self, g: dict[str, Any],
+                               p: dict[str, str]) -> str:
+        n = g.get("count", 0)
+        return (f"[{p['warning']}]⚠ UNMANAGED — {n} session(s) "
+                f"outside the roster[/]")
+
+    def _unmanaged_label(self, u: dict[str, Any], p: dict[str, str]) -> str:
+        # The AGE is the alarm — six days at a register prompt is the
+        # founding specimen — so it rides the row, not the detail pane.
+        age = self._age_short(self._now() - u["since"]) if u.get("since") \
+            else "?"
+        name = f"[{p['warning']}]⚠ {escape(u['session'])}[/]"
+        return f"{name}  [dim]{escape(u.get('socket', ''))} · {age}[/]"
+
     def _label_for(self, data: dict[str, Any], p: dict[str, str]) -> str:
         kind = data.get("kind")
         if kind == "machine":
@@ -770,6 +805,10 @@ class SettingsApp(App):
             return self._workspace_label(data, p)
         if kind == "container":
             return self._container_label(data, p)
+        if kind == "unmanaged_group":
+            return self._unmanaged_group_label(data, p)
+        if kind == "unmanaged":
+            return self._unmanaged_label(data, p)
         return self._agent_label(data, p)
 
     @staticmethod
@@ -795,6 +834,11 @@ class SettingsApp(App):
             # container AS its host, so a restructure would move the cursor up
             # a level and the pane would describe the wrong thing.
             return ("container", data.get("machine"), data.get("identity"))
+        if kind == "unmanaged":
+            return ("unmanaged", data.get("machine"), data.get("socket"),
+                    data.get("session"))
+        if kind == "unmanaged_group":
+            return ("unmanaged_group", data.get("machine"))
         return ("machine", data.get("machine"))
 
     def _all_nodes(self) -> list[TreeNode]:
@@ -888,6 +932,14 @@ class SettingsApp(App):
                         self._agent_label(a, p), data=a)
             for a in m["loose"]:
                 by_key[a["key"]] = mn.add_leaf(self._agent_label(a, p), data=a)
+            if m.get("unmanaged"):
+                g = self._unmanaged_group_data(m)
+                gn = mn.add(self._unmanaged_group_label(g, p), data=g,
+                            expand=False)
+                by_key[g["key"]] = gn
+                for u in m["unmanaged"]:
+                    by_key[u["key"]] = gn.add_leaf(
+                        self._unmanaged_label(u, p), data=u)
         want = self._default_expansion(model) if first_paint else keep
         for key in want:
             node = by_key.get(key)
@@ -928,6 +980,11 @@ class SettingsApp(App):
                     fresh[a["key"]] = a
             for a in m["loose"]:
                 fresh[a["key"]] = a
+            if m.get("unmanaged"):
+                g = self._unmanaged_group_data(m)
+                fresh[g["key"]] = g
+                for u in m["unmanaged"]:
+                    fresh[u["key"]] = u
         for node in self._all_nodes():
             data = node.data or {}
             new = fresh.get(data.get("key", ""))
@@ -1314,6 +1371,25 @@ class SettingsApp(App):
             return
         if kind == "container":
             await detail.mount_all(self._container_widgets(sel))
+            return
+        if kind == "unmanaged_group":
+            await detail.mount(Static(
+                "tmux sessions on this box that squad did not start and does "
+                "not watch — any socket, not just squad's. They appear here "
+                "so the view is an inventory of the BOX, not an account of "
+                "what squad launched. Investigate before stopping: attach "
+                "with the command on each row.", classes="note"))
+            return
+        if kind == "unmanaged":
+            sock, sess = sel.get("socket", ""), sel.get("session", "")
+            await detail.mount(Static(
+                f"unmanaged session '{sess}' on tmux socket '{sock}'.\n\n"
+                f"look first:  tmux -L {sock} attach -t '={sess}'\n"
+                f"stop:        tmux -L {sock} kill-session -t '={sess}'\n\n"
+                "The board deliberately offers no kill button — five of "
+                "these once turned out to be reclaim survivors worth a "
+                "post-mortem, and a one-keystroke kill destroys the "
+                "evidence.", classes="note"))
             return
         if kind == "agent" and not sel.get("local"):
             await detail.mount_all(self._remote_agent_widgets(sel))

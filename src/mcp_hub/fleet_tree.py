@@ -627,6 +627,25 @@ def build_tree(
                                                      a["agent"]))
         if not wss and not cts and not lo and m != this_machine:
             continue          # an enrolled box with nothing on it: no node
+        # Box-wide inventory: tmux sessions outside the roster (any socket).
+        # LOCAL machine only, by construction — the scrape runs where the
+        # sessions are, and a remote box with no producer shows no group
+        # rather than a fabricated clean one (the remote-seats-are-thinner
+        # rule again). Six days of invisible bypassPermissions sessions is
+        # the incident this group exists to end (dt's sweep, 2026-08-12).
+        unmanaged = [
+            {
+                "kind": "unmanaged",
+                "key": f"u:{m}/{u.get('socket', '')}/{u['session']}",
+                "session": str(u["session"]),
+                "socket": str(u.get("socket", "")),
+                "since": float(u.get("since") or 0),
+                "machine": m,
+                "local": True,
+            }
+            for u in (board.get("unmanaged") or [])
+            if isinstance(u, dict) and u.get("session")
+        ] if m == this_machine else []
         out.append({
             "kind": "machine",
             "key": f"m:{m}",
@@ -650,6 +669,7 @@ def build_tree(
             "workspaces": wss,
             "containers": cts,
             "loose": lo,
+            "unmanaged": unmanaged,
             "agent_count": sum(len(w["agents"]) for w in wss)
             + sum(len(c["agents"]) for c in cts) + len(lo),
             "open_count": sum(1 for w in wss if w["open_now"] or w["here"]),
@@ -692,6 +712,10 @@ def structure_key(tree: dict[str, Any]) -> tuple:
             # never gets a node, because the poll would relabel forever.
             (c["key"], tuple(a["key"] for a in c["agents"]))
             for c in m.get("containers", [])
-        ), tuple(a["key"] for a in m["loose"]))
+        ), tuple(a["key"] for a in m["loose"]),
+           # Unmanaged sessions are structure too: a session appearing must
+           # grow a node, or the poll relabels forever and the banner never
+           # shows — the same trap the containers tuple names above.
+           tuple(u["key"] for u in m.get("unmanaged", [])))
         for m in tree.get("machines", [])
     )

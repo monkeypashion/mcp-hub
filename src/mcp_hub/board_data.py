@@ -82,13 +82,23 @@ def collect(squad_bin: str, home: Path | None = None,
 
     error: str | None = None
     scan: list[dict[str, Any]] = []
+    unmanaged: list[dict[str, Any]] = []
     try:
         proc = subprocess.run(
             [squad_bin, "board", "--json"],
             capture_output=True, text=True, timeout=20,
         )
         if proc.returncode == 0:
-            scan = json.loads(proc.stdout).get("agents", [])
+            doc = json.loads(proc.stdout)
+            scan = doc.get("agents", [])
+            # Box-wide inventory: tmux sessions outside the roster, every
+            # socket. An older squad emits no key — that is "not measured",
+            # and it stays an empty list here rather than growing a second
+            # meaning; the tree's group simply doesn't appear.
+            unmanaged = [
+                u for u in doc.get("unmanaged") or []
+                if isinstance(u, dict) and u.get("session")
+            ]
         else:
             error = (proc.stderr or "squad board failed").strip().splitlines()[-1][:120]
     except FileNotFoundError:
@@ -189,7 +199,8 @@ def collect(squad_bin: str, home: Path | None = None,
         "hands": sum(1 for a in agents.values()
                      if (a.get("next") or {}).get("hand")),
     }
-    return {"agents": agents, "order": order, "counts": counts, "error": error}
+    return {"agents": agents, "order": order, "counts": counts,
+            "unmanaged": unmanaged, "error": error}
 
 
 # ---- terminal theme detection ----------------------------------------------

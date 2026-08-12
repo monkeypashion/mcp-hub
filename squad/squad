@@ -53,6 +53,38 @@ self_stale() {
 rows()   { grep -vE '^[[:space:]]*(#|$)' "$CONF" 2>/dev/null || true; }
 agents() { rows | cut -d'|' -f1; }
 field()  { rows | awk -F'|' -v a="$1" -v n="$2" '$1==a {print $n; exit}'; }
+
+# ---- box-wide session inventory (who / board --json) ------------------------
+# Enumerate EVERY tmux session on this box — all sockets under /tmp/tmux-$UID,
+# not just squad's own $SOCK. The view that renders only the roster is an
+# ACCOUNT, not an inventory: five bypassPermissions seats sat six days at a
+# register prompt with no line anywhere the operator looks (2026-08-12, dt's
+# sweep), and a reclaim can leave survivors on a socket squad never opens.
+# Output rows: socket<TAB>session-name<TAB>created-epoch. TAB, not the \037
+# the caches use: tmux vis-escapes control chars in -F output, so a \037 in
+# the format arrives as the four LITERAL bytes "\037" and every row fails
+# the field split — measured here before anything trusted this (the planted
+# probe-sock session vanished from the filter's output; empty-when-blind is
+# exactly the reading this inventory exists to kill). Tab passes unescaped.
+all_box_sessions() {
+  local d="/tmp/tmux-$(id -u)" s
+  [ -d "$d" ] || return 0
+  for s in "$d"/*; do
+    [ -S "$s" ] || continue
+    command tmux -S "$s" list-sessions \
+      -F "$(basename "$s")	#{session_name}	#{session_created}" \
+      2>/dev/null || true
+  done
+}
+# Pure filter: pass through stdin rows whose session NAME is not in the args.
+# Split from the enumerator so tests can feed fixture rows without a server.
+unmanaged_filter() {
+  awk -F'\t' -v known="$*" \
+    'BEGIN { n = split(known, k, " "); for (i = 1; i <= n; i++) K[k[i]] = 1 }
+     $2 != "" && !($2 in K)'
+}
+# dash is squad's own monitor session; agent sessions carry roster names.
+unmanaged_sessions() { all_box_sessions | unmanaged_filter $(agents) dash; }
 # Roster CLASS (5th field, optional): "" / "squad" = core squad — always-on
 # colleagues, swept by up/cmd-all/dash and always visible on who/board.
 # "faculty" = on-demand specialist (the general-workspace projects): never
@@ -3185,6 +3217,21 @@ except Exception:
                 done
               done
             }
+            who_unmanaged() {
+              # The banner that turns `who` into an INVENTORY: every session
+              # on the box that is not a roster agent (any socket, incl. ones
+              # squad never opens). Empty = no banner — quiet is the normal
+              # state, and a permanent header would train eyes past it.
+              local lines sock name created when
+              lines="$(unmanaged_sessions)"
+              [ -n "$lines" ] || return 0
+              printf '\n  \033[33m⚠ UNMANAGED — tmux sessions on this box outside the roster:\033[0m\n'
+              while IFS=$'\t' read -r sock name created; do
+                [ -n "$name" ] || continue
+                when="$(date -d "@$created" '+%b %d %H:%M' 2>/dev/null || echo '?')"
+                printf '  \033[33m⚠ %-28s sock=%s  since %s\033[0m\n' "$name" "$sock" "$when"
+              done <<< "$lines"
+            }
             WHO_PASS=0; WHO_LAST=''
             if [ -n "$wmode" ]; then
               while true; do
@@ -3192,9 +3239,9 @@ except Exception:
                 if self_stale; then exec "$SELF" who --watch; fi
                 printf '\033[2J\033[H'
                 printf 'squad who — %s   (🔴 dialog needs you · 🙋 asked, awaiting your word · 🟢 working · 💤 idle · ⚡ wakeable)\n\n' "$(date +%H:%M:%S)"
-                who_board; who_paint; who_badge; sleep 2
+                who_board; who_unmanaged; who_paint; who_badge; sleep 2
               done
-            else who_board; who_paint; who_badge; fi ;;
+            else who_board; who_unmanaged; who_paint; who_badge; fi ;;
   board)    # OPERATOR DASHBOARD. `who` answers "what state is each agent in";
             # this answers the operator's actual questions: what is blocking
             # ME, what is running right now (the parallel picture), and what
@@ -3321,6 +3368,17 @@ except Exception:
                   "$(jesc "$a")" "$st" "$(jesc "$g")" "$(jesc "$mod")" "$ctx" "${w:-0}" "$(jesc "$act")" "$(jesc "$q")" \
                   "${dirty:-0}" "${ahead:-0}" "$(jesc "${branch:-}")"
               done <<< "$1"
+              # Box-wide inventory rides the same snapshot: sessions outside
+              # the roster, every socket. The board renders these under an
+              # UNMANAGED banner — same fact `who` prints, one producer.
+              printf '],"unmanaged":['
+              local sock name created ufirst=1
+              while IFS=$'\t' read -r sock name created; do
+                [ -n "$name" ] || continue
+                [ "$ufirst" = 1 ] || printf ','; ufirst=0
+                printf '{"session":"%s","socket":"%s","since":%s}' \
+                  "$(jesc "$name")" "$(jesc "$sock")" "${created:-0}"
+              done <<< "$(unmanaged_sessions)"
               printf ']}\n'
             }
             # --- NEXT data: what each agent says comes next. Two sources, merged:

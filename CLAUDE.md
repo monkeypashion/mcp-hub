@@ -89,7 +89,9 @@ ref is the message's identity in the lineage graph.
   "nothing recorded", not "root".
 - `resolve_ref(ref)` — a work item's IDENTITY, never its status
   (`ra.feature/1?feature_set_key=…&id=…`; the pair is scoped — never derive a
-  feature_set_key from a repo name).
+  feature_set_key from a repo name). A ⟨hub.msg⟩ ref is **not a retrieval
+  handle**: a clipped render's full body comes from `get_messages` /
+  `get_history`, never from its ref — the refusal names those routes.
 - `resolve_status(ref)` — "is it done?" **currently refuses**, by design:
   UNRESOLVABLE ≠ "not done". No blessed observed-completion target exists
   yet, and the hub does not infer completion from authored documents — a
@@ -728,6 +730,17 @@ under `(machine unknown)` rather than vanishing. Machine attribution is
 `-<machine>` *containment*, longest match wins — not `endswith`, because
 `mcp-hub-fireblade-wsl-xport` is a real transport-suffixed name that would
 otherwise be homeless.
+
+**The box, not just the roster.** `squad who` and the board's local machine
+node also enumerate every tmux session on the box — **all sockets** under
+`/tmp/tmux-$UID`, not just squad's own — and anything outside the roster
+lands under a folded `⚠ UNMANAGED` banner (count on the row, look-first /
+stop commands in the detail pane; deliberately no kill button — the founding
+five were reclaim survivors worth a post-mortem). A view that renders only
+what squad started is an *account*, not an *inventory*: five
+bypassPermissions sessions once ran six days at a register prompt with no
+line anywhere the operator looks. Remote boxes have no producer for this and
+show no group — absence of measurement, not a clean bill.
 
 The join is `fleet_tree.build_tree` — pure data, tested without a terminal.
 The widget only renders it. Note that **tree labels carry resolved hex, not

@@ -306,3 +306,50 @@ def test_collect_returns_the_machine_it_was_asked_about(tmp_path):
 def test_short_dir_leaves_paths_outside_home_alone():
     assert SettingsApp._short_dir("/opt/x/a.code-workspace") == "/opt/x"
     assert SettingsApp._short_dir("") == "definition only — nothing materialized"
+
+
+@pytest.mark.asyncio
+async def test_unmanaged_sessions_appear_under_a_banner_group():
+    """The box-wide inventory: a tmux session outside the roster gets a row
+    under an UNMANAGED banner on the local machine — five bypassPermissions
+    sessions once ran six days with no line anywhere the operator looks.
+    The group starts FOLDED: the banner with its count is the signal, and
+    the detail pane owns the look-first/stop commands."""
+    rows = [_row("showcase", "here")]
+    app = _app(rows)
+    async with app.run_test(size=(120, 30)) as pilot:
+        await _ready(app, pilot)
+        app._apply_board({
+            "agents": {}, "counts": {}, "error": None,
+            "unmanaged": [{"session": "ghost", "socket": "default",
+                           "since": 1.0}],
+        })
+        await pilot.pause()
+        groups = _nodes(app, "unmanaged_group")
+        assert len(groups) == 1, "one banner group on the local machine"
+        assert "UNMANAGED" in str(groups[0].label)
+        assert "1 session" in str(groups[0].label)
+        assert not groups[0].is_expanded
+        leaves = _nodes(app, "unmanaged")
+        assert [n.data["session"] for n in leaves] == ["ghost"]
+        # Open the fold the way the operator would — a collapsed node has no
+        # laid-out line, so a cursor move to it is a silent no-op.
+        groups[0].expand()
+        await pilot.pause()
+        detail = await _detail_of(app, pilot, leaves[0])
+        assert "kill-session" in detail and "ghost" in detail
+
+
+@pytest.mark.asyncio
+async def test_no_unmanaged_sessions_means_no_banner():
+    """Quiet is the normal state — a permanent empty banner would train the
+    operator's eyes straight past the one that matters."""
+    rows = [_row("showcase", "here")]
+    app = _app(rows)
+    async with app.run_test(size=(120, 30)) as pilot:
+        await _ready(app, pilot)
+        app._apply_board({"agents": {}, "counts": {}, "error": None,
+                          "unmanaged": []})
+        await pilot.pause()
+        assert _nodes(app, "unmanaged_group") == []
+        assert _nodes(app, "unmanaged") == []
