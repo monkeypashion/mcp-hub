@@ -10,6 +10,9 @@ widget rather than clicks on list rows — still real input, still the same app.
 """
 from __future__ import annotations
 
+import asyncio
+import time
+
 import pytest
 from textual.widgets import Select, Tree
 
@@ -85,8 +88,20 @@ def _detail_text(app) -> str:
 # defensible in that one place and nowhere else.
 _SETTLE = 25
 
+# Positive waits are WALL-CLOCK, not frame counts. `pilot.pause()` on an idle
+# message pump returns in well under a millisecond, so `for _ in range(200)`
+# is ~0.1s of real time — while the thing being waited on is a WORKER THREAD,
+# which this box (ambient load ~42: 16 tmux agents, seat containers, rclone)
+# can starve for whole seconds. Frames are cheapest exactly when the box is
+# busiest, so a frame budget SHRINKS under the load that needs it most:
+# measured 2026-08-12, file-scope runs failed 2/3 on this box — identically
+# on a tree predating that day's changes, so the frame-count gate, not any
+# code change, was the defect. The sleep in each turn of the loop is what
+# actually spends time; the pause keeps the pump serviced meanwhile.
+_WAIT_WALL_SECONDS = 30.0
 
-async def _ready(pilot, app, tries: int = 200) -> None:
+
+async def _ready(pilot, app, timeout: float = _WAIT_WALL_SECONDS) -> None:
     """Wait until the controls are POPULATED — not until a frame has elapsed.
 
     🔴 One `await pilot.pause()` after `run_test()` is a fixed frame count
@@ -124,16 +139,18 @@ async def _ready(pilot, app, tries: int = 200) -> None:
     is an unrelated plain `False`, so both `str(v) == "Select.NULL"` and
     `Select.BLANK` would be wrong here in different ways.
     """
-    for _ in range(tries):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         sels = app.query("Select")
         if sels and not any(s.value is Select.NULL for s in sels):
             return
         await pilot.pause()
+        await asyncio.sleep(0.02)
     raise AssertionError(
         "controls never populated — every Select still reads Select.NULL")
 
 
-async def _ran(pilot, ran, tries: int = 200) -> list:
+async def _ran(pilot, ran, timeout: float = _WAIT_WALL_SECONDS) -> list:
     """Wait for the command to be RECORDED, not for a fixed number of frames.
 
     ⚠️ `_apply` is dispatched with `run_worker(thread=True)`, so the append
@@ -146,11 +163,18 @@ async def _ran(pilot, ran, tries: int = 200) -> list:
     Not claimed as a proven cure: that failure has not been reproduced here
     (40 targeted runs under load and a full green suite). It is the weakness
     that was actually demonstrable by reading, fixed on its own merits.
+
+    2026-08-12: the condition loop alone was NOT the cure — bounded by a
+    FRAME count it still lost the race 2/3 file-scope runs on this box (and
+    identically on a pre-change tree). See _WAIT_WALL_SECONDS: the bound is
+    now wall-clock, and each turn of the loop spends real time.
     """
-    for _ in range(tries):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         if ran:
             return ran
         await pilot.pause()
+        await asyncio.sleep(0.02)
     return ran
 
 
