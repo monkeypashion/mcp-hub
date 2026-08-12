@@ -336,3 +336,83 @@ def check_repo_mount(repo_mount: object) -> str | None:
                 "new costume."
             )
     return None
+
+
+def check_credential_policy(spec: dict) -> str | None:
+    """The container-credential policy, enforced where it can still say no.
+
+    PROPOSAL-container-credential-policy-2026-08-12: the credential stays
+    outside the container; the container gets the outcome. A seat that
+    declares `allowed_env` / `allowed_mounts` adopts the policy, and from
+    then on `env_from_host` and every host-path mount must be a subset of
+    what it declared — an undeclared name refuses the materialize rather
+    than riding in on it.
+
+    Declaring EITHER field adopts BOTH halves. A half-adopted policy would
+    let the undeclared half deliver what the declared half refuses, which
+    is the `:ro`-bounds-the-file substitution wearing yet another coat.
+
+    A spec that declares NEITHER is a pre-policy spec and passes untouched:
+    turning absent into empty would refuse every legacy seat on its next
+    recreate with nothing telling the operator why — a migration that could
+    be half-done, made mandatory. Adoption is per-seat and explicit.
+    """
+    allowed_env = spec.get("allowed_env")
+    allowed_mounts = spec.get("allowed_mounts")
+    if allowed_env is None and allowed_mounts is None:
+        return None
+
+    if allowed_env is not None and not (
+            isinstance(allowed_env, list)
+            and all(isinstance(n, str) for n in allowed_env)):
+        return "REFUSED: spec.allowed_env must be a list of variable names"
+    names = {str(n) for n in (allowed_env or [])}
+    extra = [str(n) for n in (spec.get("env_from_host") or [])
+             if str(n) not in names]
+    if extra:
+        return (
+            f"REFUSED: env_from_host names {', '.join(sorted(extra))} — not "
+            "in this seat's allowed_env. The approved list is the policy; "
+            "grow the list (with the operator's word) rather than the env."
+        )
+
+    if allowed_mounts is not None and not isinstance(allowed_mounts, list):
+        return "REFUSED: spec.allowed_mounts must be a list of objects"
+    entries: dict[str, dict] = {}
+    for m in (allowed_mounts or []):
+        if not isinstance(m, dict) or not str(m.get("path") or "").strip():
+            return (
+                "REFUSED: each allowed_mounts entry must be an object with "
+                "a host 'path'"
+            )
+        if not str(m.get("why") or "").strip() or not str(
+                m.get("scopes") or "").strip():
+            # The reason is the payload, and the scope question must be
+            # answered in the spec — ':ro' bounds the FILE, not the
+            # CAPABILITY, so the capability is stated where the mount is.
+            # A non-credential mount states that: scopes: "none — not a
+            # credential artifact".
+            return (
+                f"REFUSED: allowed_mounts entry '{m.get('path')}' needs a "
+                "'why' and the token 'scopes' inside the mounted artifact "
+                "(or 'none — not a credential artifact')"
+            )
+        entries[str(m["path"]).rstrip("/") or "/"] = m
+    for v in (spec.get("volumes") or []):
+        src, _, rest = str(v).partition(":")
+        src = src.strip()
+        if not src.startswith("/"):
+            continue  # a NAMED volume — docker-managed, not a host path
+        entry = entries.get(src.rstrip("/") or "/")
+        if entry is None:
+            return (
+                f"REFUSED: host mount '{src}' is not in this seat's "
+                "allowed_mounts. Every host path a policy-adopting seat "
+                "mounts is declared, with its reason and its scopes."
+            )
+        if entry.get("ro", True) and "ro" not in rest.split(":"):
+            return (
+                f"REFUSED: allowed_mounts marks '{src}' read-only but the "
+                "volume string does not carry ':ro'"
+            )
+    return None

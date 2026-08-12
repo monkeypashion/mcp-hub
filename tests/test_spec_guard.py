@@ -486,3 +486,67 @@ class TestEdgeRefusesToMaterialize:
         )
         assert not out.get("skipped"), out
         assert any("create" in c for c in ran)
+
+
+class TestCredentialPolicy:
+    """PROPOSAL-container-credential-policy-2026-08-12: a seat that declares
+    `allowed_env`/`allowed_mounts` adopts the policy, and materialize refuses
+    anything outside its lists. The founding lesson rides in the entry shape:
+    `:ro` bounds the FILE, not the CAPABILITY, so every mount entry states
+    the token scopes inside the artifact — the scope question made
+    un-skippable (dt, 2026-08-11)."""
+
+    def test_a_spec_that_declares_neither_field_is_pre_policy(self):
+        from mcp_hub.spec_guard import check_credential_policy
+        assert check_credential_policy(
+            {"env_from_host": ["ANYTHING"], "volumes": ["/x:/y"]}) is None
+
+    def test_an_undeclared_env_name_refuses_and_is_NAMED(self):
+        """RA's falsifiability leg: the guard must FAIL on an undeclared
+        name — a guard that cannot produce a refusal is not a control."""
+        from mcp_hub.spec_guard import check_credential_policy
+        bad = check_credential_policy(
+            {"allowed_env": ["GOOD"], "env_from_host": ["GOOD", "SMUGGLED"]})
+        assert bad and "SMUGGLED" in bad and "REFUSED" in bad
+
+    def test_a_subset_passes(self):
+        from mcp_hub.spec_guard import check_credential_policy
+        assert check_credential_policy(
+            {"allowed_env": ["A", "B"], "env_from_host": ["A"]}) is None
+
+    def test_adopting_one_half_enforces_the_other(self):
+        """A half-adopted policy would let the undeclared half deliver what
+        the declared half refuses."""
+        from mcp_hub.spec_guard import check_credential_policy
+        bad = check_credential_policy(
+            {"allowed_env": ["A"], "env_from_host": ["A"],
+             "volumes": ["/host/creds:/seat/creds:ro"]})
+        assert bad and "/host/creds" in bad
+
+    def test_a_mount_entry_without_scopes_is_malformed(self):
+        from mcp_hub.spec_guard import check_credential_policy
+        bad = check_credential_policy(
+            {"allowed_mounts": [{"path": "/host/gh", "why": "gh config"}]})
+        assert bad and "scopes" in bad
+
+    def test_a_declared_ro_mount_must_actually_be_ro(self):
+        """The entry's `ro` is a promise about the volume string; a writable
+        mount under a read-only declaration is the lie the policy exists to
+        catch."""
+        from mcp_hub.spec_guard import check_credential_policy
+        spec = {"allowed_mounts": [
+            {"path": "/host/gh", "ro": True, "why": "gh config",
+             "scopes": "codespace"}],
+            "volumes": ["/host/gh:/seat/gh"]}
+        bad = check_credential_policy(spec)
+        assert bad and ":ro" in bad
+        spec["volumes"] = ["/host/gh:/seat/gh:ro"]
+        assert check_credential_policy(spec) is None
+
+    def test_named_volumes_stay_out_of_scope(self):
+        """A docker-managed named volume carries no host path; the policy
+        governs the host boundary, same as check_volumes."""
+        from mcp_hub.spec_guard import check_credential_policy
+        assert check_credential_policy(
+            {"allowed_env": [], "volumes": ["seat-memory-x:/home/seat/.claude"]}
+        ) is None

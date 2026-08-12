@@ -1102,3 +1102,86 @@ class TestRosterEnrolment:
             {"op": "materialize", "seat": "p"}, spec)
         assert out["enrolled"]["skipped"] is True
         assert "pod" in out["enrolled"]["reason"]
+
+
+class TestCredentialPolicyAtMaterialize:
+    """The policy is enforced at the last place that can refuse before a
+    value enters the container — the same station as check_volumes."""
+
+    def test_an_undeclared_name_refuses_the_materialize(self):
+        spec = {"image": "i", "allowed_env": ["GOOD"],
+                "env_from_host": ["SMUGGLED"]}
+        out = DockerExecutor(Runner(), {"SMUGGLED": "v"}).execute(
+            {"op": "materialize", "seat": "s1"}, {"spec": spec})
+        assert out["skipped"] and "SMUGGLED" in out["reason"]
+
+    def test_a_pre_policy_spec_still_materializes(self):
+        r = Runner()
+        out = DockerExecutor(r).execute(
+            {"op": "materialize", "seat": "s1"},
+            {"spec": {"image": "i"}})
+        assert out.get("rc") == 0
+
+class TestRosterDeEnrolment:
+    """The mirror of TestRosterEnrolment: what materialize adds, destroy
+    removes. Measured asymmetry (fb, 2026-08-11): `voicebar rows after
+    destroy: 1` — and a REUSED container name would inherit an authorisation
+    nobody granted."""
+
+    @pytest.fixture()
+    def squad(self, monkeypatch):
+        monkeypatch.setattr("mcp_hub.edge._squad_bin", lambda: "/fake/squad")
+        return "/fake/squad"
+
+    def test_destroy_deenrols_the_container(self, squad):
+        """Mutation: delete the _deenrol_container call → this fails, and
+        destroyed seats leave authorisations behind again."""
+        r = Runner(world={"s1": "running"})
+        out = DockerExecutor(r).execute(
+            {"op": "destroy", "seat": "s1"}, {"spec": {"image": "i"}})
+        rm = next(c for c in r.calls if c[0] == squad)
+        assert rm[1] == "rm" and rm[2] == "s1"
+        assert out["deenrolled"]["ok"] is True
+
+    def test_deenrolment_happens_only_AFTER_a_successful_rm(self, squad):
+        """A row removed for a container that is still running would make
+        the roster lie in the opposite direction."""
+        class FailRm(Runner):
+            def __call__(self, cmd, cwd=None):
+                if cmd[:3] == ["docker", "rm", "-f"]:
+                    self.calls.append(list(cmd))
+                    return 1, "cannot remove"
+                return super().__call__(cmd, cwd)
+
+        r = FailRm()
+        DockerExecutor(r).execute({"op": "destroy", "seat": "s1"},
+                                  {"spec": {"image": "i"}})
+        assert not any(c[0] == squad for c in r.calls)
+
+    def test_a_machine_without_squad_still_destroys(self):
+        r = Runner(world={"s1": "running"})
+        out = DockerExecutor(r).execute(
+            {"op": "destroy", "seat": "s1"}, {"spec": {"image": "i"}})
+        assert out["rc"] == 0
+        assert out["deenrolled"]["skipped"]
+
+    def test_an_already_missing_row_reads_as_done(self, squad):
+        class UnknownAgent(Runner):
+            def __call__(self, cmd, cwd=None):
+                if cmd[0] == "/fake/squad":
+                    self.calls.append(list(cmd))
+                    return 1, "!! unknown agent 's1' (see conf)"
+                return super().__call__(cmd, cwd)
+
+        out = DockerExecutor(UnknownAgent()).execute(
+            {"op": "destroy", "seat": "s1"}, {"spec": {"image": "i"}})
+        assert out["deenrolled"] == {"ok": True, "already": True}
+
+    def test_a_pod_destroy_does_not_reach_past_what_materialize_added(
+            self, squad):
+        r = Runner()
+        out = DockerExecutor(r).execute(
+            {"op": "destroy", "seat": "p1"},
+            {"spec": {"image": "i", "agents": [{"identity": "a"}]}})
+        assert not any(c[0] == squad for c in r.calls)
+        assert out["deenrolled"]["skipped"]

@@ -35,7 +35,12 @@ import time
 from pathlib import Path
 from typing import Any
 
-from mcp_hub.spec_guard import SEAT_STATE_DIR, check_repo_mount, check_volumes
+from mcp_hub.spec_guard import (
+    SEAT_STATE_DIR,
+    check_credential_policy,
+    check_repo_mount,
+    check_volumes,
+)
 
 # Where the seat credentials live on an edge host. The systemd unit reads it
 # via `EnvironmentFile=-%h/.mcp-hub/edge-env`; the CLI reads it through
@@ -751,6 +756,37 @@ class DockerExecutor:
             return {"ok": True, "already": True}
         return {"ok": rc == 0, "rc": rc, "output": (out or "")[-200:]}
 
+    def _deenrol_container(self, seat: str,
+                           spec: dict[str, Any]) -> dict[str, Any] | None:
+        """Remove the destroyed container's row from the squad roster.
+
+        The exact mirror of `_enrol_container`, because the asymmetry was
+        measured (2026-08-11, fb: `voicebar rows after destroy: 1`): the edge
+        enrolled on materialize and left the row behind on destroy, so
+        `squad ls` and the workspace tabs drifted — and a REUSED container
+        name would inherit an authorisation nobody granted, since the voice
+        gate reads membership as the record of a decision.
+
+        BEST EFFORT, NEVER FATAL, REPORTED EITHER WAY — the same contract as
+        enrolment, for the same reason: the destroy itself must never be
+        blocked by roster bookkeeping, and a skipped cleanup must not read
+        as a done one.
+        """
+        if spec.get("agents"):
+            # Pods were never enrolled by materialize (their rows are
+            # per-agent, operator-made); destroying the container must not
+            # reach past what materialize added.
+            return {"skipped": True, "reason": "pod — enrolled per agent"}
+        squad_bin = _squad_bin()
+        if not squad_bin:
+            return {"skipped": True, "reason": "no `squad` on this machine"}
+        rc, out = self._run([squad_bin, "rm", seat])
+        if rc != 0 and "unknown agent" in (out or ""):
+            # Idempotent: a row already gone (operator ran `squad rm` first,
+            # or the seat predates enrolment) is the wanted end state.
+            return {"ok": True, "already": True}
+        return {"ok": rc == 0, "rc": rc, "output": (out or "")[-200:]}
+
     @staticmethod
     def create_argv(seat: str, spec: dict[str, Any],
                     environ: dict[str, str] | None = None) -> list[str]:
@@ -968,6 +1004,13 @@ class DockerExecutor:
             bad = check_repo_mount(spec.get("repo_mount"))
             if bad:
                 return {**base, "skipped": True, "reason": bad}
+            # The container-credential policy: a seat that declares its
+            # approved lists is held to them HERE, at the last place that
+            # can refuse before the value enters the container. Same
+            # fail-closed shape as check_volumes, same reasoning as W2.5.
+            bad = check_credential_policy(spec)
+            if bad:
+                return {**base, "skipped": True, "reason": bad}
             # THE CHECKOUT HAPPENS FIRST, AND ITS FAILURE STOPS THE
             # MATERIALIZE. A container started over a missing or half-fetched
             # directory looks healthy to `docker ps` and gives the agent an
@@ -989,6 +1032,12 @@ class DockerExecutor:
             cmd = ["docker", "stop", seat]
         elif op == "destroy":
             cmd = ["docker", "rm", "-f", seat]
+            rc, out = self._run(cmd)
+            deenrol = self._deenrol_container(seat, spec) if rc == 0 else None
+            res = {**base, "rc": rc, "output": out[-400:]}
+            if deenrol:
+                res["deenrolled"] = deenrol
+            return res
         else:
             return {**base, "skipped": True, "reason": f"unknown op '{op}'"}
         rc, out = self._run(cmd)
