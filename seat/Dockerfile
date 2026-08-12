@@ -17,8 +17,13 @@ FROM python:3.12-slim
 # which is per-container and reaches nothing outside it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git tmux curl ca-certificates procps \
+        openssh-client \
         alsa-utils libasound2-plugins pulseaudio-utils pulseaudio \
     && rm -rf /var/lib/apt/lists/*
+# openssh-client: `gh codespace ssh` SHELLS OUT to openssh (cp is legacy
+# since gh 2.93), so without it a seat holds a valid codespace-scoped
+# credential and still has no transport. Found by the fixture seat itself,
+# by measurement, 2026-08-12 — it surfaced rather than worked around.
 
 # NODE + GH — the fixture harness is a Node program, and it drives codespaces
 # through the `gh` CLI. Measured 2026-08-11 inside `mcp-hub-seat:latest`:
