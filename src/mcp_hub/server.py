@@ -2538,7 +2538,11 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             # `source` is reserved by Claude Code's channel layer (it's the
             # channel server's name, "hub"). Use `from_agent` to avoid a
             # duplicate `source=` attribute on the rendered <channel> tag.
-            meta={"from_agent": from_agent, "kind": "dm", "priority": priority},
+            # Every push site stamps drain_batch — when only the idle-drain
+            # path carried it, its ABSENCE elsewhere read as a third state
+            # (spike-runtime scoring push-vs-drain cells, 2026-08-12).
+            meta={"from_agent": from_agent, "kind": "dm",
+                  "priority": priority, "drain_batch": "false"},
         )
 
         # Stamp only on PRIMARY delivery (the token is the primary's stream) —
@@ -2759,6 +2763,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                     "from_agent": from_agent,
                     "kind": "broadcast",
                     "priority": priority,
+                    "drain_batch": "false",
                 },
             )
 
@@ -3133,6 +3138,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                     "kind": "post",
                     "channel": channel,
                     "priority": priority,
+                    "drain_batch": "false",
                 },
             )
 
@@ -3996,7 +4002,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         outcome = await push_channel(
             agent=row["agent"],
             content=f"DM from operator: {body}",
-            meta={"from_agent": "operator", "kind": "dm", "priority": "normal"},
+            meta={"from_agent": "operator", "kind": "dm",
+                  "priority": "normal", "drain_batch": "false"},
         )
         if outcome.primary:
             _stamp_pushed(conn, [msg_id], row["agent"])
@@ -4100,11 +4107,24 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             parsed = refs.parse_ref(ref)
             scheme = refs._REGISTRY[parsed.scheme]
             if scheme.resolve is None:
-                return (
+                refusal = (
                     f"REFUSED: scheme {parsed.scheme!r} has no resolver "
                     f"registered — its refs are identities (graph nodes), "
                     f"not resolvable work items"
                 )
+                # .scheme is the versioned key ("hub.msg/1") — match the
+                # name so the pointer survives a contract-version bump.
+                if parsed.scheme.split("/")[0] == "hub.msg":
+                    # The ref stamped on a rendered (possibly clipped) message
+                    # is NOT a retrieval handle — a reader holding a clipped
+                    # tag and its ref cannot get the body from here, and the
+                    # refusal must say where they CAN (spike-runtime,
+                    # 2026-08-12: scanned history because this string didn't).
+                    refusal += (
+                        ". To read the message body, use get_messages (your "
+                        "own unread) or get_history (any conversation/channel)"
+                    )
+                return refusal
             return json.dumps(scheme.resolve(conn, parsed))
         except refs.RefError as e:
             return f"REFUSED: {e}"

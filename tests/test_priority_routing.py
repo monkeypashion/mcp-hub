@@ -303,6 +303,56 @@ async def test_send_low_to_idle_drain_batches_unread(server):
     assert "drain batch of 3" in out.lower()
 
 
+async def test_live_push_meta_always_carries_drain_batch_false(server):
+    """Every live-push tag stamps drain_batch="false" — DM, broadcast and
+    post alike. When only the idle-drain path carried the attribute, its
+    ABSENCE on the other tags read as a third state, and a recipient
+    scoring push-vs-drain cells had to infer from a missing key
+    (spike-runtime, 2026-08-12). Absence must never be a signal."""
+    await _call_tool(server, "register", {"name": "alice", "project": "x"})
+    await _call_tool(server, "register", {"name": "bob", "project": "y"})
+
+    registry = server._hub_registry  # type: ignore[attr-defined]
+
+    class _FakeSess:
+        async def send_ping(self): ...
+        async def send_notification(self, _n): ...
+
+    registry.bind("bob", _FakeSess())
+
+    captured = []
+
+    async def _capture_push(name, notification):
+        params = getattr(notification, "params", None)
+        if params is None and isinstance(notification, dict):
+            params = notification.get("params")
+        captured.append((name, params))
+        return True
+
+    with patch.object(registry, "push", side_effect=_capture_push):
+        await _call_tool(server, "send", {
+            "from_agent": "alice", "to": "bob",
+            "message": "direct", "priority": "normal"})
+        await _call_tool(server, "broadcast", {
+            "from_agent": "alice", "message": "wide",
+            "priority": "normal", "scope": "fleet"})
+        await _call_tool(server, "create_channel", {
+            "name": "probe-ch", "created_by": "alice"})
+        await _call_tool(server, "subscribe_channel", {
+            "name": "bob", "channel": "probe-ch"})
+        await _call_tool(server, "post", {
+            "from_agent": "alice", "channel": "probe-ch",
+            "message": "topical", "priority": "normal"})
+
+    kinds = {p["meta"]["kind"] for _, p in captured}
+    assert kinds == {"dm", "broadcast", "post"}, (
+        f"expected one push per primitive, saw {kinds} in {len(captured)}")
+    for name, params in captured:
+        assert params["meta"].get("drain_batch") == "false", (
+            f"{params['meta']['kind']} push to {name} missing "
+            f"drain_batch=false: {params['meta']}")
+
+
 async def test_idle_wake_clears_is_idle_atomically(server):
     """After a successful drain-batch wake, is_idle must be cleared.
     Otherwise concurrent senders would all fire wake at the same idle

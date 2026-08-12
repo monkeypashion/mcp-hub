@@ -349,6 +349,21 @@ class TestThroughTheTools:
         assert out.startswith("REFUSED:") and "no resolver" in out
 
     @pytest.mark.anyio
+    async def test_hub_msg_refusal_names_the_recovery_routes(self, server):
+        """A clipped render carries a ref that this tool refuses — the
+        refusal must say where the body actually lives, or the reader is
+        left scanning history by guesswork (spike-runtime, 2026-08-12).
+        Only message refs get the pointer: other resolverless schemes have
+        no body to recover, and a false pointer is worse than none."""
+        out = await self._call(server, "resolve_ref",
+                               {"ref": "hub.msg/1?id=1"})
+        assert "get_messages" in out and "get_history" in out
+        other = await self._call(server, "resolve_ref",
+                                 {"ref": "hub.agent/1?name=x"})
+        assert other.startswith("REFUSED:")
+        assert "get_messages" not in other
+
+    @pytest.mark.anyio
     async def test_rule_1_reaches_the_tool_surface(self, server):
         out = await self._call(server, "resolve_ref",
                                {"ref": "ra.feature/1?id=f1"})
