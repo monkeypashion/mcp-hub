@@ -2,7 +2,7 @@
   "name": "squad-terminals",
   "displayName": "Squad Terminals",
   "description": "Auto-opens one plain terminal per squad agent (squad attach) with icon+color, and adds per-agent squad actions to the terminal tab context menu.",
-  "version": "0.35.0",
+  "version": "0.36.0",
   "publisher": "monkeypashion",
   "engines": {
     "vscode": "^1.90.0"
@@ -425,6 +425,11 @@
           "when": "squad.isAgent"
         },
         {
+          "command": "squad.copyId",
+          "group": "5_settings@0",
+          "when": "squad.isAgent"
+        },
+        {
           "command": "squad.settings",
           "group": "5_settings@1",
           "when": "squad.isAgent"
@@ -535,11 +540,6 @@
         {
           "command": "squad.dmVia",
           "group": "1_msg@2",
-          "when": "squad.isAgent"
-        },
-        {
-          "command": "squad.copyId",
-          "group": "1_msg@3",
           "when": "squad.isAgent"
         }
       ],

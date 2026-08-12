@@ -307,13 +307,43 @@ def test_copyId_shows_the_operator_what_landed_on_the_clipboard(src):
         "stripped label")
 
 
-def test_copyId_is_in_the_MESSAGING_menu(pkg):
-    """It is a comms affordance. Grouping it with start/stop/retire would put
-    a harmless act beside destructive ones."""
-    msg = [m["command"] for m in pkg["contributes"]["menus"]["squad.messagingMenu"]]
-    assert "squad.copyId" in msg
+def test_copyId_is_TOP_LEVEL_and_not_under_send_to_others(pkg):
+    """🔴 It was first placed in `squad.messagingMenu`, chosen by reading the
+    INTERNAL ID. That submenu's visible LABEL is "Send to others", and it
+    holds broadcast and message-via — acts of SENDING. Copying a name to the
+    clipboard sends nothing, so it read as a category error to the one person
+    who matters, who looked and did not find it.
+
+    ⭐ The lesson is about menus generally: place by the LABEL the operator
+    reads, never by the identifier the code uses. They diverge silently.
+
+    Top level, beside "Settings…" — both are things you READ about an agent
+    rather than acts performed on it, and a one-item utility needs no submenu
+    to hide in.
+    """
+    agent_menu = pkg["contributes"]["menus"]["squad.agentMenu"]
+    assert "squad.copyId" in [i.get("command") for i in agent_menu], (
+        "copyId must be top-level in the Squad menu — a utility buried in a "
+        "submenu whose label describes a different act is not discoverable")
     for menu, items in pkg["contributes"]["menus"].items():
-        if menu == "squad.messagingMenu":
+        if menu == "squad.agentMenu":
             continue
         assert "squad.copyId" not in [i.get("command") for i in items], (
             f"squad.copyId also appears in {menu} — one home per verb")
+
+
+def test_no_command_sits_in_a_submenu_whose_label_contradicts_it(pkg):
+    """The general form of the mistake above, as a standing guard.
+
+    "Send to others" is a VERB group: everything in it must be an act of
+    sending. A copy/show/read verb landing there is the category error that
+    made copyId unfindable.
+    """
+    titles = {c["command"]: c["title"] for c in pkg["contributes"]["commands"]}
+    sending = pkg["contributes"]["menus"].get("squad.messagingMenu", [])
+    for it in sending:
+        title = titles.get(it.get("command"), "")
+        first = title.split()[0].lower() if title else ""
+        assert first not in {"copy", "show", "open", "read", "clone"}, (
+            f'"{title}" is in the "Send to others" submenu but its verb is '
+            f'"{first}" — it does not send anything')
