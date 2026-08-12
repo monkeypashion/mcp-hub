@@ -335,6 +335,47 @@ def live_sessions(runner: Any) -> set[str] | None:
     return {ln.strip() for ln in out.splitlines() if ln.strip()}
 
 
+def host_tmux_sessions(runner: Any,
+                       socket_dir: Path | None = None
+                       ) -> dict[str, set[str]] | None:
+    """Session names per socket for EVERY tmux server on the box — or None
+    when we could not look.
+
+    A reclaim's absence evidence used to be the substrate's PRIMARY artifact
+    only — the container for docker, the roster row for a worktree seat. Five
+    sessions wearing seat names then ran 4-6 days on a socket every reader
+    could list, because each instrument iterated the KNOWN and asked about
+    it: not roster rows (squad rm had deleted those), not tmux placements
+    (their rows were docker), honestly absent as containers (dt's sweep,
+    2026-08-12). This helper is the inverse — enumerate the box, let the
+    caller subtract the known.
+
+    Three answers, kept distinct on fb's rule that UNKNOWN ≠ ABSENT:
+      {}    measured empty — no socket dir means no servers, a real negative
+      {...} measured contents; a dead socket file ("no server running") is a
+            measured-empty server, not a failure
+      None  could not look — a listing that failed for any other reason.
+            Callers must treat this as unknown, never as clean.
+    """
+    d = socket_dir if socket_dir is not None \
+        else Path(f"/tmp/tmux-{os.getuid()}")
+    if not d.is_dir():
+        return {}
+    try:
+        socks = sorted(p for p in d.iterdir() if p.is_socket())
+    except OSError:
+        return None
+    out: dict[str, set[str]] = {}
+    for s in socks:
+        rc, o = runner(["tmux", "-S", str(s), "ls", "-F", "#{session_name}"])
+        if rc != 0:
+            if "no server" in o.lower():
+                continue
+            return None
+        out[s.name] = {ln.strip() for ln in o.splitlines() if ln.strip()}
+    return out
+
+
 def local_roster(runner: Any = None) -> list[dict[str, Any]]:
     """This machine's roster — {agent, worktree, comms, running?}.
 
@@ -441,8 +482,36 @@ def observed_report(
     # containers and permanently diverged for tmux seats.
     if placement.get("desired") == "reclaimed":
         present = enumeration.get("exists", enumeration.get("enrolled"))
-        if present is False:
-            state = "reclaimed"
+        # ⚠️ ABSENCE NEEDS BOTH FACTS FALSE, and each `is False` is
+        # deliberate (UNKNOWN ≠ ABSENT, in every clause):
+        #
+        #   present — the substrate's primary artifact is gone.
+        #   alive   — nothing by this name is RUNNING. The old check read
+        #             `present` alone, and for a worktree seat `present` is
+        #             the ROSTER ROW — a record, deleted by `squad rm`
+        #             before its kill-session (whose failure it swallows).
+        #             A visibly-running session was reported `reclaimed`
+        #             while `alive: True` sat in this same dict, proven by
+        #             execution 2026-08-12. A record asserts; only the
+        #             process measurement is evidence of destruction.
+        #
+        #   host_sessions — the box-wide sweep (host_tmux_sessions): a
+        #             session wearing the seat's name on ANY socket means
+        #             the seat's footprint outlives its primary artifact —
+        #             the five 6-day survivors were exactly this, honest
+        #             container-absence with seat-named sessions running.
+        #             Non-empty -> `leftover`, a diverged state the board
+        #             surfaces, never silently converged. The
+        #             `host_sessions_unknown` flag is a sweep that FAILED:
+        #             we could not look everywhere, so nothing is granted.
+        #             Key absent entirely = an edge that didn't sweep (old
+        #             pass shape) — verdict falls back to the two facts
+        #             above rather than refusing retroactively.
+        if present is False and enumeration.get("alive") is False:
+            if enumeration.get("host_sessions"):
+                state = "leftover"
+            elif not enumeration.get("host_sessions_unknown"):
+                state = "reclaimed"
     # A container running the WRONG IMAGE is not converged, and "running"
     # would be true-but-useless: `docker ps` cannot see the difference, so
     # the drift would stay invisible forever (it bit this build for real —
@@ -1341,6 +1410,7 @@ def edge_apply(
     runner: Any,
     scan_dirs: list[Path],
     seeder: Any = None,
+    session_sweep: Any = None,
 ) -> dict[str, Any]:
     """One reconcile pass: pull → enumerate → plan → execute → report.
 
@@ -1429,6 +1499,19 @@ def edge_apply(
         img = (specs.get(p["seat"], {}).get("spec") or {}).get("image")
         if img and img not in want_image_ids:
             want_image_ids[img] = resolve_image_id(runner, img)
+    # The box-wide sweep, run at most ONCE per pass and only when a reclaim
+    # verdict is actually pending: reclaim's absence evidence must cover the
+    # seat's FOOTPRINT, not just its primary artifact. `swept` and `sweep`
+    # are separate facts — a sweep that ran and FAILED (None) must reach
+    # observed_report as `host_sessions_unknown`, never as silence, or a
+    # failed look reads as a clean one.
+    # `session_sweep` is injectable like `seeder`: the default reads the
+    # box's real socket dir, which a test must never depend on.
+    sweep_fn = session_sweep or (lambda: host_tmux_sessions(runner))
+    sweep: dict[str, set[str]] | None = None
+    swept = any(p.get("desired") == "reclaimed" for p in placements)
+    if swept:
+        sweep = sweep_fn()
     reported = 0
     for p in placements:
         state = local[p["seat"]]
@@ -1467,6 +1550,14 @@ def edge_apply(
                 "alive": state["running"],
                 "enrolled": state["materialized"],
             }
+        if swept and p.get("desired") == "reclaimed":
+            if sweep is None:
+                enumeration["host_sessions_unknown"] = True
+            else:
+                enumeration["host_sessions"] = sorted(
+                    sock for sock, names in sweep.items()
+                    if p["seat"] in names
+                )
         api.push_observed(p["id"], observed_report(p, enumeration))
         reported += 1
 

@@ -1187,9 +1187,20 @@ add_agent() {  # squad add <org>/<repo> — clone/pull, opt in, enroll/migrate u
 }
 
 rm_agent() {   # squad rm [agent] — exact inverse of add: session, roster, opt-in, daemon state
-  local a="$1" dir proj safe optnote=""
+  local a="$1" dir proj safe optnote="" rm_survived=""
   dir="$(untilde "$(field "$a" 2)")"
   tm kill-session -t "=$a" 2>/dev/null || true
+  # The kill VERIFIED, never assumed. `|| true` above is right for the
+  # ordinary case (no such session), but it also swallows a kill that
+  # genuinely failed — and this verb is the edge's DESTROY, whose exit code
+  # feeds the reclaim verdict. The roster row is removed below either way,
+  # after which nothing on the box asks about this session again: the exact
+  # falls-between-instruments shape that left five seat-named sessions
+  # running 6 days past their "reclaimed · converged" (2026-08-12).
+  if tm has-session -t "=$a" 2>/dev/null; then
+    echo "⚠ session '$a' SURVIVED kill-session — leftover process still running; investigate (tm attach -t '=$a'), then kill it before re-running rm" >&2
+    rm_survived=1
+  fi
   tmp="$(mktemp)"; awk -F'|' -v a="$a" '$1!=a' "$CONF" > "$tmp" && mv "$tmp" "$CONF"
   # Opt the project back out so hooks go silent for this repo again — but ONLY
   # if no OTHER enrolled agent still lives in it.
@@ -1251,6 +1262,9 @@ rm_agent() {   # squad rm [agent] — exact inverse of add: session, roster, opt
   # caller who stops here leaves a `ghost — registered, no file` on the board.
   echo "  still to do if you are retiring it fully: remove the folder from any" \
        ".code-workspace, and 'mcp-hub workspaces remove <name>' on the hub"
+  # Exit nonzero on a surviving session — LAST, so the retirement above is
+  # complete either way; the failure is the leftover, not the removal.
+  [ -z "$rm_survived" ]
 }
 
 # ── ext_align: keep the cockpit extension's installed dir name in step ──────

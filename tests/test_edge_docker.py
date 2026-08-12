@@ -763,6 +763,161 @@ def test_an_enumeration_with_NO_absence_key_never_claims_reclaimed():
     assert rep["state"] == "stopped"
 
 
+# ---- reclaim absence is a measurement of the BOX, not of one artifact ------
+#
+# Five seat-named tmux sessions ran 4-6 days past their placements' reading
+# `reclaimed · converged` (dt's sweep, 2026-08-12). The container verdicts
+# were honest — the sessions fell between every instrument: not roster rows,
+# not tmux placements, honestly absent as containers. These tests pin the
+# widened predicate: absence needs the artifact gone AND nothing alive AND
+# (when the box was sweepable) no seat-named session on any socket.
+
+
+def test_a_VISIBLY_ALIVE_session_is_never_reported_reclaimed():
+    """The executed proof that started this: the worktree absence key is the
+    ROSTER ROW — a record, deleted by `squad rm` before its kill — while the
+    `alive` measurement sat ignored in the same dict. A record asserts;
+    only the process measurement is evidence of destruction."""
+    from mcp_hub.edge import observed_report
+
+    rep = observed_report(
+        {"id": "pl-1", "desired": "reclaimed"},
+        {"tmux_session": "seat-1", "alive": True, "enrolled": False},
+    )
+    assert rep["state"] == "running"
+
+
+def test_alive_UNKNOWN_withholds_the_reclaimed_verdict():
+    """`alive` missing is "we could not look", not "nothing runs" — the same
+    UNKNOWN ≠ ABSENT rule the no-absence-key test above pins, applied to
+    the second fact. Found the same way: a truthiness check here reads
+    None as False and grants absence on silence."""
+    from mcp_hub.edge import observed_report
+
+    rep = observed_report(
+        {"id": "pl-1", "desired": "reclaimed"},
+        {"tmux_session": "seat-1", "enrolled": False},
+    )
+    assert rep["state"] == "stopped"
+
+
+def test_a_seat_named_session_on_ANY_socket_reads_leftover_not_reclaimed():
+    """The five specimens exactly: container honestly gone, a session
+    wearing the seat's name still running on the box. `leftover` diverges
+    against `reclaimed`, so the board surfaces it instead of converging
+    over a running process."""
+    from mcp_hub.edge import observed_report
+
+    rep = observed_report(
+        {"id": "pl-1", "desired": "reclaimed"},
+        {"container": "web-box-1", "alive": False, "exists": False,
+         "host_sessions": ["squad"]},
+    )
+    assert rep["state"] == "leftover"
+
+
+def test_a_FAILED_sweep_withholds_reclaimed_rather_than_granting_it():
+    """A sweep that could not look everywhere grants nothing — a failed
+    look must never read as a clean one."""
+    from mcp_hub.edge import observed_report
+
+    rep = observed_report(
+        {"id": "pl-1", "desired": "reclaimed"},
+        {"container": "web-box-1", "alive": False, "exists": False,
+         "host_sessions_unknown": True},
+    )
+    assert rep["state"] == "stopped"
+
+
+def test_a_MEASURED_EMPTY_sweep_completes_the_reclaim():
+    """The ordinary success: artifact gone, nothing alive, sweep ran and
+    found nothing wearing the name."""
+    from mcp_hub.edge import observed_report
+
+    rep = observed_report(
+        {"id": "pl-1", "desired": "reclaimed"},
+        {"container": "web-box-1", "alive": False, "exists": False,
+         "host_sessions": []},
+    )
+    assert rep["state"] == "reclaimed"
+
+
+class TestHostTmuxSweep:
+    """host_tmux_sessions: enumerate the box, let the caller subtract the
+    known — the inverse of every instrument the five fell between."""
+
+    def _sock(self, d, name):
+        import socket as socketlib
+        s = socketlib.socket(socketlib.AF_UNIX)
+        s.bind(str(d / name))
+        return s
+
+    def test_no_socket_dir_is_a_MEASURED_empty_not_a_failure(self, tmp_path):
+        from mcp_hub.edge import host_tmux_sessions
+        out = host_tmux_sessions(lambda cmd, cwd=None: (0, ""),
+                                 socket_dir=tmp_path / "absent")
+        assert out == {}
+
+    def test_sessions_are_reported_per_socket(self, tmp_path):
+        from mcp_hub.edge import host_tmux_sessions
+        keep = [self._sock(tmp_path, "squad"), self._sock(tmp_path, "other")]
+        (tmp_path / "not-a-socket").write_text("")   # ignored: plain file
+
+        def runner(cmd, cwd=None):
+            if cmd[2].endswith("squad"):
+                return 0, "seat-1\nmcp-hub-dev\n"
+            return 0, "ghost\n"
+
+        out = host_tmux_sessions(runner, socket_dir=tmp_path)
+        assert out == {"squad": {"seat-1", "mcp-hub-dev"},
+                       "other": {"ghost"}}
+        del keep
+
+    def test_a_dead_socket_is_measured_empty_but_a_FAILURE_is_None(
+            self, tmp_path):
+        """`no server running` is tmux answering the question; anything
+        else is the question failing. Conflating them either invents
+        sessions or, worse, reads blindness as a clean box."""
+        from mcp_hub.edge import host_tmux_sessions
+        keep = [self._sock(tmp_path, "dead"), self._sock(tmp_path, "live")]
+
+        def dead_runner(cmd, cwd=None):
+            if cmd[2].endswith("dead"):
+                return 1, "no server running on " + cmd[2]
+            return 0, "seat-1\n"
+
+        assert host_tmux_sessions(dead_runner, socket_dir=tmp_path) == \
+            {"live": {"seat-1"}}
+
+        def broken_runner(cmd, cwd=None):
+            return 1, "some other failure"
+
+        assert host_tmux_sessions(broken_runner, socket_dir=tmp_path) is None
+        del keep
+
+
+def test_the_pass_sweeps_ONCE_and_stamps_reclaim_enumerations(tmp_path):
+    """Pass-level: the sweep result reaches each reclaimed placement's
+    enumeration (here: a seat-named session on a foreign socket -> the
+    observed record says `leftover` and names the socket), and a failed
+    sweep arrives as `host_sessions_unknown`, never as silence."""
+    r = Runner()   # container gone: empty world
+    api = FakeApi([_placement(desired="reclaimed")])
+    summary = edge_apply(api, "box-1", r, [tmp_path], seeder=lambda f: True,
+                         session_sweep=lambda: {"squad": {"web-box-1"}})
+    assert summary["placements"] == 1
+    report = api.observed["pl-1"]
+    assert report["state"] == "leftover"
+    assert report["enumeration"]["host_sessions"] == ["squad"]
+
+    api2 = FakeApi([_placement(desired="reclaimed")])
+    edge_apply(api2, "box-1", Runner(), [tmp_path], seeder=lambda f: True,
+               session_sweep=lambda: None)
+    rep2 = api2.observed["pl-1"]
+    assert rep2["enumeration"].get("host_sessions_unknown") is True
+    assert rep2["state"] != "reclaimed"
+
+
 # ---------------------------------------------------------------------------
 # repo_mount — the host clones, the container mounts (docs/seat-repo-access.md)
 # ---------------------------------------------------------------------------
