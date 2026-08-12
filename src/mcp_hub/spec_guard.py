@@ -352,6 +352,13 @@ def check_credential_policy(spec: dict) -> str | None:
     let the undeclared half deliver what the declared half refuses, which
     is the `:ro`-bounds-the-file substitution wearing yet another coat.
 
+    ⚠️ `scopes` is a documented LIMIT, not a verified behaviour: nothing
+    here reads the mounted credential, so a spec may declare `codespace`
+    for a token that in fact carries `repo`+`delete_repo`, and pass. The
+    field makes a grant REVIEWABLE, not true — if materialize ever gains
+    real scope verification, replace RA's matching contract case too
+    (test_credential_policy_contract.py says the same from its side).
+
     A spec that declares NEITHER is a pre-policy spec and passes untouched:
     turning absent into empty would refuse every legacy seat on its next
     recreate with nothing telling the operator why — a migration that could
