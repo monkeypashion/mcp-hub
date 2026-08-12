@@ -127,6 +127,7 @@ SINGULAR = {
     "squad.seatLogs",       # one seat's output
     "squad.seatRebrief",    # one brief
     "squad.seatClone",      # one source, one new identity
+    "squad.copyId",         # one clipboard — N names would silently become 1
 }
 
 
@@ -268,3 +269,51 @@ def test_the_fork_quickpick_uses_the_MEMBERS_FLAG_not_positionals(src):
     assert m, "squad.manage not found"
     body = m.group(0)
     assert "--members" in body, "fork must pass members as a flag"
+
+
+# --------------------------------------------------- copyId: the RIGHT name
+
+
+def test_copyId_copies_the_RAW_name_never_the_stripped_label(src):
+    """🔴 The whole reason this verb exists.
+
+    `shortLabel()` strips THIS MACHINE'S hostname, so
+    `mcp-hub-fireblade-wsl` is displayed on every tab as `mcp-hub`. The
+    hub's derived identity IS `<repo>-<host>`, so the stripped form is not
+    addressable: `send(to="mcp-hub")` fails to route while looking exactly
+    right on screen. An operator retyping what they can SEE gets the wrong
+    string, which is precisely why copying is worth a menu item.
+
+    Mutation: `writeText(shortLabel(agent))` → this fails.
+    """
+    body = _handler_of(src, "squad.copyId")
+    assert body, "squad.copyId is not registered"
+    m = re.search(r"writeText\(([^)]*)\)", body)
+    assert m, "copyId does not write to the clipboard"
+    written = m.group(1).strip()
+    assert written == "agent", (
+        f"copyId writes {written!r} — it must write the RAW agent name; "
+        "shortLabel() strips the hostname and the result is unaddressable")
+
+
+def test_copyId_shows_the_operator_what_landed_on_the_clipboard(src):
+    """A clipboard write is invisible. Confirming with the stripped label
+    would tell the operator they copied something they did not."""
+    body = _handler_of(src, "squad.copyId")
+    m = re.search(r"showInformationMessage\((.{0,200})", body, re.S)
+    assert m, "copyId gives no feedback that anything was copied"
+    assert "shortLabel" not in m.group(1), (
+        "the toast must echo the FULL name that was copied, not the "
+        "stripped label")
+
+
+def test_copyId_is_in_the_MESSAGING_menu(pkg):
+    """It is a comms affordance. Grouping it with start/stop/retire would put
+    a harmless act beside destructive ones."""
+    msg = [m["command"] for m in pkg["contributes"]["menus"]["squad.messagingMenu"]]
+    assert "squad.copyId" in msg
+    for menu, items in pkg["contributes"]["menus"].items():
+        if menu == "squad.messagingMenu":
+            continue
+        assert "squad.copyId" not in [i.get("command") for i in items], (
+            f"squad.copyId also appears in {menu} — one home per verb")

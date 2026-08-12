@@ -49,6 +49,11 @@
         "category": "Squad"
       },
       {
+        "command": "squad.copyId",
+        "title": "Copy agent name (hub address)",
+        "category": "Squad"
+      },
+      {
         "command": "squad.interrupt",
         "title": "Interrupt (Esc)",
         "category": "Squad"
@@ -530,6 +535,11 @@
         {
           "command": "squad.dmVia",
           "group": "1_msg@2",
+          "when": "squad.isAgent"
+        },
+        {
+          "command": "squad.copyId",
+          "group": "1_msg@3",
           "when": "squad.isAgent"
         }
       ],

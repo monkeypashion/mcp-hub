@@ -874,6 +874,20 @@ function activate(context) {
       })();
       })
     ),
+    // 🔴 THE RAW NAME, NEVER shortLabel() — that helper strips this machine's
+    // hostname, so `mcp-hub-fireblade-wsl` shows on every tab as `mcp-hub`,
+    // and the stripped form does not route: hub identity IS `<repo>-<host>`.
+    // The string an operator can SEE is the wrong one, which is exactly why
+    // copying earns a menu item. Toast echoes the full name for the same
+    // reason. Singular via withOneAgent: one clipboard, N selected tabs.
+    vscode.commands.registerCommand("squad.copyId", (...args) =>
+      withOneAgent(args, "Copy agent name", async (agent) => {
+        await vscode.env.clipboard.writeText(agent);
+        vscode.window.showInformationMessage(
+          `Copied "${agent}" — paste it into send(to=…) from another agent.`
+        );
+      })
+    ),
     // ---- settings: READ-ONLY, and deliberately so ----
     // Nothing in this panel DOES anything: no restart, no transport, no retire.
     // A settings panel that can destroy an agent is one you open carefully, and
