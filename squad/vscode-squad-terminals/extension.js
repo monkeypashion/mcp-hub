@@ -66,6 +66,19 @@ const FALLBACK = ["terminal", "terminal.ansiBrightBlack"];
 
 // Terminal -> agent name, for context-menu target resolution
 const agentOf = new Map();
+// Terminal -> guest spec. A GUEST is a claude on a machine this box can only
+// reach by ssh: no tmux there, so no roster row, no hub identity, no daemon,
+// no placement — and deliberately none of those. It exists so a machine you
+// already reach through VSCode's Remotes panel stops needing a separate
+// workflow, nothing more.
+//
+// ⚠️ KEPT IN A SEPARATE MAP FROM agentOf ON PURPOSE. `squad.isAgent` is
+// derived from agentOf, so a guest cannot reach any per-agent verb: every one
+// of them is tmux on THIS box (answer parses a captured pane, restart
+// respawns a session, focus/transport need a hub identity). Putting guests in
+// agentOf would offer all of it and fail at the far end — the "delivered live"
+// mistake in a new costume.
+const guestOf = new Map();
 let buildCockpitRef = null;   // set at activation so commands can refresh tabs
 // The panel is revealed once, at startup. See buildCockpit's tail.
 let revealedOnce = false;
@@ -95,6 +108,59 @@ function rosterRows() {
 
 function rosterAgents() {
   return rosterRows().map((r) => r.agent);
+}
+
+// ---- guests: a claude reachable only over ssh -----------------------------
+//
+// Declared in the WORKSPACE file, beside the folders, because that is the
+// scope the operator is thinking in — "show it in this workspace" — and it
+// travels with the workspace rather than living in a machine-local file that
+// has to be kept in step with it:
+//
+//   "settings": {
+//     "squad.guests": [
+//       { "label": "sam-laptop", "host": "DESKTOP-3GD5AR8", "dir": "c:/Users/monke" }
+//     ]
+//   }
+//
+// `cmd` overrides the remote command outright, and exists because the far end
+// is not necessarily a POSIX shell: a Windows host logs into PowerShell or
+// cmd, where `cd <dir> && claude` is not portable. Rather than guess a shell
+// we cannot see, the default is the simple form and `cmd` is the escape
+// hatch.
+function guestSpecs() {
+  const raw = vscode.workspace.getConfiguration("squad").get("guests");
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const g of raw) {
+    if (!g || typeof g !== "object") continue;
+    const host = String(g.host || "").trim();
+    if (!host) continue;                       // a guest with no host is nothing
+    const label = String(g.label || host).trim();
+    // One tab per label: two guests sharing one would make the dedup below
+    // adopt the first and silently drop the second — the same
+    // assumes-unique-that-isn't shape that bites the roster.
+    if (seen.has(label)) continue;
+    seen.add(label);
+    out.push({
+      label,
+      host,
+      dir: String(g.dir || "").trim(),
+      cmd: String(g.cmd || "").trim(),
+      user: String(g.user || "").trim(),
+    });
+  }
+  return out;
+}
+
+// The remote command. `-t` forces a PTY: without it claude gets no terminal
+// and renders nothing interactive, which looks like a hang.
+function guestSsh(g, extra = "") {
+  const target = g.user ? `${g.user}@${g.host}` : g.host;
+  const base = g.cmd || (g.dir ? `cd ${JSON.stringify(g.dir)} && claude` : "claude");
+  const remote = extra ? `${base} ${extra}` : base;
+  return `ssh -t ${JSON.stringify(target)} ${JSON.stringify(remote)}`;
 }
 
 // Canonical form for path equality: realpath (symlink-proof — the whole tree
@@ -1105,6 +1171,12 @@ function activate(context) {
     // itself rather than of the selection: without it the toggles would appear
     // on the operator's own board and shell tabs.
     vscode.commands.executeCommand("setContext", "squad.isAgent", !!a);
+    // Disjoint from isAgent by construction (separate maps), so the guest
+    // submenu and the agent verbs can never both appear on one tab. That is
+    // the point: every agent verb is tmux on this box, and a guest has none.
+    vscode.commands.executeCommand(
+      "setContext", "squad.isGuest", !!(t && guestOf.get(t))
+    );
   }
   context.subscriptions.push(
     vscode.window.onDidChangeActiveTerminal(() => refreshLaunchContext())
@@ -1144,6 +1216,130 @@ function activate(context) {
       )
     );
   }
+
+  // ---- guest verbs ---------------------------------------------------
+  //
+  // WHAT IS AND ISN'T POSSIBLE HERE, because the boundary is the design:
+  //
+  //   works — the VSCode terminal IS the pane, so `sendText` reaches claude
+  //           directly. Typing, slash commands and interrupt need no tmux at
+  //           all, and `--continue` lets a reconnect resume the thread after
+  //           the laptop sleeps.
+  //   cannot — anything that requires READING the far screen. `squad answer`
+  //           parses the visible options and refuses when its choice is not
+  //           on screen; over ssh there is no capture-pane, so an "Answer
+  //           yes" here could only blind-press a digit while claiming to have
+  //           read a dialog. It is therefore NOT offered, and "Send key"
+  //           names what it actually does instead.
+  //   cannot — state glyphs, ⚡, waiting time. No pane to scrape, and a row
+  //           that guesses is the failure this codebase keeps paying for.
+  const withGuest = (args, fn) => {
+    const t = (args && args[0]) || vscode.window.activeTerminal;
+    const g = t ? guestOf.get(t) : null;
+    if (!g) {
+      vscode.window.showWarningMessage("Squad: that tab is not a guest.");
+      return;
+    }
+    fn(g, t);
+  };
+
+  // Reachability first. An unreachable host otherwise dumps ssh's own error
+  // into the pane, which reads as a broken feature rather than a sleeping
+  // laptop — and this guest is expected to be absent much of the time.
+  const guestReachable = (g) =>
+    new Promise((resolve) => {
+      const target = g.user ? `${g.user}@${g.host}` : g.host;
+      cp.execFile(
+        "ssh",
+        ["-o", "BatchMode=yes", "-o", "ConnectTimeout=4",
+         "-o", "StrictHostKeyChecking=accept-new", target, "exit"],
+        { timeout: 8000 },
+        (err) => resolve(!err)
+      );
+    });
+
+  const guestConnect = async (g, t, extra) => {
+    t.show(false);
+    if (!(await guestReachable(g))) {
+      // Named, not generic: "which machine, and is it me or it" is the whole
+      // question when a guest does not answer.
+      vscode.window.showWarningMessage(
+        `Squad: ${g.label} (${g.host}) is not answering on ssh — asleep, off ` +
+          "the network, or sshd down. The tab is left as it was."
+      );
+      return;
+    }
+    t.sendText(`clear; ${guestSsh(g, extra)}`);
+  };
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("squad.guest.connect", (...args) =>
+      withGuest(args, (g, t) => guestConnect(g, t, ""))
+    ),
+    // The reason a guest is usable at all despite having no tmux: persistence
+    // moves from the session to the CONVERSATION. Close the tab or let the
+    // laptop sleep, reconnect with --continue, and the thread is still there.
+    vscode.commands.registerCommand("squad.guest.resume", (...args) =>
+      withGuest(args, (g, t) => guestConnect(g, t, "--continue"))
+    ),
+    vscode.commands.registerCommand("squad.guest.send", (...args) =>
+      withGuest(args, async (g, t) => {
+        const text = await vscode.window.showInputBox({
+          prompt: `Send to ${g.label}`,
+          placeHolder: "typed straight into claude on that machine",
+        });
+        if (text) {
+          t.show(false);
+          t.sendText(text);
+        }
+      })
+    ),
+    vscode.commands.registerCommand("squad.guest.slash", (...args) =>
+      withGuest(args, async (g, t) => {
+        const pick = await vscode.window.showQuickPick(
+          ["/compact", "/clear", "/context", "/cost", "/model", "/status"],
+          { placeHolder: `Slash command for ${g.label}` }
+        );
+        if (pick) {
+          t.show(false);
+          t.sendText(pick);
+        }
+      })
+    ),
+    // Escape, the same key the local `Interrupt` sends — it just goes through
+    // the terminal rather than through tmux send-keys.
+    vscode.commands.registerCommand("squad.guest.interrupt", (...args) =>
+      withGuest(args, (_g, t) => {
+        t.show(false);
+        t.sendText("\x1b", false);
+      })
+    ),
+    // A raw keypress, NAMED as one. This is what an operator reaches for at a
+    // permission dialog — but it is not `answer`, because nothing here read
+    // the screen to know what the options are.
+    vscode.commands.registerCommand("squad.guest.key", (...args) =>
+      withGuest(args, async (g, t) => {
+        const pick = await vscode.window.showQuickPick(
+          [
+            { label: "1", description: "first option on screen" },
+            { label: "2", description: "second option on screen" },
+            { label: "3", description: "third option on screen" },
+            { label: "Enter", description: "accept" },
+            { label: "Escape", description: "dismiss / interrupt" },
+          ],
+          {
+            placeHolder: `Send a keypress to ${g.label}`,
+            title: "Blind — this tab cannot read the far screen",
+          }
+        );
+        if (!pick) return;
+        t.show(false);
+        if (pick.label === "Enter") t.sendText("", true);
+        else if (pick.label === "Escape") t.sendText("\x1b", false);
+        else t.sendText(pick.label, false);
+      })
+    )
+  );
 
   // ---- transport: clone this agent into another VSCode workspace ----
   // The operator's model: pick the agent's tab, pick a TARGET WORKSPACE, and
@@ -2244,6 +2440,45 @@ function activate(context) {
     // scrollback after a detach) and is still `&&`, so a down agent — where
     // attach exits 3 — keeps the hint instead of being blanked.
     sendWhenReady(t, `clear && squad attach --no-start ${agent} && clear`);
+  }
+
+  // guest tabs: ssh to a claude on a box with no tmux and no hub identity.
+  // Same shape as the board tab — a named terminal running a command — which
+  // is the existence proof that a cockpit tab needs neither a roster row nor a
+  // workspace folder.
+  //
+  // NAMED, unlike agent tabs. Agent tabs are deliberately unnamed so tmux's
+  // pushed OSC title can drive them; a guest has no title pusher, so an
+  // unnamed one would render as a bare ${sequence} number. The name is
+  // therefore the whole label, and it carries a marker so a guest can never be
+  // mistaken for an agent at a glance.
+  //
+  // NOT auto-connected. Agent tabs attach with --no-start precisely so opening
+  // a workspace launches nothing; a guest that dialled out over ssh on every
+  // window-open would be worse — it wakes another person's machine, and a
+  // laptop that is asleep or off the LAN would fill the panel with connection
+  // errors on every restore. The tab shows how to connect and waits.
+  for (const g of guestSpecs()) {
+    if ([...guestOf.values()].some((x) => x.label === g.label)) continue;
+    const t = vscode.window.createTerminal({
+      name: `⇢ ${g.label}`,
+      iconPath: new vscode.ThemeIcon("vm"),
+      color: new vscode.ThemeColor("terminal.ansiCyan"),
+    });
+    guestOf.set(t, g);
+    // A hint, not a connection — and printed rather than run, so the operator
+    // sees the exact ssh this tab will use before anything dials.
+    sendWhenReady(
+      t,
+      "clear && printf '%s\\n' " +
+        JSON.stringify(`⇢ guest ${g.label} — ${g.user ? g.user + "@" : ""}${g.host}`) +
+        " " +
+        JSON.stringify("  right-click → Guest → Connect  (or run the line below)") +
+        " " +
+        JSON.stringify(`  ${guestSsh(g)}`) +
+        " " +
+        JSON.stringify("  no tmux there: closing this tab ends the session.")
+    );
   }
 
   // hideOnStartup keeps VSCode from spawning a filler terminal into a

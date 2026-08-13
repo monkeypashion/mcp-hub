@@ -2,7 +2,7 @@
   "name": "squad-terminals",
   "displayName": "Squad Terminals",
   "description": "Auto-opens one plain terminal per squad agent (squad attach) with icon+color, and adds per-agent squad actions to the terminal tab context menu.",
-  "version": "0.37.0",
+  "version": "0.38.0",
   "publisher": "monkeypashion",
   "engines": {
     "vscode": "^1.90.0"
@@ -30,22 +30,22 @@
       },
       {
         "command": "squad.sendPrompt",
-        "title": "Send prompt\u2026",
+        "title": "Send prompt…",
         "category": "Squad"
       },
       {
         "command": "squad.stockPrompt",
-        "title": "Stock prompt\u2026",
+        "title": "Stock prompt…",
         "category": "Squad"
       },
       {
         "command": "squad.broadcast",
-        "title": "Broadcast to squad via this agent\u2026",
+        "title": "Broadcast to squad via this agent…",
         "category": "Squad"
       },
       {
         "command": "squad.dmVia",
-        "title": "Message agent(s) via this one\u2026",
+        "title": "Message agent(s) via this one…",
         "category": "Squad"
       },
       {
@@ -145,7 +145,7 @@
       },
       {
         "command": "squad.slash.custom",
-        "title": "Slash command\u2026",
+        "title": "Slash command…",
         "category": "Squad"
       },
       {
@@ -170,7 +170,7 @@
       },
       {
         "command": "squad.transport",
-        "title": "Transport to workspace\u2026",
+        "title": "Transport to workspace…",
         "category": "Squad"
       },
       {
@@ -180,17 +180,17 @@
       },
       {
         "command": "squad.transportAll",
-        "title": "Transport ALL agents to workspace\u2026",
+        "title": "Transport ALL agents to workspace…",
         "category": "Squad"
       },
       {
         "command": "squad.addFolder",
-        "title": "Add existing folder as agent\u2026",
+        "title": "Add existing folder as agent…",
         "category": "Squad"
       },
       {
         "command": "squad.capsuleAttach",
-        "title": "Attach placed capsule as agents\u2026",
+        "title": "Attach placed capsule as agents…",
         "category": "Squad"
       },
       {
@@ -200,7 +200,7 @@
       },
       {
         "command": "squad.transportWorkspace",
-        "title": "Workspace: transport it to\u2026",
+        "title": "Workspace: transport it to…",
         "category": "Squad"
       },
       {
@@ -215,17 +215,17 @@
       },
       {
         "command": "squad.addFromGitHub",
-        "title": "Clone from GitHub as agent\u2026",
+        "title": "Clone from GitHub as agent…",
         "category": "Squad"
       },
       {
         "command": "squad.teardownWorkspace",
-        "title": "Workspace: tear it down\u2026",
+        "title": "Workspace: tear it down…",
         "category": "Squad"
       },
       {
         "command": "squad.settings",
-        "title": "Settings\u2026",
+        "title": "Settings…",
         "category": "Squad"
       },
       {
@@ -250,22 +250,52 @@
       },
       {
         "command": "squad.seatLogs",
-        "title": "Show result / logs\u2026",
+        "title": "Show result / logs…",
         "category": "Squad"
       },
       {
         "command": "squad.seatRebrief",
-        "title": "Re-brief\u2026",
+        "title": "Re-brief…",
         "category": "Squad"
       },
       {
         "command": "squad.seatClone",
-        "title": "Clone seat\u2026",
+        "title": "Clone seat…",
         "category": "Squad"
       },
       {
         "command": "squad.manage",
-        "title": "Squad management\u2026",
+        "title": "Squad management…",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.guest.connect",
+        "title": "Guest: Connect (ssh)",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.guest.resume",
+        "title": "Guest: Connect & resume conversation",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.guest.send",
+        "title": "Guest: Send text…",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.guest.slash",
+        "title": "Guest: Slash command…",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.guest.key",
+        "title": "Guest: Send keypress…",
+        "category": "Squad"
+      },
+      {
+        "command": "squad.guest.interrupt",
+        "title": "Guest: Interrupt (Esc)",
         "category": "Squad"
       }
     ],
@@ -312,7 +342,11 @@
       },
       {
         "id": "squad.workspaceMenu",
-        "label": "Workspace\u2026"
+        "label": "Workspace…"
+      },
+      {
+        "id": "squad.guestMenu",
+        "label": "Guest (ssh)"
       }
     ],
     "menus": {
@@ -320,6 +354,11 @@
         {
           "submenu": "squad.agentMenu",
           "group": "2_squad"
+        },
+        {
+          "submenu": "squad.guestMenu",
+          "group": "2_squad",
+          "when": "squad.isGuest"
         }
       ],
       "terminal/context": [
@@ -631,6 +670,38 @@
           "group": "2_write@2",
           "when": "squad.isAgent"
         }
+      ],
+      "squad.guestMenu": [
+        {
+          "command": "squad.guest.connect",
+          "group": "0_guest@1",
+          "when": "squad.isGuest"
+        },
+        {
+          "command": "squad.guest.resume",
+          "group": "0_guest@2",
+          "when": "squad.isGuest"
+        },
+        {
+          "command": "squad.guest.send",
+          "group": "0_guest@3",
+          "when": "squad.isGuest"
+        },
+        {
+          "command": "squad.guest.slash",
+          "group": "1_guest@1",
+          "when": "squad.isGuest"
+        },
+        {
+          "command": "squad.guest.key",
+          "group": "1_guest@2",
+          "when": "squad.isGuest"
+        },
+        {
+          "command": "squad.guest.interrupt",
+          "group": "1_guest@3",
+          "when": "squad.isGuest"
+        }
       ]
     },
     "configuration": {
@@ -646,15 +717,49 @@
           "default": "confirm",
           "enumDescriptions": [
             "Focusing a down agent's terminal shows a one-click 'Start & attach' prompt (default).",
-            "Focusing a down agent's terminal starts claude immediately \u2014 zero-click; window-restore/panel-reveal focus events can start an agent from a glance.",
-            "Never auto-start; use the tab context menu (Squad \u2192 Start & attach)."
+            "Focusing a down agent's terminal starts claude immediately — zero-click; window-restore/panel-reveal focus events can start an agent from a glance.",
+            "Never auto-start; use the tab context menu (Squad → Start & attach)."
           ],
           "description": "What happens when you focus the terminal of an agent that is down."
         },
         "squadTerminals.autoAttach": {
           "type": "boolean",
           "default": false,
-          "description": "Attach a tab automatically when its agent is started from OUTSIDE this window \u2014 over ssh, by a cron, or by the hub's edge realizing a placement. Without it the agent runs but its tab stays a bare shell until you reload or right-click, because the extension only attaches at window-open. Fires once per time the agent comes up, never re-attaching a tab you deliberately detached, and waits ~30s so it cannot land in the middle of the startup-dialog dance."
+          "description": "Attach a tab automatically when its agent is started from OUTSIDE this window — over ssh, by a cron, or by the hub's edge realizing a placement. Without it the agent runs but its tab stays a bare shell until you reload or right-click, because the extension only attaches at window-open. Fires once per time the agent comes up, never re-attaching a tab you deliberately detached, and waits ~30s so it cannot land in the middle of the startup-dialog dance."
+        },
+        "squad.guests": {
+          "type": "array",
+          "default": [],
+          "scope": "resource",
+          "markdownDescription": "Claude sessions on machines reachable only by **ssh** — no tmux, no hub identity, no roster row. They appear as tabs in this workspace so a remote box stops needing a separate workflow. Declared in the `.code-workspace` file so they travel with the workspace.",
+          "items": {
+            "type": "object",
+            "required": [
+              "host"
+            ],
+            "properties": {
+              "label": {
+                "type": "string",
+                "description": "Tab label. Defaults to the host."
+              },
+              "host": {
+                "type": "string",
+                "description": "ssh host (an ~/.ssh/config alias is fine)."
+              },
+              "user": {
+                "type": "string",
+                "description": "ssh user, if not the default."
+              },
+              "dir": {
+                "type": "string",
+                "description": "Remote working directory; claude is started there."
+              },
+              "cmd": {
+                "type": "string",
+                "markdownDescription": "Override the remote command outright. Needed when the far end is not a POSIX shell — a Windows host logs into PowerShell or cmd, where `cd <dir> && claude` is not portable."
+              }
+            }
+          }
         }
       }
     }

@@ -456,6 +456,60 @@ is, so a seat placed elsewhere gets a refusal naming the machine and the ssh
 command, never an empty result. An operator who believes a seat printed nothing
 stops looking.
 
+## Guests — a claude you can only reach over ssh
+
+A **guest** is a claude on a machine that is not on the tailnet, has no tmux,
+and holds no hub identity — a laptop on the LAN you already reach through
+VSCode's *Remotes* panel. It appears as a tab in an existing workspace so that
+box stops needing a different workflow, and it is **deliberately nothing more**:
+no roster row, no `register`, no heartbeat daemon, no seat, no placement, no
+edge.
+
+Declared in the `.code-workspace` file, beside the folders — that is the scope
+the operator thinks in, and it travels with the workspace:
+
+```jsonc
+"settings": {
+  "squad.guests": [
+    { "label": "sam-laptop", "host": "DESKTOP-3GD5AR8", "dir": "c:/Users/monke" }
+  ]
+}
+```
+
+`cmd` overrides the remote command outright, and exists because **the far end
+is not necessarily a POSIX shell** — a Windows host logs into PowerShell or
+cmd, where `cd <dir> && claude` is not portable. We do not guess a shell we
+cannot see.
+
+**What is possible without tmux, and what is not — the boundary IS the design.**
+The VSCode terminal *is* the pane, so `sendText` reaches claude directly:
+typing, slash commands, interrupt and a raw keypress all work with no tmux
+anywhere. What cannot work is anything that **reads** the far screen — state
+glyphs, `⚡`, waiting time, and `answer`, which is fail-closed precisely
+because it parses the visible options first. So the menu offers **Send
+keypress…**, titled *blind*, and never "Answer yes": a blind digit-press
+wearing the word `answer` would imply a dialog had been read.
+
+**Persistence moves from the session to the CONVERSATION.** With no tmux,
+closing the tab ends the session — so **Connect & resume** passes `--continue`,
+and a slept laptop picks its thread back up. That single flag is what makes a
+tmux-less guest usable rather than a novelty.
+
+⚠️ **A guest is never in `agentOf`.** `squad.isAgent` is derived from that map,
+so a guest in it would light up every per-agent verb — answer, restart, stop,
+focus, transport — each of which is tmux on *this* box or needs a hub identity.
+`squad.isGuest` is a separate key from a separate map, and the two are disjoint
+by construction. Same rule as the roster's `faculty` class: **a tab that looks
+scrapeable and is not is the "delivered live" mistake in a new costume.**
+
+**It does not dial out on window-open.** Agent tabs attach with `--no-start` so
+opening a workspace launches nothing; a guest auto-connecting would be worse —
+it wakes someone else's machine, and an asleep laptop would fill the panel with
+ssh errors on every window restore. The tab prints the exact ssh it would run
+and waits. Unreachability is reported by name (`asleep, off the network, or
+sshd down`) from a `BatchMode` + `ConnectTimeout` probe, so ssh's own error text
+never reads as a broken feature.
+
 ## Adding an existing folder as an agent
 
 `squad add-folder <dir>`, or **Add existing folder as agent…** in the cockpit
