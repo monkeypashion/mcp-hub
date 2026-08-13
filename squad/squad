@@ -488,6 +488,59 @@ pidfile()      { printf '%s\n' "$HOME/.mcp-hub/heartbeat-$(safe_name "$1").pid";
 # so every host reader saw nothing and reported `?` for a seat that was ⚡.
 # One source, because this fact had grown two readers (ls and the board) —
 # which is how they drift.
+# Fleet ⚡ counts from THIS agent's daemon cache — "N M" on stdout, empty when
+# the cache is stale/absent (status_json's own freshness gate). Fuel for the
+# nudge's fleet-wide check: the daemon already writes fleet_wakeable/
+# fleet_total on every beat, so heal can tell "your seat" from "everyone"
+# without a network call on the heal path.
+fleet_wake_counts() {
+  local body
+  body="$(status_json "$1")" || return 0
+  [ -n "$body" ] || return 0
+  printf '%s' "$body" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    fw, ft = d.get("fleet_wakeable"), d.get("fleet_total")
+    if isinstance(fw, int) and isinstance(ft, int):
+        print(fw, ft)
+except Exception:
+    pass
+' 2>/dev/null || true
+}
+
+# The deaf-agent nudge COPY, extracted pure so tests can assert every branch
+# without a live hub (the heal_action pattern). Three regimes, in precedence:
+#
+#   churn=1        the hub just restarted — expected churn, never a fault.
+#   fleet-wide     most of the fleet lacks ⚡ at once (wakeable ≤ 1/3 of a
+#                  fleet ≥ 5): ENVIRONMENTAL. A dead per-session stream cannot
+#                  explain eleven agents losing ⚡ in lockstep, and per-session
+#                  advice on a fleet-wide signal is a wrong-repair with a
+#                  multiplier — ~14 relaunches for a condition that self-clears
+#                  with activity (pm/RA/fo, 2026-08-12 overnight). Missing
+#                  counts fall through to per-seat: an absent instrument is
+#                  not evidence of "environmental".
+#   per-seat       the old advice, kept but made falsifiable: judge by the
+#                  CONSEQUENCE (queued items in the drain), not the marker —
+#                  a relaunch always yields ⚡ (fresh session = active), so
+#                  "relaunch fixed it" can never be wrong on its own terms.
+#                  And relaunch only in a QUIET window: relaunching during
+#                  churn re-manufactures the fault (fo's failed cure).
+nudge_copy() {  # <state> <hub_restarted:1|0> [fleet_wakeable] [fleet_total]
+  local state="$1" churn="$2" fw="${3:-}" ft="${4:-}"
+  if [ "$churn" = 1 ]; then
+    printf '%s' "hub: your session shows $state because the hub just restarted (redeploy) — this is expected churn, not a fault on your side. Call register() now to rebind; no relaunch needed, and don't diagnose this as a dead wake-stream."
+  elif [ -n "$fw" ] && [ -n "$ft" ] && [ "$ft" -ge 5 ] && [ $((fw * 3)) -le "$ft" ] 2>/dev/null; then
+    printf '%s' "hub: your session shows $state — and so does most of the fleet (only $fw of $ft ⚡): this is ENVIRONMENTAL (idle wake-streams dying fleet-wide), not a fault in your session. Call register() to rebind and carry on; do NOT relaunch — messages queue and surface at your next turn, and the condition self-clears with activity."
+  else
+    # No fleet claim here: this branch also serves the counts-absent case,
+    # where "the fleet is mostly ⚡" would be an assertion nothing measured.
+    # The recurs-condition names the check instead of claiming its result.
+    printf '%s' "hub: your session shows $state. Call register() now to rebind, then judge by the CONSEQUENCE, not the marker: if your Stop-drain surfaces nothing queued, nothing was missed. If this recurs while the rest of the fleet stays ⚡, your wake-stream is dead — re-register won't fix it; a relaunch will (squad restart resumes your conversation) — but only in a QUIET window: relaunching during hub churn re-manufactures the fault."
+  fi
+}
+
 status_json() {
   local a="$1" c sf p
   if c="$(container_of "$a")"; then
@@ -2650,11 +2703,10 @@ case "${1:-help}" in
                 # withhold the relaunch advice. Stale/absent stamp = the old
                 # copy stands (dead wake-stream IS real outside that window).
                 stamp="$HOME/.mcp-hub/hub-reconnect.stamp"
-                if [ -n "$(find "$stamp" -mmin -5 2>/dev/null)" ]; then
-                  nudge="hub: your session shows $state because the hub just restarted (redeploy) — this is expected churn, not a fault on your side. Call register() now to rebind; no relaunch needed, and don't diagnose this as a dead wake-stream."
-                else
-                  nudge="hub: your session shows $state. Call register() now to rebind. If this recurs, your wake-stream is dead — re-register won't fix it; a relaunch will (squad restart resumes your conversation)."
-                fi
+                churn=0
+                [ -n "$(find "$stamp" -mmin -5 2>/dev/null)" ] && churn=1
+                read -r fw ft <<< "$(fleet_wake_counts "$a")" || true
+                nudge="$(nudge_copy "$state" "$churn" "${fw:-}" "${ft:-}")"
                 # A wedged pane must cost this ONE nudge, not the whole pass
                 # (2026-07-23: an unbounded send-keys here hung heal 2h28m and
                 # blocked all post-deploy recovery behind it).
