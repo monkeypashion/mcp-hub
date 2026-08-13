@@ -233,6 +233,11 @@ _STATE_GLYPH = {"waiting": "🔴", "working": "▶", "idle": "💤", "down": "�
 _GLYPH_STOPPED = "○"        # enrolled, no pane — a fact, not a fault
 _GLYPH_NOT_REPORTING = "⚠"  # the instrument is silent; nothing is claimed
 _GLYPH_WAKEABLE = "⚡"
+# Focus (do-not-disturb). Its own column, BESIDE ⚡ and never replacing it:
+# they answer different questions and urgent pierces focus, so a focused agent
+# is still genuinely wakeable. list_agents() renders `⚡ 💤 🔕 28m` — the
+# duration lives in the detail pane here, where there is room for it.
+_GLYPH_FOCUS = "🔕"
 
 
 def _cell2(glyph: str) -> str:
@@ -578,6 +583,10 @@ class SettingsApp(App):
         return f"{head}  [dim]{escape(tail)}[/]" if tail else head
 
     def _agent_label(self, a: dict[str, Any], p: dict[str, str]) -> str:
+        # Declared for EVERY branch below, so a path that forgets to set it
+        # renders an empty cell rather than raising — a row that vanishes with
+        # a traceback is the worst way to learn a branch was missed.
+        focus = ""
         if a["local"]:
             rec = a.get("rec") or {}
             st = rec.get("state", "")
@@ -594,7 +603,17 @@ class SettingsApp(App):
             # cannot see is not a marker.
             hand = "🙋 " if a["hand"] else ""
             glyph = _STATE_GLYPH.get(st, _GLYPH_STOPPED)
-            wake = _GLYPH_WAKEABLE if rec.get("wakeable") else ""
+            # 🔴 `rec` is a row from `squad board --json`, which emits `hub`
+            # (the glyph) and has NEVER emitted `wakeable` — so the old
+            # `rec.get("wakeable")` was always falsy and a LOCAL seat could not
+            # render ⚡ at all, though CLAUDE.md documents exactly that row.
+            # Measured 2026-08-13, not inferred: the live board JSON carries
+            # `"hub":"⚡"` and no wakeable key. Read the field that exists.
+            hub_s = str(rec.get("hub") or "")
+            wake = (_GLYPH_WAKEABLE
+                    if (rec.get("wakeable") or hub_s.startswith(_GLYPH_WAKEABLE))
+                    else "")
+            focus = _GLYPH_FOCUS if _GLYPH_FOCUS in hub_s else ""
             # Context percentage but NOT the model name: an agent name is
             # already ~22 cells and `Sonnet` pushed the longest real seat past
             # the panel. The model is one row down in the live section.
@@ -604,6 +623,11 @@ class SettingsApp(App):
             # another box, so the row is thinner ON PURPOSE.
             colour, hand = "", ""
             wake = _GLYPH_WAKEABLE if a.get("wakeable") else ""
+            # The fleet snapshot carries presence only, so focus is shown for a
+            # remote seat exactly when its producer reported one — never
+            # inferred. A box that does not report focus reads as "not known
+            # to be focused", which is what an empty cell already means.
+            focus = _GLYPH_FOCUS if a.get("focused") else ""
             if a.get("off_hub"):
                 # Its machine's roster lists it; the hub has no presence.
                 # WHICH of those matters depends on two more facts, or the
@@ -636,7 +660,11 @@ class SettingsApp(App):
                 # reporting` says both things at once and the operator has to
                 # decide which half to believe. Not reporting means we do not
                 # know, and ⚡ is a claim we can no longer make.
-                glyph, bits, wake = _GLYPH_NOT_REPORTING, ["not reporting"], ""
+                # Focus goes with it, for the same reason: it was read from the
+                # snapshot this row has just called not-reporting, so it is no
+                # longer a claim this row can make either.
+                glyph, bits, wake, focus = (
+                    _GLYPH_NOT_REPORTING, ["not reporting"], "", "")
             else:
                 # `hub only` stays on the row: a remote `idle` is a weaker
                 # claim than a local one (a snapshot, not a scraped pane), and
@@ -664,6 +692,25 @@ class SettingsApp(App):
                 bits = [f"want {pl.get('desired', '')} · DIVERGED"]
             else:
                 bits = [f"placed · {pl.get('desired', '')}"] if not bits else bits
+        # 🔕 rides the TAIL, not a third fixed column — and that is a measured
+        # decision, not a preference. A third _cell2 column costs two cells on
+        # EVERY row for a state that is rare and transient, and
+        # test_no_tree_row_overflows_the_panel_it_is_drawn_in failed at 51/49
+        # cells the moment it was added: the panel is already at capacity, and
+        # a Tree clips rather than wraps, so the overflow would have been
+        # silent. Same pressure that already cost this row the model name and
+        # the faculty/squad class.
+        #
+        # FIRST in the tail, deliberately: the tail is what gets clipped when a
+        # row runs long, and a silencer that disappears under truncation is the
+        # invisible-focus bug in a new place.
+        # The GLYPH here, the remaining time in the statusline and
+        # list_agents(). Carrying the duration too would mean threading an
+        # expiry through `squad board --json`, and the row cannot spare the
+        # width — "silenced" is the glanceable fact; "for how much longer" is a
+        # detail-pane question.
+        if focus:
+            bits = [focus] + bits
         name = f"{_cell2(glyph)}{_cell2(wake)} {hand}{a['agent']}"
         head = f"[{colour}]{escape(name)}[/]" if colour else escape(name)
         if pl and pl.get("status") in ("pending-edge", "diverged"):

@@ -513,6 +513,29 @@ hub_glyph() {
       case "$body" in *'"wakeable"'*true*) printf '⚡' ;; *) printf '⚠' ;; esac ;;
     *) printf '✖' ;;
   esac
+  # 🔕 rides BESIDE the wake glyph, never instead of it: ⚡ answers "bound and
+  # push-deliverable", 🔕 answers "wakes suppressed", and urgent pierces focus
+  # so a focused agent really is still wakeable. Replacing ⚡ would make a
+  # focused-and-healthy seat indistinguishable from a focused-and-dead one.
+  # Same additive form list_agents() already ships.
+  #
+  # Derived from the stored EXPIRY, so a snapshot up to 3 minutes old still
+  # decides correctly and an elapsed focus simply stops showing. Absent field
+  # (older daemon) prints nothing rather than guessing — a missing instrument
+  # must never render a silencer.
+  focus_glyph "$body"
+}
+
+# 🔕 if the snapshot's focus_until is still in the future, else nothing.
+focus_glyph() {
+  local until now
+  until="$(printf '%s' "$1" | grep -o '"focus_until"[[:space:]]*:[[:space:]]*[0-9.]*' \
+           | grep -o '[0-9.]*$')" || return 0
+  [ -n "$until" ] || return 0
+  now="$(date +%s)"
+  # Integer compare: the field is epoch seconds, possibly with a float tail.
+  [ "${until%%.*}" -gt "$now" ] 2>/dev/null && printf '🔕'
+  return 0
 }
 
 # The mcp-hub cli — repo venv next to this script, else PATH.

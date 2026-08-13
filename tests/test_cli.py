@@ -1262,12 +1262,18 @@ def test_parse_status_bio_markers_do_not_skew_counts():
 
 
 def test_parse_status_empty_text():
+    """Empty input yields the all-negative snapshot, and WHOLE-DICT equality is
+    the point: a new key must be a deliberate contract change, not something
+    that slips into the statusline's input unnoticed. `focus_until: 0.0` is the
+    negative value for an expiry — never focused, and it stays so as the clock
+    moves, which a bool could not express."""
     s = _parse_status_from_agents("", "alice")
     assert s == {
         "online": False,
         "wakeable": False,
         "fleet_wakeable": 0,
         "fleet_total": 0,
+        "focus_until": 0.0,
     }
 
 

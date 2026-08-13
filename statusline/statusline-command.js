@@ -27,6 +27,23 @@ process.stdin.on('end', () => {
   };
   const paint = (s, ...c) => `${c.join('')}${s}${C.reset}`;
 
+  // Focus (do-not-disturb) as `🔕28m`, or '' when not focused. Mirrors the
+  // hub's own _fmt_minutes ('45m' / '2h10m') so the same state reads the same
+  // in list_agents(), on the board and here.
+  //
+  // Takes an EXPIRY and derives the remainder, so this is correct against a
+  // snapshot of any age and an elapsed focus simply stops rendering — the
+  // reason the hub stores an expiry rather than a flag applies identically to
+  // every reader of it. A missing field (older daemon) yields '' rather than
+  // a guess: absence of the instrument must not print a silencer.
+  const fmtFocus = (until) => {
+    const left = Math.floor((Number(until) || 0) - Date.now() / 1000);
+    if (left <= 0) return '';
+    const mins = Math.floor(left / 60);
+    if (mins < 60) return `🔕${mins}m`;
+    return `🔕${Math.floor(mins / 60)}h${String(mins % 60).padStart(2, '0')}m`;
+  };
+
   // Default usage thresholds (5h): green < 50, yellow 50-79, red >= 80.
   const usageColor = (p) => (p >= 80 ? C.red : p >= 50 ? C.yellow : C.green);
   // ctx is more aggressive by request: red once past 50%.
@@ -191,7 +208,19 @@ process.stdin.on('end', () => {
       } else if (!st.wakeable) {
         hubSeg = paint(`hub ✖ REBIND ${fleet}`, C.bold, C.red);
       } else {
-        hubSeg = paint(`⚡ ${fleet}`, C.green);
+        // 🔕 sits BESIDE ⚡, never instead of it. They answer different
+        // questions — ⚡ is "bound and push-deliverable", 🔕 is "wakes
+        // suppressed for N more minutes" — and urgent pierces focus, so a
+        // focused agent genuinely IS still wakeable. Replacing ⚡ would make a
+        // focused-and-healthy agent render identically to a focused-and-dead
+        // one, and leave you unable to tell a lapsed focus from a lost
+        // binding when the marker goes. Same additive form list_agents()
+        // already ships, so one thing looks the same wherever it appears.
+        //
+        // Computed from an EXPIRY, not a stored countdown, so a snapshot a
+        // minute old shows the real remaining time and an expired focus stops
+        // rendering even if the daemon died holding it.
+        hubSeg = paint(`⚡${fmtFocus(st.focus_until)} ${fleet}`, C.green);
       }
 
       // ── Squad segment ────────────────────────────────────────────

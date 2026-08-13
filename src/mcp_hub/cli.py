@@ -4915,14 +4915,26 @@ def _parse_status_from_agents(agents_text: str, agent_name: str) -> dict[str, An
     We read only the head (before the ` — ` bio separator) for markers so a
     bio that happens to contain ⚡/🟢/`**` can't skew the counts.
 
-    Returns {online, wakeable, fleet_wakeable, fleet_total} where online/
-    wakeable are this agent's own state and the fleet_* are totals across all
-    listed (online) agents.
+    Returns {online, wakeable, fleet_wakeable, fleet_total, focus_until} where
+    online/wakeable/focus_until are this agent's own state and the fleet_* are
+    totals across all listed (online) agents.
+
+    🔕 is carried as an ABSOLUTE EXPIRY, never as the rendered "28m" or a bool.
+    Three reasons, and they are the same ones that made the hub store an expiry
+    rather than a flag:
+      - a snapshot is up to a heartbeat old, so a stored countdown would be
+        shown stale — an expiry lets every reader compute the truth itself;
+      - focus that lapses while the daemon is dead then reads as OVER rather
+        than frozen at whatever minute the last beat caught. A silencer that
+        outlives its own expiry on screen is worse than one that isn't shown;
+      - it survives the reader having no clock skew opinion: `remaining <= 0`
+        is the same verdict everywhere.
     """
     fleet_total = 0
     fleet_wakeable = 0
     self_online = False
     self_wakeable = False
+    self_focus_until = 0.0
     for line in agents_text.splitlines():
         head = line.split("—", 1)[0]
         if "🟢" not in head:
@@ -4934,12 +4946,30 @@ def _parse_status_from_agents(agents_text: str, agent_name: str) -> dict[str, An
         if f"**{agent_name}**" in head:
             self_online = True
             self_wakeable = is_wakeable
+            secs = _parse_focus_remaining(head)
+            self_focus_until = (time.time() + secs) if secs > 0 else 0.0
     return {
         "online": self_online,
         "wakeable": self_wakeable,
         "fleet_wakeable": fleet_wakeable,
         "fleet_total": fleet_total,
+        "focus_until": self_focus_until,
     }
+
+
+def _parse_focus_remaining(head: str) -> float:
+    """Seconds left on `🔕 45m` / `🔕 2h10m`, or 0 when the marker is absent.
+
+    Mirrors server._fmt_minutes, which is the only writer of this text. Kept
+    strict: an unrecognised shape returns 0 (no focus shown) rather than a
+    guess, because inventing a duration would put a silencer on screen that
+    the hub never reported.
+    """
+    m = re.search(r"🔕\s*(?:(\d+)h)?(\d+)m", head)
+    if not m:
+        return 0.0
+    hours = int(m.group(1) or 0)
+    return (hours * 60 + int(m.group(2))) * 60.0
 
 
 def _status_cache_path(agent_name: str) -> pathlib.Path:
