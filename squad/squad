@@ -2455,6 +2455,18 @@ case "${1:-help}" in
                 [ -n "$started" ] || continue
                 [ "$started" -lt "$disrupt" ] || continue      # postdates it — stream is fine
                 args="$(field "$a" 4)"
+                # A CONTAINER seat reaches here — comms_agents includes it,
+                # since has_comms answers ON for containers — and its field 4 is
+                # the marker, which can never carry --continue. So it always
+                # took the branch below and was told "Fix: squad resume on",
+                # i.e. the tool recommended the one command that CORRUPTS the
+                # marker (2026-08-13). Behaviour is unchanged (it was never
+                # relaunched here either way); only the cure it names is, and it
+                # now names the party that owns it.
+                if cseat="$(container_of "$a")"; then
+                  echo "!! $a: DEAF (predates hub disruption) — container seat ($cseat); heal cannot relaunch it and 'resume on' does not apply. The edge owns its lifecycle: mcp-hub placements list, then reclaim/re-place it." >&2
+                  continue
+                fi
                 # Word-boundary, matching has_resume and heal_action — a bare
                 # substring would count a future `--continue-on-error` as
                 # resume-capable and relaunch the agent blank.
@@ -2815,6 +2827,22 @@ case "${1:-help}" in
             esac
             if [ -n "${1:-}" ] && agents | grep -qxF -- "${1:-}"; then a="$1"
             else a="$(need_agent "")" || exit 1; fi
+            # A CONTAINER seat's field 4 is the MARKER, not launch args, and its
+            # comms are armed INSIDE the container by seat-entry. `show` is
+            # answerable (has_comms knows), but on/off are not: `off` reports a
+            # change it cannot make, and `on` appends the flag to the marker,
+            # naming a container that does not exist and breaking every future
+            # attach. The launch path and arm_comms guard this by name; this arm
+            # did not, and it is the one the COCKPIT calls — the menu offers the
+            # toggles for every agent tab, container seats included.
+            if cseat="$(container_of "$a")"; then
+              case "$mode" in
+                on|off) echo "!! $a is a container seat ($cseat) — comms are armed inside the container by seat-entry, not from the roster. Its args field holds the marker, so there is nothing here to turn $mode." >&2
+                        exit 1 ;;
+                show)   echo "$a: comms ON  (container seat $cseat — armed inside the container)"
+                        exit 0 ;;
+              esac
+            fi
             cur="$(field "$a" 4)"
             case "$mode" in
               show) if has_comms "$a"; then echo "$a: comms ON  (args: $cur)"
@@ -2856,6 +2884,28 @@ case "${1:-help}" in
             esac
             if [ -n "${1:-}" ] && agents | grep -qxF -- "${1:-}"; then a="$1"
             else a="$(need_agent "")" || exit 1; fi
+            # 🔴 THE SAME MARKER RULE, and this arm is where it actually bit.
+            # has_comms has a container branch; has_resume does not, so `resume
+            # on` prepended --continue to `@docker:<name>` — after which the row
+            # no longer matches container_of's `@docker:*` and squad SILENTLY
+            # STOPS KNOWING IT IS A CONTAINER (`squad ls` drops the "container
+            # not running — the EDGE starts it" verdict, comms reports OFF for a
+            # seat armed inside the container, and `comms on` — now unblocked —
+            # writes the channels flag into the marker too). Two cockpit clicks,
+            # two success toasts, marker destroyed. Found 2026-08-13 by running
+            # the verbs, invisible to all 111 static cockpit tests.
+            #
+            # Refused rather than made to work: continuity for a seat is the
+            # image's business, and the edge starts it — there is no relaunch
+            # here for --continue to modify.
+            if cseat="$(container_of "$a")"; then
+              case "$mode" in
+                on|off) echo "!! $a is a container seat ($cseat) — its args field holds the marker, not launch args, and the edge starts it rather than a relaunch. Turning resume $mode here would corrupt the marker, not change continuity." >&2
+                        exit 1 ;;
+                show)   echo "$a: resume N/A (container seat $cseat — started by the edge, not by a relaunch)"
+                        exit 0 ;;
+              esac
+            fi
             cur="$(field "$a" 4)"
             case "$mode" in
               show) if has_resume "$a"; then

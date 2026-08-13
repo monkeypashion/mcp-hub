@@ -131,9 +131,9 @@ SINGULAR = {
 }
 
 
-def _handler_of(src: str, command: str) -> str:
+def _handler_of(src: str, command: str, window: int = 900) -> str:
     m = re.search(
-        r'registerCommand\(\s*"' + re.escape(command) + r'"\s*,(.{0,900})',
+        r'registerCommand\(\s*"' + re.escape(command) + r'"\s*,(.{0,%d})' % window,
         src, re.S)
     return m.group(1) if m else ""
 
@@ -347,3 +347,69 @@ def test_no_command_sits_in_a_submenu_whose_label_contradicts_it(pkg):
         assert first not in {"copy", "show", "open", "read", "clone"}, (
             f'"{title}" is in the "Send to others" submenu but its verb is '
             f'"{first}" — it does not send anything')
+
+
+# --------------------------------------- what the surfaces SAY about the act
+#
+# 🔴 Both found 2026-08-13 by RUNNING the verbs against a scratch roster, in
+# the functional half of the capability audit. Everything above proves the
+# wiring; neither of these is a wiring failure, and neither was visible to any
+# static check — the item is registered, contributed, gated and singular, and
+# still tells the operator the wrong thing.
+
+
+def _code_only(js: str) -> str:
+    """Strip `//` line comments.
+
+    Both tests below FAILED on their own explanatory comments the first time —
+    the comment names the bug, so a naive substring check reads the comment and
+    passes (or, for the negative assertions, fails) regardless of the code.
+    Vacuous-test shape #4: assert on the thing under test, not on prose that
+    happens to sit beside it.
+    """
+    return "\n".join(re.sub(r"^\s*//.*$", "", ln) for ln in js.splitlines())
+
+
+def test_the_retire_dialog_names_the_SESSION_KILL(src):
+    """`rm_agent` runs `tm kill-session` FIRST — verified by retiring a live
+    agent on a scratch tmux socket. That is the only consequence here that is
+    immediate and destroys work in flight, and the dialog enumerated the other
+    four precisely while omitting it.
+
+    Nothing else can tell the operator: the CLI line that does name it
+    ("session, roster, hub opt-in, daemon") goes to stdout, and squadExec
+    surfaces stderr only.
+    """
+    body = _handler_of(_code_only(src), "squad.retire")
+    assert body.strip(), "squad.retire is not registered"
+    m = re.search(r"detail:(.{0,600}?)\},", body, re.S)
+    assert m, "the retire confirmation has no detail text"
+    detail = m.group(1).lower()
+    assert any(w in detail for w in ("stops the agent", "kills", "session")), (
+        "the Retire dialog does not say the agent is stopped — retiring a "
+        "running agent ends its turn and the operator is not told")
+
+
+def test_the_duplicate_refusal_keeps_the_REASON(src):
+    """Two bugs in one line, both measured:
+
+    - `e.stdout || e.stderr` picked ONE stream, and `squad duplicate` refuses
+      on stdout for the gate checks and on stderr for the no-git case.
+    - `.split("\\n").pop()` took the LAST line, which on a two-line refusal is
+      the footnote. A plain folder toasted "cannot duplicate x —
+      Duplicating clones from the remote, like transport does." with the
+      actual reason ("has no git origin") dropped — and plain-folder agents
+      are most of the roster (13 of 15 on dev-vm-1).
+    """
+    body = _handler_of(_code_only(src), "squad.duplicate", window=2000)
+    assert body.strip(), "squad.duplicate is not registered"
+    m = re.search(r"catch \(e\)(.{0,900}?)return;", body, re.S)
+    assert m, "the duplicate dry-run has no refusal branch"
+    branch = m.group(1)
+    assert "e.stdout || e.stderr" not in branch, (
+        "the refusal reads ONE stream — squad duplicate refuses on both")
+    assert "e.stdout" in branch and "e.stderr" in branch, (
+        "the refusal must read both streams")
+    assert ".pop()" not in branch, (
+        "the refusal still shows only the last line, which is the footnote "
+        "rather than the reason")

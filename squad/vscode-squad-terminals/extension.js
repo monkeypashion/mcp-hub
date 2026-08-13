@@ -1513,9 +1513,23 @@ function activate(context) {
           dest = (out.match(/^\s*dest\s*:\s*(.+)$/m) || [])[1];
           if (dest) dest = dest.trim();
         } catch (e) {
-          const why = String((e && (e.stdout || e.stderr || e.message)) || e).trim();
+          // BOTH streams, and the WHOLE refusal. Two bugs lived in one line:
+          //   - `e.stdout || e.stderr` picked one, but `squad duplicate`
+          //     refuses on stdout for the gate checks ("branch has no upstream")
+          //     and on stderr for the no-git case, so half the refusals were
+          //     reported as a bare "Command failed".
+          //   - `.split("\n").pop()` took the LAST line, which for a multi-line
+          //     refusal is the footnote, not the reason. A plain folder gave
+          //     "cannot duplicate x —    Duplicating clones from the remote,
+          //     like transport does." with the actual reason ("has no git
+          //     origin") dropped — and plain folders are most of the roster.
+          const why = [e && e.stdout, e && e.stderr]
+            .map((s) => String(s || "").trim())
+            .filter(Boolean)
+            .join("\n") || String((e && e.message) || e).trim();
           vscode.window.showWarningMessage(
-            `Squad: cannot duplicate ${shortLabel(agent)} — ${why.split("\n").pop()}`
+            `Squad: cannot duplicate ${shortLabel(agent)} — ` +
+              why.split("\n").map((l) => l.trim()).filter(Boolean).join(" ")
           );
           return;
         }
@@ -1978,9 +1992,19 @@ function activate(context) {
           {
             modal: true,
             detail:
-              "Removes the roster row, opts the repo out of the hub and retires " +
-              "the heartbeat daemon, on every workspace. The worktree and its " +
-              "files are left on disk.",
+              // KILLS THE LIVE SESSION FIRST, and that has to be the opening
+              // clause. `rm_agent` runs tm kill-session before it touches
+              // anything else, so retiring a running agent ends its turn — the
+              // one consequence here that is immediate and destroys work in
+              // flight. The dialog used to enumerate the other four precisely
+              // and omit this one, and the CLI line that does name it
+              // ("session, roster, hub opt-in, daemon") goes to stdout, which
+              // squadExec discards. So the only surface that could tell the
+              // operator was this string.
+              "Stops the agent if it is running — any turn in flight is lost. " +
+              "Then removes the roster row, opts the repo out of the hub and " +
+              "retires the heartbeat daemon, on every workspace. The worktree " +
+              "and its files are left on disk.",
           },
           "Retire agent"
         );
