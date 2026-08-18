@@ -284,7 +284,7 @@ def _extract_decision_card(turn_text: str) -> str:
 
 async def _query_hub(
     hub_url: str, agent_name: str, project: str = "", card: str = "",
-    decided: str = "",
+    decided: str = "", rendered_refs: str = "",
 ) -> tuple[str, str, bool]:
     """Connect to the hub, return (dm_text, broadcast_text, is_online).
 
@@ -324,31 +324,54 @@ async def _query_hub(
             # newer CLI still works against a hub that predates it — during a
             # deploy the two versions coexist for a few minutes, and a hard
             # failure there would silently stop surfacing messages entirely.
+            # rendered_refs is the delivery-receipt report (card #56): the
+            # message ids this agent's own transcript proves rendered, or
+            # "none" for an explicit empty report. It rides both drain calls
+            # so either alone lands the record. The version-skew fallbacks
+            # peel arguments newest-first — a deploy briefly pairs a newer
+            # CLI with an older hub, and a hard failure here would silently
+            # stop surfacing messages entirely.
             msg_args = {
                 "agent_name": agent_name,
                 "bind": False,
                 "mark_idle": True,
                 "compact": True,
             }
+            if rendered_refs:
+                msg_args["rendered_refs"] = rendered_refs
             try:
                 messages_result = await session.call_tool("get_messages", msg_args)
             except Exception:  # noqa: BLE001
-                msg_args.pop("compact")
-                messages_result = await session.call_tool("get_messages", msg_args)
+                try:
+                    msg_args.pop("rendered_refs", None)
+                    messages_result = await session.call_tool(
+                        "get_messages", msg_args
+                    )
+                except Exception:  # noqa: BLE001
+                    msg_args.pop("compact")
+                    messages_result = await session.call_tool(
+                        "get_messages", msg_args
+                    )
             # compact=True mirrors the DM economy onto broadcasts (they were
-            # the unclipped half of the Stop-hook context tax). Same
-            # version-skew fallback as get_messages above: during a deploy a
-            # newer CLI may hit an older hub that rejects the flag.
+            # the unclipped half of the Stop-hook context tax).
             bc_args = {"agent_name": agent_name, "bind": False, "compact": True}
+            if rendered_refs:
+                bc_args["rendered_refs"] = rendered_refs
             try:
                 broadcasts_result = await session.call_tool(
                     "get_broadcasts_for_agent", bc_args
                 )
             except Exception:  # noqa: BLE001
-                bc_args.pop("compact")
-                broadcasts_result = await session.call_tool(
-                    "get_broadcasts_for_agent", bc_args
-                )
+                try:
+                    bc_args.pop("rendered_refs", None)
+                    broadcasts_result = await session.call_tool(
+                        "get_broadcasts_for_agent", bc_args
+                    )
+                except Exception:  # noqa: BLE001
+                    bc_args.pop("compact")
+                    broadcasts_result = await session.call_tool(
+                        "get_broadcasts_for_agent", bc_args
+                    )
             # DECISION card leg. Precedence: a DECIDED marker (the agent
             # recording the in-pane verdict it just received) closes the
             # open card WITH the verdict; else a card in the last turn ->
@@ -4485,9 +4508,22 @@ def stop_hook_command(args: argparse.Namespace) -> int:
                        "nagged" if card_nag else "suppressed_grace")
             _log_nag_event(name, outcome, phrase)
 
+    # Delivery-receipt report (card #56): what this agent's own transcript
+    # proves rendered. Defensive like everything else on this path — a scan
+    # failure reports "none", which just means fuller reprints this drain.
+    from mcp_hub import receipts
+
+    try:
+        rendered_report = receipts.encode_report(
+            receipts.rendered_message_ids(payload.get("transcript_path"))
+        )
+    except Exception:  # noqa: BLE001
+        rendered_report = "none"
+
     try:
         messages_text, broadcasts_text, is_online, card_notice = asyncio.run(
-            _query_hub(args.hub_url, name, project or "", card, decided)
+            _query_hub(args.hub_url, name, project or "", card, decided,
+                       rendered_report)
         )
     except Exception as exc:  # noqa: BLE001
         # Fail open — never block the agent on hub flakiness.

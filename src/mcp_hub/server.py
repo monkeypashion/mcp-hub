@@ -534,6 +534,24 @@ def init_db(db_path: Path = DB_PATH) -> None:
     except sqlite3.OperationalError:
         pass  # Column already exists
 
+    # The shared delivery record (card #56). One row = one message body
+    # PROVABLY rendered into one agent's context, reported by that agent's
+    # own Stop hook from its transcript — the only place render-truth
+    # exists. The drain compacts a message to one line IFF its row is here;
+    # everything the pushed_gen/broadcast_pending_* inference used to guess
+    # becomes a fact or a full reprint. Those legacy columns stay written
+    # and stay read for clients that don't report receipts yet (the ""
+    # sentinel on rendered_refs), so the migration has no flag day.
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS delivery_receipts (
+            message_id INTEGER NOT NULL,
+            agent TEXT NOT NULL,
+            rendered_at REAL NOT NULL,
+            PRIMARY KEY (message_id, agent)
+        )"""
+    )
+    conn.commit()
+
     # Migrate: add per-agent broadcast cursor. Stop hooks surface unseen
     # broadcasts via this cursor so drifted agents catch up on broadcast
     # history they missed while unbound. New rows default to 0 (will be
@@ -745,6 +763,29 @@ def init_db(db_path: Path = DB_PATH) -> None:
 
 def _msg_ref(message_id: int) -> str:
     return refs.canonical(refs.make_ref("hub.msg/1", id=message_id))
+
+
+def _parse_receipt_report(rendered_refs: str) -> set[int] | None:
+    """The drain tools' `rendered_refs` argument, decoded.
+
+    Returns None for `""` — the OLD-CLIENT sentinel, meaning "this client
+    doesn't know how to report", which keeps the legacy generation-inference
+    alive for it. `"none"` is an explicit empty report ("I looked, nothing
+    rendered") and returns an empty set — receipt mode with zero receipts,
+    so everything reprints in full. Ids are accepted bare (`"7,12"`) or as
+    full refs (`"hub.msg/1?id=7"`); anything unparseable is skipped rather
+    than failing the drain — a lost receipt costs a reprint, never a loss.
+    """
+    if not rendered_refs:
+        return None
+    if rendered_refs.strip().lower() == "none":
+        return set()
+    ids: set[int] = set()
+    for part in rendered_refs.split(","):
+        m = re.search(r"(?:^|id=)(\d+)\s*$", part.strip())
+        if m:
+            ids.add(int(m.group(1)))
+    return ids
 
 
 def _validate_reply_ref(conn: sqlite3.Connection, in_reply_to: str) -> tuple[str, str]:
@@ -3265,6 +3306,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         bind: bool = True,
         mark_idle: bool = False,
         compact: bool = False,
+        rendered_refs: str = "",
         ctx: Context | None = None,
     ) -> str:
         """Get unread direct messages for this agent. Marks them as read.
@@ -3285,6 +3327,14 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                   because end-of-turn IS the idle transition. Default False
                   for ordinary callers — they're in an active turn, not
                   idle.
+            rendered_refs: The caller's delivery-receipt report — message
+                  ids (or hub.msg refs) whose renders its own transcript
+                  proves, comma-separated; the literal "none" for an
+                  explicit empty report. Recorded per (message, agent) and
+                  from then on the compact leg keys on that RECORD: receipt
+                  → one line, no receipt → full reprint. Default "" means
+                  "client too old to report" and keeps the legacy
+                  pushed_gen inference for that caller only.
         """
         now = time.time()
         conn = _get_db(db_path)
@@ -3324,6 +3374,19 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 
         # Update last_seen
         conn.execute("UPDATE agents SET last_seen = ? WHERE name = ?", (now, agent_name))
+
+        # Record the caller's delivery receipts BEFORE composing anything —
+        # they cover broadcast/post ids too, and get_broadcasts_for_agent
+        # (called right after this in the Stop hook) reads the same table.
+        # Recorded even when the inbox is empty for the same reason.
+        receipt_ids = _parse_receipt_report(rendered_refs)
+        if receipt_ids:
+            conn.executemany(
+                "INSERT OR IGNORE INTO delivery_receipts "
+                "(message_id, agent, rendered_at) VALUES (?, ?, ?)",
+                [(mid, agent_name, now) for mid in receipt_ids],
+            )
+            conn.commit()
 
         # One-shot coverage-gap notice: queued at coming-online, delivered on
         # the first drain after, then cleared. Delivered even with an empty
@@ -3368,6 +3431,21 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # Both degrade to full text whenever there's any doubt: no message is
         # ever dropped, only ever shortened.
         gen_now = registry.generation(agent_name)
+        # Receipt mode: the caller reports what its transcript PROVES
+        # rendered, so "already delivered live" is read from the record —
+        # including rows receipted on an earlier report whose drain never
+        # completed. Legacy mode (receipt_ids is None): the pushed_gen
+        # inference below, unchanged, until every client reports.
+        receipted: set[int] = set()
+        if receipt_ids is not None and rows:
+            id_ph = ",".join("?" * len(rows))
+            receipted = {
+                row["message_id"] for row in conn.execute(
+                    f"SELECT message_id FROM delivery_receipts "
+                    f"WHERE agent = ? AND message_id IN ({id_ph})",
+                    (agent_name, *[r["id"] for r in rows]),
+                )
+            }
         lines: list[str] = []
         seen_live = 0
         capped = 0
@@ -3381,18 +3459,22 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             prio_tag = f" [{prio}]" if prio else ""
             body = r["body"]
             if compact:
-                pushed_gen = r["pushed_gen"] if "pushed_gen" in r.keys() else ""
-                # "already delivered live" needs BOTH: the push hit the binding
-                # the agent still holds (generation match) AND that binding's
-                # render is not in doubt (no wake left unacked before this
-                # drain). The second gate is the deaf-⚡ fix — without it, a
-                # bound-but-non-rendering stream gets its messages truncated on
-                # a false live-delivery claim (worst fleet-wide right after a
-                # redeploy). Doubt → fall through to full text.
-                if (
-                    pushed_gen and gen_now and pushed_gen == gen_now
-                    and not wake_render_unproven
-                ):
+                if receipt_ids is not None:
+                    already_rendered = r["id"] in receipted
+                else:
+                    # Legacy inference: "already delivered live" needs BOTH —
+                    # the push hit the binding the agent still holds
+                    # (generation match) AND that binding's render is not in
+                    # doubt (no wake left unacked before this drain, the
+                    # deaf-⚡ fix). Doubt → fall through to full text.
+                    pushed_gen = (
+                        r["pushed_gen"] if "pushed_gen" in r.keys() else ""
+                    )
+                    already_rendered = bool(
+                        pushed_gen and gen_now and pushed_gen == gen_now
+                        and not wake_render_unproven
+                    )
+                if already_rendered:
                     seen_live += 1
                     lines.append(
                         f"[{ts}] **{r['from_agent']}** ⟨{_msg_ref(r['id'])}⟩"
@@ -3400,7 +3482,12 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                         f"(already delivered live — {_summarise(body)})"
                     )
                     continue
-                if full_budget > 0:
+                if prio == "urgent":
+                    # P3: an unproven urgent prints IN FULL — never clipped,
+                    # never counted against the budget. Urgency is exactly
+                    # the wrong place to economise on a failure path.
+                    pass
+                elif full_budget > 0:
                     full_budget -= 1
                     clipped_body = _clip(body)
                     if clipped_body is not body:
@@ -3466,6 +3553,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         limit: int = 50,
         bind: bool = True,
         compact: bool = False,
+        rendered_refs: str = "",
         ctx: Context | None = None,
     ) -> str:
         """Get broadcasts this agent hasn't seen yet, and advance their cursor.
@@ -3494,10 +3582,18 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                   Broadcasts turned out to be the unclipped half of the
                   Stop-hook context tax (operator, 2026-07-26: multi-KB
                   fleet broadcasts landing whole in every idle agent's
-                  context). No already-seen-live leg here: a broadcast row
-                  is shared by all recipients, so it can't carry a
-                  per-recipient pushed generation. Nothing is dropped,
-                  only shortened — the footer points at the full text.
+                  context). Nothing is dropped, only shortened — the
+                  footer points at the full text.
+            rendered_refs: The caller's delivery-receipt report — same
+                  wire form and semantics as get_messages. In receipt mode
+                  the already-seen-live leg exists HERE TOO (receipts are
+                  per (message, agent), which is the per-recipient fact a
+                  shared broadcast row could never carry), and it replaces
+                  the broadcast_pending_* cursor-jump: a rendered row
+                  drains as one line instead of being silently absorbed —
+                  which also stops the jump absorbing queue-only rows
+                  (e.g. low-priority) that sat BELOW a pushed one. Default
+                  "" keeps the legacy jump for clients that don't report.
         """
         conn = _get_db(db_path)
         # READ THE RENDER EVIDENCE BEFORE ACKING. `wake_ack` below CLEARS the
@@ -3524,6 +3620,18 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             touch_session(agent_name, ctx)
 
         cursor = row["last_broadcast_seen_id"]
+
+        # Record the caller's delivery receipts (idempotent with the
+        # get_messages leg — the Stop hook reports the same list to both, so
+        # a direct call to either tool alone still lands the record).
+        receipt_ids = _parse_receipt_report(rendered_refs)
+        if receipt_ids:
+            conn.executemany(
+                "INSERT OR IGNORE INTO delivery_receipts "
+                "(message_id, agent, rendered_at) VALUES (?, ?, ?)",
+                [(mid, agent_name, time.time()) for mid in receipt_ids],
+            )
+            conn.commit()
 
         # -- promote the pending push, but only against evidence -------------
         #
@@ -3561,10 +3669,19 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # Failing this test is not an error and not a loss — it just leaves the
         # cursor where it was, so the rows below include the pushed ones and the
         # agent catches up. That is the entire cure.
+        #
+        # RECEIPT MODE SKIPS THE JUMP ENTIRELY (receipt_ids is not None): a
+        # rendered row drains as one line against its own per-(message,agent)
+        # receipt instead of being silently absorbed by id-range. The jump's
+        # range absorption is also its defect — every queue-only row (e.g. a
+        # low-priority broadcast, which never pushes) sitting BELOW a pushed
+        # one was absorbed unseen. The record makes the per-row question
+        # answerable, so the range guess retires with the clients that need it.
         pending = row["broadcast_pending_id"] or 0
         pending_gen = row["broadcast_pending_gen"] or ""
         if (
-            pending > cursor
+            receipt_ids is None
+            and pending > cursor
             and pending_gen and gen_now and pending_gen == gen_now
             and not wake_render_unproven
         ):
@@ -3651,7 +3768,21 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         if not rows:
             return ""
 
+        # Receipt mode: rows whose render this agent's own transcript proved
+        # (recorded above, or on any earlier report) drain as one line.
+        receipted: set[int] = set()
+        if receipt_ids is not None:
+            id_ph = ",".join("?" * len(rows))
+            receipted = {
+                rr["message_id"] for rr in conn.execute(
+                    f"SELECT message_id FROM delivery_receipts "
+                    f"WHERE agent = ? AND message_id IN ({id_ph})",
+                    (agent_name, *[r["id"] for r in rows]),
+                )
+            }
+
         lines = []
+        seen_live = 0
         capped = 0
         clipped = 0
         full_budget = COMPACT_FULL_MESSAGES
@@ -3661,7 +3792,19 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             prio_tag = f" [{prio}]" if prio else ""
             body = r["body"]
             if compact:
-                if full_budget > 0:
+                if r["id"] in receipted:
+                    seen_live += 1
+                    lines.append(
+                        f"[{ts}] **{r['from_agent']}** ⟨{_msg_ref(r['id'])}⟩"
+                        f"{prio_tag}: "
+                        f"(already delivered live — {_summarise(body)})"
+                    )
+                    continue
+                if prio == "urgent":
+                    # P3: an unproven urgent prints in full — same rule as
+                    # the get_messages leg, for the same reason.
+                    pass
+                elif full_budget > 0:
                     full_budget -= 1
                     clipped_body = _clip(body)
                     if clipped_body is not body:
@@ -3672,11 +3815,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                     body = _summarise(body, COMPACT_SUMMARY_CHARS)
             lines.append(f"[{ts}] **{r['from_agent']}** ⟨{_msg_ref(r['id'])}⟩"
                          f"{prio_tag}: {body}")
-        if compact and (capped or clipped):
+        if compact and (seen_live or capped or clipped):
             # Point at get_history('#general'), not get_broadcasts_for_agent:
             # this very call advanced the cursor, so a repeat returns nothing.
             # (Same read-semantics trap the get_messages footer already hit.)
             what = []
+            if seen_live:
+                what.append(f"{seen_live} already surfaced live")
             if capped:
                 what.append(f"{capped} past the {COMPACT_FULL_MESSAGES}-message cap")
             if clipped:

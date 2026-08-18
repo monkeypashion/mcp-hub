@@ -42,7 +42,15 @@ from pathlib import Path
 # `_read_last_assistant_text` uses: that one wants the last assistant turn,
 # this one wants every channel render of the turn that just ended, and a
 # drain-batch of long DMs is easily bigger than one turn's prose.
-TRANSCRIPT_WINDOW = 512 * 1024
+#
+# Kept equal to receipts.TRANSCRIPT_WINDOW deliberately: the compact claims
+# this module audits are now receipt-backed, verified through that window. An
+# auditor looking through a SMALLER window than the claimant would log
+# "false_compaction" artifacts for any render that sits between the two
+# horizons — measurement noise in the very ledger the card #56 before/after
+# evidence reads. (512KiB also proved too small against a real transcript:
+# one tool-heavy turn wrote ~1MiB after its renders.)
+TRANSCRIPT_WINDOW = 4 * 1024 * 1024
 
 # Keep the last N records. The log is a diagnostic that runs at EVERY Stop of
 # every agent on the box; unbounded, it is a slow disk leak nobody is watching.
