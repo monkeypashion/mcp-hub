@@ -1234,7 +1234,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             "NOT wake the recipient — the message queues and surfaces at "
             "their next natural turn, held at most 10 minutes (the hold "
             "sweep wakes them if nothing else does). Nothing is lost or "
-            "reordered. Two exceptions wake immediately: 'urgent' (always — "
+            "reordered. Three exceptions wake immediately: 'urgent' (always — "
             "it should mean 'blocking on you' or 'production incident'), "
             "a message FROM the operator (operator-console/operator senders "
             "never sit in the hold-queue), "
@@ -1364,21 +1364,39 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             # first live firing of this notice (2026-07-27, on the seat that
             # shipped it) counted exactly one "missed" message — the author's
             # own deploy broadcast, sent during their own binding gap.
-            n = conn.execute(
+            #
+            # DMs and broadcasts are counted SEPARATELY and the notice names
+            # each kind: a single "N message(s)" under the drain's DM heading
+            # read as a possibly-missed DM when the item was a broadcast —
+            # one printed in full three lines below the warning (features-
+            # json, measured twice on 2026-08-18's deploys). A warning whose
+            # count can't be reconciled against what follows it teaches
+            # readers to ignore warnings.
+            dms = conn.execute(
                 "SELECT COUNT(*) AS n FROM messages WHERE ts > ? AND "
-                "from_agent != ? AND (to_agent = ? OR channel = ?)",
-                (since, name, name, _BROADCAST_CHANNEL),
+                "from_agent != ? AND to_agent = ?",
+                (since, name, name),
+            ).fetchone()["n"]
+            bcs = conn.execute(
+                "SELECT COUNT(*) AS n FROM messages WHERE ts > ? AND "
+                "from_agent != ? AND channel = ?",
+                (since, name, _BROADCAST_CHANNEL),
             ).fetchone()["n"]
             notice = ""
-            if n:
+            if dms or bcs:
                 t1 = time.strftime("%H:%M", time.gmtime(since))
                 t2 = time.strftime("%H:%M", time.gmtime())
+                parts = []
+                if dms:
+                    parts.append(f"{dms} DM(s)")
+                if bcs:
+                    parts.append(f"{bcs} broadcast(s)")
                 notice = (
                     f"⚠️ Coverage gap: your binding was down {t1}–{t2} UTC "
-                    f"and {n} message(s) arrived in that window. They are in "
-                    "your queue/cursor, but anything you reasoned about "
-                    "during the gap may be missing context — "
-                    "get_history() holds the record."
+                    f"and {' and '.join(parts)} arrived in that window — "
+                    "queued, nothing lost, surfacing via this drain. But "
+                    "anything you reasoned about DURING the gap may be "
+                    "missing context — get_history() holds the record."
                 )
             conn.execute(
                 "UPDATE agents SET offline_since = NULL, gap_notice = ? "

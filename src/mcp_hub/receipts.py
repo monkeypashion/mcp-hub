@@ -44,16 +44,21 @@ import re
 # loss).
 TRANSCRIPT_WINDOW = 4 * 1024 * 1024
 
-# The two positions a render puts a ref, and nothing else:
+# The positions a render puts a ref, and nothing else:
 #   DM from alice ⟨hub.msg/1?id=7⟩: …            (live push tag head)
 #   BROADCAST from alice ⟨hub.msg/1?id=7⟩: …     (live push tag head)
 #   #general post from alice ⟨hub.msg/1?id=7⟩: … (live push tag head)
+#   [15:39:03] DM from alice ⟨hub.msg/1?id=7⟩: … (batched wake line —
+#       _wake_with_queue, and Case 1 before it, stamp a timestamp first.
+#       Missed on 2026-08-18's first live batch, whose message re-printed
+#       at the next drain: a missed pattern costs a duplicate, never a
+#       loss, which is why it was safe to discover in production.)
 #   [15:39:03] **alice** ⟨hub.msg/1?id=7⟩ …      (drain / drain-batch line)
-# Both anchored to line start so a ref cited mid-prose never matches. The
+# All anchored to line start so a ref cited mid-prose never matches. The
 # `<channel …>` opener may share the head's line or precede it — both shapes
 # occur in real transcripts, so the anchor tolerates an optional tag prefix.
 _TAG_HEAD_RE = re.compile(
-    r"^(?:<channel\b[^>]*>\s*)?"
+    r"^(?:<channel\b[^>]*>\s*)?(?:\[\d{2}:\d{2}:\d{2}\] )?"
     r"(?:DM|BROADCAST|.{0,80}? post) from \S+ ⟨hub\.msg/1\?id=(\d+)⟩",
     re.MULTILINE,
 )

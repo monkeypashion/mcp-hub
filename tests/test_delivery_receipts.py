@@ -195,6 +195,19 @@ def test_a_ref_quoted_in_prose_does_not_mint_a_receipt(tmp_path):
     assert 99 not in ids, "a QUOTED ref was counted as a render"
 
 
+def test_batched_wake_lines_mint_receipts(tmp_path):
+    """The _wake_with_queue render shape: `[HH:MM:SS] DM from name ⟨ref⟩:`.
+    Discovered missing against a LIVE batch on 2026-08-18 — its message
+    re-printed at the next drain (duplicate, not loss: the safe failure
+    direction doing its job as a discovery mechanism)."""
+    path = _transcript(tmp_path, [
+        _user_record('<channel source="hub" from_agent="hub" kind="dm">\n'
+                     "[08:45:50] DM from features-json ⟨hub.msg/1?id=12⟩ "
+                     "[low]: report body</channel>"),
+    ])
+    assert receipts.rendered_message_ids(path) == [12]
+
+
 def test_drain_batch_lines_mint_receipts(tmp_path):
     """A drain-batched wake surfaces several messages as get_messages-style
     lines inside one channel event; each is a genuine render."""

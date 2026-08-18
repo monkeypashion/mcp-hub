@@ -389,6 +389,36 @@ async def test_gap_notice_ignores_the_agents_own_traffic(tmp_path):
     )
 
 
+async def test_gap_notice_names_broadcasts_as_broadcasts(tmp_path):
+    """features-json's measured defect (2026-08-18, twice in one day): a
+    lone broadcast arriving during the gap was reported as '1 message(s)'
+    under the drain's DM heading, while the broadcast itself printed in
+    full three lines below. A warning whose count can't be reconciled
+    against what follows it teaches readers to ignore warnings — the
+    notice now names each kind separately."""
+    server = create_server(db_path=tmp_path / "t.db")
+    await _call_tool(server, "register", {"name": "alice", "project": "p"})
+    await _call_tool(server, "register", {"name": "bob", "project": "p"})
+    import sqlite3
+    import time as _t
+    conn = sqlite3.connect(tmp_path / "t.db")
+    conn.execute(
+        "UPDATE agents SET status='offline', offline_since=? WHERE name='alice'",
+        (_t.time() - 60,),
+    )
+    conn.commit()
+    conn.close()
+    await _call_tool(server, "broadcast",
+                     {"scope": "fleet", "from_agent": "bob",
+                      "message": "deploy announcement during the gap"})
+    await _call_tool(server, "register", {"name": "alice", "project": "p"})
+    inbox = await _call_tool(server, "get_messages", {"agent_name": "alice"})
+    assert "1 broadcast(s)" in inbox, inbox
+    assert "DM(s)" not in inbox, (
+        "a broadcast-only gap was counted as DMs again:\n" + inbox
+    )
+
+
 async def test_no_gap_no_notice(tmp_path):
     server = create_server(db_path=tmp_path / "t.db")
     await _call_tool(server, "register", {"name": "alice", "project": "p"})
