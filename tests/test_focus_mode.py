@@ -88,29 +88,50 @@ def _focus_for(db_path, agent, seconds):
     conn.commit()
 
 
+async def _reply_ref(server, db_path, author, to="alice"):
+    """`author` sends a DM (their turn) then idles; returns the ⟨ref⟩ a
+    rule-3 reply needs. Under card #59 wake-batching, a reply to the
+    author's last turn is the non-urgent send that still ATTEMPTS a wake —
+    exactly the thing the focus gate must cover."""
+    await _call(server, "send",
+                {"from_agent": author, "to": to, "message": "q?"})
+    conn = _db(db_path)
+    mid = conn.execute(
+        "SELECT MAX(id) FROM messages WHERE from_agent = ?", (author,)
+    ).fetchone()[0]
+    await _call(server, "get_messages",
+                {"agent_name": author, "bind": False, "mark_idle": True})
+    return f"hub.msg/1?id={mid}"
+
+
 class TestTheGuardIsRealNotVacuous:
-    async def test_a_BOUND_unfocused_agent_definitely_wakes(self, server):
+    async def test_a_BOUND_unfocused_agent_definitely_wakes(self, server, db_path):
         """The control. If this ever fails, every 'no wake' test below is
-        measuring the binding rather than the focus."""
+        measuring the binding rather than the focus (reply-wake vehicle,
+        since card #59 batched plain normal sends)."""
         await _register(server, "alice", "bob")
         registry = _bind(server, "bob")
+        ref = await _reply_ref(server, db_path, "bob")
         with patch.object(registry, "push", AsyncMock(return_value=True)) as push:
             await _call(server, "send", {
                 "from_agent": "alice", "to": "bob", "message": "hi",
-                "priority": "normal",
+                "priority": "normal", "in_reply_to": ref,
             })
         assert push.called
 
 
 class TestTheGate:
     async def test_a_normal_dm_does_not_wake_a_focused_agent(self, server, db_path):
+        """The non-urgent wake that still exists post-card-#59 is the
+        reply-wake; focus must gate it (urgent alone pierces)."""
         await _register(server, "alice", "bob")
         registry = _bind(server, "bob")
+        ref = await _reply_ref(server, db_path, "bob")
         _focus_for(db_path, "bob", 600)
         with patch.object(registry, "push", AsyncMock(return_value=True)) as push:
             out = await _call(server, "send", {
                 "from_agent": "alice", "to": "bob", "message": "hi",
-                "priority": "normal",
+                "priority": "normal", "in_reply_to": ref,
             })
         push.assert_not_called()
         assert "focus mode" in out
@@ -146,22 +167,24 @@ class TestTheGate:
         with no sweeper to fail and nothing to remember to undo."""
         await _register(server, "alice", "bob")
         registry = _bind(server, "bob")
+        ref = await _reply_ref(server, db_path, "bob")
         _focus_for(db_path, "bob", -1)          # already in the past
         with patch.object(registry, "push", AsyncMock(return_value=True)) as push:
             await _call(server, "send", {
                 "from_agent": "alice", "to": "bob", "message": "hi",
-                "priority": "normal",
+                "priority": "normal", "in_reply_to": ref,
             })
         assert push.called
 
     async def test_focus_does_not_leak_to_another_agent(self, server, db_path):
         await _register(server, "alice", "bob", "carol")
         registry = _bind(server, "bob", "carol")
+        ref = await _reply_ref(server, db_path, "carol")
         _focus_for(db_path, "bob", 600)
         with patch.object(registry, "push", AsyncMock(return_value=True)) as push:
             await _call(server, "send", {
                 "from_agent": "alice", "to": "carol", "message": "hi",
-                "priority": "normal",
+                "priority": "normal", "in_reply_to": ref,
             })
         assert push.called
 
@@ -221,16 +244,17 @@ class TestTheTool:
         assert "urgent still gets through" in out
         assert "expires on its own" in out
 
-    async def test_focus_zero_ends_it(self, server):
-        await _register(server, "bob")
+    async def test_focus_zero_ends_it(self, server, db_path):
+        await _register(server, "alice", "bob")
         registry = _bind(server, "bob")
+        ref = await _reply_ref(server, db_path, "bob")
         await _call(server, "focus", {"agent_name": "bob", "minutes": 30})
         out = await _call(server, "focus", {"agent_name": "bob", "minutes": 0})
         assert "Focus off" in out
         with patch.object(registry, "push", AsyncMock(return_value=True)) as push:
             await _call(server, "send", {
-                "from_agent": "a", "to": "bob", "message": "hi",
-                "priority": "normal",
+                "from_agent": "alice", "to": "bob", "message": "hi",
+                "priority": "normal", "in_reply_to": ref,
             })
         assert push.called
 

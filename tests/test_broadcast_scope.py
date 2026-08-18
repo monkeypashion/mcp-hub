@@ -94,7 +94,7 @@ async def test_a_team_broadcast_reaches_the_team_across_projects_and_orgs(server
     await _squad(server)
     with patch.object(server._hub_registry, "names", lambda: list(FLEET)):
         out = await _call(server, "broadcast",
-                          {"from_agent": "pm", "message": "who deleted it?"})
+                          {"from_agent": "pm", "message": "who deleted it?", "priority": "urgent"})
     # fo + vps, not hub or hub-clone, not the sender
     assert _recipients(out) == 2, out
 
@@ -127,9 +127,10 @@ async def test_scope_fleet_stays_available_and_explicit(server):
     await _squad(server)
     with patch.object(server._hub_registry, "names", lambda: list(FLEET)):
         team = await _call(server, "broadcast",
-                           {"from_agent": "pm", "message": "x"})
+                           {"from_agent": "pm", "message": "x", "priority": "urgent"})
         fleet = await _call(server, "broadcast",
-                            {"from_agent": "pm", "message": "hub down", "scope": "fleet"})
+                            {"from_agent": "pm", "message": "hub down", "scope": "fleet",
+                                "priority": "urgent"})
     assert _recipients(team) == 2 and _recipients(fleet) == 4, (team, fleet)
 
 
@@ -354,13 +355,15 @@ async def test_a_sender_in_several_squads_must_say_which_one(server):
     await _squad(server)
     await _call(server, "set_squads", {"name": "hub", "squads": "dreamteam,hublane"})
 
-    out = await _call(server, "broadcast", {"from_agent": "hub", "message": "which?"})
+    out = await _call(server, "broadcast", {"from_agent": "hub", "message": "which?",
+        "priority": "urgent"})
     assert "name the one you mean" in out, out
     assert "dreamteam" in out and "hublane" in out, f"refusal must list them: {out}"
     assert "woke" not in out, f"refused but delivered anyway: {out}"
 
     ok = await _call(server, "broadcast",
-                     {"from_agent": "hub", "message": "this one", "scope": "hublane"})
+                     {"from_agent": "hub", "message": "this one", "scope": "hublane",
+                         "priority": "urgent"})
     assert "woke" in ok, f"naming the squad should have worked: {ok}"
 
 
@@ -406,7 +409,7 @@ async def test_muting_a_squad_silences_BOTH_delivery_paths(server):
 
     with patch.object(server._hub_registry, "names", lambda: list(FLEET)):
         out = await _call(server, "broadcast",
-                          {"from_agent": "pm", "message": "noisy thread"})
+                          {"from_agent": "pm", "message": "noisy thread", "priority": "urgent"})
     assert _recipients(out) == 1, f"muted member was still woken: {out}"   # vps only
 
     caught = await _call(server, "get_broadcasts_for_agent",
@@ -441,7 +444,7 @@ async def test_a_muted_member_is_still_a_member(server):
     await _call(server, "mute_squad", {"name": "fo", "squad": "dreamteam"})
 
     out = await _call(server, "broadcast",
-                      {"from_agent": "fo", "message": "I can still speak"})
+                      {"from_agent": "fo", "message": "I can still speak", "priority": "urgent"})
     assert "woke" in out, f"a muted member lost the ability to broadcast: {out}"
     assert "dreamteam" in await _call(server, "list_squads", {"agent": "fo"})
 
@@ -678,21 +681,18 @@ def test_legacy_clear_happens_even_when_the_import_inserts_nothing(tmp_path):
 # Correcting the agents without correcting the string is a half-fix — we did
 # exactly that for a day and watched the belief come back.
 
-def test_the_instructions_blob_does_not_generalise_low_priority(server):
+def test_the_instructions_blob_states_wake_batching_correctly(server):
     """The hub's top-level instructions — the first text every agent reads —
-    stated broadcast's low-priority rule as if it were global. A low send()
-    deliberately WAKES an idle recipient (Case 1). The whole fleet quoted the
-    wrong half for a weekend, including as the accepted explanation for an
-    all-drain canary result, which was true only because that test used
-    broadcasts."""
+    once misstated the priority rules for a whole weekend. Under card #59
+    they must state: low/normal queue (no wake), urgent wakes, and a reply
+    to the recipient's last turn wakes — the in_reply_to latency lever the
+    fleet has to learn from exactly this text."""
     blob = server.instructions or ""
-    assert "low" in blob.lower()
-    # It must name the split. Mentioning wake at all is not enough — the old
-    # text mentioned wake, and that is precisely how it misled.
-    assert "idle" in blob.lower(), (
-        "instructions do not mention the idle-recipient exception for DMs:\n" + blob
+    assert "WAKE-BATCHING" in blob, blob
+    assert "do NOT wake" in blob, blob
+    assert "urgent" in blob.lower()
+    assert "in_reply_to" in blob, (
+        "instructions do not teach the reply-wake lever:\n" + blob
     )
-    assert "send" in blob.lower()
-    assert "queues these without firing a channel-push wake" not in blob, (
-        "instructions still state broadcast's rule as universal:\n" + blob
-    )
+    # The retired Case 1 wording must be gone — it was the misleading half.
+    assert "still wakes a recipient who is IDLE" not in blob

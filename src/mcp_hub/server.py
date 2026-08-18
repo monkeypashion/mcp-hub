@@ -132,6 +132,31 @@ class _PushOutcome(NamedTuple):
 _VALID_PRIORITIES = {"low", "normal", "urgent"}
 _NO_WAKE_PRIORITIES = {"low"}
 
+# Card #59 — wake-batching. Low/normal traffic no longer fires its own wake;
+# it rides the recipient's next natural turn, bounded by this holding cap so
+# nothing rots in a quiet lane (rule 4; the 10 minutes is the operator's
+# number from the card). The hold sweep runs much more often than the cap so
+# the cap is a maximum, not a granularity.
+HOLD_MAX_SECONDS = 600
+HOLD_SWEEP_INTERVAL_SECONDS = 60
+
+# Rule 2a (operator amendment, 2026-08-18): messages FROM the operator
+# never sit in the hold-queue — these senders wake immediately at any
+# priority, exactly like urgent. The operator waiting on a lane IS the
+# blocking case rule 2 exists for; the sender is the signal, not the
+# priority field they remembered to set.
+_OPERATOR_SENDERS = frozenset({"operator-console", "operator"})
+
+# Rule 3's "last turn" is bounded by the recipient's own idle marks
+# (prev_idle_at). An agent that predates the prev_idle_at migration — or has
+# never had a Stop hook fire — has no bound, so a recency window stands in:
+# a reply to something they sent this recently still wakes them.
+REPLY_RECENCY_FALLBACK_SECONDS = 1800
+
+# Wake-log retention (rule 5's server-side witness). Two weeks covers the
+# before/after ledger sample with margin.
+WAKE_LOG_KEEP_SECONDS = 14 * 24 * 3600
+
 # Focus mode. `urgent` PIERCES it: a focus that also swallows "production
 # incident" is one nobody dares switch on, and an unusable silencer just
 # returns everyone to the convention it replaced. Everything else queues and
@@ -533,6 +558,36 @@ def init_db(db_path: Path = DB_PATH) -> None:
         conn.commit()
     except sqlite3.OperationalError:
         pass  # Column already exists
+
+    # Card #59 wake-batching state. prev_idle_at bounds "the agent's last
+    # turn" for rule 3 (a reply to a message sent after this mark wakes its
+    # author immediately); last_hold_wake_at rate-limits the rule-4 hold
+    # sweep to one wake per cap window per agent. Zero defaults are correct
+    # for pre-migration rows: no bound falls back to the recency window,
+    # and a zero hold stamp means the sweep may fire at the first quorum.
+    for col in ("prev_idle_at", "last_hold_wake_at"):
+        try:
+            conn.execute(
+                f"ALTER TABLE agents ADD COLUMN {col} REAL NOT NULL DEFAULT 0"
+            )
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+    # Rule 5's server-side witness: one row per DELIVERED wake, with the
+    # reason it fired (urgent | reply | hold). The ledger's before/after is
+    # squad-proxy's measurement; this is the hub's own account of the same
+    # events, prunable (WAKE_LOG_KEEP_SECONDS) because it is a witness, not
+    # a system of record.
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS wake_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            agent TEXT NOT NULL,
+            reason TEXT NOT NULL
+        )"""
+    )
+    conn.commit()
 
     # The shared delivery record (card #56). One row = one message body
     # PROVABLY rendered into one agent's context, reported by that agent's
@@ -1175,15 +1230,20 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             "- post(from, channel, message, priority) — to a named channel\n"
             "- broadcast(from, message, priority) — to the whole fleet\n\n"
             "Priority is one of low|normal|urgent. Default is normal. "
-            "Use 'low' for FYIs / status updates / EOD recaps that the recipient "
-            "doesn't need to act on now. What 'low' does then DIFFERS BY "
-            "PRIMITIVE, deliberately: broadcast and post queue without ever "
-            "firing a wake, while a low send() still wakes a recipient who is "
-            "IDLE (and queues silently for one mid-turn) — a soft ask should "
-            "still reach an idle agent. Do not generalise either rule to the "
-            "other. Use 'normal' when you're waiting on the recipient. "
-            "Use 'urgent' sparingly — it should mean 'blocking on you' or "
-            "'production incident'.\n\n"
+            "WAKE-BATCHING (operator-signed, card #59): low and normal do "
+            "NOT wake the recipient — the message queues and surfaces at "
+            "their next natural turn, held at most 10 minutes (the hold "
+            "sweep wakes them if nothing else does). Nothing is lost or "
+            "reordered. Two exceptions wake immediately: 'urgent' (always — "
+            "it should mean 'blocking on you' or 'production incident'), "
+            "a message FROM the operator (operator-console/operator senders "
+            "never sit in the hold-queue), "
+            "and a message whose in_reply_to targets something the "
+            "recipient sent in THEIR LAST TURN, any priority — an active "
+            "conversation never slows. So: COPY THE ⟨ref⟩ INTO in_reply_to "
+            "WHEN YOU ANSWER someone; it is now also the latency lever, "
+            "not just lineage. Use 'low' vs 'normal' to signal reading "
+            "priority to the recipient; they queue the same.\n\n"
             "After register() the hub binds your MCP session for channel-push wake. "
             "Use list_agents() to see who's online — the ⚡ marker indicates a live, "
             "ping-verified wakeable session.\n\n"
@@ -1390,6 +1450,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     )
     # Exposed for main() so it can spawn the reaper alongside the server.
     mcp._hub_registry = registry  # type: ignore[attr-defined]
+    mcp._hub_db_path = db_path  # type: ignore[attr-defined]
 
     def _drop_context_probe(name: str, session: Any) -> str:
         """Snapshot the external discriminators a wake-ack drop needs to
@@ -1835,6 +1896,162 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             conn.commit()
         except Exception:  # noqa: BLE001
             logger.debug("pushed_gen stamp failed for %s", agent, exc_info=True)
+
+    def _log_wake(conn: Any, agent: str, reason: str) -> None:
+        """Rule 5's witness: record a DELIVERED wake and why it fired.
+        Fail-soft — measurement must never cost a wake."""
+        try:
+            conn.execute(
+                "INSERT INTO wake_log (ts, agent, reason) VALUES (?, ?, ?)",
+                (time.time(), agent, reason),
+            )
+            conn.commit()
+        except Exception:  # noqa: BLE001
+            logger.debug("wake_log insert failed for %s", agent, exc_info=True)
+
+    def _reply_wakes_author(conn: Any, reply_ref: str, recipient: str) -> bool:
+        """Rule 3: does this reply target something `recipient` sent in
+        their LAST TURN? Author must match, and the target must postdate
+        the recipient's second-to-last idle mark (prev_idle_at) — i.e. be
+        last-turn or current-turn. With no mark recorded (pre-migration
+        row, or an agent whose Stop hook has never fired) a recency window
+        stands in. False on any doubt: a mistaken batch costs at most the
+        rule-4 cap; a mistaken wake re-opens the leak this card closes."""
+        if not reply_ref:
+            return False
+        try:
+            target_id = int(refs.parse_ref(reply_ref).get("id"))
+        except Exception:  # noqa: BLE001 — validated upstream; stay safe
+            return False
+        target = conn.execute(
+            "SELECT from_agent, ts FROM messages WHERE id = ?", (target_id,)
+        ).fetchone()
+        if not target or target["from_agent"] != recipient:
+            return False
+        row = conn.execute(
+            "SELECT prev_idle_at FROM agents WHERE name = ?", (recipient,)
+        ).fetchone()
+        prev_idle = float(row["prev_idle_at"]) if row and row["prev_idle_at"] else 0.0
+        if prev_idle > 0:
+            return float(target["ts"]) > prev_idle
+        return float(target["ts"]) > time.time() - REPLY_RECENCY_FALLBACK_SECONDS
+
+    async def _wake_with_queue(
+        conn: Any, to: str, reason: str,
+        extra_lines: list[str] | None = None,
+    ) -> _PushOutcome:
+        """Fire one drain-batched wake carrying the recipient's ENTIRE
+        unread DM queue in ts order — rule 1 composed with rules 3/4: a
+        wake never surfaces its trigger ahead of earlier queued messages.
+        Bodies are clipped exactly as live pushes always were; the Stop
+        drain plus delivery receipts own the rest."""
+        unread = conn.execute(
+            """SELECT id, ts, from_agent, body, priority FROM messages
+               WHERE to_agent = ? AND read = 0 ORDER BY ts ASC""",
+            (to,),
+        ).fetchall()
+        lines = []
+        for r in unread:
+            ts = time.strftime("%H:%M:%S", time.localtime(r["ts"]))
+            prio_tag = f" [{r['priority']}]" if r["priority"] != "normal" else ""
+            lines.append(
+                f"[{ts}] DM from {r['from_agent']} "
+                f"⟨{_msg_ref(r['id'])}⟩{prio_tag}: {_clip_push(r['body'])}"
+            )
+        lines.extend(extra_lines or [])
+        if not lines:
+            return _PushOutcome(False, False)
+        outcome = await push_channel(
+            agent=to,
+            content="\n".join(lines),
+            meta={"from_agent": "hub", "kind": "dm", "priority": "low",
+                  "drain_batch": "true" if len(lines) > 1 else "false"},
+        )
+        if outcome.delivered:
+            conn.execute(
+                "UPDATE agents SET is_idle = 0 WHERE name = ?", (to,)
+            )
+            conn.commit()
+            if outcome.primary and unread:
+                _stamp_pushed(conn, [r["id"] for r in unread], to)
+            _log_wake(conn, to, reason)
+        return outcome
+
+    async def _hold_sweep_pass() -> int:
+        """One rule-4 pass: wake every bound agent holding traffic older
+        than HOLD_MAX_SECONDS that no wake has covered yet. Returns the
+        number of wakes fired.
+
+        Two independent guards stop re-fires: last_hold_wake_at rate-limits
+        to one hold wake per cap window per agent, and a delivered wake
+        stamps its DMs' pushed_gen so they stop counting as held. Unbound
+        agents are skipped, not queued-for: there is nothing to wake, and
+        their Stop-hook drain already covers the return path. Broadcasts
+        held past the cap are NAMED in the wake, never rendered — the Stop
+        drain owns broadcast bodies (cursor + receipts)."""
+        now = time.time()
+        cutoff = now - HOLD_MAX_SECONDS
+        conn = _get_db(db_path)
+        try:
+            conn.execute("DELETE FROM wake_log WHERE ts < ?",
+                         (now - WAKE_LOG_KEEP_SECONDS,))
+            conn.commit()
+        except Exception:  # noqa: BLE001 — pruning must never cost a pass
+            pass
+        fired = 0
+        rows = conn.execute(
+            "SELECT name, last_hold_wake_at, last_broadcast_seen_id "
+            "FROM agents"
+        ).fetchall()
+        for row in rows:
+            name = row["name"]
+            if now - float(row["last_hold_wake_at"] or 0) <= HOLD_MAX_SECONDS:
+                continue
+            if not registry.generation(name):
+                continue
+            held_dm = conn.execute(
+                "SELECT 1 FROM messages WHERE to_agent = ? AND read = 0 "
+                "AND pushed_gen = '' AND ts < ? LIMIT 1",
+                (name, cutoff),
+            ).fetchone()
+            my_squads = _squads_of(conn, name, include_muted=False)
+            ph = ",".join("?" * len(my_squads)) if my_squads else "NULL"
+            held_bc = conn.execute(
+                f"SELECT COUNT(*) AS n FROM messages WHERE channel = ? "
+                f"AND id > ? AND ts < ? AND from_agent != ? "
+                f"AND (audience = '' OR audience IN ({ph}))",  # noqa: S608
+                (_BROADCAST_CHANNEL, row["last_broadcast_seen_id"] or 0,
+                 cutoff, name, *my_squads),
+            ).fetchone()["n"]
+            if not held_dm and not held_bc:
+                continue
+            extra = []
+            if held_bc:
+                extra.append(
+                    f"({held_bc} queued broadcast(s) also waiting — "
+                    f"they surface at this turn's end)"
+                )
+            outcome = await _wake_with_queue(conn, name, "hold",
+                                             extra_lines=extra)
+            if outcome.delivered:
+                conn.execute(
+                    "UPDATE agents SET last_hold_wake_at = ? WHERE name = ?",
+                    (now, name),
+                )
+                conn.commit()
+                fired += 1
+        return fired
+
+    async def _hold_sweep_loop() -> None:
+        while True:
+            try:
+                await _hold_sweep_pass()
+            except Exception:  # noqa: BLE001
+                logger.exception("hold sweep pass failed")
+            await anyio.sleep(HOLD_SWEEP_INTERVAL_SECONDS)
+
+    mcp._hub_hold_sweep_pass = _hold_sweep_pass  # type: ignore[attr-defined]
+    mcp._hub_hold_sweep = _hold_sweep_loop  # type: ignore[attr-defined]
 
     async def push_channel(agent: str, content: str, meta: dict[str, str]) -> _PushOutcome:
         """Push a channel notification to `agent` via the live session registry.
@@ -2422,28 +2639,33 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     ) -> str:
         """Send a direct message to another agent.
 
-        Priority controls whether the recipient is woken from idle:
+        Wake-batching (card #59, operator-signed): low and normal do NOT
+        wake the recipient — the message queues and surfaces at their next
+        natural turn, held at most 10 minutes by the hold sweep so nothing
+        rots. Nothing is lost or reordered. Immediate wakes:
 
-        - "normal" (default): wake on receipt + persist to inbox.
-        - "low": queue-only when the recipient is in a turn (don't interrupt
-          focused work). Wake when the recipient is idle (Case 1 — soft asks
-          should still reach idle agents without operator-in-the-loop).
-          Wake delivery is drain-batched: ALL queued unread DMs surface in
-          one channel event so a flurry of low-prio sends doesn't wake the
-          recipient repeatedly.
-        - "urgent": wake + persist + flag as urgent in the rendered <channel>
-          tag's meta so the recipient can visually triage. Use sparingly —
-          urgent should mean "blocking on you" or "production incident".
+        - "urgent": always wakes, unchanged. Use sparingly — it should
+          mean "blocking on you" or "production incident".
+        - any priority whose `in_reply_to` targets a message the recipient
+          sent in THEIR LAST TURN — an active conversation never slows.
+          The wake is drain-batched: ALL their queued unread DMs surface
+          in one channel event, in order.
+
+        So copy the ⟨ref⟩ into in_reply_to when you answer someone — it is
+        the latency lever now, not just lineage.
 
         Args:
             from_agent: Your agent name (must be registered).
             to: Target agent name.
             message: The message body.
-            priority: One of "low" | "normal" | "urgent". Defaults to "normal".
-            in_reply_to: Optional ref of the message this ANSWERS — copy the
-                ⟨ref⟩ shown on the message you are replying to (e.g.
-                hub.msg/1?id=123). Declared lineage: the hub records the edge
-                you assert and never guesses one.
+            priority: One of "low" | "normal" | "urgent". Defaults to
+                "normal". Low vs normal signals reading priority to the
+                recipient; both queue the same.
+            in_reply_to: Ref of the message this ANSWERS — copy the ⟨ref⟩
+                shown on the message you are replying to (e.g.
+                hub.msg/1?id=123). Declared lineage, and the rule-3
+                immediate-wake trigger. The hub records the edge you
+                assert and never guesses one.
         """
         if priority not in _VALID_PRIORITIES:
             return (
@@ -2487,89 +2709,39 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         _record_msg_lineage(conn, message_id, from_agent, to_agent=to,
                             reply_ref=reply_ref)
 
-        # Low-priority — Case 1 path. Check recipient's idle state.
-        # is_idle=1 means the recipient's last Stop hook fired (turn-end
-        # transition). If the recipient is also bound, the wake will land;
-        # if not bound, push() will return False and we fall back to the
-        # queued path below. Either way it's correct — the binding check
-        # is the real liveness gate.
-        if priority in _NO_WAKE_PRIORITIES:
-            recipient_row = conn.execute(
-                "SELECT is_idle FROM agents WHERE name = ?",
-                (to,),
-            ).fetchone()
-            recipient_is_idle = bool(
-                recipient_row and recipient_row["is_idle"]
-            )
-            if not recipient_is_idle:
+        # Card #59 wake-batching. Low and normal no longer fire their own
+        # wake (they ride the recipient's next natural turn, bounded by the
+        # rule-4 hold sweep) — with ONE exception carved out by rule 3: a
+        # direct reply to something the recipient sent in their last turn
+        # wakes them immediately regardless of priority, because batching
+        # must never slow an active conversation. The Case 1 idle wake this
+        # replaces is retired, not broken: its drain-batch delivery shape
+        # lives on in _wake_with_queue, which every non-urgent wake uses so
+        # rule 1's ordering holds (a wake never surfaces its trigger ahead
+        # of earlier queued messages).
+        if priority != "urgent" and from_agent not in _OPERATOR_SENDERS:
+            if _reply_wakes_author(conn, reply_ref, to):
+                outcome = await _wake_with_queue(conn, to, "reply")
+                if outcome.delivered:
+                    return (
+                        f"Message sent to '{to}' (priority={priority}; "
+                        f"reply-wake fired — active conversation)."
+                    )
+                if outcome.suppressed:
+                    return (
+                        f"Message queued for '{to}' (priority={priority}; "
+                        f"{outcome.suppressed} — NOT offline; it surfaces at "
+                        f"their next turn)."
+                    )
                 return (
-                    f"Message queued for '{to}' (priority={priority}; no wake "
-                    f"— recipient is in a turn or not registered)."
-                )
-
-            # Drain batch: pull ALL unread DMs for the recipient (including
-            # the one we just inserted), deliver in one channel event, then
-            # mark them all read in one commit. Avoids wake-storming when
-            # multiple low-prio sends land in quick succession against an
-            # idle recipient.
-            unread = conn.execute(
-                """SELECT id, ts, from_agent, body, priority FROM messages
-                   WHERE to_agent = ? AND read = 0 ORDER BY ts ASC""",
-                (to,),
-            ).fetchall()
-            if not unread:  # defensive — should always include our insert
-                unread = [{"id": message_id, "ts": now, "from_agent": from_agent,
-                           "body": message, "priority": priority}]
-
-            content_lines = []
-            for r in unread:
-                ts = time.strftime("%H:%M:%S", time.localtime(r["ts"]))
-                prio = r["priority"]
-                prio_tag = f" [{prio}]" if prio != "normal" else ""
-                content_lines.append(
-                    f"[{ts}] DM from {r['from_agent']} "
-                    f"⟨{_msg_ref(r['id'])}⟩{prio_tag}: "
-                    f"{_clip_push(r['body'])}"
-                )
-            content = "\n".join(content_lines)
-
-            outcome = await push_channel(
-                agent=to,
-                content=content,
-                meta={
-                    "from_agent": from_agent,
-                    "kind": "dm",
-                    "priority": "low",
-                    "drain_batch": "true" if len(unread) > 1 else "false",
-                },
-            )
-
-            if outcome.delivered:
-                # Do NOT mark the batch read on push. push_channel returning
-                # True only means the notification was written to the bound
-                # stream — not that the recipient surfaced it (a stale/
-                # non-surfacing stream still reports deliverable, which silently
-                # destroyed messages). The inbox is the source of truth;
-                # get_messages marks read only when the recipient genuinely
-                # pulls. We still clear is_idle (recipient is taking a turn) —
-                # which also prevents a re-push storm: subsequent low-prio sends
-                # see not-idle and queue instead of re-pushing the batch.
-                conn.execute(
-                    "UPDATE agents SET is_idle = 0 WHERE name = ?", (to,)
-                )
-                conn.commit()
-                # Stamp ONLY if the primary got it — the generation token is the
-                # primary's stream. An extra-only delivery must fall through to
-                # a full reprint (fail-safe), never a summary.
-                if outcome.primary:
-                    _stamp_pushed(conn, [r["id"] for r in unread], to)
-                return (
-                    f"Message sent to '{to}' (priority={priority}; idle wake "
-                    f"fired, drain batch of {len(unread)} item(s))."
+                    f"Message queued for '{to}' (priority={priority}; "
+                    f"reply-wake undeliverable — surfaces via their next "
+                    f"turn or the hold sweep)."
                 )
             return (
-                f"Message queued for '{to}' (priority={priority}; idle-wake "
-                f"push failed, will surface via Stop-hook auto-pull)."
+                f"Message queued for '{to}' (priority={priority}; "
+                f"wake-batched — rides their next turn, held at most "
+                f"{HOLD_MAX_SECONDS // 60} min)."
             )
 
         outcome = await push_channel(
@@ -2590,6 +2762,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # an extra-only delivery fails safe to a full reprint.
         if outcome.primary:
             _stamp_pushed(conn, [message_id], to)
+        if outcome.delivered:
+            _log_wake(conn, to,
+                      "urgent" if priority == "urgent" else "operator")
 
         # Do NOT mark the message read on push success. push_channel returning
         # True only means the notification was written to the bound stream — NOT
@@ -2637,20 +2812,17 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         scoped to a subset of activity, use `post` to a named channel
         instead. For a single recipient, use `send`.
 
-        Priority controls whether currently-connected agents are woken
-        from idle on receipt:
+        Wake-batching (card #59, operator-signed): low AND normal persist
+        to the feed without waking anyone — recipients catch up at their
+        next natural turn, held at most 10 minutes by the hold sweep.
+        Immediate wakes:
 
-        - "normal" (default): wake every connected agent. Use for things
-          everyone should see now.
-        - "low": persist to the broadcast feed only; do NOT wake anyone.
-          Use for EOD recaps, status updates, FYIs — anything that doesn't
-          need immediate attention. Agents pick it up via `get_broadcasts`
-          when they next look. Strongly preferred for informational
-          broadcasts to avoid distracting focused work.
-        - "urgent": wake every connected agent with priority="urgent"
-          surfaced in the rendered tag's meta so receivers can visually
-          triage. Use sparingly — urgent should mean "everyone needs to
-          stop what they're doing."
+        - "urgent": wake every connected recipient, unchanged. Use
+          sparingly — it should mean "everyone needs to stop what they're
+          doing."
+        - a broadcast whose `in_reply_to` targets something a recipient
+          said in their last turn wakes THAT ONE author immediately, any
+          priority — the thread stays fast without waking the squad.
 
         Args:
             from_agent: Your agent name.
@@ -2755,14 +2927,58 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         )
         conn.commit()
 
-        # Low-priority broadcasts go to the feed only; no wake. Recipients
-        # see them via Stop-hook auto-pull on next turn — don't advance
-        # any recipient cursors.
-        if priority in _NO_WAKE_PRIORITIES:
+        # Card #59: low AND normal broadcasts go to the feed only; no wake.
+        # Recipients catch up at their next natural turn, bounded by the
+        # rule-4 hold sweep — don't advance any recipient cursors. Rule 3
+        # carve-out: when this broadcast REPLIES to something an eligible
+        # recipient sent in their last turn, that ONE author is woken
+        # immediately — the thread stays fast without waking the squad.
+        if priority != "urgent" and from_agent not in _OPERATOR_SENDERS:
+            woken = ""
+            author = ""
+            if reply_ref:
+                try:
+                    tid = int(refs.parse_ref(reply_ref).get("id"))
+                    author_row = conn.execute(
+                        "SELECT from_agent FROM messages WHERE id = ?", (tid,)
+                    ).fetchone()
+                    author = author_row["from_agent"] if author_row else ""
+                except Exception:  # noqa: BLE001 — validated upstream
+                    author = ""
+            if (
+                author and author != from_agent
+                and _reply_wakes_author(conn, reply_ref, author)
+            ):
+                eligible = True
+                if audience:
+                    # Same membership gate as the fan-out below: a reply
+                    # must not wake someone the broadcast itself would not
+                    # reach (lapsed loan, muted, not a member).
+                    purge_expired_memberships(conn)
+                    eligible = bool(conn.execute(
+                        "SELECT 1 FROM squad_members WHERE squad = ? "
+                        "AND agent = ? AND muted = 0",
+                        (audience, author),
+                    ).fetchone())
+                if eligible:
+                    outcome = await push_channel(
+                        agent=author,
+                        content=f"BROADCAST from {from_agent} "
+                                f"⟨{_msg_ref(broadcast_id)}⟩: "
+                                f"{_clip_push(message)}",
+                        meta={"from_agent": from_agent, "kind": "broadcast",
+                              "priority": priority, "drain_batch": "false"},
+                    )
+                    if outcome.delivered:
+                        _log_wake(conn, author, "reply")
+                        woken = f"; reply-wake fired for {author}"
+            # The verbosity advisory rides the batched path too — size
+            # discipline is about the feed, not about whether a wake fired.
             return (
-                f"Broadcast posted (priority={priority}; no wake — "
-                f"agents will see it via get_broadcasts())."
-            )
+                f"Broadcast posted (priority={priority}; wake-batched — "
+                f"agents see it at their next turn or within "
+                f"{HOLD_MAX_SECONDS // 60} min{woken})."
+            ) + _verbosity_advisory(message)
 
         # BOTH delivery paths must filter or the fix is cosmetic. A broadcast
         # reaches an agent live here, AND via the Stop-hook cursor catch-up in
@@ -2912,6 +3128,10 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # Honest woke count — anyone we delivered a live wake to (primary or an
         # extra), distinct from the cursor-advance set above.
         woke = sum(1 for o in push_results.values() if o.delivered)
+        for a, o in push_results.items():
+            if o.delivered:
+                _log_wake(conn, a,
+                          "urgent" if priority == "urgent" else "operator")
         return (
             f"Broadcast posted (priority={priority}; "
             f"woke {woke}/{len(recipients)} connected agents)."
@@ -3076,11 +3296,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         """Post a message to a named channel.
 
         The channel must already exist (use `create_channel` first). Same
-        priority semantics as `broadcast`: "low" persists to channel
-        history without firing wake; "normal" wakes every connected
-        SUBSCRIBER of the channel; "urgent" ditto with the priority surfaced
-        in the rendered tag. Posting subscribes you; reading stays open to
-        everyone (delivery, not confidentiality).
+        wake-batching as `broadcast` (card #59): low and normal persist to
+        channel history without waking anyone — subscribers catch up at
+        their next turn; "urgent" wakes every connected SUBSCRIBER; a post
+        whose `in_reply_to` targets something a subscriber said in their
+        last turn wakes that one author immediately, any priority. Posting
+        subscribes you; reading stays open to everyone (delivery, not
+        confidentiality).
 
         For global messages every agent should see, use `broadcast`. For
         a single recipient, use `send`.
@@ -3146,11 +3368,47 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         )
         conn.commit()
 
-        if priority in _NO_WAKE_PRIORITIES:
+        # Card #59: low AND normal posts persist without waking anyone —
+        # subscribers catch up at their next turn. Rule 3 carve-out mirrors
+        # broadcast(): a post replying to something a SUBSCRIBED agent said
+        # in their last turn wakes that one author immediately.
+        if priority != "urgent" and from_agent not in _OPERATOR_SENDERS:
+            woken = ""
+            author = ""
+            if reply_ref:
+                try:
+                    tid = int(refs.parse_ref(reply_ref).get("id"))
+                    author_row = conn.execute(
+                        "SELECT from_agent FROM messages WHERE id = ?", (tid,)
+                    ).fetchone()
+                    author = author_row["from_agent"] if author_row else ""
+                except Exception:  # noqa: BLE001 — validated upstream
+                    author = ""
+            if (
+                author and author != from_agent
+                and _reply_wakes_author(conn, reply_ref, author)
+                and conn.execute(
+                    "SELECT 1 FROM channel_subscriptions WHERE agent = ? "
+                    "AND channel = ? AND subscribed = 1",
+                    (author, channel),
+                ).fetchone()
+            ):
+                outcome = await push_channel(
+                    agent=author,
+                    content=f"#{channel} from {from_agent} "
+                            f"⟨{_msg_ref(post_id)}⟩: {_clip_push(message)}",
+                    meta={"from_agent": from_agent, "kind": "post",
+                          "channel": channel, "priority": priority,
+                          "drain_batch": "false"},
+                )
+                if outcome.delivered:
+                    _log_wake(conn, author, "reply")
+                    woken = f"; reply-wake fired for {author}"
             return (
-                f"Posted to #{channel} (priority={priority}; no wake — "
-                f"subscribers will see it via get_channel_messages())."
-            )
+                f"Posted to #{channel} (priority={priority}; wake-batched — "
+                f"subscribers see it at their next turn or within "
+                f"{HOLD_MAX_SECONDS // 60} min{woken})."
+            ) + _verbosity_advisory(message)
 
         subscribers = {
             r["agent"]
@@ -3188,6 +3446,10 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 tg.start_soon(_push_one, agent)
 
         woke = sum(1 for o in push_results.values() if o.delivered)
+        for a, o in push_results.items():
+            if o.delivered:
+                _log_wake(conn, a,
+                          "urgent" if priority == "urgent" else "operator")
         # The receipt names its population (a string identical in a broken
         # world is a rendering, not evidence — spike-runtime, 2026-07-29).
         return (
@@ -3366,9 +3628,12 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # Only update if the agent row exists; touching a non-agent name
         # silently no-ops (consistent with touch_session's discipline).
         if mark_idle:
+            # prev_idle_at inherits the OLD last_idle_at (SQLite evaluates
+            # the RHS against the pre-update row), so the pair brackets the
+            # turn that just ended — rule 3's "last turn" bound.
             conn.execute(
-                "UPDATE agents SET is_idle = 1, last_idle_at = ? "
-                "WHERE name = ?",
+                "UPDATE agents SET is_idle = 1, prev_idle_at = last_idle_at, "
+                "last_idle_at = ? WHERE name = ?",
                 (now, agent_name),
             )
 
@@ -4754,6 +5019,7 @@ def main():
             async with anyio.create_task_group() as tg:
                 tg.start_soon(registry.run_reaper)
                 tg.start_soon(server._hub_url_rebind_sweep)  # type: ignore[attr-defined]
+                tg.start_soon(server._hub_hold_sweep)  # type: ignore[attr-defined]
                 try:
                     await server.run_streamable_http_async()
                 finally:

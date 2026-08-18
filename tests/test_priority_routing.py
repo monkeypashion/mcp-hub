@@ -1,9 +1,12 @@
 """Tests for priority-aware send/broadcast routing.
 
-The contract: priority controls whether the hub fires a channel-push wake.
-- "low":    inbox only, no wake
-- "normal": inbox + wake (default)
-- "urgent": inbox + wake (with priority="urgent" surfaced in meta)
+The contract (card #59, wake-batching): priority controls whether the hub
+fires a channel-push wake.
+- "low":    inbox only, wake-batched (next natural turn / hold sweep)
+- "normal": inbox only, wake-batched — same as low (default)
+- "urgent": inbox + immediate wake (priority="urgent" surfaced in meta)
+- exception: a direct reply to something the recipient sent in their last
+  turn wakes immediately regardless of priority (rule 3).
 
 These tests bypass the MCP transport layer and call tool functions directly
 via the FastMCP tool manager — that's enough to validate the routing logic
@@ -89,7 +92,7 @@ async def test_send_low_priority_skips_channel_push(server):
             {"from_agent": "alice", "to": "bob", "message": "fyi", "priority": "low"},
         )
     push.assert_not_called()
-    assert "no wake" in out.lower()
+    assert "wake-batched" in out.lower()
     assert "low" in out
 
 
@@ -101,7 +104,7 @@ async def test_broadcast_low_priority_skips_channel_push(server):
             {"scope": "fleet", "from_agent": "alice", "message": "EOD recap", "priority": "low"},
         )
     push.assert_not_called()
-    assert "no wake" in out.lower()
+    assert "wake-batched" in out.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -134,8 +137,10 @@ def _idle_helper_db(server):
 
 
 async def test_send_low_to_idle_recipient_fires_wake(server):
-    """Case 1 — the load-bearing test. Recipient is bound + flagged idle.
-    A low-prio DM must call push_channel (not just queue)."""
+    """Case 1 RETIRED by card #59 (wake-batching): a low-prio DM to a
+    bound, idle recipient QUEUES — it rides their next natural turn or the
+    hold sweep. The immediate idle wake this file was built around is the
+    exact per-message wake the operator's five rules remove."""
     import time as _t
 
     await _call_tool(server, "register", {"name": "alice", "project": "x"})
@@ -164,8 +169,8 @@ async def test_send_low_to_idle_recipient_fires_wake(server):
              "message": "soft ask", "priority": "low"},
         )
 
-    push.assert_called_once()
-    assert "idle wake" in out.lower()
+    push.assert_not_called()
+    assert "wake-batched" in out.lower()
 
 
 async def test_send_low_to_running_recipient_does_not_wake(server):
@@ -191,17 +196,15 @@ async def test_send_low_to_running_recipient_does_not_wake(server):
 
     push.assert_not_called()
     assert "queued" in out.lower()
-    assert "in a turn" in out.lower()
+    assert "wake-batched" in out.lower()
 
 
-async def test_send_low_to_long_idle_recipient_still_fires_wake(server):
-    """No decay on the idle flag — the registry binding is the liveness
-    gate, not the timestamp on last_idle_at. An agent that's been idle
-    for hours (operator left their Claude Code open overnight) but is
-    still bound (heartbeat daemon keeping ⚡ alive) should still receive
-    a low-prio idle wake. Earlier versions had a 30-min decay that
-    over-restricted this case."""
-    import time as _t
+async def test_long_idle_bound_recipient_is_delivered_by_the_hold_sweep(server):
+    """Card #59's replacement guarantee for the long-idle case: the send
+    itself no longer wakes, but a bound agent left idle for hours is still
+    DELIVERED to — the rule-4 hold sweep fires once the message ages past
+    the cap. The binding remains the liveness gate, exactly as before."""
+    from mcp_hub.server import HOLD_MAX_SECONDS
 
     await _call_tool(server, "register", {"name": "alice", "project": "x"})
     await _call_tool(server, "register", {"name": "bob", "project": "y"})
@@ -214,30 +217,29 @@ async def test_send_low_to_long_idle_recipient_still_fires_wake(server):
 
     registry.bind("bob", _FakeSess())
 
-    # Bob has been idle for 4 hours — old last_idle_at, but still bound.
-    conn = _idle_helper_db(server)
-    conn.execute(
-        "UPDATE agents SET is_idle = 1, last_idle_at = ? WHERE name = ?",
-        (_t.time() - 4 * 60 * 60, "bob"),
-    )
-    conn.commit()
-
     with patch.object(registry, "push", AsyncMock(return_value=True)) as push:
-        out = await _call_tool(
+        await _call_tool(
             server, "send",
             {"from_agent": "alice", "to": "bob",
              "message": "soft ask", "priority": "low"},
         )
+        push.assert_not_called()
 
-    # Wake fires regardless of how long bob has been idle.
+        conn = _idle_helper_db(server)
+        conn.execute("UPDATE messages SET ts = ts - ?",
+                     (HOLD_MAX_SECONDS + 60,))
+        conn.commit()
+        fired = await server._hub_hold_sweep_pass()
+
+    assert fired == 1, "the hold sweep did not deliver to the idle agent"
     push.assert_called_once()
-    assert "idle wake" in out.lower()
 
 
-async def test_send_low_to_idle_drain_batches_unread(server):
-    """When the wake fires, ALL queued unread DMs deliver in one channel
-    event. Avoids wake-storming when multiple low-prio sends land in
-    quick succession against an idle recipient."""
+async def test_reply_wake_drain_batches_unread_across_senders(server):
+    """When a card #59 reply-wake fires, ALL queued unread DMs — from
+    every sender — deliver in one channel event, in ts order. The Case 1
+    drain-batch shape survives the wake that carried it; wake-storming
+    stays impossible."""
     import time as _t
 
     await _call_tool(server, "register", {"name": "alice", "project": "x"})
@@ -252,10 +254,18 @@ async def test_send_low_to_idle_drain_batches_unread(server):
 
     registry.bind("bob", _FakeSess())
 
-    # Pre-seed bob's inbox with unread DMs that didn't wake (e.g. arrived
-    # while bob was running). These should be folded into the drain batch
-    # when the next low-prio send finds bob idle.
+    # bob asks alice something (his current turn), then his Stop hook
+    # marks him idle — the last-turn bound rule 3 wakes against.
+    await _call_tool(server, "send",
+                     {"from_agent": "bob", "to": "alice", "message": "q?"})
     conn = _idle_helper_db(server)
+    bob_mid = conn.execute(
+        "SELECT MAX(id) AS m FROM messages WHERE from_agent = 'bob'"
+    ).fetchone()["m"]
+    await _call_tool(server, "get_messages",
+                     {"agent_name": "bob", "bind": False, "mark_idle": True})
+
+    # Unread DMs that arrived without waking bob (wake-batched).
     conn.execute(
         "INSERT INTO messages (ts, from_agent, to_agent, body, priority, read) "
         "VALUES (?, ?, ?, ?, ?, 0)",
@@ -266,17 +276,11 @@ async def test_send_low_to_idle_drain_batches_unread(server):
         "VALUES (?, ?, ?, ?, ?, 0)",
         (_t.time() - 20, "carol", "bob", "earlier-2", "low"),
     )
-    # Now flip bob to idle
-    conn.execute(
-        "UPDATE agents SET is_idle = 1, last_idle_at = ? WHERE name = ?",
-        (_t.time(), "bob"),
-    )
     conn.commit()
 
     captured = {}
 
     async def _capture_push(name, notification):
-        # FastMCP / pydantic notification — pull the params dict out
         params = getattr(notification, "params", None)
         if params is None and isinstance(notification, dict):
             params = notification.get("params")
@@ -288,19 +292,18 @@ async def test_send_low_to_idle_drain_batches_unread(server):
         out = await _call_tool(
             server, "send",
             {"from_agent": "alice", "to": "bob",
-             "message": "third-and-current", "priority": "low"},
+             "message": "third-and-current",
+             "in_reply_to": f"hub.msg/1?id={bob_mid}"},
         )
 
     assert captured["name"] == "bob"
     content = captured["params"]["content"]
-    # All three messages should be in the batched delivery
     assert "earlier-1" in content
     assert "earlier-2" in content
     assert "third-and-current" in content
-    # Drain batch is flagged in meta
+    assert content.index("earlier-1") < content.index("third-and-current")
     assert captured["params"]["meta"].get("drain_batch") == "true"
-    # Output mentions the batch size
-    assert "drain batch of 3" in out.lower()
+    assert "reply-wake fired" in out.lower()
 
 
 async def test_live_push_meta_always_carries_drain_batch_false(server):
@@ -330,19 +333,21 @@ async def test_live_push_meta_always_carries_drain_batch_false(server):
         return True
 
     with patch.object(registry, "push", side_effect=_capture_push):
+        # urgent on all three: card #59 batches low/normal, and this test
+        # is about the META of a push that fires, not about when one does.
         await _call_tool(server, "send", {
             "from_agent": "alice", "to": "bob",
-            "message": "direct", "priority": "normal"})
+            "message": "direct", "priority": "urgent"})
         await _call_tool(server, "broadcast", {
             "from_agent": "alice", "message": "wide",
-            "priority": "normal", "scope": "fleet"})
+            "priority": "urgent", "scope": "fleet"})
         await _call_tool(server, "create_channel", {
             "name": "probe-ch", "created_by": "alice"})
         await _call_tool(server, "subscribe_channel", {
             "name": "bob", "channel": "probe-ch"})
         await _call_tool(server, "post", {
             "from_agent": "alice", "channel": "probe-ch",
-            "message": "topical", "priority": "normal"})
+            "message": "topical", "priority": "urgent"})
 
     kinds = {p["meta"]["kind"] for _, p in captured}
     assert kinds == {"dm", "broadcast", "post"}, (
@@ -354,11 +359,10 @@ async def test_live_push_meta_always_carries_drain_batch_false(server):
 
 
 async def test_idle_wake_clears_is_idle_atomically(server):
-    """After a successful drain-batch wake, is_idle must be cleared.
-    Otherwise concurrent senders would all fire wake at the same idle
-    state — the cleared flag is the gate."""
-    import time as _t
-
+    """After a successful drain-batch wake, is_idle must be cleared —
+    otherwise concurrent wakes would all fire at the same idle state. The
+    property moved with the wake: under card #59 the batch wake fires on a
+    rule-3 reply (and the hold sweep), not on every low send."""
     await _call_tool(server, "register", {"name": "alice", "project": "x"})
     await _call_tool(server, "register", {"name": "bob", "project": "y"})
 
@@ -370,18 +374,24 @@ async def test_idle_wake_clears_is_idle_atomically(server):
 
     registry.bind("bob", _FakeSess())
 
+    # bob sends (his turn), then idles — the reply target for rule 3.
+    await _call_tool(server, "send",
+                     {"from_agent": "bob", "to": "alice", "message": "q?"})
     conn = _idle_helper_db(server)
-    conn.execute(
-        "UPDATE agents SET is_idle = 1, last_idle_at = ? WHERE name = ?",
-        (_t.time(), "bob"),
-    )
-    conn.commit()
+    bob_mid = conn.execute(
+        "SELECT MAX(id) AS m FROM messages WHERE from_agent = 'bob'"
+    ).fetchone()["m"]
+    await _call_tool(server, "get_messages",
+                     {"agent_name": "bob", "bind": False, "mark_idle": True})
+    assert conn.execute(
+        "SELECT is_idle FROM agents WHERE name = 'bob'"
+    ).fetchone()["is_idle"] == 1
 
     with patch.object(registry, "push", AsyncMock(return_value=True)):
         await _call_tool(
             server, "send",
-            {"from_agent": "alice", "to": "bob",
-             "message": "soft ask", "priority": "low"},
+            {"from_agent": "alice", "to": "bob", "message": "the answer",
+             "in_reply_to": f"hub.msg/1?id={bob_mid}"},
         )
 
     row = conn.execute(
@@ -563,7 +573,11 @@ async def test_touch_session_clears_is_idle(server):
 # ---------------------------------------------------------------------------
 
 
-async def test_send_normal_priority_pushes_with_meta(server):
+async def test_send_normal_priority_queues_wake_batched(server):
+    """Card #59: normal is no longer an immediate wake — it queues like
+    low, rides the recipient's next turn, and the hold sweep bounds the
+    wait. The urgent test below keeps the push-meta coverage this test
+    used to carry."""
     registry = server._hub_registry  # type: ignore[attr-defined]
 
     class _FakeSess:
@@ -572,16 +586,12 @@ async def test_send_normal_priority_pushes_with_meta(server):
 
     registry.bind("bob", _FakeSess())
     with patch.object(registry, "push", AsyncMock(return_value=True)) as push:
-        await _call_tool(
+        out = await _call_tool(
             server, "send",
             {"from_agent": "alice", "to": "bob", "message": "hi"},  # default priority
         )
-    push.assert_called_once()
-    _, kwargs = push.call_args
-    notification = kwargs.get("notification") or push.call_args.args[1]
-    # Verify priority="normal" is in the channel notification's meta
-    assert notification.params["meta"]["priority"] == "normal"
-    assert notification.params["meta"]["from_agent"] == "alice"
+    push.assert_not_called()
+    assert "wake-batched" in out.lower()
 
 
 async def test_send_urgent_priority_pushes_with_urgent_in_meta(server):
@@ -1141,7 +1151,8 @@ async def test_broadcast_push_success_alone_does_not_silence_the_catch_up(server
     with patch.object(registry, "push", side_effect=selective_push):
         await _call_tool(
             server, "broadcast",
-            {"scope": "fleet", "from_agent": "publisher", "message": "fanout test"},
+            {"scope": "fleet", "from_agent": "publisher",
+             "message": "fanout test", "priority": "urgent"},
         )
 
     # We didn't register publisher; treat alice and bob as recipients.
@@ -1427,7 +1438,8 @@ async def test_create_channel_then_post(server):
     with patch.object(registry, "push", AsyncMock(return_value=False)) as push:
         out = await _call_tool(
             server, "post",
-            {"from_agent": "alice", "channel": "deploys", "message": "shipping"},
+            {"from_agent": "alice", "channel": "deploys",
+             "message": "shipping", "priority": "urgent"},
         )
     push.assert_called_once()
     # Verify the channel is in the meta on the rendered tag
@@ -1465,7 +1477,7 @@ async def test_post_low_priority_skips_wake(server):
             },
         )
     push.assert_not_called()
-    assert "no wake" in out.lower()
+    assert "wake-batched" in out.lower()
 
 
 async def test_post_rejects_invalid_priority(server):

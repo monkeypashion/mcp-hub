@@ -100,7 +100,7 @@ async def test_broadcast_fans_out_in_parallel(server):
                 "scope": "fleet",
                 "from_agent": "sender",
                 "message": "hello fleet",
-                "priority": "normal",
+                "priority": "urgent",
             },
         )
         elapsed = time.monotonic() - t0
@@ -142,7 +142,7 @@ async def test_post_fans_out_in_parallel(server):
                 "from_agent": "sender",
                 "channel": "deploys",
                 "message": "rollout starting",
-                "priority": "normal",
+                "priority": "urgent",
             },
         )
         elapsed = time.monotonic() - t0
@@ -202,7 +202,8 @@ async def test_broadcast_records_pending_only_for_successful_pushes(server):
     with patch.object(registry, "push", side_effect=_mixed_push):
         out = await _call_tool(
             server, "broadcast",
-            {"scope": "fleet", "from_agent": "sender", "message": "x", "priority": "normal"},
+            {"scope": "fleet", "from_agent": "sender", "message": "x",
+             "priority": "urgent"},
         )
 
     assert "woke 2/3" in out

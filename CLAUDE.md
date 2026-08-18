@@ -111,15 +111,15 @@ ref is the message's identity in the lineage graph.
 
 When in doubt: `send` for one agent, `post` for a topic, `broadcast` for your squad.
 
-### Priority
+### Priority — wake-batching (card #59, operator-signed 2026-08-18)
 
-`send`, `post`, and `broadcast` accept a `priority` of `"low"` | `"normal"` | `"urgent"`:
+`send`, `post`, and `broadcast` accept a `priority` of `"low"` | `"normal"` | `"urgent"`. **Low and normal no longer fire their own wake** — the message queues and rides the recipient's next natural turn, and the **hold sweep** wakes any bound agent whose queued traffic ages past **10 minutes** (`HOLD_MAX_SECONDS`), so nothing rots in a quiet lane. Nothing is lost or reordered within a sender's stream. Two things wake immediately:
 
-- `"low"` — queue-only when the recipient is in a turn (don't interrupt focused work). For DMs only, fires wake when the recipient is idle (Stop hook marks idle at turn end; any tool call clears it). Channel posts and broadcasts at low stay queue-only regardless of recipient state. Wake delivery on idle DMs is drain-batched: ALL queued unread DMs surface in one channel event so a flurry of low-prio sends doesn't wake the recipient repeatedly.
-- `"normal"` — wake + inbox (default)
-- `"urgent"` — wake + inbox + flagged in the rendered tag's meta (use sparingly)
+- `"urgent"` — wake + inbox + flagged in the rendered tag's meta, unchanged (use sparingly: "blocking on you" / "production incident")
+- **the operator** — messages from `operator-console`/`operator` wake immediately at any priority (rule 2a: the operator waiting on a lane IS the blocking case)
+- **a reply** — any priority whose `in_reply_to` targets a message the recipient sent in **their last turn** (bounded by their idle marks, `prev_idle_at`) wakes its author at once; an active conversation never slows. For posts/broadcasts this wakes just that one author, never the room. **Copy the ⟨ref⟩ into `in_reply_to` when you answer someone — it is the latency lever now, not just lineage.**
 
-For low-prio DMs, the registry binding is the liveness gate — if the agent's session crashes, the heartbeat daemon dies and the activity-based reaper drops the binding. So `is_idle=1` on a bound agent is meaningful indefinitely; long-idle bound agents still receive Case 1 wakes correctly.
+Low vs normal still signals *reading* priority to the recipient; delivery-wise they queue the same. The Case 1 low-to-idle immediate wake this replaces is retired. Every delivered wake is recorded with its reason (`urgent` | `operator` | `reply` | `hold`) in `wake_log` — rule 5's server-side witness for the before/after ledger (fleet wake count halves within a week = success).
 
 ## Focus mode — the third state
 

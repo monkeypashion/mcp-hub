@@ -113,7 +113,8 @@ async def test_a_push_into_a_stream_that_never_rendered_is_NOT_marked_seen(
     code advanced the cursor here, and the broadcast was gone for good."""
     stream = await _pair(server)
     await _call(server, "broadcast",
-                {"from_agent": "sender", "message": "the one that went missing"})
+                {"from_agent": "sender", "message": "the one that went missing",
+                    "priority": "urgent"})
     assert stream.sent, "the fixture never pushed — this test proves nothing"
 
     out = await _drain(server)
@@ -127,7 +128,8 @@ async def test_the_cursor_does_not_move_at_push_time(server, tmp_path):
     the scoping tests read it directly."""
     await _pair(server)
     before = _row(tmp_path, "listener")["cursor"]
-    await _call(server, "broadcast", {"from_agent": "sender", "message": "hi"})
+    await _call(server, "broadcast", {"from_agent": "sender", "message": "hi",
+        "priority": "urgent"})
     after = _row(tmp_path, "listener")
     assert after["cursor"] == before, \
         "the cursor advanced on push success — the defect is still here"
@@ -147,7 +149,7 @@ async def test_an_agent_that_PROVED_it_rendered_is_not_shown_it_again(server):
     """
     await _pair(server)
     await _call(server, "broadcast",
-                {"from_agent": "sender", "message": "seen live"})
+                {"from_agent": "sender", "message": "seen live", "priority": "urgent"})
     server._hub_registry.wake_ack("listener")      # the agent acted on the wake
 
     out = await _drain(server)
@@ -158,7 +160,7 @@ async def test_the_promotion_actually_moves_the_cursor(server, tmp_path):
     """Not merely 'returns nothing' — an empty return is also what a stalled
     cursor with no new rows looks like."""
     await _pair(server)
-    await _call(server, "broadcast", {"from_agent": "sender", "message": "x"})
+    await _call(server, "broadcast", {"from_agent": "sender", "message": "x", "priority": "urgent"})
     pending = _row(tmp_path, "listener")["pending"]
     server._hub_registry.wake_ack("listener")
     await _drain(server)
@@ -176,7 +178,8 @@ async def test_a_REBIND_between_push_and_drain_refuses_the_promotion(server):
     """
     await _pair(server)
     await _call(server, "broadcast",
-                {"from_agent": "sender", "message": "sent to the old session"})
+                {"from_agent": "sender", "message": "sent to the old session",
+                    "priority": "urgent"})
     server._hub_registry.bind("listener", _Stream())   # relaunched: new generation
 
     out = await _drain(server)
@@ -191,7 +194,8 @@ async def test_an_unbound_agent_is_never_promoted(server):
                 {"name": "sender", "project": "org/a", "squads": "team"})
     await _call(server, "register",
                 {"name": "drifted", "project": "org/b", "squads": "team"})
-    await _call(server, "broadcast", {"from_agent": "sender", "message": "catch up"})
+    await _call(server, "broadcast", {"from_agent": "sender", "message": "catch up",
+        "priority": "urgent"})
     assert "catch up" in await _drain(server, "drifted")
 
 
@@ -209,7 +213,7 @@ async def test_the_drains_OWN_ack_does_not_authorise_its_own_promotion(server):
     """
     stream = await _pair(server)
     await _call(server, "broadcast",
-                {"from_agent": "sender", "message": "nobody acked this"})
+                {"from_agent": "sender", "message": "nobody acked this", "priority": "urgent"})
     assert stream.sent
     out = await _drain(server)
     assert "nobody acked this" in out, \
@@ -223,7 +227,8 @@ async def test_a_muted_squads_broadcast_is_still_filtered(server):
     suppresses BOTH delivery paths and this adds machinery to one of them."""
     await _pair(server)
     await _call(server, "mute_squad", {"name": "listener", "squad": "team"})
-    await _call(server, "broadcast", {"from_agent": "sender", "message": "muted"})
+    await _call(server, "broadcast", {"from_agent": "sender", "message": "muted",
+        "priority": "urgent"})
     assert "muted" not in await _drain(server)
 
 
@@ -231,7 +236,8 @@ async def test_a_second_drain_returns_nothing(server):
     """Read-marks-seen still holds on the catch-up path: whatever the promotion
     did or didn't do, a drain that RETURNED a row has shown it."""
     await _pair(server)
-    await _call(server, "broadcast", {"from_agent": "sender", "message": "once"})
+    await _call(server, "broadcast", {"from_agent": "sender", "message": "once",
+        "priority": "urgent"})
     assert "once" in await _drain(server)
     assert await _drain(server) == "", "the same broadcast surfaced twice"
 
@@ -262,7 +268,7 @@ async def test_a_REBIND_DURING_the_push_is_not_stamped_with_the_new_generation(
 
     stream.send_notification = rebind_mid_push
     await _call(server, "broadcast",
-                {"from_agent": "sender", "message": "raced by a relaunch"})
+                {"from_agent": "sender", "message": "raced by a relaunch", "priority": "urgent"})
     assert stream.sent, "the injection point was never reached"
 
     # The relaunched agent then does ordinary work, which acks. This line is
@@ -304,14 +310,15 @@ async def test_an_id_pushed_to_a_DEAD_generation_is_not_promoted_by_a_later_one(
     reg = server._hub_registry
 
     await _call(server, "broadcast",
-                {"from_agent": "sender", "message": "pushed to the doomed stream"})
+                {"from_agent": "sender", "message": "pushed to the doomed stream",
+                    "priority": "urgent"})
 
     # The deploy: that stream dies without ever rendering, and the agent comes
     # back on a new session. No ack in between — nothing proved anything.
     reg.bind("listener", _Stream())
 
     await _call(server, "broadcast",
-                {"from_agent": "sender", "message": "pushed to the live one"})
+                {"from_agent": "sender", "message": "pushed to the live one", "priority": "urgent"})
     reg.wake_ack("listener")          # the new session does ordinary work
 
     out = await _drain(server)
@@ -329,7 +336,8 @@ async def test_a_run_within_ONE_generation_is_still_promoted_whole(server):
     await _pair(server)
     for i in range(3):
         await _call(server, "broadcast",
-                    {"from_agent": "sender", "message": f"burst {i}"})
+                    {"from_agent": "sender", "message": f"burst {i}",
+                     "priority": "urgent"})
     server._hub_registry.wake_ack("listener")
     assert await _drain(server) == "", "a single-generation run was not promoted"
 
@@ -341,13 +349,16 @@ async def test_the_stale_pending_stops_blocking_once_the_drain_catches_up(server
     suppression for that agent forever."""
     await _pair(server)
     reg = server._hub_registry
-    await _call(server, "broadcast", {"from_agent": "sender", "message": "old gen"})
+    await _call(server, "broadcast", {"from_agent": "sender", "message": "old gen",
+        "priority": "urgent"})
     reg.bind("listener", _Stream())
-    await _call(server, "broadcast", {"from_agent": "sender", "message": "new gen"})
+    await _call(server, "broadcast", {"from_agent": "sender", "message": "new gen",
+        "priority": "urgent"})
     reg.wake_ack("listener")
     assert "old gen" in await _drain(server)          # the catch-up happens
 
-    await _call(server, "broadcast", {"from_agent": "sender", "message": "after"})
+    await _call(server, "broadcast", {"from_agent": "sender", "message": "after",
+        "priority": "urgent"})
     reg.wake_ack("listener")
     assert await _drain(server) == "", \
         "the agent is stuck re-reading live broadcasts after one deploy"
@@ -367,7 +378,8 @@ async def test_a_JUST_PROMOTED_agent_starts_a_clean_run_on_the_next_generation(
     """
     await _pair(server)
     reg = server._hub_registry
-    await _call(server, "broadcast", {"from_agent": "sender", "message": "first"})
+    await _call(server, "broadcast", {"from_agent": "sender", "message": "first",
+        "priority": "urgent"})
     reg.wake_ack("listener")
     await _drain(server)                                  # promote: cursor == pending
     row = _row(tmp_path, "listener")
@@ -375,7 +387,8 @@ async def test_a_JUST_PROMOTED_agent_starts_a_clean_run_on_the_next_generation(
         f"fixture did not reach the == boundary: {tuple(row)}"
 
     reg.bind("listener", _Stream())                       # new generation
-    await _call(server, "broadcast", {"from_agent": "sender", "message": "second"})
+    await _call(server, "broadcast", {"from_agent": "sender", "message": "second",
+        "priority": "urgent"})
     reg.wake_ack("listener")
     assert await _drain(server) == "", \
         "a clean cursor was mistaken for an outstanding run — suppression is dead"

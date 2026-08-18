@@ -81,7 +81,7 @@ async def test_send_fans_out_to_both_sessions(server):
 
     await _call_tool(
         server, "send",
-        {"from_agent": "alice", "to": "pm", "message": "wake up"},
+        {"from_agent": "alice", "to": "pm", "message": "wake up", "priority": "urgent"},
     )
 
     assert len(tmux.sends) == 1, "the demoted session must still be woken"
@@ -129,7 +129,7 @@ async def test_dead_extra_pruned_at_push_time(server):
 
     await _call_tool(
         server, "send",
-        {"from_agent": "alice", "to": "pm", "message": "hi"},
+        {"from_agent": "alice", "to": "pm", "message": "hi", "priority": "urgent"},
     )
 
     assert len(live.sends) == 1          # primary got it
@@ -158,7 +158,7 @@ async def test_stamp_skipped_when_only_extra_delivers(server):
 
     await _call_tool(
         server, "send",
-        {"from_agent": "alice", "to": "pm", "message": "hi"},
+        {"from_agent": "alice", "to": "pm", "message": "hi", "priority": "urgent"},
     )
     assert len(live.sends) == 1, "the live extra should still get the wake"
 
@@ -184,7 +184,7 @@ async def test_stamp_applied_when_primary_delivers(server):
 
     await _call_tool(
         server, "send",
-        {"from_agent": "alice", "to": "pm", "message": "hi"},
+        {"from_agent": "alice", "to": "pm", "message": "hi", "priority": "urgent"},
     )
     conn = _server_db(server)
     row = conn.execute(
@@ -212,7 +212,8 @@ async def test_broadcast_cursor_not_advanced_on_extra_only(server):
 
     await _call_tool(
         server, "broadcast",
-        {"scope": "fleet", "from_agent": "alice", "message": "fleet-wide"},
+        {"scope": "fleet", "from_agent": "alice", "message": "fleet-wide",
+         "priority": "urgent"},
     )
     assert len(live.sends) == 1, "the live extra should still be woken"
 
@@ -247,7 +248,8 @@ async def test_broadcast_records_pending_when_primary_delivers(server):
 
     await _call_tool(
         server, "broadcast",
-        {"scope": "fleet", "from_agent": "alice", "message": "fleet-wide"},
+        {"scope": "fleet", "from_agent": "alice", "message": "fleet-wide",
+         "priority": "urgent"},
     )
     after = conn.execute(q).fetchone()
     assert after["pending"] > before["pending"], "the delivered push was not recorded"

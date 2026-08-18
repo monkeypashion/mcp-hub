@@ -280,7 +280,7 @@ async def test_old_client_sentinel_keeps_the_legacy_inference(server):
     inference — so the migration has no flag day. This pin is what makes
     deleting the legacy branch a deliberate act later, not an accident."""
     registry = await _setup_dm(server)
-    await _send(server)
+    await _send(server, priority="urgent")  # urgent still pushes (card #59)
     registry.wake_ack("bob")
 
     out = await _call(
@@ -361,7 +361,8 @@ async def test_receipted_broadcast_drains_as_one_line_and_advances_cursor(
 ):
     stream = await _bc_pair(server)
     await _call(server, "broadcast",
-                {"from_agent": "sender", "message": "seen live\nseen tail"})
+                {"from_agent": "sender", "message": "seen live\nseen tail",
+                 "priority": "urgent"})
     assert stream.sent, "the fixture never pushed — this test proves nothing"
     mid = _last_msg_id(tmp_path)
 
@@ -392,7 +393,8 @@ async def test_legacy_pending_jump_absorbs_queue_only_rows_below_it(
                 {"from_agent": "sender", "message": "quiet low note",
                  "priority": "low"})
     await _call(server, "broadcast",
-                {"from_agent": "sender", "message": "loud normal one"})
+                {"from_agent": "sender", "message": "loud normal one",
+                 "priority": "urgent"})
     server._hub_registry.wake_ack("listener")
 
     out = await _call(server, "get_broadcasts_for_agent",
@@ -416,7 +418,8 @@ async def test_receipt_mode_surfaces_the_queue_only_row_the_jump_ate(
                 {"from_agent": "sender", "message": "quiet low note",
                  "priority": "low"})
     await _call(server, "broadcast",
-                {"from_agent": "sender", "message": "loud normal one"})
+                {"from_agent": "sender", "message": "loud normal one",
+                 "priority": "urgent"})
     pushed_id = _last_msg_id(tmp_path)
     server._hub_registry.wake_ack("listener")
 

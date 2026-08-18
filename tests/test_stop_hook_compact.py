@@ -60,7 +60,12 @@ async def _setup(server, *, bind: bool = True):
     return registry
 
 
-async def _send(server, body: str = BODY, pushed: bool = True):
+async def _send(server, body: str = BODY, pushed: bool = True,
+                priority: str = "urgent"):
+    # urgent, since card #59: low/normal no longer push at send time, and
+    # every test in this file is about the fate of a message that WAS
+    # pushed live. Urgent is the priority that still does that
+    # unconditionally, so the old premises hold unchanged.
     with patch.object(
         server._hub_registry,  # type: ignore[attr-defined]
         "push",
@@ -69,7 +74,8 @@ async def _send(server, body: str = BODY, pushed: bool = True):
         return await _call_tool(
             server,
             "send",
-            {"from_agent": "alice", "to": "bob", "message": body},
+            {"from_agent": "alice", "to": "bob", "message": body,
+             "priority": priority},
         )
 
 
@@ -208,7 +214,8 @@ async def test_bulk_beyond_budget_is_summarised_but_present(server):
     await _setup(server, bind=False)  # unbound => nothing counts as live-seen
     total = COMPACT_FULL_MESSAGES + 3
     for i in range(total):
-        await _send(server, body=f"msg{i} first line\nmsg{i} second line", pushed=False)
+        await _send(server, priority="normal", pushed=False,
+                    body=f"msg{i} first line\nmsg{i} second line")
 
     out = await _call_tool(
         server, "get_messages", {"agent_name": "bob", "bind": False, "compact": True}
@@ -260,7 +267,7 @@ async def test_capped_bulk_also_gets_a_footer(server):
     had no way to know text had been dropped, or where to find it."""
     await _setup(server, bind=False)
     for i in range(COMPACT_FULL_MESSAGES + 2):
-        await _send(server, body=f"msg{i} first\nmsg{i} second", pushed=False)
+        await _send(server, priority="normal", body=f"msg{i} first\nmsg{i} second", pushed=False)
 
     out = await _call_tool(
         server, "get_messages", {"agent_name": "bob", "bind": False, "compact": True}
@@ -296,7 +303,7 @@ async def test_full_budget_bodies_are_clipped_at_the_char_limit(server):
     head = "HEAD-MARKER " + "x" * 100
     tail = "TAIL-MARKER-THAT-MUST-BE-CLIPPED"
     body = head + "\n" + ("filler " * ((COMPACT_FULL_BODY_CHARS // 7) + 40)) + "\n" + tail
-    await _send(server, body=body, pushed=False)
+    await _send(server, priority="normal", body=body, pushed=False)
 
     out = await _call_tool(
         server, "get_messages", {"agent_name": "bob", "bind": False, "compact": True}
@@ -316,7 +323,7 @@ async def test_short_bodies_inside_budget_are_untouched(server):
     """A body under the clip limit renders byte-identical inside the budget —
     no clip marker, no footer noise for the quiet-day case."""
     await _setup(server, bind=False)
-    await _send(server, body="short body\nsecond line", pushed=False)
+    await _send(server, priority="normal", body="short body\nsecond line", pushed=False)
 
     out = await _call_tool(
         server, "get_messages", {"agent_name": "bob", "bind": False, "compact": True}

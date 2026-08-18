@@ -343,7 +343,8 @@ async def test_send_push_render_is_clipped(server):
     await _call_tool(server, "register", {"name": "bob", "project": "p"})
     long = "headline\n" + "x" * 4000
     content = await _captured_push_content(
-        server, "send", {"from_agent": "alice", "to": "bob", "message": long},
+        server, "send", {"from_agent": "alice", "to": "bob", "message": long,
+                         "priority": "urgent"},
     )
     assert len(content) < 1000
     assert "[…clipped] (full text: get_history)" in content
@@ -354,7 +355,8 @@ async def test_broadcast_push_render_is_clipped(server):
     await _call_tool(server, "register", {"name": "bob", "project": "p"})
     long = "headline\n" + "y" * 4000
     content = await _captured_push_content(
-        server, "broadcast", {"scope": "fleet", "from_agent": "alice", "message": long},
+        server, "broadcast", {"scope": "fleet", "from_agent": "alice",
+                              "message": long, "priority": "urgent"},
     )
     assert len(content) < 1000
     assert "(full text: get_history)" in content
@@ -364,7 +366,8 @@ async def test_short_push_render_untouched(server):
     await _call_tool(server, "register", {"name": "alice", "project": "p"})
     await _call_tool(server, "register", {"name": "bob", "project": "p"})
     content = await _captured_push_content(
-        server, "send", {"from_agent": "alice", "to": "bob", "message": "short one"},
+        server, "send", {"from_agent": "alice", "to": "bob",
+                         "message": "short one", "priority": "urgent"},
     )
     # W3: the ⟨ref⟩ is the lineage handle — a reply can only cite a ref the
     # sender has SEEN, so every rendered message carries its own.
@@ -378,7 +381,8 @@ async def test_inbox_keeps_full_body_after_clipped_push(server):
     await _call_tool(server, "register", {"name": "bob", "project": "p"})
     long = "headline\n" + "z" * (COMPACT_FULL_BODY_CHARS * 3)
     await _captured_push_content(
-        server, "send", {"from_agent": "alice", "to": "bob", "message": long},
+        server, "send", {"from_agent": "alice", "to": "bob", "message": long,
+                         "priority": "urgent"},
     )
     history = await _call_tool(server, "get_history", {"agent_or_channel": "bob"})
     assert "z" * (COMPACT_FULL_BODY_CHARS * 3) in history

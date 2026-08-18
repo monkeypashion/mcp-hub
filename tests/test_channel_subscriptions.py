@@ -79,7 +79,8 @@ async def test_normal_post_wakes_only_subscribers(server):
     await _call(
         server,
         "post",
-        {"from_agent": "poster", "channel": "topic", "message": "hello"},
+        {"from_agent": "poster", "channel": "topic", "message": "hello",
+         "priority": "urgent"},
     )
     assert listener.sends, "subscriber must be woken"
     assert not bystander.sends, "non-subscriber must NOT be woken — the #16 fix"
@@ -95,7 +96,8 @@ async def test_receipt_names_subscribers_not_agents(server):
     out = await _call(
         server,
         "post",
-        {"from_agent": "poster", "channel": "topic", "message": "hello"},
+        {"from_agent": "poster", "channel": "topic", "message": "hello",
+         "priority": "urgent"},
     )
     # A receipt that reads the same in a broken world is a rendering, not
     # evidence (spike-runtime, backlog #14): name the population.
@@ -108,13 +110,15 @@ async def test_creator_and_poster_are_auto_subscribed(server):
     await _agent(server, "chime")
     await _call(server, "create_channel", {"name": "topic", "created_by": "maker"})
     await _call(
-        server, "post", {"from_agent": "chime", "channel": "topic", "message": "in"}
+        server, "post", {"from_agent": "chime", "channel": "topic", "message": "in",
+         "priority": "urgent"}
     )
     await _agent(server, "maker2")  # third seat, only ever the sender
     out = await _call(
         server,
         "post",
-        {"from_agent": "maker2", "channel": "topic", "message": "who hears?"},
+        {"from_agent": "maker2", "channel": "topic", "message": "who hears?",
+         "priority": "urgent"},
     )
     # maker (creator) and chime (past poster) are both subscribed.
     assert "2/2" in out or "2 subscriber" in out or "woke 2" in out
@@ -132,12 +136,14 @@ async def test_unsubscribe_stops_wakes_and_resubscribe_restores(server):
         {"name": "listener", "channel": "topic", "subscribed": False},
     )
     await _call(
-        server, "post", {"from_agent": "poster", "channel": "topic", "message": "a"}
+        server, "post", {"from_agent": "poster", "channel": "topic", "message": "a",
+         "priority": "urgent"}
     )
     assert not listener.sends
     await _call(server, "subscribe_channel", {"name": "listener", "channel": "topic"})
     await _call(
-        server, "post", {"from_agent": "poster", "channel": "topic", "message": "b"}
+        server, "post", {"from_agent": "poster", "channel": "topic", "message": "b",
+         "priority": "urgent"}
     )
     assert listener.sends
 
