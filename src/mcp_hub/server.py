@@ -2524,14 +2524,68 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         return f"Squad '{squad}' {verb} for '{name}'."
 
     @mcp.tool()
-    def list_squads(agent: str = "") -> str:
-        """Show squads and their members, or one agent's memberships.
+    def list_squads(agent: str = "", squad: str = "") -> str:
+        """Show squads and member counts, one agent's memberships, or one
+        squad's full roster with live presence.
 
         Args:
             agent: Optional — show only this agent's squads, with mute state.
+            squad: Optional — show this squad's members with presence
+                (🟢 online, ⚡ wakeable now, 💤 idle, 🔕 focus, muted).
         """
         conn = _get_db(db_path)
         purge_expired_memberships(conn)
+        if agent and squad:
+            return (
+                "Pass agent OR squad, not both — they answer different "
+                "questions (one agent's memberships vs one squad's roster), "
+                "and guessing which list you meant is how the wrong one "
+                "gets read without anyone noticing."
+            )
+        if squad:
+            rows = conn.execute(
+                "SELECT m.agent, m.muted, a.status, a.is_idle "
+                "FROM squad_members m LEFT JOIN agents a ON a.name = m.agent "
+                "WHERE m.squad = ? ORDER BY m.agent",
+                (squad,),
+            ).fetchall()
+            if not rows:
+                known = [
+                    r["squad"] for r in conn.execute(
+                        "SELECT DISTINCT squad FROM squad_members ORDER BY squad"
+                    )
+                ]
+                others = ", ".join(known) if known else "none exist yet"
+                # A typo'd name must never read as "squad exists, empty" —
+                # membership IS existence in this registry.
+                return (
+                    f"No squad named '{squad}' (or it has no members). "
+                    f"Known squads: {others}."
+                )
+            lines = [f"**{squad}** — {len(rows)} member(s):"]
+            for r in rows:
+                member = r["agent"]
+                if r["status"] is None:
+                    # In the squad but never register()ed — the poc-harness
+                    # pre-boot state. Presence CANNOT be manufactured for it.
+                    lines.append(f"  ⚫ {member} (not yet registered)")
+                    continue
+                status = "🟢" if r["status"] == "online" else "⚫"
+                wakeable = sum(
+                    1 for s in registry.sessions(member) if _can_deliver_push(s)
+                )
+                if wakeable > 1:
+                    wake = f" ⚡×{wakeable}"
+                elif wakeable == 1:
+                    wake = " ⚡"
+                else:
+                    wake = ""
+                idle = " 💤" if r["is_idle"] else ""
+                left = _focus_remaining(member)
+                focus = f" 🔕 {_fmt_minutes(left)}" if left > 0 else ""
+                muted = "  (muted)" if r["muted"] else ""
+                lines.append(f"  {status} {member}{wake}{idle}{focus}{muted}")
+            return "\n".join(lines)
         if agent:
             rows = conn.execute(
                 "SELECT squad, muted FROM squad_members WHERE agent = ? "
