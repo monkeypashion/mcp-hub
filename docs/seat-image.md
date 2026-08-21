@@ -414,3 +414,13 @@ box. That is a per-box operator decision (`edge.py:356-359`).
   claude-internals either way, not seat config. Until reproduced and fixed
   upstream, seat briefs must spawn subagents FOREGROUND — which is also the
   honest shape for one-subagent-per-package designs.
+- **"Unverifiable from here" is not "unverified", and the contract cannot
+  say so yet** (raised by dreamteam 2026-08-21, no ask attached). A seat's
+  mounts arrive only at spawn and it has no network, so a claim about text
+  at a NEWER pin is structurally unreadable from inside — distinct from a
+  claim it simply has not checked. Both render identically today, and the
+  second decays into the first: a "pending" entry nobody re-runs becomes
+  indistinguishable from one nobody could. dt-poc worked around it by
+  ledgering PENDING-AT-RESPAWN with the exact re-check and its failure
+  consequence written into the entry, which is the right shape and should
+  probably become contract rather than a per-seat convention.
