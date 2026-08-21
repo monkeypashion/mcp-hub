@@ -1340,3 +1340,197 @@ class TestRosterDeEnrolment:
             {"spec": {"image": "i", "agents": [{"identity": "a"}]}})
         assert not any(c[0] == squad for c in r.calls)
         assert out["deenrolled"]["skipped"]
+
+
+class TestExtraRepoMounts:
+    """POC-2 (console #137): a seat may need REFERENCE repos beside its
+    working checkout — reliable-ai at a pinned commit, read-only. Extras are
+    the same host-clones-container-mounts shape as the primary, with two
+    deliberate differences: every extra names an explicit dest (a guessed
+    path is a path nobody's brief mentions), and every extra mounts :ro (a
+    reference the seat could edit is a fork nobody asked for)."""
+
+    SPEC = {
+        "image": "mcp-hub-seat",
+        "env_from_host": ["CLAUDE_CODE_OAUTH_TOKEN", "SEAT_GITHUB_TOKEN"],
+        "repo_mount": {"repo": "dreamteam-ai-labs/dreamteam"},
+        "extra_repo_mounts": [
+            {"repo": "dreamteam-ai-labs/reliable-ai",
+             "ref": "a" * 40,
+             "dest": "/home/seat/mounts/reliable-ai"},
+        ],
+        "memory_volume": "seat-memory-x",
+    }
+    ENV = {"CLAUDE_CODE_OAUTH_TOKEN": "oauth-value",
+           "SEAT_GITHUB_TOKEN": "ghp-SECRET-VALUE"}
+
+    def test_the_extra_is_mounted_read_only_at_its_dest(self):
+        from mcp_hub.edge import repo_mount_dir
+
+        argv = DockerExecutor.create_argv("s1", self.SPEC, self.ENV)
+        host = repo_mount_dir("s1", "dreamteam-ai-labs/reliable-ai")
+        assert f"{host}:/home/seat/mounts/reliable-ai:ro" in argv
+
+    def test_the_primary_mount_is_unchanged_and_writable(self):
+        """The extra must not demote the working checkout — no :ro there."""
+        from mcp_hub.edge import SEAT_WORK_DIR, repo_mount_dir
+
+        argv = DockerExecutor.create_argv("s1", self.SPEC, self.ENV)
+        want = repo_mount_dir("s1", "dreamteam-ai-labs/dreamteam")
+        assert f"{want}:{SEAT_WORK_DIR}" in argv
+
+    def test_both_repos_are_prepared_before_the_container(self, tmp_path,
+                                                          monkeypatch):
+        monkeypatch.setattr("mcp_hub.edge.SEAT_REPOS_ROOT", tmp_path)
+        r = Runner()
+        DockerExecutor(r, self.ENV).execute(
+            {"op": "materialize", "seat": "s1"}, {"spec": self.SPEC})
+        git_calls = [c for c in r.calls if c[0] == "git"]
+        docker_at = next(i for i, c in enumerate(r.calls) if c[0] == "docker")
+        assert len([c for c in git_calls if "clone" in c]) == 2
+        assert all(i < docker_at for i, c in enumerate(r.calls)
+                   if c[0] == "git"), "an extra was cloned AFTER docker ran"
+
+    def test_a_failed_extra_clone_stops_the_materialize(self, tmp_path,
+                                                        monkeypatch):
+        """An extra that failed to clone must not yield a running seat with
+        a silently absent reference — the brief names a path that would
+        simply not exist."""
+        monkeypatch.setattr("mcp_hub.edge.SEAT_REPOS_ROOT", tmp_path)
+
+        class _FailsSecondClone(Runner):
+            def __call__(self, cmd, cwd=None):
+                if cmd[0] == "git" and "reliable-ai" in " ".join(cmd):
+                    self.calls.append(list(cmd))
+                    return 128, "fatal: repository not found"
+                return super().__call__(cmd, cwd=cwd)
+
+        r = _FailsSecondClone()
+        out = DockerExecutor(r, self.ENV).execute(
+            {"op": "materialize", "seat": "s1"}, {"spec": self.SPEC})
+        assert out.get("skipped"), out
+        assert not any(c[0] == "docker" for c in r.calls), (
+            "container created over an incomplete extra checkout"
+        )
+
+    def test_extras_alone_still_drop_the_github_token(self):
+        """The credential-drop rationale covers extras identically: mounted
+        code needs no token in the container."""
+        from mcp_hub.edge import injected_credentials
+
+        spec = {k: v for k, v in self.SPEC.items() if k != "repo_mount"}
+        assert "SEAT_GITHUB_TOKEN" not in injected_credentials(spec)
+
+
+class TestPinnedCommitRef:
+    """A 40-hex ref is a COMMIT PIN, not a branch: `clone --branch <sha>`
+    and `checkout origin/<sha>` both fail on real git. POC-2's whole point
+    is a commit dreamteam pins, so the argv generator must branch on shape."""
+
+    def test_fresh_clone_of_a_sha_clones_then_detaches(self, tmp_path):
+        from mcp_hub.edge import repo_mount_argv
+
+        sha = "b" * 40
+        cmds = repo_mount_argv(
+            "s1", {"repo": "o/r", "ref": sha}, root=tmp_path)
+        flat = [" ".join(c) for c in cmds]
+        assert "clone" in flat[0] and f"--branch {sha}" not in flat[0], flat
+        assert any(f"checkout --detach {sha}" in f for f in flat), flat
+
+    def test_existing_checkout_of_a_sha_fetches_then_detaches(self, tmp_path):
+        from mcp_hub.edge import repo_mount_argv, repo_mount_dir
+
+        sha = "b" * 40
+        dest = repo_mount_dir("s1", "o/r", tmp_path)
+        (dest / ".git").mkdir(parents=True)
+        cmds = repo_mount_argv(
+            "s1", {"repo": "o/r", "ref": sha}, root=tmp_path)
+        flat = [" ".join(c) for c in cmds]
+        assert any("fetch" in f for f in flat)
+        assert any(f"checkout --detach {sha}" in f for f in flat), flat
+        assert not any(f"origin/{sha}" in f for f in flat), (
+            "a sha is not a remote ref — origin/<sha> does not exist"
+        )
+
+    def test_branch_refs_keep_todays_behaviour(self, tmp_path):
+        from mcp_hub.edge import repo_mount_argv
+
+        cmds = repo_mount_argv(
+            "s1", {"repo": "o/r", "ref": "main"}, root=tmp_path)
+        flat = [" ".join(c) for c in cmds]
+        assert any("--branch main" in f for f in flat), flat
+
+
+class TestRepoMountNpmCi:
+    """POC-2 tier-1 checks `require()` repo scripts, and a bare host clone
+    has no node_modules — so a repo_mount may declare `npm_ci: true` and
+    the edge installs AT CLONE/REFRESH TIME, host-side. The hard rule:
+    `--ignore-scripts` ALWAYS — `npm ci` without it executes lifecycle
+    scripts from the repo and every dependency ON THE HOST, outside the
+    container sandbox, which is the exact boundary this design exists to
+    keep. A dep that needs build scripts is a different conversation."""
+
+    SPEC = {
+        "image": "mcp-hub-seat",
+        "repo_mount": {"repo": "dreamteam-ai-labs/dreamteam",
+                       "npm_ci": True},
+        "memory_volume": "seat-memory-x",
+    }
+    ENV = {"CLAUDE_CODE_OAUTH_TOKEN": "oauth-value"}
+
+    def test_npm_ci_runs_after_the_git_legs_with_scripts_disabled(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setattr("mcp_hub.edge.SEAT_REPOS_ROOT", tmp_path)
+        monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/npm")
+        r = Runner()
+        DockerExecutor(r, self.ENV).execute(
+            {"op": "materialize", "seat": "s1"}, {"spec": self.SPEC})
+        npm_at = [i for i, c in enumerate(r.calls) if c[0] == "/usr/bin/npm"]
+        assert npm_at, [c[0] for c in r.calls]
+        npm_call = r.calls[npm_at[0]]
+        assert "ci" in npm_call and "--ignore-scripts" in npm_call, npm_call
+        assert "--omit=dev" in npm_call
+        last_git = max(i for i, c in enumerate(r.calls) if c[0] == "git")
+        assert npm_at[0] > last_git, "npm ran before the checkout existed"
+
+    def test_no_flag_means_no_npm(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("mcp_hub.edge.SEAT_REPOS_ROOT", tmp_path)
+        spec = {**self.SPEC,
+                "repo_mount": {"repo": "dreamteam-ai-labs/dreamteam"}}
+        r = Runner()
+        DockerExecutor(r, self.ENV).execute(
+            {"op": "materialize", "seat": "s1"}, {"spec": spec})
+        assert not any("npm" in c[0] for c in r.calls)
+
+    def test_npm_missing_from_the_edge_environment_fails_loudly(
+            self, tmp_path, monkeypatch):
+        """The edge runs under systemd with a bare PATH (no ~/.nvm, no
+        ~/.local/bin) — npm simply absent is the LIKELY failure, and it
+        must name the fix (PATH via ~/.mcp-hub/edge-env), not yield a
+        seat whose tier-1 checks die at import."""
+        monkeypatch.setattr("mcp_hub.edge.SEAT_REPOS_ROOT", tmp_path)
+        monkeypatch.setattr("shutil.which", lambda _: None)
+        r = Runner()
+        out = DockerExecutor(r, self.ENV).execute(
+            {"op": "materialize", "seat": "s1"}, {"spec": self.SPEC})
+        assert out.get("skipped"), out
+        assert "edge-env" in out.get("reason", ""), out
+        assert not any(c[0] == "docker" for c in r.calls)
+
+    def test_a_failed_install_stops_the_materialize(self, tmp_path,
+                                                    monkeypatch):
+        monkeypatch.setattr("mcp_hub.edge.SEAT_REPOS_ROOT", tmp_path)
+        monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/npm")
+
+        class _NpmFails(Runner):
+            def __call__(self, cmd, cwd=None):
+                if cmd[0] == "/usr/bin/npm":
+                    self.calls.append(list(cmd))
+                    return 1, "ERESOLVE"
+                return super().__call__(cmd, cwd=cwd)
+
+        r = _NpmFails()
+        out = DockerExecutor(r, self.ENV).execute(
+            {"op": "materialize", "seat": "s1"}, {"spec": self.SPEC})
+        assert out.get("skipped"), out
+        assert not any(c[0] == "docker" for c in r.calls)

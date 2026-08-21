@@ -113,7 +113,7 @@ def injected_credentials(spec: dict[str, Any]) -> list[str]:
     from mcp_hub.seat import SEAT_GITHUB_TOKEN
 
     wanted = [str(n) for n in (spec.get("env_from_host") or [])]
-    if spec.get("repo_mount"):
+    if spec.get("repo_mount") or spec.get("extra_repo_mounts"):
         return [n for n in wanted if n != SEAT_GITHUB_TOKEN]
     return wanted
 
@@ -150,20 +150,31 @@ def repo_mount_argv(seat: str, repo_mount: dict[str, Any],
     # line, or an error message. Verified on the same live clone: the token
     # appears nowhere in the resulting `.git/config`.
     cred = ["-c", f"credential.helper={credential_helper_value()}"]
+    # A 40-hex ref is a COMMIT PIN, not a branch: `clone --branch <sha>`
+    # and `checkout origin/<sha>` both fail on real git (a sha is not a
+    # remote ref). POC-2's pins are exactly this shape, so the argv
+    # branches on it rather than leaving the seat a git error.
+    is_sha = bool(re.fullmatch(r"[0-9a-f]{40}", ref))
     if (dest / ".git").is_dir():
         base = ["git", *cred, "-C", str(dest)]
         cmds = [[*base, "fetch", "--prune", "origin"]]
-        if ref:
+        if is_sha:
+            cmds.append([*base, "checkout", "--detach", ref])
+        elif ref:
             cmds.append([*base, "checkout", "--detach", f"origin/{ref}"])
         else:
             cmds.append([*base, "reset", "--hard", "origin/HEAD"])
         return cmds
     argv = ["git", *cred, "clone", url, str(dest)]
-    if ref:
+    if ref and not is_sha:
         # `--branch` takes a branch or a tag, which is what a `ref` is in
         # every case this feature has: an operator assigning a build.
         argv[-2:-2] = ["--branch", ref]
-    return [argv]
+    cmds = [argv]
+    if is_sha:
+        cmds.append(["git", *cred, "-C", str(dest),
+                     "checkout", "--detach", ref])
+    return cmds
 
 # The image's WORKDIR, and the root a pod hangs its per-agent workdirs under
 # (`<root>/<identity>`). Harvest targets these with `docker exec -w`, because
@@ -735,9 +746,23 @@ class DockerExecutor:
         (the edge's `~/.mcp-hub/edge-env` is loaded by the systemd unit), so
         the token never has to travel.
         """
-        rm = spec.get("repo_mount")
-        if not rm:
+        mounts = [m for m in
+                  [spec.get("repo_mount"),
+                   *(spec.get("extra_repo_mounts") or [])] if m]
+        if not mounts:
             return None
+        for rm in mounts:
+            skip = self._prepare_one_checkout(seat, rm)
+            if skip:
+                return skip
+        return None
+
+    def _prepare_one_checkout(self, seat: str,
+                              rm: dict[str, Any]) -> dict[str, Any] | None:
+        """One repo's clone/fetch leg of _prepare_repo_mount — extras run
+        the identical sequence as the primary, so a failure in either
+        stops the materialize the same way (a brief naming a path that
+        does not exist is a silently absent reference)."""
         dest = repo_mount_dir(seat, str(rm.get("repo") or ""))
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -769,6 +794,36 @@ class DockerExecutor:
                     f"repo_mount: `git … {argv[-2] if len(argv) > 2 else ''}` "
                     f"failed rc={rc} — refusing to start a seat over an "
                     f"incomplete checkout.{hint} {out[-200:]}"
+                )}
+        if rm.get("npm_ci"):
+            # Host-side dependency install for checkouts whose mounted
+            # scripts the seat must `require()` (POC-2 tier-1 checks): a
+            # bare clone has no node_modules and the seat image carries no
+            # npm. `--ignore-scripts` is NON-NEGOTIABLE — without it, `npm
+            # ci` executes lifecycle scripts from the repo and every dep on
+            # the HOST, outside the container sandbox, which is exactly the
+            # boundary the repo_mount design keeps. A dep needing build
+            # scripts fails visibly at require-time in the seat, which is
+            # the honest outcome.
+            import shutil
+
+            npm = shutil.which("npm")
+            if not npm:
+                return {"skipped": True, "reason": (
+                    "repo_mount npm_ci: npm is not on the edge's PATH — "
+                    "systemd user units get a bare PATH, so an nvm-installed "
+                    "npm is invisible here. Add its directory to PATH in "
+                    "~/.mcp-hub/edge-env (loaded by the unit via "
+                    "EnvironmentFile) rather than installing globally."
+                )}
+            rc, out = self._run(
+                [npm, "ci", "--omit=dev", "--ignore-scripts"],
+                cwd=str(dest))
+            if rc != 0:
+                return {"skipped": True, "reason": (
+                    f"repo_mount npm_ci failed rc={rc} in {dest} — refusing "
+                    f"to start a seat whose mounted scripts cannot resolve "
+                    f"their imports. {out[-200:]}"
                 )}
         return None
 
@@ -944,6 +999,14 @@ class DockerExecutor:
             dest = str(rm.get("dest") or "").strip() or SEAT_WORK_DIR
             argv += ["-v", f"{repo_mount_dir(seat, str(rm.get('repo') or ''))}"
                            f":{dest}"]
+        # Reference repos (extra_repo_mounts) mount READ-ONLY, always: a
+        # reference the seat could edit is a fork nobody asked for, and the
+        # ro flag is enforced here rather than declared in the spec so no
+        # spec can forget it. dest is guaranteed by the guard.
+        for extra in spec.get("extra_repo_mounts") or []:
+            argv += ["-v",
+                     f"{repo_mount_dir(seat, str(extra.get('repo') or ''))}"
+                     f":{str(extra.get('dest') or '').strip()}:ro"]
         # THE MEMORY VOLUME IS A MOUNT, not just a flag.
         #
         # It was declared on every seat and read in exactly one place — the

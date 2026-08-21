@@ -25,6 +25,7 @@ from starlette.testclient import TestClient
 from mcp_hub.cli import _read_brief_and_inputs
 from mcp_hub.server import create_server
 from mcp_hub.spec_guard import (
+    check_extra_repo_mounts,
     check_repo_mount,
     check_volumes,
     scan_secret,
@@ -550,3 +551,40 @@ class TestCredentialPolicy:
         assert check_credential_policy(
             {"allowed_env": [], "volumes": ["seat-memory-x:/home/seat/.claude"]}
         ) is None
+
+
+class TestExtraRepoMounts:
+    """POC-2: reference repos beside the working checkout. Each extra is
+    held to the primary's rules PLUS an explicit dest — a defaulted path
+    is one the seat's brief never names, i.e. a mount nobody opens."""
+
+    def test_well_formed_extras_pass(self):
+        assert check_extra_repo_mounts([
+            {"repo": "a/b", "ref": "c" * 40, "dest": "/home/seat/mounts/b"},
+        ]) is None
+
+    def test_not_a_list_is_refused(self):
+        assert check_extra_repo_mounts(
+            {"repo": "a/b", "dest": "/x"}) is not None
+
+    def test_each_entry_is_held_to_the_primary_rules(self):
+        out = check_extra_repo_mounts(
+            [{"repo": "../escape", "dest": "/home/seat/mounts/x"}])
+        assert out is not None
+
+    def test_an_extra_without_dest_is_refused(self):
+        out = check_extra_repo_mounts([{"repo": "a/b"}])
+        assert out is not None
+        assert "dest" in out
+
+    def test_an_extra_shadowing_the_state_dir_is_refused(self):
+        out = check_extra_repo_mounts(
+            [{"repo": "a/b", "dest": "/home/seat/.claude"}])
+        assert out is not None
+
+
+def test_npm_ci_must_be_a_boolean():
+    """The flag triggers host-side execution — "false" (a truthy string)
+    silently installing is the failure shape refused here."""
+    assert check_repo_mount({"repo": "a/b", "npm_ci": "false"}) is not None
+    assert check_repo_mount({"repo": "a/b", "npm_ci": True}) is None

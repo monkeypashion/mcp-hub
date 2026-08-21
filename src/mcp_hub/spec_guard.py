@@ -156,6 +156,11 @@ def validate_spec(spec: dict, *, keys: set[str] | None = None) -> str | None:
         if bad:
             return bad
 
+    if _wanted("extra_repo_mounts"):
+        bad = check_extra_repo_mounts(spec.get("extra_repo_mounts"))
+        if bad:
+            return bad
+
     return None
 
 
@@ -303,6 +308,11 @@ def check_repo_mount(repo_mount: object) -> str | None:
     if any(part in (".", "..") for part in repo.split("/")):
         return f"REFUSED: repo '{repo}' contains a path-traversal component"
 
+    if not isinstance(repo_mount.get("npm_ci", False), bool):
+        # A string here would be truthy-by-accident ("false" installs);
+        # the flag triggers host-side execution, so its type is strict.
+        return "REFUSED: repo_mount npm_ci must be a boolean"
+
     ref = str(repo_mount.get("ref") or "").strip()
     if ref:
         if ref.startswith("-"):
@@ -334,6 +344,34 @@ def check_repo_mount(repo_mount: object) -> str | None:
                 "is mounted. A checkout there would shadow the seat's memory "
                 "and transcripts — the durability failure of 2026-08-06 in a "
                 "new costume."
+            )
+    return None
+
+
+def check_extra_repo_mounts(extras: object) -> str | None:
+    """Validate `spec.extra_repo_mounts` — reference repos mounted beside
+    the primary checkout (POC-2, console #137). Each entry is held to the
+    primary's rules PLUS an explicit `dest`: a defaulted path is one the
+    seat's brief never names, i.e. a mount nobody opens. The edge mounts
+    every extra read-only — a reference the seat could edit is a fork
+    nobody asked for."""
+    if extras is None:
+        return None
+    if not isinstance(extras, list):
+        return (
+            "REFUSED: spec.extra_repo_mounts must be a list of objects like "
+            '{"repo": "org/name", "ref": "<sha|branch>", "dest": "/abs/path"}'
+        )
+    for entry in extras:
+        bad = check_repo_mount(entry)
+        if bad:
+            return bad
+        if not (isinstance(entry, dict)
+                and str(entry.get("dest") or "").strip()):
+            return (
+                "REFUSED: every extra_repo_mounts entry needs an explicit "
+                "'dest' — the brief has to name the path, so the spec "
+                "declares it rather than the edge inventing one"
             )
     return None
 
