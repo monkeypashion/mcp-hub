@@ -203,7 +203,13 @@ async def test_long_idle_bound_recipient_is_delivered_by_the_hold_sweep(server):
     """Card #59's replacement guarantee for the long-idle case: the send
     itself no longer wakes, but a bound agent left idle for hours is still
     DELIVERED to — the rule-4 hold sweep fires once the message ages past
-    the cap. The binding remains the liveness gate, exactly as before."""
+    the cap. The binding remains the liveness gate, exactly as before.
+
+    DELIBERATELY REWRITTEN for rule 4a (card #73, operator-approved
+    2026-08-21): this test originally rode a LOW send, and low-only holds
+    now wait for the agent's next natural turn instead of the sweep —
+    restoring low's pre-batching "never interrupts" promise. The sweep
+    guarantee this test pins belongs to normal-and-above traffic."""
     from mcp_hub.server import HOLD_MAX_SECONDS
 
     await _call_tool(server, "register", {"name": "alice", "project": "x"})
@@ -221,7 +227,7 @@ async def test_long_idle_bound_recipient_is_delivered_by_the_hold_sweep(server):
         await _call_tool(
             server, "send",
             {"from_agent": "alice", "to": "bob",
-             "message": "soft ask", "priority": "low"},
+             "message": "soft ask", "priority": "normal"},
         )
         push.assert_not_called()
 

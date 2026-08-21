@@ -434,3 +434,170 @@ async def test_every_delivered_wake_logs_a_reason(server):
     assert "urgent" in reasons
     assert "reply" in reasons
     assert "hold" in reasons
+
+
+# ---- R4a (card #73, operator-approved 2026-08-21): low-only holds skip -----
+#
+# As signed, rule 4's sweep woke an idle agent even when the ONLY thing
+# waiting was low-priority chatter — pre-batching, low NEVER interrupted
+# anyone, and a flapping low lane (mic-watch) could buy every idle bound
+# agent ~6 backstop wakes/hour (70% of all measured wakes were the backstop,
+# vps's wake_log read). 4a restores low's old promise: a queue holding only
+# low waits for the agent's next natural turn; anything normal-or-above in
+# the held set fires the sweep exactly as before, and the wake still
+# carries the WHOLE queue (R1 — low items ride along, never reordered).
+
+
+async def test_low_only_dm_hold_does_not_fire_the_sweep(server):
+    stream = await _pair(server)
+    await _call(server, "send",
+                {"from_agent": "alice", "to": "bob",
+                 "message": "quiet fyi", "priority": "low"})
+    conn = _db(server)
+    conn.execute("UPDATE messages SET ts = ts - ?", (HOLD_MAX_SECONDS + 60,))
+    conn.commit()
+    fired = await server._hub_hold_sweep_pass()
+    assert fired == 0, "sweep fired for a low-only hold (rule 4a)"
+    assert _wakes(stream) == 0
+    # Nothing is lost: still queued unread for the next natural turn.
+    row = conn.execute(
+        "SELECT read FROM messages WHERE body = 'quiet fyi'").fetchone()
+    assert row["read"] == 0
+
+
+async def test_low_plus_normal_hold_fires_and_carries_the_whole_queue(server):
+    stream = await _pair(server)
+    await _call(server, "send",
+                {"from_agent": "alice", "to": "bob",
+                 "message": "low first", "priority": "low"})
+    await _call(server, "send",
+                {"from_agent": "alice", "to": "bob",
+                 "message": "the real one"})
+    conn = _db(server)
+    conn.execute("UPDATE messages SET ts = ts - ?", (HOLD_MAX_SECONDS + 60,))
+    conn.commit()
+    fired = await server._hub_hold_sweep_pass()
+    assert fired == 1
+    content = str(stream.sent[0])
+    assert "low first" in content and "the real one" in content, (
+        "the wake must carry the whole queue — R1 composed with 4a"
+    )
+    assert content.index("low first") < content.index("the real one")
+
+
+async def test_low_only_broadcast_hold_does_not_fire(server):
+    stream = await _pair(server)
+    await _call(server, "set_squads", {"name": "alice", "squads": "team"})
+    await _call(server, "set_squads", {"name": "bob", "squads": "team"})
+    await _call(server, "broadcast",
+                {"from_agent": "alice", "message": "flappy lane note",
+                 "priority": "low"})
+    conn = _db(server)
+    conn.execute("UPDATE messages SET ts = ts - ?", (HOLD_MAX_SECONDS + 60,))
+    conn.commit()
+    fired = await server._hub_hold_sweep_pass()
+    assert fired == 0, "sweep fired for a low-only broadcast hold (rule 4a)"
+    assert _wakes(stream) == 0
+
+
+async def test_a_low_skip_does_not_consume_the_cap_window(server):
+    """The skip must leave last_hold_wake_at untouched: a mutant that stamps
+    on skip would silently delay the NEXT real wake by up to a full cap."""
+    stream = await _pair(server)
+    await _call(server, "send",
+                {"from_agent": "alice", "to": "bob",
+                 "message": "quiet fyi", "priority": "low"})
+    conn = _db(server)
+    conn.execute("UPDATE messages SET ts = ts - ?", (HOLD_MAX_SECONDS + 60,))
+    conn.commit()
+    assert await server._hub_hold_sweep_pass() == 0
+    await _call(server, "send",
+                {"from_agent": "alice", "to": "bob", "message": "real ask"})
+    conn.execute("UPDATE messages SET ts = ts - ? WHERE body = 'real ask'",
+                 (HOLD_MAX_SECONDS + 60,))
+    conn.commit()
+    fired = await server._hub_hold_sweep_pass()
+    assert fired == 1, "the low-only skip consumed the once-per-cap window"
+    assert _wakes(stream) == 1
+
+
+async def test_hold_wake_records_the_max_held_priority(server):
+    """The rule-5 witness gains the field the 4a debate lacked: WHAT the
+    backstop fired for. held_max lands only on hold rows ('normal' or
+    'urgent'); every other reason keeps ''."""
+    stream = await _pair(server)
+    await _call(server, "send",
+                {"from_agent": "alice", "to": "bob", "message": "plain ask"})
+    conn = _db(server)
+    conn.execute("UPDATE messages SET ts = ts - ?", (HOLD_MAX_SECONDS + 60,))
+    conn.commit()
+    assert await server._hub_hold_sweep_pass() == 1
+    row = conn.execute(
+        "SELECT reason, held_max FROM wake_log WHERE agent = 'bob' "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["reason"] == "hold"
+    assert row["held_max"] == "normal", row["held_max"]
+    # Urgent path: an urgent that queued while bob was unbound (undelivered)
+    # then aged — the sweep fires and the witness says the backstop covered
+    # an URGENT, which is worth alarming on in any later ledger.
+    server._hub_registry.unbind_name("bob")
+    await _call(server, "send",
+                {"from_agent": "alice", "to": "bob",
+                 "message": "missed urgent", "priority": "urgent"})
+    server._hub_registry.bind("bob", stream)
+    conn.execute("UPDATE messages SET ts = ts - ?, read = 0 "
+                 "WHERE body = 'missed urgent'", (HOLD_MAX_SECONDS + 60,))
+    conn.execute("UPDATE agents SET last_hold_wake_at = 0 WHERE name = 'bob'")
+    conn.commit()
+    assert await server._hub_hold_sweep_pass() == 1
+    row = conn.execute(
+        "SELECT reason, held_max FROM wake_log WHERE agent = 'bob' "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["held_max"] == "urgent", row["held_max"]
+    # Non-hold rows never carry it.
+    blank = conn.execute(
+        "SELECT COUNT(*) AS n FROM wake_log "
+        "WHERE reason != 'hold' AND held_max != ''").fetchone()
+    assert blank["n"] == 0
+
+
+async def test_wake_log_migration_adds_held_max_to_an_existing_table(tmp_path):
+    """Prod's wake_log predates held_max: CREATE IF NOT EXISTS is a no-op
+    there, so the ALTER is the only thing standing between the deploy and
+    every _log_wake insert failing silently (fail-soft would eat it — the
+    witness would just go dark). Build the OLD shape first, then boot."""
+    import sqlite3
+
+    db = tmp_path / "test.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        """CREATE TABLE wake_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            agent TEXT NOT NULL,
+            reason TEXT NOT NULL
+        )"""
+    )
+    import time as _t
+
+    # A recent ts — the sweep's retention prune must not eat the witness row.
+    conn.execute("INSERT INTO wake_log (ts, agent, reason) "
+                 "VALUES (?, 'old', 'hold')", (_t.time(),))
+    conn.commit()
+    conn.close()
+
+    server = create_server(db_path=db)
+    stream = await _pair(server)
+    await _call(server, "send",
+                {"from_agent": "alice", "to": "bob", "message": "aging"})
+    conn = _db(server)
+    conn.execute("UPDATE messages SET ts = ts - ?", (HOLD_MAX_SECONDS + 60,))
+    conn.commit()
+    assert await server._hub_hold_sweep_pass() == 1
+    rows = conn.execute(
+        "SELECT agent, held_max FROM wake_log ORDER BY id").fetchall()
+    assert rows[0]["agent"] == "old" and rows[0]["held_max"] == "", (
+        "migration must default existing rows to ''"
+    )
+    assert rows[-1]["agent"] == "bob" and rows[-1]["held_max"] == "normal"
+    assert _wakes(stream) == 1

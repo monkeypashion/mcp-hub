@@ -584,9 +584,20 @@ def init_db(db_path: Path = DB_PATH) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts REAL NOT NULL,
             agent TEXT NOT NULL,
-            reason TEXT NOT NULL
+            reason TEXT NOT NULL,
+            held_max TEXT NOT NULL DEFAULT ''
         )"""
     )
+    try:
+        # Migration for tables created before rule 4a (card #73): held_max
+        # records WHAT the backstop fired for ('normal' | 'urgent', hold
+        # rows only) — the field the 4a debate lacked when 70% of wakes
+        # turned out to be the backstop and nothing recorded their cargo.
+        conn.execute(
+            "ALTER TABLE wake_log ADD COLUMN held_max TEXT NOT NULL DEFAULT ''"
+        )
+    except Exception:  # noqa: BLE001 — column already exists (fresh table)
+        pass
     conn.commit()
 
     # The shared delivery record (card #56). One row = one message body
@@ -1232,8 +1243,11 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             "Priority is one of low|normal|urgent. Default is normal. "
             "WAKE-BATCHING (operator-signed, card #59): low and normal do "
             "NOT wake the recipient — the message queues and surfaces at "
-            "their next natural turn, held at most 10 minutes (the hold "
-            "sweep wakes them if nothing else does). Nothing is lost or "
+            "their next natural turn; normal is held at most 10 minutes "
+            "(the hold sweep wakes them if nothing else does), while LOW "
+            "waits for a natural turn with no backstop wake (rule 4a — low "
+            "never interrupts; it still rides along whenever a wake fires). "
+            "Nothing is lost or "
             "reordered. Three exceptions wake immediately: 'urgent' (always — "
             "it should mean 'blocking on you' or 'production incident'), "
             "a message FROM the operator (operator-console/operator senders "
@@ -1915,13 +1929,18 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         except Exception:  # noqa: BLE001
             logger.debug("pushed_gen stamp failed for %s", agent, exc_info=True)
 
-    def _log_wake(conn: Any, agent: str, reason: str) -> None:
+    def _log_wake(conn: Any, agent: str, reason: str,
+                  held_max: str = "") -> None:
         """Rule 5's witness: record a DELIVERED wake and why it fired.
-        Fail-soft — measurement must never cost a wake."""
+        `held_max` is set by hold wakes only — the highest priority the
+        backstop covered — so the ledger can tell a deferred normal from
+        an urgent that missed its live wake. Fail-soft — measurement must
+        never cost a wake."""
         try:
             conn.execute(
-                "INSERT INTO wake_log (ts, agent, reason) VALUES (?, ?, ?)",
-                (time.time(), agent, reason),
+                "INSERT INTO wake_log (ts, agent, reason, held_max) "
+                "VALUES (?, ?, ?, ?)",
+                (time.time(), agent, reason, held_max),
             )
             conn.commit()
         except Exception:  # noqa: BLE001
@@ -1957,6 +1976,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     async def _wake_with_queue(
         conn: Any, to: str, reason: str,
         extra_lines: list[str] | None = None,
+        held_max: str = "",
     ) -> _PushOutcome:
         """Fire one drain-batched wake carrying the recipient's ENTIRE
         unread DM queue in ts order — rule 1 composed with rules 3/4: a
@@ -1992,7 +2012,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             conn.commit()
             if outcome.primary and unread:
                 _stamp_pushed(conn, [r["id"] for r in unread], to)
-            _log_wake(conn, to, reason)
+            _log_wake(conn, to, reason, held_max)
         return outcome
 
     async def _hold_sweep_pass() -> int:
@@ -2006,7 +2026,17 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         agents are skipped, not queued-for: there is nothing to wake, and
         their Stop-hook drain already covers the return path. Broadcasts
         held past the cap are NAMED in the wake, never rendered — the Stop
-        drain owns broadcast bodies (cursor + receipts)."""
+        drain owns broadcast bodies (cursor + receipts).
+
+        Rule 4a (card #73, operator-approved 2026-08-21): a hold set that
+        is LOW-ONLY does not fire — low waits for the agent's next natural
+        turn, restoring its pre-batching "never interrupts" promise (a
+        flapping low lane was buying every idle bound agent a backstop
+        wake per cap window; 70% of all measured wakes were the backstop).
+        Anything normal-or-above in the held set fires as before, and the
+        delivered wake still carries the WHOLE queue — low items ride
+        along, never reordered (rule 1). The skip stamps nothing: a
+        low-only pass must not consume the once-per-cap window."""
         now = time.time()
         cutoff = now - HOLD_MAX_SECONDS
         conn = _get_db(db_path)
@@ -2028,29 +2058,39 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             if not registry.generation(name):
                 continue
             held_dm = conn.execute(
-                "SELECT 1 FROM messages WHERE to_agent = ? AND read = 0 "
-                "AND pushed_gen = '' AND ts < ? LIMIT 1",
+                "SELECT COUNT(*) AS n, "
+                "SUM(CASE WHEN priority = 'urgent' THEN 1 ELSE 0 END) AS u "
+                "FROM messages WHERE to_agent = ? AND read = 0 "
+                "AND pushed_gen = '' AND ts < ? AND priority != 'low'",
                 (name, cutoff),
             ).fetchone()
             my_squads = _squads_of(conn, name, include_muted=False)
             ph = ",".join("?" * len(my_squads)) if my_squads else "NULL"
             held_bc = conn.execute(
-                f"SELECT COUNT(*) AS n FROM messages WHERE channel = ? "
+                f"SELECT COUNT(*) AS n, "
+                f"SUM(CASE WHEN priority != 'low' THEN 1 ELSE 0 END) AS ne, "
+                f"SUM(CASE WHEN priority = 'urgent' THEN 1 ELSE 0 END) AS u "
+                f"FROM messages WHERE channel = ? "
                 f"AND id > ? AND ts < ? AND from_agent != ? "
                 f"AND (audience = '' OR audience IN ({ph}))",  # noqa: S608
                 (_BROADCAST_CHANNEL, row["last_broadcast_seen_id"] or 0,
                  cutoff, name, *my_squads),
-            ).fetchone()["n"]
-            if not held_dm and not held_bc:
+            ).fetchone()
+            # Rule 4a: only normal-or-above traffic fires the backstop.
+            # Low-only holds wait for a natural turn — the wake below still
+            # carries every queued item, low included, once it fires.
+            if not held_dm["n"] and not (held_bc["ne"] or 0):
                 continue
             extra = []
-            if held_bc:
+            if held_bc["n"]:
                 extra.append(
-                    f"({held_bc} queued broadcast(s) also waiting — "
+                    f"({held_bc['n']} queued broadcast(s) also waiting — "
                     f"they surface at this turn's end)"
                 )
-            outcome = await _wake_with_queue(conn, name, "hold",
-                                             extra_lines=extra)
+            urgent_held = (held_dm["u"] or 0) or (held_bc["u"] or 0)
+            outcome = await _wake_with_queue(
+                conn, name, "hold", extra_lines=extra,
+                held_max="urgent" if urgent_held else "normal")
             if outcome.delivered:
                 conn.execute(
                     "UPDATE agents SET last_hold_wake_at = ? WHERE name = ?",
@@ -2713,8 +2753,10 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 
         Wake-batching (card #59, operator-signed): low and normal do NOT
         wake the recipient — the message queues and surfaces at their next
-        natural turn, held at most 10 minutes by the hold sweep so nothing
-        rots. Nothing is lost or reordered. Immediate wakes:
+        natural turn. Normal is held at most 10 minutes by the hold sweep
+        so nothing rots; LOW has no backstop wake (rule 4a, card #73 — low
+        never interrupts, though it rides along whenever a wake does fire).
+        Nothing is lost or reordered. Immediate wakes:
 
         - "urgent": always wakes, unchanged. Use sparingly — it should
           mean "blocking on you" or "production incident".
@@ -2810,6 +2852,14 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                     f"reply-wake undeliverable — surfaces via their next "
                     f"turn or the hold sweep)."
                 )
+            if priority == "low":
+                # Rule 4a: promising low the 10-min backstop would be a lie
+                # the sender plans around — low waits for a natural turn.
+                return (
+                    f"Message queued for '{to}' (priority=low; "
+                    f"wake-batched — rides their next natural turn; low "
+                    f"has no hold-sweep backstop)."
+                )
             return (
                 f"Message queued for '{to}' (priority={priority}; "
                 f"wake-batched — rides their next turn, held at most "
@@ -2886,8 +2936,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 
         Wake-batching (card #59, operator-signed): low AND normal persist
         to the feed without waking anyone — recipients catch up at their
-        next natural turn, held at most 10 minutes by the hold sweep.
-        Immediate wakes:
+        next natural turn; normal is held at most 10 minutes by the hold
+        sweep, LOW has no backstop wake (rule 4a — a flapping low lane
+        must never buy the fleet interrupts). Immediate wakes:
 
         - "urgent": wake every connected recipient, unchanged. Use
           sparingly — it should mean "everyone needs to stop what they're
@@ -3046,6 +3097,12 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                         woken = f"; reply-wake fired for {author}"
             # The verbosity advisory rides the batched path too — size
             # discipline is about the feed, not about whether a wake fired.
+            if priority == "low":
+                return (
+                    f"Broadcast posted (priority=low; wake-batched — "
+                    f"agents see it at their next natural turn; low has "
+                    f"no hold-sweep backstop{woken})."
+                ) + _verbosity_advisory(message)
             return (
                 f"Broadcast posted (priority={priority}; wake-batched — "
                 f"agents see it at their next turn or within "
@@ -3476,6 +3533,12 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 if outcome.delivered:
                     _log_wake(conn, author, "reply")
                     woken = f"; reply-wake fired for {author}"
+            if priority == "low":
+                return (
+                    f"Posted to #{channel} (priority=low; wake-batched — "
+                    f"subscribers see it at their next natural turn; low "
+                    f"has no hold-sweep backstop{woken})."
+                ) + _verbosity_advisory(message)
             return (
                 f"Posted to #{channel} (priority={priority}; wake-batched — "
                 f"subscribers see it at their next turn or within "
