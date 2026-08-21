@@ -403,3 +403,14 @@ box. That is a per-box operator decision (`edge.py:356-359`).
   that matters is per-account concurrency, not per-container — so N seats in
   ONE container (docs/n-seats-per-container.md) asks the same question, not a
   new one.
+- **Background Agent spawns are UNSUPPORTED in-seat** (measured 2026-08-21,
+  POC-2 run 1, dt-poc's controlled diagnostic): an identical no-Bash
+  pure-read subagent task returned cleanly FOREGROUND (4.4s) and went
+  permanently idle with zero relayed content BACKGROUND — five for five,
+  reproducibly, with the container inspected from outside confirming no
+  subagent subprocesses ever existed (in-process spawns, nothing OS-stuck).
+  Mechanism unidentified — plausibly the background-completion notification
+  never re-invokes the parent turn in the seat's tmux/channels environment;
+  claude-internals either way, not seat config. Until reproduced and fixed
+  upstream, seat briefs must spawn subagents FOREGROUND — which is also the
+  honest shape for one-subagent-per-package designs.
