@@ -1815,6 +1815,55 @@ WS_SKELETON='{
   }
 }'
 
+# ---- per-squad workspace files (operator directive 2026-08-21) -------------
+#
+# "I want a workspace file on every squad so that I can open in vs code
+# cockpit terminal view." A squad lives on the HUB; a workspace file is
+# MACHINE-LOCAL, and the extension gates tabs on folder membership — so the
+# generated file can only carry members that have a roster row on THIS box.
+#
+# ⚠️ Members without one are NAMED in the output, never silently omitted. A
+# squad of five that opens with two tabs and no explanation reads as a broken
+# cockpit; the same "absence is not a measurement" rule the fleet tree keeps.
+# Container seats DO qualify: their roster row carries @docker:<container>,
+# which squad's own attach path already understands.
+ws_squad() {
+  local squad="$1" out="$2" force="$3"
+  [ -n "$squad" ] || { echo "!! name the squad: squad ws-squad <squad>" >&2; return 1; }
+  local members
+  members="$("$(hub_bin)" squads members "$squad" 2>/dev/null | awk 'NF{print $1}')" || true
+  [ -n "$members" ] || { echo "!! squad '$squad' has no members (or the hub is unreachable)" >&2; return 1; }
+
+  [ -n "$out" ] || out="$HOME/Projects/$squad.code-workspace"
+  case "$out" in *.code-workspace) ;; *) out="$out.code-workspace" ;; esac
+  if [ -e "$out" ] && [ "$force" != "force" ]; then
+    echo "!! $out already exists — it may be a hand-kept workspace with comments." >&2
+    echo "   Re-run with --force to regenerate it, or pass --out <file>." >&2
+    return 1
+  fi
+  printf '%s\n' "$WS_SKELETON" > "$out" || return 1
+
+  local m dir added=0 missing=""
+  for m in $members; do
+    dir="$(field "$m" 2)"
+    if [ -n "$dir" ] && [ -d "$dir" ]; then
+      ws_add_folder "$out" "$dir" "$m" >/dev/null
+      added=$((added + 1))
+      echo "  + $m  $dir"
+    else
+      missing="$missing $m"
+    fi
+  done
+
+  echo "$out  ($added tab(s))"
+  if [ -n "$missing" ]; then
+    echo "  not on this machine (no tab here — they run elsewhere or are not enrolled):$missing"
+  fi
+  [ "$added" -gt 0 ] || echo "  !! no members of '$squad' are on this box — the file opens empty"
+}
+
+
+
 # Does an EXISTING workspace lack the setting the painter needs? Reported, never
 # silently fixed: a hand-kept file with comments and deliberate ordering is the
 # operator's, and rewriting its settings behind their back is exactly the kind of
@@ -4140,6 +4189,17 @@ print("\n".join(r[2] for r in rows))
             # Diagnostic, and the only way to test the launch path without a
             # tmux server: it prints EXACTLY what up/restart would type.
             a="$(need_agent "${2:-}")" || exit 1; launch_line "$a" ;;
+  ws-squad) # squad ws-squad <squad> [--out <file>] [--force]
+            # One .code-workspace per squad — the operator's one-click door to
+            # that squad's cockpit terminal view.
+            shift; sq_arg="${1:-}"; out_arg=""; force_arg=""
+            while [ $# -gt 0 ]; do case "$1" in
+              --out)   out_arg="$(untilde "${2:-}")"; shift 2 ;;
+              --force) force_arg="force"; shift ;;
+              -*)      echo "!! unknown ws-squad flag '$1' (valid: --out, --force)" >&2; exit 1 ;;
+              *)       shift ;;
+            esac; done
+            ws_squad "$sq_arg" "$out_arg" "$force_arg" ;;
   add-folder) # squad add-folder <dir> [--to <file.code-workspace>] [--name <agent>]
             shift; d_arg="${1:-}"; ws_arg=""; name_arg=""; hub_arg=""; proj_arg=""
             while [ $# -gt 0 ]; do case "$1" in
