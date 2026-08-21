@@ -1293,7 +1293,32 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
         row = db().execute(
             "SELECT * FROM api_squads WHERE name = ? AND archived = 0", (name,)
         ).fetchone()
-        if not row:
+        # RETIREMENT MUST BE COMPLETABLE. A bare archive leaves the comms
+        # memberships behind, and the name is then reserved (POST 409) while
+        # every route here 404s on `archived = 0` — so the operator who
+        # archived a dead squad had no way to finish the job, and it kept
+        # appearing in the console's Squads tab forever (found live retiring
+        # `capsule`, console #168). Purge stays reachable on an archived row;
+        # a bare DELETE does not, or "archive" would stop meaning anything.
+        purge_wanted = (request.method == "DELETE"
+                        and request.query_params.get("purge") == "true")
+        if not row and purge_wanted:
+            row = db().execute(
+                "SELECT * FROM api_squads WHERE name = ?", (name,)
+            ).fetchone()
+        # TWO REGISTRIES, ONE INTENT. A squad can exist ONLY in comms
+        # membership — agents named it in register()/set_squads and nothing
+        # ever registered it with the runtime (`duo`, retired 2026-08-21).
+        # It shows in the console's Squads tab like any other and every route
+        # here 404s for want of an api_squads row, so it is unretireable by
+        # construction. "Retire this squad" must reach whichever registries
+        # the name is actually in.
+        comms_only = False
+        if not row and purge_wanted:
+            comms_only = bool(db().execute(
+                "SELECT 1 FROM squad_members WHERE squad = ? LIMIT 1", (name,)
+            ).fetchone())
+        if not row and not comms_only:
             return _err(404, f"no squad '{name}'")
         if request.method == "GET":
             return JSONResponse(squad_json(row))

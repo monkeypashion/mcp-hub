@@ -461,3 +461,95 @@ def test_a_seat_with_no_brief_gets_no_brief_env():
     from mcp_hub.edge import DockerExecutor
     argv = DockerExecutor.create_argv("plain-1", {"image": "seat:latest"})
     assert not any("SEAT_BRIEF" in a or "SEAT_INPUTS" in a for a in argv)
+
+
+class TestRetirementIsCompletable:
+    """Found live 2026-08-21 retiring the dead `capsule` squad (console #168):
+    `squads rm` WITHOUT --purge archives the runtime record and leaves the
+    comms memberships behind — and then strands them. The name is reserved
+    (POST 409 "names are reserved") while every member route 404s on
+    `archived = 0`, so the operator has NO route to finish the retirement
+    they started. The squad keeps appearing in the console's Squads tab,
+    which reads comms membership, and nothing can remove it.
+
+    Archiving is not the risky half — the memberships are. So purge must
+    stay reachable on an ALREADY-ARCHIVED squad: retirement becomes
+    completable and idempotent, instead of one-shot and unfinishable.
+    """
+
+    def _dead_squad(self, client):
+        client.post("/api/v1/squads", json={"name": "capsule"}, headers=H)
+        client.put("/api/v1/squads/capsule/members/ghost-a", headers=H)
+        client.put("/api/v1/squads/capsule/members/ghost-b", headers=H)
+
+    def test_purge_still_works_after_a_bare_archive(self, client):
+        self._dead_squad(client)
+        client.delete("/api/v1/squads/capsule", headers=H)      # bare archive
+        r = client.delete("/api/v1/squads/capsule?purge=true", headers=H)
+        assert r.status_code == 200, r.text
+        assert r.json()["purged"]["memberships"] == 2, r.json()
+
+    def test_the_squad_leaves_the_comms_registry_after_that_purge(self, client):
+        """The console's tab reads comms membership — the operator's actual
+        complaint. Archiving alone must not leave it listed forever."""
+        self._dead_squad(client)
+        client.delete("/api/v1/squads/capsule", headers=H)
+        client.delete("/api/v1/squads/capsule?purge=true", headers=H)
+        rows = client.get("/api/v1/squads/capsule/members", headers=H)
+        assert rows.status_code in (200, 404)
+        if rows.status_code == 200:
+            assert rows.json() in ([], {"members": []}), rows.text
+
+    def test_purging_twice_is_idempotent_not_an_error(self, client):
+        self._dead_squad(client)
+        client.delete("/api/v1/squads/capsule?purge=true", headers=H)
+        r = client.delete("/api/v1/squads/capsule?purge=true", headers=H)
+        assert r.status_code == 200, r.text
+        assert r.json()["purged"]["memberships"] == 0
+
+    def test_a_bare_delete_on_an_archived_squad_still_404s(self, client):
+        """Positive control: only PURGE reopens the door. A plain DELETE
+        must not become a silent no-op success, or 'archive' would stop
+        meaning anything."""
+        self._dead_squad(client)
+        client.delete("/api/v1/squads/capsule", headers=H)
+        r = client.delete("/api/v1/squads/capsule", headers=H)
+        assert r.status_code == 404, r.text
+
+    def test_an_unknown_squad_still_404s_even_with_purge(self, client):
+        """The reopened door is for ARCHIVED squads, not for typos."""
+        r = client.delete("/api/v1/squads/never-existed?purge=true", headers=H)
+        assert r.status_code == 404, r.text
+
+
+class TestPurgingACommsOnlySquad:
+    """The second half of the same trap, and the one that bit `duo`: a squad
+    can exist ONLY in comms membership (agents named it in register()/
+    set_squads and it was never registered with the runtime). It shows in
+    the console's Squads tab like any other, and every /api/v1/squads route
+    404s because there is no api_squads row to find — so it is unretireable
+    by construction.
+
+    TWO REGISTRIES, ONE OPERATOR INTENT: "retire this squad" must work on
+    whichever registries the name actually appears in.
+    """
+
+    def test_purge_clears_a_squad_that_only_exists_in_comms(
+            self, client, tmp_path: Path):
+        import sqlite3
+
+        db = sqlite3.connect(tmp_path / "hub.db")
+        db.execute("INSERT INTO squad_members (agent, squad, muted) "
+                   "VALUES ('ghost-a', 'duo', 0)")
+        db.execute("INSERT INTO squad_members (agent, squad, muted) "
+                   "VALUES ('ghost-b', 'duo', 0)")
+        db.commit()
+        db.close()
+
+        r = client.delete("/api/v1/squads/duo?purge=true", headers=H)
+        assert r.status_code == 200, r.text
+        assert r.json()["purged"]["memberships"] == 2, r.json()
+
+    def test_a_name_in_neither_registry_still_404s(self, client):
+        r = client.delete("/api/v1/squads/never-existed?purge=true", headers=H)
+        assert r.status_code == 404, r.text
