@@ -328,6 +328,70 @@ def init_api_tables(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    # Seat CONTROL plane (cards #144/#152). The console records INTENT; the
+    # machine that owns the seat carries it out and reports what it OBSERVED
+    # — the placements pattern, applied to keystrokes. The console never
+    # holds a shell: it can only ask, and one compromised console therefore
+    # cannot reach a single machine directly.
+    #
+    # `status` starts `pending` and is terminal thereafter (done | failed |
+    # refused | expired). `refused` is a real OUTCOME, not an error: a
+    # fail-closed edge must be able to say "I would not do that" and have it
+    # recorded, or the honest refusal looks identical to a crash.
+    #
+    # `observed` and `pane_after` are NULLABLE on purpose — an action the
+    # edge has not reached yet has no observation, and an empty string there
+    # would read as "the pane was blank", which is a measurement.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS api_seat_actions (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            seat         TEXT NOT NULL,
+            kind         TEXT NOT NULL,   -- interrupt | prompt  (phase 1)
+            args         TEXT NOT NULL DEFAULT '{}',
+            requested_at REAL NOT NULL,
+            requested_by TEXT NOT NULL DEFAULT '',
+            status       TEXT NOT NULL DEFAULT 'pending',
+            observed     TEXT,
+            pane_after   TEXT,
+            settled_at   REAL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_seat_actions_seat "
+        "ON api_seat_actions (seat, status)"
+    )
+    # Watch leg. A viewer DECLARATION with the open-now 180s window, so a
+    # console tab left open in a closed laptop stops the stream by itself.
+    # One row per seat: "is anyone looking", not "who is looking".
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS api_seat_viewers (
+            seat       TEXT PRIMARY KEY,
+            declared_at REAL NOT NULL,
+            declared_by TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+    # Pane captures — a RING BUFFER, never a transcript. Durable history is
+    # the memory volume's job; this exists so the console can show what the
+    # seat looked like, and storing it forever would make every pane's
+    # contents a permanent record nobody asked for.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS api_seat_panes (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            seat        TEXT NOT NULL,
+            pane        TEXT NOT NULL,
+            captured_at REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_seat_panes_seat "
+        "ON api_seat_panes (seat, id)"
+    )
     conn.commit()
 
 
@@ -1067,6 +1131,311 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
         # of at the next timer tick.
         notify_machine(row["machine"], "seat-archived")
         return JSONResponse({"identity": identity, "archived": True})
+
+    # -- seat control plane (cards #144 design / #152 build, phase 1) --------
+    #
+    # Three verbs: watch, prompt, interrupt. Everything here is a RECORD —
+    # the console asks, the seat's own machine acts under its own machine
+    # token, and the outcome carries what was OBSERVED rather than what was
+    # assumed. See docs/seat-control-plane.md.
+
+    # Phase 1's closed verb set. `answer` and `restart` are phase 2 and are
+    # refused BY NAME below: a refusal that does not say "not yet" gets read
+    # as "never", and the whole category then looks forbidden (the
+    # headless-pod lesson — a refusal justified by one mechanism outlived
+    # the mechanism).
+    _PHASE1_VERBS = ("interrupt", "prompt")
+    _PHASE2_VERBS = ("answer", "restart")
+    # An interrupt written during a stall must not land minutes later in the
+    # middle of healthy work. The stored value is a REQUEST TIME and expiry
+    # is derived, so a pending action cannot outlive this by being missed.
+    _ACTION_TTL_SECONDS = 120.0
+    # Same window as the workspace manager's `open now` column, for the same
+    # reason: two consecutive missed refreshes are survivable, a closed
+    # laptop is not a viewer.
+    _WATCH_WINDOW_SECONDS = 180.0
+    _PANE_RING = 20
+
+    def _seat_row(identity: str):
+        return db().execute(
+            "SELECT * FROM api_seats WHERE identity = ? AND archived = 0",
+            (identity,),
+        ).fetchone()
+
+    def _expire_stale_actions(seat: str) -> None:
+        """Age out pending intent. A PURGE would be wrong here — a vanished
+        action is indistinguishable from one never written — so this marks
+        `expired` and leaves the row as the record that it lapsed.
+
+        Guarded by a cheap SELECT for the same reason the loan purge is: an
+        unconditional UPDATE takes a write lock on every read path, which
+        surfaced immediately as `database is locked` the first time.
+        """
+        cutoff = _now() - _ACTION_TTL_SECONDS
+        stale = db().execute(
+            "SELECT 1 FROM api_seat_actions WHERE seat = ? AND status = "
+            "'pending' AND requested_at < ? LIMIT 1", (seat, cutoff),
+        ).fetchone()
+        if not stale:
+            return
+        db().execute(
+            "UPDATE api_seat_actions SET status = 'expired', settled_at = ? "
+            "WHERE seat = ? AND status = 'pending' AND requested_at < ?",
+            (_now(), seat, cutoff),
+        )
+        db().commit()
+
+    def _action_json(row: sqlite3.Row) -> dict:
+        return {
+            "id": row["id"],
+            "seat": row["seat"],
+            "kind": row["kind"],
+            "args": json.loads(row["args"] or "{}"),
+            "requested_at": row["requested_at"],
+            "requested_by": row["requested_by"],
+            "status": row["status"],
+            # NULL stays NULL: "not observed yet" is not an empty pane.
+            "observed": json.loads(row["observed"]) if row["observed"] else None,
+            "pane_after": row["pane_after"],
+            "settled_at": row["settled_at"],
+        }
+
+    def _owning_machine_only(request: Request, identity: str):
+        """Operator, or the machine this seat is placed on — nobody else.
+
+        The console may only ASK (it writes intent through operator_only);
+        this gate is for the READ/REPORT side, where a machine acts on its
+        own seats. Letting box-2 report an outcome for box-1's seat would
+        hand one compromised machine the fleet, which is the entire reason
+        this design records intent instead of opening a shell.
+        """
+        got = auth(request)
+        if isinstance(got, JSONResponse):
+            return got
+        principal, machine = got
+        row = _seat_row(identity)
+        if row is None:
+            return _err(404, f"no such seat '{identity}'")
+        if principal == "operator":
+            return got
+        if machine != row["machine"]:
+            return _err(
+                403,
+                f"seat '{identity}' is placed on '{row['machine']}', not "
+                f"'{machine}' — a machine may only act on its own seats",
+            )
+        return got
+
+    @route("/api/v1/seats/{identity}/actions", methods=["GET", "POST"])
+    async def seat_actions(request: Request) -> Response:
+        identity = request.path_params["identity"]
+
+        if request.method == "POST":
+            # Operator token ONLY. Seats must not be able to drive each
+            # other; same stance as feature-set registration. A machine
+            # token here would make the edge both asker and actor.
+            got = operator_only(request)
+            if isinstance(got, JSONResponse):
+                return got
+            row = _seat_row(identity)
+            if row is None:
+                return _err(404, f"no such seat '{identity}'")
+            body = await body_of(request)
+            kind = str(body.get("kind") or "")
+            args = body.get("args") or {}
+            if kind in _PHASE2_VERBS:
+                return _err(
+                    400,
+                    f"'{kind}' is PHASE 2 of the seat control plane and is "
+                    f"not built yet — phase 1 is {', '.join(_PHASE1_VERBS)}. "
+                    f"({kind} needs the fail-closed dialog parser / the "
+                    f"seat image's --continue leg; see "
+                    f"docs/seat-control-plane.md)",
+                )
+            if kind not in _PHASE1_VERBS:
+                return _err(
+                    400,
+                    f"unknown seat action '{kind}'. The verb set is CLOSED "
+                    f"by design — no arbitrary keystroke pass-through, no "
+                    f"shell. Phase 1 verbs: {', '.join(_PHASE1_VERBS)}",
+                )
+            if kind == "prompt" and not str(args.get("text") or "").strip():
+                return _err(
+                    400,
+                    "a prompt needs `args.text` — a prompt that types "
+                    "nothing is a no-op wearing the word prompt",
+                )
+            # UPSERT, never queue: mashing the button re-states the ask.
+            # Superseded intent is recorded as such rather than deleted, so
+            # the trail shows what was asked and overtaken.
+            db().execute(
+                "UPDATE api_seat_actions SET status = 'superseded', "
+                "settled_at = ? WHERE seat = ? AND status = 'pending'",
+                (_now(), identity),
+            )
+            cur = db().execute(
+                "INSERT INTO api_seat_actions (seat, kind, args, "
+                "requested_at, requested_by, status) VALUES (?,?,?,?,?, "
+                "'pending')",
+                (identity, kind, json.dumps(args), _now(), "operator"),
+            )
+            db().commit()
+            # After the commit — a doorbell that can break a write is worse
+            # than no doorbell. This is what turns ~30s into ~1s.
+            notify_machine(row["machine"], "seat-action")
+            new = db().execute(
+                "SELECT * FROM api_seat_actions WHERE id = ?", (cur.lastrowid,)
+            ).fetchone()
+            return JSONResponse(_action_json(new), status_code=201)
+
+        got = _owning_machine_only(request, identity)
+        if isinstance(got, JSONResponse):
+            return got
+        _expire_stale_actions(identity)
+        rows = db().execute(
+            "SELECT * FROM api_seat_actions WHERE seat = ? ORDER BY id DESC "
+            "LIMIT 50", (identity,),
+        ).fetchall()
+        return JSONResponse({"actions": [_action_json(r) for r in rows]})
+
+    @route("/api/v1/seats/{identity}/actions/{action_id}", methods=["PATCH"])
+    async def seat_action_report(request: Request) -> Response:
+        """The edge reports what it OBSERVED. Not 'we sent Escape' but 'here
+        is the pane afterwards' — observed, never assumed."""
+        identity = request.path_params["identity"]
+        got = _owning_machine_only(request, identity)
+        if isinstance(got, JSONResponse):
+            return got
+        action_id = request.path_params["action_id"]
+        row = db().execute(
+            "SELECT * FROM api_seat_actions WHERE id = ? AND seat = ?",
+            (action_id, identity),
+        ).fetchone()
+        if row is None:
+            return _err(404, f"no action {action_id} on seat '{identity}'")
+        body = await body_of(request)
+        status = str(body.get("status") or "")
+        if status not in ("done", "failed", "refused"):
+            return _err(
+                400,
+                "status must be one of done | failed | refused — `refused` "
+                "is a real outcome (a fail-closed edge declining to act), "
+                "not an error",
+            )
+        observed = body.get("observed")
+        db().execute(
+            "UPDATE api_seat_actions SET status = ?, observed = ?, "
+            "pane_after = ?, settled_at = ? WHERE id = ?",
+            (status,
+             json.dumps(observed) if observed is not None else None,
+             body.get("pane_after"), _now(), action_id),
+        )
+        db().commit()
+        new = db().execute(
+            "SELECT * FROM api_seat_actions WHERE id = ?", (action_id,)
+        ).fetchone()
+        return JSONResponse(_action_json(new))
+
+    @route("/api/v1/seats/{identity}/watch", methods=["GET", "POST"])
+    async def seat_watch(request: Request) -> Response:
+        """View ON DEMAND. No viewer declared → the edge streams nothing; a
+        fleet permanently streaming every pane is cost and exposure with no
+        reader."""
+        identity = request.path_params["identity"]
+
+        if request.method == "POST":
+            got = operator_only(request)
+            if isinstance(got, JSONResponse):
+                return got
+            if _seat_row(identity) is None:
+                return _err(404, f"no such seat '{identity}'")
+            db().execute(
+                "INSERT INTO api_seat_viewers (seat, declared_at, declared_by)"
+                " VALUES (?,?,?) ON CONFLICT(seat) DO UPDATE SET "
+                "declared_at = excluded.declared_at",
+                (identity, _now(), "operator"),
+            )
+            db().commit()
+            row = _seat_row(identity)
+            notify_machine(row["machine"], "seat-watch")
+            return JSONResponse({"seat": identity, "watching": True})
+
+        got = _owning_machine_only(request, identity)
+        if isinstance(got, JSONResponse):
+            return got
+        row = db().execute(
+            "SELECT declared_at FROM api_seat_viewers WHERE seat = ?",
+            (identity,),
+        ).fetchone()
+        watching = bool(
+            row and (_now() - row["declared_at"]) <= _WATCH_WINDOW_SECONDS
+        )
+        return JSONResponse({
+            "seat": identity,
+            "watching": watching,
+            "window_seconds": _WATCH_WINDOW_SECONDS,
+        })
+
+    @route("/api/v1/seats/{identity}/view", methods=["GET", "POST"])
+    async def seat_view(request: Request) -> Response:
+        identity = request.path_params["identity"]
+        got = _owning_machine_only(request, identity)
+        if isinstance(got, JSONResponse):
+            return got
+
+        if request.method == "POST":
+            body = await body_of(request)
+            pane = body.get("pane")
+            if pane is None:
+                return _err(400, "a capture needs `pane`")
+            db().execute(
+                "INSERT INTO api_seat_panes (seat, pane, captured_at) "
+                "VALUES (?,?,?)", (identity, str(pane), _now()),
+            )
+            # Ring buffer, trimmed on write: this is a LIVE VIEW, and a
+            # durable pane history is a transcript nobody asked for.
+            db().execute(
+                "DELETE FROM api_seat_panes WHERE seat = ? AND id NOT IN ("
+                "SELECT id FROM api_seat_panes WHERE seat = ? "
+                "ORDER BY id DESC LIMIT ?)",
+                (identity, identity, _PANE_RING),
+            )
+            db().commit()
+            return JSONResponse({"seat": identity, "captured": True})
+
+        row = db().execute(
+            "SELECT pane, captured_at FROM api_seat_panes WHERE seat = ? "
+            "ORDER BY id DESC LIMIT 1", (identity,),
+        ).fetchone()
+        agg = db().execute(
+            "SELECT COUNT(*) AS n, MIN(captured_at) AS oldest "
+            "FROM api_seat_panes WHERE seat = ?", (identity,),
+        ).fetchone()
+        # ⚠️ THE RING IS COUNT-BOUNDED, AND A COUNT BOUND HAS NO DURATION.
+        # Its horizon is `_PANE_RING ÷ write rate`, so it SHRINKS as the seat
+        # gets busier — weeks on a quiet seat, minutes on a thrashing one,
+        # i.e. shortest during an incident, which is exactly when someone
+        # opens it (vps, 2026-08-23). A time bound degrades gracefully; a
+        # count bound degrades ADVERSARIALLY.
+        #
+        # So the response reports the reach it OBSERVED rather than leaving
+        # the reader to assume one: `kept` counts captures and
+        # `oldest_captured_at` dates the far end. Never quote this as
+        # "the last N minutes" — it does not have an N.
+        #
+        # Corollary for anyone investigating with it: watching a busy seat
+        # GENERATES writes, so your own looking consumes the evidence.
+        # Snapshot before poking.
+        return JSONResponse({
+            "seat": identity,
+            # `pane: null` when nothing has been captured — absence of
+            # measurement must not render as a measurement of emptiness.
+            "pane": row["pane"] if row else None,
+            "captured_at": row["captured_at"] if row else None,
+            "kept": agg["n"],
+            "oldest_captured_at": agg["oldest"],
+            "ring": _PANE_RING,
+        })
 
     @route("/api/v1/seats/{identity}/restore", methods=["POST"])
     async def seat_restore(request: Request) -> Response:

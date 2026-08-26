@@ -641,6 +641,202 @@ class HubAPI:
         )
         r.raise_for_status()
 
+    # -- seat control plane (cards #144/#152) -------------------------------
+
+    def pull_seat_actions(self, seat: str) -> list[dict[str, Any]]:
+        r = self._c.get(f"/api/v1/seats/{seat}/actions", headers=self._h)
+        r.raise_for_status()
+        return r.json()["actions"]
+
+    def report_seat_action(
+        self, seat: str, action_id: int, report: dict[str, Any]
+    ) -> None:
+        r = self._c.patch(
+            f"/api/v1/seats/{seat}/actions/{action_id}",
+            headers=self._h, json=report,
+        )
+        r.raise_for_status()
+
+    def seat_watched(self, seat: str) -> bool:
+        r = self._c.get(f"/api/v1/seats/{seat}/watch", headers=self._h)
+        r.raise_for_status()
+        return bool(r.json().get("watching"))
+
+    def push_seat_pane(self, seat: str, pane: str) -> None:
+        r = self._c.post(
+            f"/api/v1/seats/{seat}/view", headers=self._h, json={"pane": pane}
+        )
+        r.raise_for_status()
+
+
+# -- seat control plane, edge leg (cards #144/#152, phase 1) ----------------
+#
+# The hub records INTENT; this is where a machine carries it out on its own
+# seats and reports what it OBSERVED. Phase 1 is `interrupt` and `prompt`.
+#
+# Everything goes through the injected runner, exactly like SquadExecutor,
+# and for a sharper reason: this code sends KEYSTROKES to a live agent's
+# terminal. No import of subprocess here means no test path can type into a
+# real seat.
+
+_SEAT_PHASE1_VERBS = ("interrupt", "prompt")
+
+
+def _seat_tmux_argv(seat: dict[str, Any], args: list[str]) -> list[str]:
+    """tmux argv for this seat, on the host or inside its container.
+
+    A docker seat's pane lives INSIDE the container, so host tmux would
+    either miss it or — worse — hit a same-named host session. The substrate
+    decides the door; it is never inferred from the session name.
+    """
+    session = seat.get("session") or "seat"
+    if seat.get("substrate") == "docker":
+        return ["docker", "exec", seat["identity"], "tmux", *args, "-t", session]
+    return ["tmux", "-L", "squad", *args, "-t", session]
+
+
+def _capture_pane(seat: dict[str, Any], runner: Any) -> tuple[bool, str]:
+    rc, out = runner(_seat_tmux_argv(seat, ["capture-pane", "-p"]))
+    return rc == 0, out
+
+
+def realize_seat_action(
+    action: dict[str, Any], seat: dict[str, Any], runner: Any,
+) -> dict[str, Any]:
+    """Carry out one seat action and report what was OBSERVED.
+
+    Returns the PATCH body the hub expects: `status` (done | refused |
+    failed), `observed`, `pane_after`.
+
+    ⚠️ FAIL CLOSED. The pane is captured BEFORE anything is typed, and a
+    capture that fails refuses the action outright rather than sending a
+    keystroke blind. This is the seat-entry lesson, and it is not
+    negotiable: a blind keypress lands on whatever row happens to be
+    default, which is how a seat once confirmed its own death — cleanly,
+    exit 0, with nothing anywhere that looked wrong.
+
+    ⚠️ The verb set is checked here as well as at the hub. The hub refusing
+    to WRITE an unknown verb and the edge refusing to EXECUTE one are
+    different guarantees; keeping only the first would mean one compromised
+    writer becomes one executed keystroke.
+    """
+    kind = action.get("kind") or ""
+    if kind not in _SEAT_PHASE1_VERBS:
+        return {
+            "status": "refused",
+            "observed": {"why": f"'{kind}' is not a phase-1 seat verb "
+                                f"({', '.join(_SEAT_PHASE1_VERBS)}); the edge "
+                                f"executes nothing it does not recognise"},
+            "pane_after": None,
+        }
+
+    readable, before = _capture_pane(seat, runner)
+    if not readable:
+        return {
+            "status": "refused",
+            "observed": {
+                "why": "could not capture the seat's pane — refusing to send "
+                       "keystrokes to a terminal we cannot read",
+                "runner_output": before,
+            },
+            "pane_after": None,
+        }
+
+    if kind == "interrupt":
+        # Escape ALONE. Escape-then-Enter would interrupt and then submit
+        # whatever was left in the box — a different act than the one asked.
+        rc, out = runner(_seat_tmux_argv(seat, ["send-keys", "Escape"]))
+        sent: dict[str, Any] = {"sent": "Escape"}
+    else:
+        text = str(action.get("args", {}).get("text") or "")
+        # Two sends, deliberately. `send-keys "<text>" Enter` in one call
+        # makes tmux interpret the literal as a KEY NAME whenever it happens
+        # to match one — a prompt whose text is "Enter" or "C-c" would be
+        # executed as that key. `-l` types it literally; Enter submits.
+        rc, out = runner(
+            _seat_tmux_argv(seat, ["send-keys", "-l", text])
+        )
+        if rc == 0:
+            rc, out = runner(_seat_tmux_argv(seat, ["send-keys", "Enter"]))
+        sent = {"sent": "text+Enter", "chars": len(text)}
+
+    # Captured AFTER — the evidence is the pane the action produced, not the
+    # one it started from. "We sent Escape" is an assumption with a number
+    # attached; this is an observation.
+    _, after = _capture_pane(seat, runner)
+
+    if rc != 0:
+        return {
+            "status": "failed",
+            "observed": {**sent, "why": "send-keys failed",
+                         "runner_output": out},
+            "pane_after": after,
+        }
+    return {"status": "done", "observed": sent, "pane_after": after}
+
+
+def seat_control_pass(
+    api: Any, placements: list[dict[str, Any]], runner: Any,
+) -> dict[str, Any]:
+    """Realize pending seat actions and stream panes for watched seats.
+
+    Runs alongside the placement reconcile on the same timer + doorbell.
+
+    ⚠️ EVERY SEAT IS ISOLATED, and the whole leg is isolated from the
+    reconcile that carries it. A seat whose tmux is wedged, or a hub route
+    that 500s, must not stop the OTHER seats' actions and must not stop
+    placements converging — the same reason `mcp-hub-edge` is its own
+    systemd unit rather than folded into `squad-heal`: a oneshot that fails
+    takes its whole ExecStart chain with it.
+
+    Only seats this machine actually holds a RUNNING placement for are
+    touched. A reclaimed or stopped seat has no pane to drive, and asking
+    would turn a normal state into an error every pass.
+    """
+    realized: list[dict[str, Any]] = []
+    streamed = 0
+    errors: list[str] = []
+
+    for p in placements:
+        if p.get("desired") != "running":
+            continue
+        seat_id = p["seat"]
+        seat = {
+            "identity": seat_id,
+            "substrate": p.get("substrate", "worktree"),
+            # A worktree seat's tmux session is its own name; a container's
+            # is the seat image's fixed inner session.
+            "session": "seat" if p.get("substrate") == "docker" else seat_id,
+        }
+        try:
+            for action in api.pull_seat_actions(seat_id):
+                if action.get("status") != "pending":
+                    continue
+                report = realize_seat_action(action, seat, runner)
+                api.report_seat_action(seat_id, action["id"], report)
+                realized.append({"seat": seat_id, "id": action["id"],
+                                 "kind": action.get("kind"),
+                                 "status": report["status"]})
+        except Exception as exc:  # noqa: BLE001 — one seat must not stop the rest
+            errors.append(f"{seat_id}: actions: {exc}")
+
+        try:
+            # View ON DEMAND: ask first, capture only if someone is looking.
+            # Capturing unconditionally would put every pane on the wire for
+            # no reader, which is the cost and exposure the design refuses.
+            if api.seat_watched(seat_id):
+                ok, pane = _capture_pane(seat, runner)
+                if ok:
+                    api.push_seat_pane(seat_id, pane)
+                    streamed += 1
+                # A failed capture pushes NOTHING. An empty pane would read
+                # as "the seat is showing nothing", which is a measurement;
+                # absence is not.
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{seat_id}: view: {exc}")
+
+    return {"realized": realized, "streamed": streamed, "errors": errors}
+
 
 class SquadExecutor:
     """Maps planned actions onto the proven squad verbs via an injected runner.
@@ -1624,6 +1820,14 @@ def edge_apply(
         api.push_observed(p["id"], observed_report(p, enumeration))
         reported += 1
 
+    # Seat control (cards #144/#152) rides the same pass — but AFTER the
+    # placements are reported, and inside its own guard: a wedged pane must
+    # not cost the fleet its reconcile.
+    try:
+        seat_control = seat_control_pass(api, placements, runner)
+    except Exception as exc:  # noqa: BLE001 — never let control break convergence
+        seat_control = {"realized": [], "streamed": 0, "errors": [str(exc)]}
+
     workspaces = discover_workspaces([Path(d) for d in scan_dirs])
     # The roster, agent → worktree. Only this machine can say which folder an
     # agent sits in: a remote row in the board carries no worktree, so without
@@ -1652,7 +1856,14 @@ def edge_apply(
                 "result": "ok",
                 "placements": len(placements),
                 "actions": len(results),
-                "errors": [],
+                # Seat-control failures are REPORTED, not swallowed. They
+                # are isolated from convergence on purpose, and an isolated
+                # failure with no reader is the defect this fleet spent
+                # today naming — a control is not done until it names who
+                # receives it firing.
+                "seat_actions": len(seat_control["realized"]),
+                "panes_streamed": seat_control["streamed"],
+                "errors": seat_control["errors"],
             },
         },
     )
@@ -1661,6 +1872,7 @@ def edge_apply(
         "actions": results,
         "observed_reported": reported,
         "workspaces_reported": len(workspaces),
+        "seat_control": seat_control,
     }
 
 

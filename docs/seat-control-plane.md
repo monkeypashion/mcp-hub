@@ -1,6 +1,23 @@
 # Seat control + live view — one design (console card #144)
 
-**Status: DESIGN, operator review pending. Nothing here is built.**
+**Status: PHASE 1 BUILT (console card #152, approved 2026-08-23), HELD — not
+yet deployed, so none of it is reachable on the live hub. Phase 2 is design
+only.**
+
+What exists as of 2026-08-23, all uncommitted in the working tree:
+
+| Leg | Where | Tests |
+|-----|-------|-------|
+| `actions` / `watch` / `view` routes + tables | `api_v1.py` | `test_seat_control_plane.py` (28) |
+| `realize_seat_action` — the keystroke half | `edge.py` | `test_seat_control_edge.py` (15) |
+| `seat_control_pass` — polling + streaming | `edge.py` | `test_seat_control_edge.py` (7) |
+
+Not built: the **console UI**, which is squad-proxy's surface, and everything
+under *Phase 2* below.
+
+⚠️ The API is inert until the hub deploys. A console calling these routes
+against the live hub today gets 404s — that is a missing deploy, not a
+missing feature.
 
 The console's Squads tab gains the cockpit's powers over a seat — watch it
 work live, interrupt it, send it a prompt, answer its dialogs, restart or
@@ -75,7 +92,25 @@ seat's edge streams pane captures (`tmux capture-pane`, ~2s cadence) to
 
 1. **Phase 1: watch + prompt + interrupt** — the three the operator reached
    for today, and the smallest honest loop (see it stuck → nudge it → see
-   the result).
+   the result). ✅ **BUILT 2026-08-23.** Three things the build settled that
+   the design had left implicit, each mutation-proven:
+   - **A prompt is typed with tmux's literal flag, and Enter is a SEPARATE
+     send.** `send-keys "<text>" Enter` in one call makes tmux read the
+     literal as a KEY NAME whenever it matches one — a prompt whose text is
+     "Enter" or "C-c" would be executed as that key rather than typed.
+   - **Interrupt sends Escape alone.** Escape-then-Enter would interrupt and
+     then submit whatever was left in the box: a different act than the one
+     asked for.
+   - **The verb set is enforced at BOTH ends.** The hub refusing to *write*
+     an unknown verb and the edge refusing to *execute* one are different
+     guarantees; with only the first, one compromised writer becomes one
+     executed keystroke.
+
+   The seat-control leg is also **isolated from the placement reconcile and
+   from other seats** — a wedged pane costs that seat its action and nothing
+   else. Same reason `mcp-hub-edge` is its own systemd unit rather than part
+   of `squad-heal`: a `oneshot` that fails takes its whole ExecStart chain
+   with it.
 2. **Phase 2: answer** (needs the fail-closed dialog parser ported from the
    cockpit) **+ restart resume/fresh** (needs the seat image's `--continue`
    leg). Stop needs nothing — it already exists as a placement verb the
