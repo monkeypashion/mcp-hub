@@ -336,3 +336,54 @@ def test_logs_says_so_when_the_seat_was_never_PLACED(capsys):
     rc = cli.seats_command(args, api=LogsApi([]))
     assert rc == 1
     assert "never placed" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------- rm wording
+
+
+class TestRmSaysWhatItDid:
+    """Found live closing #168 (2026-08-26): `squads rm capsule --purge`
+    printed "archived — its message history is KEPT", the ARCHIVE message,
+    and the operator had to run list_squads to learn the purge had in fact
+    worked. A success string that describes a different, weaker act than the
+    one performed is the lying-receipt family — the reader either concludes
+    the purge failed, or worse, believes the name is still reserved when it
+    is free."""
+
+    def test_purge_says_purged_not_archived(self, capsys):
+        api = FakeApi({"capsule": ["a", "b"]})
+        rc = cli.squads_command(
+            _args(action="rm", name="capsule", purge=True), api=api)
+        assert rc == 0
+        assert api.calls == [("delete", "capsule", True)]
+        out = capsys.readouterr().out.lower()
+        assert "purged" in out, f"the purge reported itself as: {out!r}"
+        assert "archived" not in out, (
+            "purge described itself as the weaker act — the operator who "
+            f"reads this verifies by hand or believes it failed: {out!r}"
+        )
+        assert "history" in out, (
+            "history survival is the one thing purge does NOT change and "
+            f"the reader will worry about first — say it: {out!r}"
+        )
+
+    def test_purge_says_the_name_is_free(self, capsys):
+        """The 409-reserved trap was the whole reason purge exists; its
+        success message should close that loop."""
+        api = FakeApi({"capsule": []})
+        cli.squads_command(
+            _args(action="rm", name="capsule", purge=True), api=api)
+        out = capsys.readouterr().out.lower()
+        assert "free" in out or "reuse" in out, (
+            f"purge did not say the name is reusable again: {out!r}")
+
+    def test_bare_rm_still_says_archived_and_offers_purge(self, capsys):
+        api = FakeApi({"capsule": []})
+        cli.squads_command(
+            _args(action="rm", name="capsule", purge=False), api=api)
+        out = capsys.readouterr().out.lower()
+        assert "archived" in out
+        assert "--purge" in out, (
+            "the bare archive must keep pointing at the finishing move, or "
+            f"the operator is back in the no-route-to-finish trap: {out!r}"
+        )

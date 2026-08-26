@@ -3209,9 +3209,18 @@ def squads_command(args: argparse.Namespace, api: Any = None) -> int:
                       + (" and drop its memberships" if args.purge else ""))
                 return 0
             api.delete_api_squad(args.name, args.purge)
-            print(f"squad '{args.name}' archived — its message history is "
-                  f"KEPT and stays readable under that name")
-            if not args.purge:
+            # Two different acts, two different sentences. Purging while
+            # printing the ARCHIVE message made the operator verify by hand
+            # that the purge had happened at all (#168, 2026-08-26) — a
+            # success string describing a weaker act than the one performed
+            # is a lying receipt.
+            if args.purge:
+                print(f"squad '{args.name}' PURGED — runtime record and "
+                      f"memberships removed, the name is free for reuse; "
+                      f"message history is KEPT and stays readable")
+            else:
+                print(f"squad '{args.name}' archived — its message history "
+                      f"is KEPT and stays readable under that name")
                 print("memberships were left in place (--purge drops them)")
             return 0
 
