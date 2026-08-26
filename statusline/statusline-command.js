@@ -133,6 +133,11 @@ process.stdin.on('end', () => {
   // opt-in check needed here: if the daemon never ran, there's no status
   // file and the segment stays silent.
   let hubSeg = '';
+  // Resolved agent identity, hoisted out of the hub block so the usage
+  // snapshot at the bottom can key its file by the SAME name the daemon
+  // uses. Null when this isn't a hub agent — which is why that snapshot
+  // writes nothing rather than inventing a filename.
+  let agentName = null;
   try {
     const sanitizeIdent = (s) =>
       String(s).toLowerCase().replace(/[^a-z0-9_-]/g, '-').replace(/^-+|-+$/g, '');
@@ -194,9 +199,14 @@ process.stdin.on('end', () => {
             path.join(os.homedir(), '.mcp-hub', `status-${safe}.json`), 'utf8'
           )
         );
+        agentName = name;
         break;
       } catch { /* try next candidate */ }
     }
+    // No status file matched — the daemon may simply never have run here.
+    // Fall back to the first derived candidate so the usage snapshot still
+    // has a name; identity resolution and daemon liveness are separate facts.
+    if (!agentName && candidates.length) agentName = candidates[0];
     if (st) {
       const age = Math.floor(Date.now() / 1000) - (st.ts || 0);
       const fleet = `${st.fleet_wakeable}/${st.fleet_total}`;
@@ -350,4 +360,105 @@ process.stdin.on('end', () => {
   if (dirSeg) segs.push(dirSeg);
 
   process.stdout.write(segs.join(` ${C.dim}·${C.reset} `) + '\n');
+
+  // ── Usage snapshot — persist what we just rendered ──────────────
+  // Claude Code hands us rate_limits on every render and we used to throw it
+  // away, so the one number the usage-limits thread needed was on every seat's
+  // screen and readable by nobody but a human. Written AFTER stdout: the
+  // statusline's job is to render, and a disk problem must never cost a line.
+  //
+  // Two things a reader MUST honour, both of which make this file lie in the
+  // reassuring direction if ignored:
+  //
+  //  1. `scope: "account"` is not decoration. Rate limits are per-CREDENTIAL,
+  //     not per-agent: seats sharing one credential all write the SAME
+  //     numbers, so the per-agent filename is a redundant witness of a shared
+  //     fact, NOT a partition of it. Summing or averaging across agents
+  //     divides a real 100% by the fleet size and reports plenty while work
+  //     is stopping.
+  //
+  //     Do NOT group by the raw (5h, 7d) pair to count credentials, either.
+  //     Tried on dev-vm-1 and it reported 10 "credentials" across 12 seats,
+  //     which was an artefact: each seat samples at a different instant, so
+  //     one account's 7d reads 63-69% across the fleet. Group by the 7d
+  //     `resets_at` instead — a window boundary is a property of the ACCOUNT
+  //     and identical for every seat sharing it, where the percentage is a
+  //     property of the moment you looked.
+  //
+  //  3. A `resets_at` in the PAST means the value is a FOSSIL, not a reading:
+  //     a long-lived session can keep rendering a rate_limits block it
+  //     fetched days ago, so `observed_at` is fresh while the number is
+  //     ancient. Caught live — one seat showed 7d=96% with a boundary 12.6
+  //     days gone, and it was briefly reported as a fleet emergency. Check
+  //     BOTH clocks: observed_at says when we looked, resets_at says whether
+  //     what we saw was still real.
+  //
+  //  2. `observed_at` is mandatory because a statusline only renders when a
+  //     session is ON SCREEN. This witnesses what a seat last SAW, never what
+  //     is true now — a closed or idle seat's file is arbitrarily stale. Treat
+  //     missing or stale as NO MEASUREMENT, never as 0%. Same rule as the
+  //     fleet board's staleness cutoff: an absent instrument must not read as
+  //     a perfect one.
+  //
+  // Written only when the VALUES change, since renders are frequent and an
+  // unchanged rewrite is pure IO; and atomically (tmp + rename), so a reader
+  // can never catch a half-written file.
+  try {
+    if (agentName && (rl.five_hour || rl.seven_day)) {
+      const safe = agentName.replace(/[^A-Za-z0-9_-]/g, '_');
+      const dir = path.join(os.homedir(), '.mcp-hub', 'usage');
+      const dest = path.join(dir, `${safe}.json`);
+      const win = (w) => (w && w.used_percentage != null)
+        ? { used_percentage: w.used_percentage, resets_at: w.resets_at ?? null }
+        : null;
+      // The PLAN a percentage was measured under. Without it, a stored 96%
+      // from early August and a live 70% from today are percentages of two
+      // different denominators and nothing says so — this account went Pro →
+      // Max at an unrecorded date, and an hour of token↔percentage
+      // calibration was built across that seam before it surfaced.
+      //
+      // ⚠️ This reads a CREDENTIALS file, so it takes exactly two fields BY
+      // NAME and never iterates the object. Both are plan identifiers, not
+      // secrets; the tokens beside them must never reach a file that lands in
+      // ~/.mcp-hub, which is not treated as secret storage. Nulls when
+      // unreadable — an unknown plan is a fact, and guessing one would
+      // reintroduce the exact ambiguity this field exists to remove.
+      let plan = null;
+      try {
+        const cred = JSON.parse(fs.readFileSync(
+          path.join(os.homedir(), '.claude', '.credentials.json'), 'utf8'
+        )).claudeAiOauth || {};
+        plan = {
+          subscription_type: cred.subscriptionType ?? null,
+          rate_limit_tier: cred.rateLimitTier ?? null,
+        };
+        if (plan.subscription_type == null && plan.rate_limit_tier == null) plan = null;
+      } catch { /* no credentials file (container seat, other login) → null */ }
+
+      const payload = {
+        agent: agentName,
+        scope: 'account',
+        plan,
+        five_hour: win(rl.five_hour),
+        seven_day: win(rl.seven_day),
+      };
+      // Compare the VALUES only — observed_at changes every render and would
+      // defeat the write-on-change guard entirely.
+      let prev = null;
+      try {
+        const old = JSON.parse(fs.readFileSync(dest, 'utf8'));
+        delete old.observed_at;
+        prev = JSON.stringify(old);
+      } catch { /* no file yet / unreadable → write it */ }
+      if (prev !== JSON.stringify(payload)) {
+        fs.mkdirSync(dir, { recursive: true });
+        const tmp = `${dest}.${process.pid}.tmp`;
+        fs.writeFileSync(
+          tmp,
+          JSON.stringify({ observed_at: nowSec, ...payload }) + '\n'
+        );
+        fs.renameSync(tmp, dest);
+      }
+    }
+  } catch { /* usage snapshot is best-effort; never break the statusline */ }
 });
