@@ -1884,6 +1884,83 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # active set — the underlying session_id has been DELETEd/crashed.
         return False
 
+    def _recipient_liveness(conn: Any, to: str) -> str:
+        """A short phrase for the send receipt saying whether anyone is
+        actually THERE — card #205.
+
+        "Message queued for 'X'" proves the name matched a row and nothing
+        more. It read identically for a live lane and for a name nobody had
+        used in weeks, so a sender could file a silent non-delivery as done
+        (vps's 128-commits-behind finding to the retired `dreamteam-lead`;
+        nobody who owned the gate ever saw it).
+
+        Two constraints the operator attached to the approval, both the
+        fossil lesson one layer down:
+
+        - Read at SEND time. Never cache it — a stale liveness is the same
+          defect in a different hat, so this takes `conn` and asks now.
+        - An UNREADABLE liveness renders UNKNOWN, never "online". A receipt
+          that claims presence because the check failed is precisely the bug
+          being repaired, which is why every failure path below lands on
+          "liveness unknown" and none of them fall through to the live text.
+
+        The honest bound, deliberately reflected in the wording: this makes
+        a dead name visible. It does not make delivery certain — an online,
+        idle agent can still never read the thing — so nothing here says
+        "will read" or "delivered".
+        """
+        try:
+            row = conn.execute(
+                "SELECT status, last_seen FROM agents WHERE name = ?", (to,)
+            ).fetchone()
+        except Exception:  # noqa: BLE001 — C2: never render a guess as presence
+            return "recipient liveness unknown — could not check"
+
+        if row is None:
+            # A name that never existed and a name that went quiet are
+            # different facts, and only one of them is a typo. Saying
+            # "offline" here would send the caller hunting for a seat to
+            # relaunch instead of re-reading what they typed.
+            return (
+                f"⚠️ recipient UNKNOWN — no agent named '{to}' has ever "
+                f"registered; check the name"
+            )
+
+        if row["status"] != "online":
+            return f"⚠️ recipient OFFLINE, last seen {_ago(row['last_seen'])}"
+
+        # Online — but "bound" is not "reachable", the distinction ⚡ exists
+        # to make. Probing the transport is what can raise, so it is inside
+        # its own guard: a failed probe must not downgrade a known-online
+        # agent to a guess about the wrong question.
+        try:
+            wakeable = any(
+                _can_deliver_push(s) for s in registry.sessions(to)
+            )
+        except Exception:  # noqa: BLE001 — C2 again
+            return "recipient online; wakeability unknown — could not check"
+
+        if wakeable:
+            return "recipient online"
+        return "recipient online but NOT push-bound — may need a relaunch"
+
+    def _ago(ts: float | None) -> str:
+        """Human-readable age, for receipts that must DATE an absence.
+
+        "offline" alone does not tell a sender whether to re-route: quiet for
+        ten minutes and quiet for three weeks call for different actions.
+        """
+        if not ts:
+            return "never"
+        secs = max(0, int(time.time() - ts))
+        if secs < 60:
+            return f"{secs}s ago"
+        if secs < 3600:
+            return f"{secs // 60}m ago"
+        if secs < 86400:
+            return f"{secs // 3600}h ago"
+        return f"{secs // 86400}d ago"
+
     def _focus_remaining(agent: str) -> float:
         """Seconds of focus left for `agent`, or 0 when not focused.
 
@@ -2823,6 +2900,16 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         _record_msg_lineage(conn, message_id, from_agent, to_agent=to,
                             reply_ref=reply_ref)
 
+        # Card #205 — the receipt names whether anyone is actually THERE.
+        # "queued" proves the name matched a row, never that anything will
+        # read it, and the sentence was byte-identical for a live lane and a
+        # retired name (vps sent a 128-commits-behind safety finding to
+        # `dreamteam-lead` and filed the "queued" as delivered; the lane that
+        # owned the gate never heard). Read HERE, at send time, per the
+        # operator's attached constraint — a cached liveness is the fossil
+        # defect one layer down.
+        liveness = _recipient_liveness(conn, to)
+
         # Card #59 wake-batching. Low and normal no longer fire their own
         # wake (they ride the recipient's next natural turn, bounded by the
         # rule-4 hold sweep) — with ONE exception carved out by rule 3: a
@@ -2850,7 +2937,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 return (
                     f"Message queued for '{to}' (priority={priority}; "
                     f"reply-wake undeliverable — surfaces via their next "
-                    f"turn or the hold sweep)."
+                    f"turn or the hold sweep; {liveness})."
                 )
             if priority == "low":
                 # Rule 4a: promising low the 10-min backstop would be a lie
@@ -2858,12 +2945,12 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 return (
                     f"Message queued for '{to}' (priority=low; "
                     f"wake-batched — rides their next natural turn; low "
-                    f"has no hold-sweep backstop)."
+                    f"has no hold-sweep backstop; {liveness})."
                 )
             return (
                 f"Message queued for '{to}' (priority={priority}; "
                 f"wake-batched — rides their next turn, held at most "
-                f"{HOLD_MAX_SECONDS // 60} min)."
+                f"{HOLD_MAX_SECONDS // 60} min; {liveness})."
             )
 
         outcome = await push_channel(
@@ -2912,9 +2999,12 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 "wait."
             )
         else:
+            # The urgent/operator path's own undeliverable case. It already
+            # said "offline"; it did not say for HOW LONG, which is the fact
+            # that decides between waiting and re-routing.
             body = (
-                f"Message sent to '{to}' (priority={priority}; recipient "
-                f"offline — will see on next register/get_messages)."
+                f"Message sent to '{to}' (priority={priority}; {liveness} "
+                f"— will see on next register/get_messages)."
             )
         return body + _verbosity_advisory(message)
 
