@@ -68,7 +68,9 @@ It can still DM, `post()` to named channels, and `broadcast(scope="fleet")` — 
 - `list_twins(project, exclude_agent)` — online clones of one repo on other machines (same derived project). `register()` also announces your twins.
 - `memory_put(project, filename, content, from_agent)` / `memory_list(project)` / `memory_get(project, filename)` — the hub-side staging store behind `mcp-hub memory-export` / `memory-import` (see **Memory transfer** below). The hub stages; the files' home is each machine's Claude memory dir.
 
-**Lineage — how the fleet got from A to B, as data**
+**Lineage — work-item relationships as data, in service of a legible
+forward path** (operator's corrected framing, 2026-08-26 — relationships
+matter "only in the name of quality and speed of production")
 
 Every rendered message carries its **⟨ref⟩** (e.g. `hub.msg/1?id=123`) — in
 live tags, `get_messages`, `get_history`, broadcasts and channel reads. That

@@ -812,8 +812,10 @@ def init_db(db_path: Path = DB_PATH) -> None:
         except sqlite3.OperationalError:
             pass  # Column already exists
 
-    # W3.1: the lineage graph — how the fleet got from A to B, as data.
-    # Nodes are refs (refs.py), edges are (subject, predicate, object).
+    # W3.1: the lineage graph — work-item relationships as data, in service
+    # of a legible forward path (operator's corrected requirement, 2026-08-26
+    # — see lineage.py's header). Nodes are refs (refs.py), edges are
+    # (subject, predicate, object).
     lineage.ensure_schema(conn)
     # W3.3/W3.5: the ra.feature/1 store and the (deliberately empty until
     # attested) status-target table.
@@ -888,6 +890,49 @@ def _validate_reply_ref(conn: sqlite3.Connection, in_reply_to: str) -> tuple[str
             f"invented fact in the lineage record"
         )
     return refs.canonical(ref), ""
+
+
+def _apply_blocked_by(
+    conn: sqlite3.Connection, from_agent: str, blocked_by: str,
+) -> str:
+    """Parse and apply a blocked-by declaration riding a verb — the
+    forward-looking half of declared lineage (docs/lineage-blocked-by.md).
+
+    Format: `"<subject-ref>|<object-ref>"` declares;
+    `"clear:<subject-ref>|<object-ref>"` clears. Returns "" on success or a
+    refusal string — and like in_reply_to, refusal happens BEFORE the
+    carrying message is stored, loudly: a silently dropped declaration
+    would leave the path view lying by omission.
+
+    Authority and lifecycle live in lineage.declare_blocked/clear_blocked;
+    the ONE fact added here is who the operator is: senders in
+    _OPERATOR_SENDERS clear with operator authority (rule 2a's principal,
+    reused rather than reinvented).
+    """
+    if not blocked_by:
+        return ""
+    body = blocked_by
+    clearing = body.startswith("clear:")
+    if clearing:
+        body = body[len("clear:"):]
+    if "|" not in body:
+        return (
+            "blocked_by refused: format is '<subject-ref>|<object-ref>' "
+            "(or 'clear:<subject-ref>|<object-ref>') — the subject is the "
+            "work that is blocked, the object what it waits on"
+        )
+    subject, obj = (part.strip() for part in body.split("|", 1))
+    try:
+        if clearing:
+            lineage.clear_blocked(
+                conn, subject, obj, from_agent,
+                is_operator=from_agent in _OPERATOR_SENDERS,
+            )
+        else:
+            lineage.declare_blocked(conn, subject, obj, from_agent)
+    except refs.RefError as e:
+        return f"blocked_by refused: {e}"
+    return ""
 
 
 def _record_msg_lineage(
@@ -2824,7 +2869,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     @mcp.tool()
     async def send(
         from_agent: str, to: str, message: str, priority: str = "normal",
-        in_reply_to: str = "", ctx: Context | None = None,
+        in_reply_to: str = "", blocked_by: str = "",
+        ctx: Context | None = None,
     ) -> str:
         """Send a direct message to another agent.
 
@@ -2857,6 +2903,12 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 hub.msg/1?id=123). Declared lineage, and the rule-3
                 immediate-wake trigger. The hub records the edge you
                 assert and never guesses one.
+            blocked_by: Forward-looking declared lineage —
+                "<subject-ref>|<object-ref>" records that YOUR work item
+                (subject) cannot start until object clears;
+                "clear:<subject>|<object>" clears it (declarer or operator
+                only). Owner-declares-own: a subject with a recorded author
+                that is not you is refused. See docs/lineage-blocked-by.md.
         """
         if priority not in _VALID_PRIORITIES:
             return (
@@ -2881,6 +2933,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         reply_ref, reply_err = _validate_reply_ref(conn, in_reply_to)
         if reply_err:
             return reply_err
+        blocked_err = _apply_blocked_by(conn, from_agent, blocked_by)
+        if blocked_err:
+            return blocked_err
 
         # Auto-bind sender's session — any tool call refreshes the binding
         # so drift across redeploys self-heals without explicit register().
@@ -3510,6 +3565,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         message: str,
         priority: str = "normal",
         in_reply_to: str = "",
+        blocked_by: str = "",
         ctx: Context | None = None,
     ) -> str:
         """Post a message to a named channel.
@@ -3560,6 +3616,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         reply_ref, reply_err = _validate_reply_ref(conn, in_reply_to)
         if reply_err:
             return reply_err
+        blocked_err = _apply_blocked_by(conn, from_agent, blocked_by)
+        if blocked_err:
+            return blocked_err
 
         # Auto-bind sender's session for drift self-heal.
         touch_session(from_agent, ctx)
@@ -4339,6 +4398,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         project: str = "",
         source: str = "stop-hook",
         tags: str = "",
+        blocked_by: str = "",
         ctx: Context | None = None,
     ) -> str:
         """Submit (or restate) a DECISION card for the operator's triage queue.
@@ -4349,6 +4409,11 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             project: Project the ask belongs to (derived where possible).
             source: 'stop-hook' (harvested from a turn) or 'api' (services).
             tags: Extra comma-separated tags, merged with the card's TAGS line.
+            blocked_by: Forward-looking declared lineage —
+                "<subject-ref>|<object-ref>" records that your work item
+                waits on object; "clear:..." clears it. A card that says
+                "waiting on X" can declare it as data in the same breath.
+                See docs/lineage-blocked-by.md.
         """
         now = time.time()
         # A card is an ask in the OPERATOR's queue under the asker's name —
@@ -4357,6 +4422,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         grade, attr_err = _attribution(ctx, from_agent)
         if attr_err:
             return attr_err
+        blocked_err = _apply_blocked_by(_get_db(db_path), from_agent, blocked_by)
+        if blocked_err:
+            return blocked_err
         # Defensive size cap: the harvester takes DECISION→end-of-turn, so a
         # convention-breaking turn (card followed by a ramble) could ship a
         # novel. The queue is for one-glance asks; the ledger keeps raw
@@ -4695,9 +4763,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     @mcp.tool()
     def get_lineage(
         ref: str, depth: int = 2, direction: str = "both",
-        predicate: str = "",
+        predicate: str = "", include_cleared: bool = False,
     ) -> str:
-        """How the fleet got from A to B — the lineage subgraph around a ref.
+        """The lineage subgraph around a ref — its relationships, as data.
 
         Every message carries its ref in ⟨angle brackets⟩ wherever it is
         shown (live tags, get_messages, get_history). Feed one in here to see
@@ -4714,13 +4782,20 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         A node with no edges returns `lineage_blind: true` — nothing was
         RECORDED about it, which is not the same claim as "nothing happened".
         Edges carry `source`: 'auto' is a fact the hub itself performed;
-        'declared' is what a sender asserted via in_reply_to.
+        'declared' is what a sender asserted via in_reply_to or blocked_by.
+
+        blocked-by edges (the forward-looking predicate) additionally carry
+        `declared_by` and `declared_at` — RENDER THE AGE of a live blockage;
+        the hub never infers completion, so an old uncleared edge is a
+        question for its owner, not a truth. Cleared blockages leave the
+        path view by default; pass include_cleared=True for history.
         """
         conn = _get_db(db_path)
         try:
             return json.dumps(lineage.walk(
                 conn, ref, depth=depth, direction=direction,
                 predicate=predicate or None,
+                include_cleared=include_cleared,
             ))
         except refs.RefError as e:
             return f"REFUSED: {e}"
