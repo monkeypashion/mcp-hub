@@ -700,9 +700,20 @@ def _seat_tmux_argv(seat: dict[str, Any], args: list[str]) -> list[str]:
     decides the door; it is never inferred from the session name.
     """
     session = seat.get("session") or "seat"
+    # `-t` goes IMMEDIATELY after the subcommand, before any other argument.
+    # tmux stops parsing options at `-l`: everything after it is literal
+    # keys, so a trailing `-t <session>` is TYPED — into whichever session
+    # tmux considers current, which is some other lane's pane. Measured
+    # 2026-08-28: three console fires at one lane put the prompt text plus
+    # the string `-tmcp-hub-dev-vm-1` into two other sessions' input boxes,
+    # while the bare Enter (its -t still parsed) went to the right pane.
+    # The fake runner in the tests never parsed tmux options, which is why
+    # the order shipped green; the argv-shape test now pins it.
+    sub, rest = args[0], args[1:]
     if seat.get("substrate") == "docker":
-        return ["docker", "exec", seat["identity"], "tmux", *args, "-t", session]
-    return ["tmux", "-L", "squad", *args, "-t", session]
+        return ["docker", "exec", seat["identity"], "tmux", sub, "-t", session,
+                *rest]
+    return ["tmux", "-L", "squad", sub, "-t", session, *rest]
 
 
 def _capture_pane(seat: dict[str, Any], runner: Any) -> tuple[bool, str]:

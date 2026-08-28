@@ -475,7 +475,7 @@ class TestLaneSeats:
         sent = r.sent()[0]
         assert sent[:3] == ["tmux", "-L", "squad"]
         assert "docker" not in sent
-        assert sent[-1] == "vps-hetzner-dev-vm-1"  # -t <session>
+        assert sent[sent.index("-t") + 1] == "vps-hetzner-dev-vm-1"
 
     def test_spec_session_overrides_the_identity(self):
         from mcp_hub.edge import seat_control_pass
@@ -488,7 +488,8 @@ class TestLaneSeats:
         )
         r = Runner(_ok_capture())
         seat_control_pass(api, [], r, machine="m1")
-        assert r.sent()[0][-1] == "other-session"
+        s0 = r.sent()[0]
+        assert s0[s0.index("-t") + 1] == "other-session"
 
     def test_a_placement_shadowed_identity_is_not_double_driven(self):
         """One identity, a placement AND a lane row: the placement owns the
@@ -648,6 +649,47 @@ class TestPromptSubmissionWitness:
             pause=lambda s: order.append("pause"),
         )
         assert order.index("text") < order.index("pause") < order.index("Enter"), order
+
+
+# ---------------------------------------------------------------------------
+# The argv SHAPE — tmux parses it, the fake runner does not. Three console
+# fires (2026-08-28) typed the prompt plus `-tmcp-hub-dev-vm-1` into OTHER
+# lanes' panes because `-t <session>` trailed the `-l` literal.
+# ---------------------------------------------------------------------------
+
+
+class TestTmuxArgvShape:
+    @pytest.mark.parametrize("seat", [
+        SEAT,
+        {"identity": "dt-poc", "substrate": "docker", "session": "seat"},
+        {"identity": "lane-a", "substrate": "lane", "session": "lane-a"},
+    ])
+    def test_the_literal_text_is_the_LAST_argv_element(self, seat):
+        r = Runner(
+            [(["docker", "exec"], 0, "● ready\n❯ ")],
+            captures=_submitted("hello there"),
+        )
+        realize_seat_action(
+            {"id": 2, "kind": "prompt", "args": {"text": "hello there"}},
+            seat, r,
+        )
+        literal = [c for c in r.sent() if "-l" in c][0]
+        assert literal[-1] == "hello there", (
+            "something follows the literal text — tmux would TYPE it: "
+            f"{literal!r}"
+        )
+        assert literal.index("-t") < literal.index("-l"), (
+            f"-t must be parsed before -l switches to literal mode: {literal!r}"
+        )
+
+    def test_the_target_follows_the_subcommand_on_every_tmux_call(self):
+        r = Runner(captures=_submitted("hi"))
+        realize_seat_action(
+            {"id": 2, "kind": "prompt", "args": {"text": "hi"}}, SEAT, r
+        )
+        for c in r.calls:
+            sub = c.index("send-keys") if "send-keys" in c else c.index("capture-pane")
+            assert c[sub + 1] == "-t" and c[sub + 2] == SEAT["session"], c
 
     def test_interrupt_is_not_subject_to_the_prompt_witness(self):
         """Escape leaves nothing to find in the pane; its witness is the
