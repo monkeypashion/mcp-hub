@@ -643,6 +643,16 @@ class HubAPI:
 
     # -- seat control plane (cards #144/#152) -------------------------------
 
+    def pull_seats(self, machine: str) -> list[dict[str, Any]]:
+        """This machine's seat declarations, spec included — the lane leg's
+        discovery door. /seats itself is operator-only, and lane seats have
+        no placement to carry their spec in pull_placements."""
+        r = self._c.get(
+            f"/api/v1/machines/{machine}/seats", headers=self._h
+        )
+        r.raise_for_status()
+        return r.json().get("seats", [])
+
     def pull_seat_actions(self, seat: str) -> list[dict[str, Any]]:
         r = self._c.get(f"/api/v1/seats/{seat}/actions", headers=self._h)
         r.raise_for_status()
@@ -777,6 +787,7 @@ def realize_seat_action(
 
 def seat_control_pass(
     api: Any, placements: list[dict[str, Any]], runner: Any,
+    machine: str = "",
 ) -> dict[str, Any]:
     """Realize pending seat actions and stream panes for watched seats.
 
@@ -789,25 +800,19 @@ def seat_control_pass(
     systemd unit rather than folded into `squad-heal`: a oneshot that fails
     takes its whole ExecStart chain with it.
 
-    Only seats this machine actually holds a RUNNING placement for are
-    touched. A reclaimed or stopped seat has no pane to drive, and asking
-    would turn a normal state into an error every pass.
+    Placement-backed seats are touched only while a RUNNING placement holds
+    them — a reclaimed or stopped seat has no pane to drive, and asking
+    would turn a normal state into an error every pass. When `machine` is
+    given, LANE seats (spec.substrate == "lane", no placement ever) are
+    also driven — see the lane-leg comment below for why they exist and why
+    a placement-shadowed identity is skipped.
     """
     realized: list[dict[str, Any]] = []
     streamed = 0
     errors: list[str] = []
 
-    for p in placements:
-        if p.get("desired") != "running":
-            continue
-        seat_id = p["seat"]
-        seat = {
-            "identity": seat_id,
-            "substrate": p.get("substrate", "worktree"),
-            # A worktree seat's tmux session is its own name; a container's
-            # is the seat image's fixed inner session.
-            "session": "seat" if p.get("substrate") == "docker" else seat_id,
-        }
+    def _drive(seat_id: str, seat: dict[str, Any]) -> None:
+        nonlocal streamed
         try:
             for action in api.pull_seat_actions(seat_id):
                 if action.get("status") != "pending":
@@ -834,6 +839,54 @@ def seat_control_pass(
                 # absence is not.
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{seat_id}: view: {exc}")
+
+    for p in placements:
+        if p.get("desired") != "running":
+            continue
+        seat_id = p["seat"]
+        _drive(seat_id, {
+            "identity": seat_id,
+            "substrate": p.get("substrate", "worktree"),
+            # A worktree seat's tmux session is its own name; a container's
+            # is the seat image's fixed inner session.
+            "session": "seat" if p.get("substrate") == "docker" else seat_id,
+        })
+
+    # Lane leg: interactive squad lanes enrolled as seats with
+    # spec.substrate == "lane". They have NO placements — a placement means
+    # the edge owns lifecycle (materialize/destroy), and lane lifecycle is
+    # squad's (`heal`/`up`); giving lanes placements is the double-owner
+    # collision `capsules place --as` exists to prevent. So they are
+    # discovered via the machine-scoped seats route and driven through
+    # squad's own tmux socket (the non-docker door of _seat_tmux_argv,
+    # which already speaks it). Console verbs reach them; nothing manages
+    # them.
+    if machine:
+        placed = {p["seat"] for p in placements}
+        try:
+            lane_rows = api.pull_seats(machine)
+        except Exception as exc:  # noqa: BLE001 — discovery must not stop placements
+            errors.append(f"lane discovery: {exc}")
+            lane_rows = []
+        for srow in lane_rows:
+            spec = srow.get("spec") or {}
+            if spec.get("substrate") != "lane":
+                continue
+            identity = srow.get("identity") or ""
+            if not identity:
+                continue
+            if identity in placed:
+                # A same-named placement owns the pane door (any desired
+                # state — a stopped placement is still the authority on
+                # which door). The lane leg driving it too would type into
+                # a second, same-named pane: the stale host-session shadow
+                # of the dt-poc collision class.
+                continue
+            _drive(identity, {
+                "identity": identity,
+                "substrate": "lane",
+                "session": spec.get("session") or identity,
+            })
 
     return {"realized": realized, "streamed": streamed, "errors": errors}
 
@@ -1824,7 +1877,8 @@ def edge_apply(
     # placements are reported, and inside its own guard: a wedged pane must
     # not cost the fleet its reconcile.
     try:
-        seat_control = seat_control_pass(api, placements, runner)
+        seat_control = seat_control_pass(api, placements, runner,
+                                         machine=machine)
     except Exception as exc:  # noqa: BLE001 — never let control break convergence
         seat_control = {"realized": [], "streamed": 0, "errors": [str(exc)]}
 

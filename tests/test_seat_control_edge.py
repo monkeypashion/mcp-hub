@@ -384,3 +384,163 @@ class TestSeatControlPass:
         out = seat_control_pass(api, [_pl("seat-a")], Runner(_ok_capture()))
         assert api.reported == [("seat-a", 7, "done")]
         assert out["errors"], "the view failure was not reported"
+
+
+# ---------------------------------------------------------------------------
+# Lane seats — interactive squad lanes enrolled with spec.substrate == "lane".
+# No placement EVER (a placement means the edge owns lifecycle, and lane
+# lifecycle is squad's); discovered via the machine-scoped seats route and
+# driven through squad's own tmux socket. The defect this exists to close,
+# measured 2026-08-28: every lane that actually freezes was off the control
+# plane, so "stop everyone" interrupted 0 of 7 and fell through to telling.
+# ---------------------------------------------------------------------------
+
+
+class LaneApi(FakeApi):
+    def __init__(self, *args, seats=None, fail_seats=False, **kw):
+        super().__init__(*args, **kw)
+        self._seats = seats or []
+        self._fail_seats = fail_seats
+        self.seats_pulled_for: list[str] = []
+
+    def pull_seats(self, machine):
+        self.seats_pulled_for.append(machine)
+        if self._fail_seats:
+            raise RuntimeError("hub 500")
+        return self._seats
+
+
+def _lane(identity, session=None):
+    spec = {"substrate": "lane"}
+    if session:
+        spec["session"] = session
+    return {"identity": identity, "machine": "m1", "spec": spec}
+
+
+class TestLaneSeats:
+    def test_a_lane_seat_with_no_placement_is_driven(self):
+        from mcp_hub.edge import seat_control_pass
+
+        api = LaneApi(
+            actions={"vps-hetzner-dev-vm-1": [
+                {"id": 3, "kind": "interrupt", "args": {}, "status": "pending"},
+            ]},
+            seats=[_lane("vps-hetzner-dev-vm-1")],
+        )
+        out = seat_control_pass(api, [], Runner(_ok_capture()), machine="m1")
+        assert api.reported == [("vps-hetzner-dev-vm-1", 3, "done")]
+        assert out["realized"][0]["seat"] == "vps-hetzner-dev-vm-1"
+
+    def test_the_lane_is_driven_through_squad_host_tmux(self):
+        """The door is squad's own socket on the HOST — never docker, and
+        the session is the lane's name."""
+        from mcp_hub.edge import seat_control_pass
+
+        api = LaneApi(
+            actions={"vps-hetzner-dev-vm-1": [
+                {"id": 3, "kind": "interrupt", "args": {}, "status": "pending"},
+            ]},
+            seats=[_lane("vps-hetzner-dev-vm-1")],
+        )
+        r = Runner(_ok_capture())
+        seat_control_pass(api, [], r, machine="m1")
+        sent = r.sent()[0]
+        assert sent[:3] == ["tmux", "-L", "squad"]
+        assert "docker" not in sent
+        assert sent[-1] == "vps-hetzner-dev-vm-1"  # -t <session>
+
+    def test_spec_session_overrides_the_identity(self):
+        from mcp_hub.edge import seat_control_pass
+
+        api = LaneApi(
+            actions={"lane-a": [
+                {"id": 3, "kind": "interrupt", "args": {}, "status": "pending"},
+            ]},
+            seats=[_lane("lane-a", session="other-session")],
+        )
+        r = Runner(_ok_capture())
+        seat_control_pass(api, [], r, machine="m1")
+        assert r.sent()[0][-1] == "other-session"
+
+    def test_a_placement_shadowed_identity_is_not_double_driven(self):
+        """One identity, a placement AND a lane row: the placement owns the
+        pane door. The lane leg typing into a same-named host session is the
+        stale-shadow variant of the dt-poc double-registration collision."""
+        from mcp_hub.edge import seat_control_pass
+
+        api = LaneApi(
+            actions={"seat-a": [
+                {"id": 3, "kind": "interrupt", "args": {}, "status": "pending"},
+            ]},
+            seats=[_lane("seat-a")],
+        )
+        r = Runner(_ok_capture())
+        seat_control_pass(api, [_pl("seat-a")], r, machine="m1")
+        assert len(api.reported) == 1, "the action was realized twice"
+        assert len(r.sent()) == 1, "two panes were typed into for one action"
+
+    def test_a_stopped_placement_still_shadows_the_lane_leg(self):
+        """Any placement row is the authority on the identity's door — a
+        stopped seat must not become drivable through a same-named host
+        session."""
+        from mcp_hub.edge import seat_control_pass
+
+        api = LaneApi(
+            actions={"seat-a": [
+                {"id": 3, "kind": "interrupt", "args": {}, "status": "pending"},
+            ]},
+            seats=[_lane("seat-a")],
+        )
+        r = Runner(_ok_capture())
+        seat_control_pass(api, [_pl("seat-a", desired="stopped")], r,
+                          machine="m1")
+        assert api.reported == []
+        assert not r.sent()
+
+    def test_non_lane_discovered_seats_are_ignored(self):
+        """A docker seat with no placement is NOT drivable via discovery —
+        without a placement the edge cannot know its door, and guessing is
+        the blind-keystroke class."""
+        from mcp_hub.edge import seat_control_pass
+
+        api = LaneApi(
+            actions={"docker-seat": [
+                {"id": 3, "kind": "interrupt", "args": {}, "status": "pending"},
+            ]},
+            seats=[{"identity": "docker-seat", "machine": "m1",
+                    "spec": {"image": "img:tag"}}],
+        )
+        r = Runner(_ok_capture())
+        seat_control_pass(api, [], r, machine="m1")
+        assert api.reported == []
+        assert not r.calls
+
+    def test_lane_discovery_failure_does_not_stop_placement_seats(self):
+        from mcp_hub.edge import seat_control_pass
+
+        api = LaneApi(
+            actions={"seat-a": [
+                {"id": 7, "kind": "interrupt", "args": {}, "status": "pending"},
+            ]},
+            fail_seats=True,
+        )
+        out = seat_control_pass(api, [_pl("seat-a")], Runner(_ok_capture()),
+                                machine="m1")
+        assert api.reported == [("seat-a", 7, "done")]
+        assert any("lane discovery" in e for e in out["errors"])
+
+    def test_no_machine_means_no_discovery(self):
+        """Callers that predate the lane leg (or tests driving placements
+        only) must not need a pull_seats on their api object."""
+        from mcp_hub.edge import seat_control_pass
+
+        api = FakeApi()  # has no pull_seats at all
+        out = seat_control_pass(api, [], Runner(_ok_capture()))
+        assert out["errors"] == []
+
+    def test_a_watched_lane_streams_its_pane(self):
+        from mcp_hub.edge import seat_control_pass
+
+        api = LaneApi(watched=["lane-a"], seats=[_lane("lane-a")])
+        seat_control_pass(api, [], Runner(_ok_capture("live")), machine="m1")
+        assert [s for s, _ in api.panes] == ["lane-a"]

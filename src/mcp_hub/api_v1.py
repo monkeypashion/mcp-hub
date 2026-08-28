@@ -756,6 +756,32 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             out.append(p)
         return JSONResponse({"placements": out})
 
+    @route("/api/v1/machines/{name}/seats", methods=["GET"])
+    async def machine_seats(request: Request) -> Response:
+        """A machine's own seat declarations, spec included.
+
+        Exists for the edge's LANE leg: /seats is operator-only, and a lane
+        seat (spec.substrate == "lane" — an interactive squad lane enrolled
+        so console verbs can reach it) never has a placement, so
+        pull_placements cannot carry its spec either. Without this door the
+        edge cannot discover which lanes it should drive, and a console
+        interrupt into a lane stores an action nothing ever realizes — a
+        button that fires into a plane the lane is not on (measured
+        2026-08-28: 'stop everyone' interrupted 0 of 7 frozen lanes).
+        """
+        got = auth(request)
+        if isinstance(got, JSONResponse):
+            return got
+        principal, mname = got
+        name = request.path_params["name"]
+        if principal == "machine" and mname != name:
+            return _err(403, "machine token may only list its own seats")
+        rows = db().execute(
+            "SELECT * FROM api_seats WHERE machine = ? AND archived = 0",
+            (name,),
+        ).fetchall()
+        return JSONResponse({"seats": [seat_json(r) for r in rows]})
+
     @route("/api/v1/machines/{name}/watch", methods=["GET"])
     async def machine_watch(request: Request) -> Response:
         """SSE doorbell: 'something changed for you, pull now'.

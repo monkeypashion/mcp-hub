@@ -495,3 +495,58 @@ class TestEdges:
             kw = {"json": {"kind": "interrupt"}} if method == "post" else {}
             r = getattr(client, method)(path, **kw)
             assert r.status_code == 401, f"{method} {path} answered unauthenticated"
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/machines/{name}/seats — the lane leg's discovery door.
+# /seats is operator-only and a lane seat has no placement to carry its spec,
+# so the edge needs a machine-scoped list or console actions into lanes are
+# stored and never realized (2026-08-28: "stop everyone" interrupted 0 of 7).
+# ---------------------------------------------------------------------------
+
+
+class TestMachineSeats:
+    def test_a_machine_lists_its_own_seats_with_spec(self, client):
+        m = _machine(client)
+        client.post(
+            "/api/v1/seats",
+            json={"identity": "vps-lane", "machine": "box-1",
+                  "folder": "/home/x/vps", "repo": "acme/vps",
+                  "spec": {"substrate": "lane"}},
+            headers=H,
+        )
+        r = client.get("/api/v1/machines/box-1/seats", headers=_mh(m))
+        assert r.status_code == 200
+        seats = r.json()["seats"]
+        assert [s["identity"] for s in seats] == ["vps-lane"]
+        assert seats[0]["spec"]["substrate"] == "lane"
+
+    def test_a_machine_token_cannot_list_another_machines_seats(self, client):
+        m1 = _machine(client, "box-1")
+        _machine(client, "box-2")
+        _seat(client, "seat-b2", machine="box-2")
+        r = client.get("/api/v1/machines/box-2/seats", headers=_mh(m1))
+        assert r.status_code == 403
+
+    def test_operator_token_may_list_any_machine(self, client):
+        _machine(client)
+        _seat(client)
+        r = client.get("/api/v1/machines/box-1/seats", headers=H)
+        assert r.status_code == 200
+        assert [s["identity"] for s in r.json()["seats"]] == ["seat-a"]
+
+    def test_no_token_is_refused(self, client):
+        _machine(client)
+        r = client.get("/api/v1/machines/box-1/seats")
+        assert r.status_code in (401, 403)
+
+    def test_archived_and_other_machine_seats_are_absent(self, client):
+        m = _machine(client)
+        _machine(client, "box-2")
+        _seat(client, "mine", machine="box-1")
+        _seat(client, "theirs", machine="box-2")
+        _seat(client, "gone", machine="box-1")
+        r = client.delete("/api/v1/seats/gone", headers=H)
+        assert r.status_code in (200, 204), r.text
+        r = client.get("/api/v1/machines/box-1/seats", headers=_mh(m))
+        assert [s["identity"] for s in r.json()["seats"]] == ["mine"]

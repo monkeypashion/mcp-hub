@@ -35,6 +35,9 @@ class _RecordingApi:
     def pull_placements(self, machine):
         return []
 
+    def pull_seats(self, machine):
+        return []  # the lane leg's discovery door — no lane seats here
+
     def push_observed(self, pid, report):
         pass
 
