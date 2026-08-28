@@ -574,8 +574,10 @@ def build_hook_response(
             (
                 f"📌 {card_notice}\n"
                 "If the operator already answered in-pane, end your reply "
-                "with **DECIDED:** <their verdict>. If you're still waiting, "
-                "restate the card to keep it fresh."
+                "with **DECIDED:** <their verdict> (this closes YOUR OPEN "
+                "card — don't name a different #id in the line). If you're "
+                "still waiting, nothing is needed: the ask stays on the "
+                "board."
             ),
         ])
 

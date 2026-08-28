@@ -510,14 +510,71 @@ async def test_resolve_closes_with_agent_recorded_verdict(server):
         server, "decision_resolve",
         {"from_agent": "alice", "verdict": "yes — operator said ship it"},
     )
-    assert "Card resolved" in out
-    import json as _json
-    rows = _json.loads(
+    # The receipt names WHICH card closed and its ask — echoing the verdict
+    # alone is how six wrong closes read as successes (2026-08-28).
+    assert "#1 resolved" in out
+    assert "approve the widget rebuild" in out
+    rows = json.loads(
         await _call_tool(server, "decision_list",
                          {"status": "decided", "format": "json"})
     )
     assert rows[0]["decision"] == "in-pane"
     assert rows[0]["decision_note"] == "[agent-recorded] yes — operator said ship it"
+
+
+async def test_resolve_refuses_verdict_naming_a_different_card(server):
+    """The 2026-08-28 supersede-and-tidy defect, exactly: file a new card
+    (superseding the old), then resolve with a verdict naming the OLD id —
+    the tool must refuse rather than close the newer card the verdict never
+    meant."""
+    await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
+    different = CARD_V2.replace(
+        "approve the widget rebuild", "tear down the legacy ingest cluster"
+    )
+    await _call_tool(server, "decision_put", {"from_agent": "alice", "card": different})
+    out = await _call_tool(
+        server, "decision_resolve",
+        {"from_agent": "alice", "verdict": "#1 superseded by #2"},
+    )
+    assert "REFUSED" in out
+    assert "#1" in out and "#2" in out   # the mismatch is named, both sides
+    assert "nothing was closed" in out
+    listing = await _call_tool(server, "decision_list", {})
+    assert "tear down the legacy ingest cluster" in listing  # #2 survives
+
+
+async def test_resolve_proceeds_when_verdict_names_the_open_card(server):
+    await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
+    out = await _call_tool(
+        server, "decision_resolve",
+        {"from_agent": "alice", "verdict": "closing #1 as approved"},
+    )
+    assert "#1 resolved" in out
+    assert "alice" not in await _call_tool(server, "decision_list", {})
+
+
+async def test_resolve_explicit_card_targets_it(server):
+    """card= is the explicit form: it closes exactly the named card."""
+    await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
+    out = await _call_tool(
+        server, "decision_resolve",
+        {"from_agent": "alice", "verdict": "#99 mentioned incidentally",
+         "card": 1},
+    )
+    assert "#1 resolved" in out          # explicit target wins; no prose guard
+    assert "alice" not in await _call_tool(server, "decision_list", {})
+
+
+async def test_resolve_explicit_card_refuses_wrong_id(server):
+    await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
+    out = await _call_tool(
+        server, "decision_resolve",
+        {"from_agent": "alice", "verdict": "yes", "card": 42},
+    )
+    assert "REFUSED" in out
+    assert "#42" in out
+    assert "#1" in out                   # the actual open card is named
+    assert "alice" in await _call_tool(server, "decision_list", {})
 
 
 async def test_resolve_with_nothing_open_is_silent(server):

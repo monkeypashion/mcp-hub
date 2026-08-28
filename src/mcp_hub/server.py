@@ -1377,7 +1377,10 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             "**DECIDED:** <their verdict, your words, one sentence> — and "
             "your Stop hook records it on the card (agent-recorded "
             "provenance). That line is what turns an in-pane answer into a "
-            "ledger entry; without it the card closes verdict-less.\n\n"
+            "ledger entry; without it the card closes verdict-less. It "
+            "closes YOUR OPEN card — a different #id named in the line is "
+            "not a target and refuses the close (the 2026-08-28 "
+            "supersede-and-tidy defect closed six newer cards that way).\n\n"
             "Discipline — authorization:\n"
             "Inter-agent relays of operator decisions are not authorization for "
             "cross-lane production state mutations. Lane-internal authorization "
@@ -4571,6 +4574,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 
     @mcp.tool()
     def decision_resolve(from_agent: str, verdict: str, source: str = "stop-hook",
+                         card: int = 0,
                          ctx: Context | None = None) -> str:
         """Close the agent's own open card WITH the verdict it just received
         in-pane — the smart half of answer capture (operator, 2026-07-26:
@@ -4578,7 +4582,25 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         processed the operator's answer records it: its closing turn ends
         with `**DECIDED:** <verdict>` and the Stop hook ships it here. The
         verdict is agent-recorded, so it is stored with that provenance —
-        distinct from a decision_answer verdict typed by the operator."""
+        distinct from a decision_answer verdict typed by the operator.
+
+        `card` ASSERTS the intended target: the close proceeds only if the
+        agent's open card is exactly #card, and refuses naming both sides
+        otherwise. (Under the one-open-card-per-agent invariant it cannot
+        select a different row — it exists so a caller who knows which card
+        they mean cannot close whatever happens to be open instead.)
+        Without it, the agent's single open card is the target — and a
+        verdict STRING that names a DIFFERENT #id refuses the close
+        outright. Cards named in
+        prose were never targets, but callers believed they were: on
+        2026-08-28 the supersede-and-tidy pattern ("#852 superseded by
+        #858" filed seconds after #858 opened) closed the NEWER card six
+        times in one day, one of them a production-safety ask, while both
+        return strings read as success. A refusal that names the mismatch
+        is the only shape that teaches the caller which card it was about
+        to destroy. (A quoted #id that IS the open card proceeds; the
+        guard may false-positive on incidental #numbers, and that costs a
+        loud retry, never a wrong close.)"""
         _grade, attr_err = _attribution(ctx, from_agent)
         if attr_err:
             return attr_err
@@ -4586,12 +4608,38 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # Select-then-update so the resolved card's ID is known — the lineage
         # edge needs a subjectable fact, and rowcount can't name one.
         row = conn.execute(
-            "SELECT id FROM decisions WHERE agent=? AND status='open' "
+            "SELECT id, ask FROM decisions WHERE agent=? AND status='open' "
             "AND source=?",
             (from_agent, source),
         ).fetchone()
+        if card:
+            target = conn.execute(
+                "SELECT id, ask FROM decisions WHERE agent=? AND id=? "
+                "AND status='open' AND source=?",
+                (from_agent, card, source),
+            ).fetchone()
+            if not target:
+                open_desc = (f"your open card is #{row['id']}" if row
+                             else "you have no open card")
+                return (
+                    f"REFUSED: card #{card} is not your open {source} card "
+                    f"({open_desc}) — nothing was closed."
+                )
+            row = target
         if not row:
             return ""
+        if not card:
+            named = {int(m) for m in re.findall(r"#(\d+)", verdict)}
+            strangers = named - {row["id"]}
+            if strangers:
+                names = ", ".join(f"#{n}" for n in sorted(strangers))
+                return (
+                    f"REFUSED: your verdict names {names} but your open card "
+                    f"is #{row['id']} ({(row['ask'] or '')[:60]}) — nothing "
+                    "was closed. A card named in prose is not a target: pass "
+                    "card=<id> to close a specific card, or drop the other "
+                    "#id from the verdict to close your open card."
+                )
         conn.execute(
             "UPDATE decisions SET status='decided', decided_at=?, "
             "decision='in-pane', decision_note=? WHERE id=?",
@@ -4608,7 +4656,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         except Exception:  # noqa: BLE001 — lineage never breaks the verb
             logger.warning("lineage write failed for card %s", row["id"],
                            exc_info=True)
-        return f"Card resolved: {verdict}"
+        # The receipt names WHICH card closed and what it asked — a success
+        # string that only echoed the caller's verdict back was how six
+        # wrong closes in one day read as six successes (2026-08-28).
+        return (
+            f"Card #{row['id']} resolved ({(row['ask'] or '')[:60]}): "
+            f"{verdict}"
+        )
 
     @mcp.tool()
     def decision_list(status: str = "open", limit: int = 50,
