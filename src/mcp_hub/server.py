@@ -147,6 +147,16 @@ HOLD_SWEEP_INTERVAL_SECONDS = 60
 # priority field they remembered to set.
 _OPERATOR_SENDERS = frozenset({"operator-console", "operator"})
 
+# Staleness on the decision board is judged by the ASK, never by the asking
+# lane's turn cadence (card #237, operator-approved 2026-08-28). The
+# turn-rate clock it replaces demoted the best-behaved lane's 6-minute-old
+# ask after three quiet turns while a purged owner's 20-day card — whose
+# lane took no turns at all — read fresh forever: it measured chatter, and
+# rewarded restatement, the exact token burn the board exists to stop. A
+# card is stale when nothing substantive has happened to the CARD itself
+# (filed or restated) for this long; computed at read time, never stored.
+DECISION_STALE_AFTER_SECONDS = 7 * 86400
+
 # Rule 3's "last turn" is bounded by the recipient's own idle marks
 # (prev_idle_at). An agent that predates the prev_idle_at migration — or has
 # never had a Stop hook fire — has no bound, so a recency window stands in:
@@ -500,6 +510,18 @@ def init_db(db_path: Path = DB_PATH) -> None:
         conn.commit()
     except sqlite3.OperationalError:
         pass  # Column already exists
+
+    # Migrate (#237, operator-approved 2026-08-28): stored turn-rate
+    # staleness is retired — the flag recorded the SENDER's chatter, not the
+    # ask's state. Clear legacy demotions once so old flags stop lying to
+    # json readers; the column itself stays for reader compat, dormant.
+    # Guarded by a cheap SELECT so a converged database costs a read, not a
+    # write lock (the loan-purge lesson).
+    if conn.execute(
+        "SELECT 1 FROM decisions WHERE stale=1 LIMIT 1"
+    ).fetchone():
+        conn.execute("UPDATE decisions SET stale=0 WHERE stale=1")
+        conn.commit()
 
     # Migrate: add bio column for existing databases
     try:
@@ -4508,59 +4530,44 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     @mcp.tool()
     def decision_clear(from_agent: str, source: str = "stop-hook",
                        ctx: Context | None = None) -> str:
-        """Register a cardless turn against the agent's open card; mark it
-        STALE after 3 consecutive ones — never withdraw it.
+        """The owner-notice channel, and nothing else: remind the agent at
+        each turn boundary that its ask is still open on the operator's
+        board. Writes NO state.
 
-        Withdrawal-at-3-strikes was the 2026-07-26 fix for instant
-        evaporation; on 2026-07-27 it proved to be the same defect at a
-        different threshold: ~25 asks auto-withdrew unanswered in one day,
-        because strikes measure the SENDER's turn rate and nothing else —
+        The turn-rate staleness clock this verb used to drive is retired
+        (card #237, operator-approved 2026-08-28). Its whole history was
+        one defect at three thresholds: instant evaporation (2026-07-26),
+        withdrawal at 3 strikes (~25 asks lost in a day, 2026-07-27 —
         "the harder a blocked lane works, the faster it loses the ask it
-        is blocked on" (pm). Worst on live investigations, where turn rate
-        rises BECAUSE the ask got more urgent (dt's #101). So 3 strikes now
-        DEMOTES instead of removing: stale=1, status stays 'open', the card
-        stays on the operator's board sorted last. Only an operator answer,
-        an agent DECIDED (decision_resolve), or supersession by a new ask
-        closes a card — an unanswered ask is impossible to lose.
+        is blocked on"), then demote-at-3-strikes, which softened the
+        consequence but kept the defective clock: strikes measured the
+        SENDER's turn rate and nothing else, so the board demoted a
+        6-minute-old top-scored ask from a lane that obediently stopped
+        restating, while a purged owner's 20-day card — no lane, no turns,
+        no strikes — read fresh forever. Measured live 2026-08-27, on the
+        curator's own card, filed while asking for this fix.
 
-        The return string is the owner-notice channel: the Stop hook
-        surfaces it to the agent, because the other 2026-07-27 lesson was
-        that silent state changes leave agents waiting on an operator who
-        has nothing in front of them.
+        Staleness now derives from the ASK's own age at read time
+        (DECISION_STALE_AFTER_SECONDS in decision_list); a quiet lane is
+        indistinguishable from a chatty one, by design. Only an operator
+        answer, an agent DECIDED (decision_resolve), or supersession by a
+        new ask closes a card — an unanswered ask is impossible to lose.
 
-        Only touches cards of the given source — an api-submitted service
-        card is not the agent's to mark."""
+        Only reads cards of the given source — an api-submitted service
+        card is not the agent's to be nagged about."""
         _grade, attr_err = _attribution(ctx, from_agent)
         if attr_err:
             return attr_err
         conn = _get_db(db_path)
         row = conn.execute(
-            "SELECT id, ask, clear_strikes, stale FROM decisions "
+            "SELECT id, ask FROM decisions "
             "WHERE agent=? AND status='open' AND source=?",
             (from_agent, source),
         ).fetchone()
         if row is None:
             return ""
         ask = (row["ask"] or "")[:80]
-        if row["stale"]:
-            return f"Card #{row['id']} is STALE on the board: {ask}"
-        strikes = (row["clear_strikes"] or 0) + 1
-        if strikes >= 3:
-            conn.execute(
-                "UPDATE decisions SET stale=1, clear_strikes=? WHERE id=?",
-                (strikes, row["id"]),
-            )
-            conn.commit()
-            return (
-                f"Card #{row['id']} marked STALE after {strikes} cardless "
-                f"turns — still on the operator's board, sorted last: {ask}"
-            )
-        conn.execute(
-            "UPDATE decisions SET clear_strikes=? WHERE id=?",
-            (strikes, row["id"]),
-        )
-        conn.commit()
-        return f"Card #{row['id']} kept open (cardless turn {strikes}/3): {ask}"
+        return f"Card #{row['id']} still open on the operator's board: {ask}"
 
     @mcp.tool()
     def decision_resolve(from_agent: str, verdict: str, source: str = "stop-hook",
@@ -4617,18 +4624,37 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         conn = _get_db(db_path)
         where = "" if status == "all" else "WHERE status = ?"
         args: tuple = () if status == "all" else (status,)
+        # Staleness is the ASK's own age — time since the card was filed or
+        # last restated (card #237; see DECISION_STALE_AFTER_SECONDS). It is
+        # computed here at read time, never stored: a stored flag was the
+        # old turn-rate clock's residue, and it measured the lane's chatter.
+        now = time.time()
+        stale_cutoff = now - DECISION_STALE_AFTER_SECONDS
+
+        def _is_stale(r) -> bool:
+            touched = r["updated_at"] or r["submitted_at"]
+            return r["status"] == "open" and touched < stale_cutoff
+
         rows = conn.execute(
             f"""SELECT * FROM decisions {where}
-                ORDER BY stale ASC, net_score IS NULL, net_score DESC,
+                ORDER BY (status = 'open' AND
+                          COALESCE(updated_at, submitted_at) < ?) ASC,
+                         net_score IS NULL, net_score DESC,
                          submitted_at ASC
                 LIMIT ?""",
-            (*args, limit),
+            (*args, stale_cutoff, limit),
         ).fetchall()
         if format == "json":
-            return json.dumps([dict(r) for r in rows])
+            # The json contract keeps a `stale` field, now truthful: the
+            # computed verdict overrides the dormant stored column.
+            out = []
+            for r in rows:
+                d = dict(r)
+                d["stale"] = 1 if _is_stale(r) else 0
+                out.append(d)
+            return json.dumps(out)
         if not rows:
             return f"No {status} decision cards."
-        now = time.time()
         lines = []
         for r in rows:
             age = int(now - r["submitted_at"])
@@ -4642,10 +4668,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             # ledger rows as queue (measured 2026-07-27: 25 of 28 rows in an
             # `all` render were closed, none said so).
             status_tag = "" if r["status"] == "open" else f" · {r['status'].upper()}"
-            if r["status"] == "open" and r["stale"]:
-                # Demoted, not gone: the sender kept taking turns without
-                # restating, so it sorts last — but an unanswered ask never
-                # leaves the board (2026-07-27 evaporation incident).
+            if _is_stale(r):
+                # Demoted, not gone: nothing substantive has happened to the
+                # ask itself for DECISION_STALE_AFTER_SECONDS, so it sorts
+                # last — but an unanswered ask never leaves the board
+                # (2026-07-27 evaporation incident). A restatement after a
+                # week is the honest "still live" and refreshes the clock;
+                # the lane's turn cadence no longer moves it (card #237).
                 status_tag = " · STALE"
             closure = ""
             if r["status"] == "decided":

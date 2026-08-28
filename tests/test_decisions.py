@@ -5,6 +5,7 @@ hub tools (put/upsert, clear, list, answer), the live-push clip (the
 formerly-unclipped 840KB/day path), and the sender verbosity advisory.
 """
 
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,6 +13,7 @@ import pytest
 
 from mcp_hub.server import (
     COMPACT_FULL_BODY_CHARS,
+    DECISION_STALE_AFTER_SECONDS,
     create_server,
     parse_decision_card,
 )
@@ -126,47 +128,75 @@ async def test_put_opens_then_restate_updates_in_place(server):
     assert "net +6" in listing  # 9 - 3, recomputed on restate
 
 
-async def test_clear_marks_stale_after_three_strikes_never_withdraws(server):
-    """Three cardless turns DEMOTES a card, never removes it. Withdrawal-at-3
-    was the 2026-07-27 evaporation incident: strikes measure the sender's
-    turn rate, so ~25 asks — including live ones — vanished unanswered in a
-    day. An unanswered ask must be impossible to lose."""
+def _age_card(server_dir_db, card_id: int, seconds: float) -> None:
+    """Backdate a card's substantive timestamps — the only honest way to
+    make one stale now that staleness is the ask's own age (card #237)."""
+    import sqlite3 as _sq
+    conn = _sq.connect(server_dir_db)
+    conn.execute(
+        "UPDATE decisions SET submitted_at = submitted_at - ?, "
+        "updated_at = updated_at - ? WHERE id=?",
+        (seconds, seconds, card_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+async def test_clear_is_pure_notice_and_never_stales(server, tmp_path):
+    """The turn-rate clock is retired (card #237, operator-approved
+    2026-08-28): any number of cardless turns leaves the card exactly as
+    fresh as its own age says. The old rule demoted a 6-minute-old
+    top-scored ask after three quiet turns — punishing the lane that
+    obediently stopped restating."""
     await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
-    for expected in ("1/3", "2/3"):
+    for _ in range(5):
         out = await _call_tool(server, "decision_clear", {"from_agent": "alice"})
-        assert f"kept open (cardless turn {expected})" in out
-        assert "alice" in await _call_tool(server, "decision_list", {})
-    out = await _call_tool(server, "decision_clear", {"from_agent": "alice"})
-    assert "marked STALE" in out
+        assert "#1 still open" in out
+        assert "STALE" not in out            # no restate-to-keep-fresh prompt
     listing = await _call_tool(server, "decision_list", {})
-    assert "alice" in listing            # STILL on the board
-    assert "· STALE" in listing
-    # Further cardless turns: notice repeats, nothing changes state.
-    out = await _call_tool(server, "decision_clear", {"from_agent": "alice"})
-    assert "is STALE" in out
-    assert "alice" in await _call_tool(server, "decision_list", {})
+    assert "alice" in listing
+    assert "STALE" not in listing
+    rows = json.loads(
+        await _call_tool(server, "decision_list", {"format": "json"})
+    )
+    assert rows[0]["stale"] == 0
 
 
-async def test_stale_card_revived_by_restatement(server):
+async def test_staleness_is_the_age_of_the_ask(server, tmp_path):
+    """A card nobody has touched for DECISION_STALE_AFTER_SECONDS is stale
+    regardless of the lane's turn cadence — and a purged owner's card can
+    no longer read fresh forever by taking no turns (the #439 shape)."""
     await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
-    for _ in range(3):
-        await _call_tool(server, "decision_clear", {"from_agent": "alice"})
+    _age_card(tmp_path / "test.db", 1, DECISION_STALE_AFTER_SECONDS + 60)
+    listing = await _call_tool(server, "decision_list", {})
+    assert "· STALE" in listing
+    rows = json.loads(
+        await _call_tool(server, "decision_list", {"format": "json"})
+    )
+    assert rows[0]["stale"] == 1             # computed, truthful in json too
+
+
+async def test_restatement_is_the_honest_still_live(server, tmp_path):
+    """Restating a week-old ask refreshes its clock — that is the one
+    legitimate 'still blocking' signal, priced at once per threshold
+    rather than demanded every three turns."""
+    await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
+    _age_card(tmp_path / "test.db", 1, DECISION_STALE_AFTER_SECONDS + 60)
     assert "· STALE" in await _call_tool(server, "decision_list", {})
     await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
     listing = await _call_tool(server, "decision_list", {})
     assert "alice" in listing
-    assert "STALE" not in listing        # fresh again, strikes reset
+    assert "STALE" not in listing            # updated_at moved, clock reset
 
 
-async def test_stale_card_still_answerable_and_sorts_last(server):
+async def test_stale_card_still_answerable_and_sorts_last(server, tmp_path):
     """The whole point: the operator can still answer a stale card, and a
     stale high-net card must not outrank a fresh low-net one."""
     await _call_tool(server, "register", {"name": "alice", "project": "p"})
     await _call_tool(server, "decision_put",
                      {"from_agent": "alice",
                       "card": CARD_V2.replace("[7/10]", "[10/10]")})
-    for _ in range(3):
-        await _call_tool(server, "decision_clear", {"from_agent": "alice"})
+    _age_card(tmp_path / "test.db", 1, DECISION_STALE_AFTER_SECONDS + 60)
     await _call_tool(server, "decision_put",
                      {"from_agent": "bob",
                       "card": CARD_V2.replace("[7/10]", "[4/10]")})
@@ -177,17 +207,42 @@ async def test_stale_card_still_answerable_and_sorts_last(server):
     )
     assert "decided: yes" in out
     assert "alice" not in await _call_tool(server, "decision_list", {})
+    # An aged card that got ANSWERED is history, not stale — staleness is
+    # a property of open asks only.
+    all_listing = await _call_tool(server, "decision_list", {"status": "all"})
+    alice_line = next(ln for ln in all_listing.splitlines() if "alice" in ln)
+    assert "DECIDED" in alice_line
+    assert "STALE" not in alice_line
 
 
-async def test_restatement_resets_clear_strikes(server):
-    """A restated card starts the 3-count over — strikes must be
-    CONSECUTIVE cardless turns."""
+async def test_legacy_stored_stale_flag_is_cleared_on_boot(tmp_path):
+    """A stale=1 row written by the retired turn-rate clock must stop
+    lying: the migration clears stored flags once, and a young card reads
+    fresh everywhere afterwards."""
+    import sqlite3 as _sq
+    db = tmp_path / "test.db"
+    server = create_server(db_path=db)
     await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
-    await _call_tool(server, "decision_clear", {"from_agent": "alice"})
-    await _call_tool(server, "decision_clear", {"from_agent": "alice"})
-    await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
-    out = await _call_tool(server, "decision_clear", {"from_agent": "alice"})
-    assert "1/3" in out  # back to strike one, not withdrawn
+    conn = _sq.connect(db)
+    conn.execute("UPDATE decisions SET stale=1 WHERE id=1")
+    conn.commit()
+    conn.close()
+    server2 = create_server(db_path=db)
+    listing = await _call_tool(server2, "decision_list", {})
+    assert "alice" in listing
+    assert "STALE" not in listing
+    rows = json.loads(
+        await _call_tool(server2, "decision_list", {"format": "json"})
+    )
+    assert rows[0]["stale"] == 0
+    # The API computes staleness, so it cannot witness the stored column —
+    # assert the migration at the DB itself, where external read-only
+    # consumers (prod DB access) would still see a lying flag.
+    conn = _sq.connect(db)
+    assert conn.execute(
+        "SELECT stale FROM decisions WHERE id=1"
+    ).fetchone()[0] == 0
+    conn.close()
 
 
 async def test_clear_with_nothing_open_is_silent(server):
@@ -239,7 +294,7 @@ async def test_list_orders_by_net_desc_nulls_last(server):
     assert listing.index("high") < listing.index("low") < listing.index("unscored")
 
 
-async def test_all_listing_labels_history_rows(server):
+async def test_all_listing_labels_history_rows(server, tmp_path):
     """A mixed-status listing must SAY which rows are closed — in a real
     `all` render on 2026-07-27, 25 of 28 rows were history and none said
     so, and the reader tallied ledger rows as live queue. (Withdrawn rows
@@ -250,8 +305,7 @@ async def test_all_listing_labels_history_rows(server):
     await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
     await _call_tool(server, "decision_answer", {"decision": "yes", "agent": "alice"})
     await _call_tool(server, "decision_put", {"from_agent": "bob", "card": CARD_V2})
-    for _ in range(3):
-        await _call_tool(server, "decision_clear", {"from_agent": "bob"})
+    _age_card(tmp_path / "test.db", 2, DECISION_STALE_AFTER_SECONDS + 60)
     await _call_tool(server, "decision_put", {"from_agent": "carol", "card": CARD_V2})
     different = CARD_V2.replace(
         "approve the widget rebuild", "tear down the legacy ingest cluster"
