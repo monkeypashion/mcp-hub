@@ -710,8 +710,45 @@ def _capture_pane(seat: dict[str, Any], runner: Any) -> tuple[bool, str]:
     return rc == 0, out
 
 
+# How long the seat's TUI is given to catch up between typing the text and
+# submitting it, and again before the after-capture. MEASURED 2026-08-28 on
+# an IDLE lane (two console fires, identical outcome): text and Enter sent in
+# the same instant left the text sitting in the input box unsubmitted, and
+# the lane's next channel wake discarded the draft; the same text with a 1s
+# pause before Enter submitted (the dt-poc nudge). The after-capture needs
+# the pause for a different reason — the TUI renders asynchronously, and a
+# capture taken in the same instant as the keys shows the frame from BEFORE
+# them (fire 2 witnessed an empty box that the text had not yet reached).
+SEAT_SETTLE_SECONDS = 1.0
+
+
+def _prompt_submitted(pane: str, text: str) -> str:
+    """'' when the pane shows the prompt SUBMITTED, else the reason it does
+    not. The witness is the pane, never the send: claude's TUI renders a
+    submitted message as a transcript line and keeps an unsubmitted one in
+    the input box — the LAST prompt-marker line. Two console fires reported
+    "done" while the text sat in that box; "keys sent" is not "submitted".
+    """
+    probe = (text.splitlines() or [""])[0][:30]
+    if not probe:
+        return ""  # nothing typed — an Enter alone has no witness to check
+    lines = pane.splitlines()
+    box_idx = max(
+        (i for i, ln in enumerate(lines) if ln.lstrip().startswith("❯")),
+        default=-1,
+    )
+    if box_idx >= 0 and probe in lines[box_idx]:
+        return ("the text is still in the input box — Enter did not submit "
+                "it")
+    if any(probe in ln for i, ln in enumerate(lines) if i != box_idx):
+        return ""
+    return ("the typed text is not visible anywhere in the pane after "
+            "settling — submission unverified")
+
+
 def realize_seat_action(
     action: dict[str, Any], seat: dict[str, Any], runner: Any,
+    pause: Any = None,
 ) -> dict[str, Any]:
     """Carry out one seat action and report what was OBSERVED.
 
@@ -730,6 +767,7 @@ def realize_seat_action(
     different guarantees; keeping only the first would mean one compromised
     writer becomes one executed keystroke.
     """
+    pause = pause or time.sleep
     kind = action.get("kind") or ""
     if kind not in _SEAT_PHASE1_VERBS:
         return {
@@ -767,12 +805,17 @@ def realize_seat_action(
             _seat_tmux_argv(seat, ["send-keys", "-l", text])
         )
         if rc == 0:
+            # Settle before Enter — see SEAT_SETTLE_SECONDS. An Enter in the
+            # same instant as the text left it unsubmitted on an idle lane.
+            pause(SEAT_SETTLE_SECONDS)
             rc, out = runner(_seat_tmux_argv(seat, ["send-keys", "Enter"]))
         sent = {"sent": "text+Enter", "chars": len(text)}
 
     # Captured AFTER — the evidence is the pane the action produced, not the
     # one it started from. "We sent Escape" is an assumption with a number
-    # attached; this is an observation.
+    # attached; this is an observation. Settled first, or the capture shows
+    # the frame from before the keys (see SEAT_SETTLE_SECONDS).
+    pause(SEAT_SETTLE_SECONDS)
     _, after = _capture_pane(seat, runner)
 
     if rc != 0:
@@ -782,6 +825,14 @@ def realize_seat_action(
                          "runner_output": out},
             "pane_after": after,
         }
+    if kind == "prompt":
+        why = _prompt_submitted(after, text)
+        if why:
+            return {
+                "status": "failed",
+                "observed": {**sent, "why": why},
+                "pane_after": after,
+            }
     return {"status": "done", "observed": sent, "pane_after": after}
 
 

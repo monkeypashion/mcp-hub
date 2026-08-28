@@ -30,12 +30,19 @@ from mcp_hub.edge import realize_seat_action
 class Runner:
     """Records commands; returns canned (rc, output) per matched prefix."""
 
-    def __init__(self, responses: list[tuple[list[str], int, str]] | None = None):
+    def __init__(self, responses: list[tuple[list[str], int, str]] | None = None,
+                 captures: list[str] | None = None):
         self.calls: list[list[str]] = []
         self._responses = responses or []
+        # Sequential pane frames, consumed one per capture-pane call — the
+        # before-frame and the after-frame genuinely differ once the
+        # realizer verifies submission from the pane.
+        self._captures = list(captures or [])
 
     def __call__(self, cmd, cwd=None):  # noqa: ANN001
         self.calls.append(list(cmd))
+        if "capture-pane" in cmd and self._captures:
+            return 0, self._captures.pop(0)
         for prefix, rc, out in self._responses:
             if cmd[: len(prefix)] == prefix:
                 return rc, out
@@ -47,6 +54,26 @@ class Runner:
 
 def _ok_capture(pane: str = "● ready\n> ") -> list[tuple[list[str], int, str]]:
     return [(["tmux", "-L", "squad", "capture-pane"], 0, pane)]
+
+
+def _submitted(text: str) -> list[str]:
+    """Before/after frames for a prompt that SUBMITTED: the text appears as
+    a transcript line and the input box (the last ❯ line) is empty."""
+    return ["● ready\n❯ ", f"❯ {text}\n\n● working\n❯ "]
+
+
+def _stuck(text: str) -> list[str]:
+    """Frames for the measured 2026-08-28 failure: text sits in the box."""
+    return ["● ready\n❯ ", f"● ready\n❯ {text}"]
+
+
+@pytest.fixture(autouse=True)
+def no_real_sleep(monkeypatch):
+    """The realizer settles with time.sleep; tests record instead of wait."""
+    import time as _t
+    slept: list[float] = []
+    monkeypatch.setattr(_t, "sleep", lambda s: slept.append(s))
+    return slept
 
 
 SEAT = {"identity": "seat-a", "substrate": "tmux", "session": "seat-a"}
@@ -119,7 +146,7 @@ class TestInterrupt:
 
 class TestPrompt:
     def test_prompt_types_the_text_then_enter(self):
-        r = Runner(_ok_capture())
+        r = Runner(captures=_submitted("status?"))
         out = realize_seat_action(
             {"id": 2, "kind": "prompt", "args": {"text": "status?"}}, SEAT, r
         )
@@ -132,7 +159,7 @@ class TestPrompt:
         """R3. The text must never be split, quoted, or interpolated into a
         command string — a prompt containing a semicolon is a prompt, not a
         second command."""
-        r = Runner(_ok_capture())
+        r = Runner(captures=_submitted("check; then rm -rf /  # not a command"))
         realize_seat_action(
             {"id": 2, "kind": "prompt",
              "args": {"text": "check; then rm -rf /  # not a command"}},
@@ -149,7 +176,7 @@ class TestPrompt:
         """`send-keys "text" Enter` in one call makes tmux interpret the
         literal as a key name when it happens to match one ("Enter", "C-c").
         Typing then submitting is two calls, deliberately."""
-        r = Runner(_ok_capture())
+        r = Runner(captures=_submitted("Enter"))
         realize_seat_action(
             {"id": 2, "kind": "prompt", "args": {"text": "Enter"}}, SEAT, r
         )
@@ -381,7 +408,8 @@ class TestSeatControlPass:
             ]},
             fail_view_for=["seat-a"],
         )
-        out = seat_control_pass(api, [_pl("seat-a")], Runner(_ok_capture()))
+        out = seat_control_pass(api, [_pl("seat-a")],
+                                Runner(captures=_submitted("hi")))
         assert api.reported == [("seat-a", 7, "done")]
         assert out["errors"], "the view failure was not reported"
 
@@ -544,3 +572,88 @@ class TestLaneSeats:
         api = LaneApi(watched=["lane-a"], seats=[_lane("lane-a")])
         seat_control_pass(api, [], Runner(_ok_capture("live")), machine="m1")
         assert [s for s, _ in api.panes] == ["lane-a"]
+
+
+# ---------------------------------------------------------------------------
+# Submission is WITNESSED, never assumed — the 2026-08-28 live-fire finding.
+# Two console prompts at an idle lane reported "done" while the text sat in
+# the input box unsubmitted, and the lane's next wake discarded the draft.
+# ---------------------------------------------------------------------------
+
+
+class TestPromptSubmissionWitness:
+    def test_text_left_in_the_input_box_is_FAILED_not_done(self):
+        r = Runner(captures=_stuck("status?"))
+        out = realize_seat_action(
+            {"id": 2, "kind": "prompt", "args": {"text": "status?"}}, SEAT, r
+        )
+        assert out["status"] == "failed", out
+        assert "input box" in out["observed"]["why"]
+        assert "status?" in out["pane_after"]  # the evidence travels
+
+    def test_text_visible_nowhere_is_FAILED_unverified(self):
+        """An empty box is not proof of submission — fire 2's after-frame was
+        captured before the TUI had rendered the keys at all."""
+        r = Runner(captures=["● ready\n❯ ", "● ready\n❯ "])
+        out = realize_seat_action(
+            {"id": 2, "kind": "prompt", "args": {"text": "status?"}}, SEAT, r
+        )
+        assert out["status"] == "failed", out
+        assert "unverified" in out["observed"]["why"]
+
+    def test_text_as_a_transcript_line_is_done(self):
+        r = Runner(captures=_submitted("status?"))
+        out = realize_seat_action(
+            {"id": 2, "kind": "prompt", "args": {"text": "status?"}}, SEAT, r
+        )
+        assert out["status"] == "done", out
+
+    def test_a_long_prompt_is_matched_on_its_first_line_prefix(self):
+        """The transcript wraps and clips long text; the witness must not
+        demand the whole string on one line."""
+        text = "first line of a long prompt that will surely wrap\nsecond line"
+        after = "❯ first line of a long prompt that\n  will surely wrap\n❯ "
+        r = Runner(captures=["● ready\n❯ ", after])
+        out = realize_seat_action(
+            {"id": 2, "kind": "prompt", "args": {"text": text}}, SEAT, r
+        )
+        assert out["status"] == "done", out
+
+    def test_the_realizer_settles_before_enter_and_before_capture(
+        self, no_real_sleep
+    ):
+        """Measured: text and Enter in the same instant left the text
+        unsubmitted on an idle lane; a 1s pause before Enter submitted."""
+        from mcp_hub.edge import SEAT_SETTLE_SECONDS
+
+        r = Runner(captures=_submitted("status?"))
+        realize_seat_action(
+            {"id": 2, "kind": "prompt", "args": {"text": "status?"}}, SEAT, r
+        )
+        assert no_real_sleep.count(SEAT_SETTLE_SECONDS) >= 2, no_real_sleep
+        assert SEAT_SETTLE_SECONDS >= 0.5
+
+    def test_the_pause_sits_between_text_and_enter(self):
+        order: list[str] = []
+
+        class OrderRunner(Runner):
+            def __call__(self, cmd, cwd=None):  # noqa: ANN001
+                if "send-keys" in cmd:
+                    order.append("Enter" if cmd[-3:-2] == ["Enter"] or "Enter" in cmd else "text")
+                return super().__call__(cmd, cwd)
+
+        r = OrderRunner(captures=_submitted("status?"))
+        realize_seat_action(
+            {"id": 2, "kind": "prompt", "args": {"text": "status?"}}, SEAT, r,
+            pause=lambda s: order.append("pause"),
+        )
+        assert order.index("text") < order.index("pause") < order.index("Enter"), order
+
+    def test_interrupt_is_not_subject_to_the_prompt_witness(self):
+        """Escape leaves nothing to find in the pane; its witness is the
+        pane itself, unchanged from phase 1."""
+        r = Runner(_ok_capture())
+        out = realize_seat_action(
+            {"id": 1, "kind": "interrupt", "args": {}}, SEAT, r
+        )
+        assert out["status"] == "done", out
