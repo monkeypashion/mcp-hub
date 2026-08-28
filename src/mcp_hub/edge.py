@@ -64,6 +64,52 @@ EDGE_ENV_FILE = Path.home() / ".mcp-hub" / "edge-env"
 # working tree, or their index and checked-out ref fight silently.
 SEAT_REPOS_ROOT = Path.home() / ".mcp-hub" / "seat-repos"
 
+# One seat-control leg per machine at a time. The timer pass and the
+# doorbell pass are separate processes on the same box, and a pending action
+# stays pending until its realizer REPORTS — which, with the settle pauses,
+# is ~2s after it started typing. Measured 2026-08-28 23:03: a doorbell pass
+# at :00 and a timer pass at :02 both pulled action 4 while pending and both
+# typed it; the lane received the prompt twice, and the hub row went
+# failed→done as the two reports landed in turn. Serialized here rather than
+# by a hub-side claim: a claim needs a deploy, a lock needs a pull.
+EDGE_CONTROL_LOCK = Path.home() / ".mcp-hub" / "edge-control.lock"
+
+
+class ControlLock:
+    """Non-blocking machine-wide lock around the seat-control leg.
+
+    `with ControlLock(path) as held:` — `held` is False when another pass
+    holds it, and the caller SKIPS the leg this time (the holder is doing
+    it; the next pass, ≤30s away, picks up anything new). Skipping is
+    reported, never silent: a leg that did not run must not read as a leg
+    that found nothing to do.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._fh: Any = None
+        self.held = False
+
+    def __enter__(self) -> bool:
+        import fcntl
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(self._path, "a+")  # noqa: SIM115 — released in __exit__
+        try:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.held = True
+        except OSError:
+            self.held = False
+        return self.held
+
+    def __exit__(self, *exc: Any) -> None:
+        import fcntl
+        if self._fh is not None:
+            if self.held:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+            self._fh.close()
+            self._fh = None
+        self.held = False
+
 
 def _squad_bin() -> str | None:
     """`squad`'s absolute path, found the way every other caller finds it.
@@ -1938,11 +1984,22 @@ def edge_apply(
     # Seat control (cards #144/#152) rides the same pass — but AFTER the
     # placements are reported, and inside its own guard: a wedged pane must
     # not cost the fleet its reconcile.
-    try:
-        seat_control = seat_control_pass(api, placements, runner,
-                                         machine=machine)
-    except Exception as exc:  # noqa: BLE001 — never let control break convergence
-        seat_control = {"realized": [], "streamed": 0, "errors": [str(exc)]}
+    with ControlLock(EDGE_CONTROL_LOCK) as held:
+        if not held:
+            # Another pass (timer vs doorbell) is realizing right now. Two
+            # passes on one pending row typed one prompt twice — see
+            # EDGE_CONTROL_LOCK. Skip, and SAY so.
+            seat_control = {
+                "realized": [], "streamed": 0, "errors": [],
+                "skipped": "another edge pass holds the seat-control lock",
+            }
+        else:
+            try:
+                seat_control = seat_control_pass(api, placements, runner,
+                                                 machine=machine)
+            except Exception as exc:  # noqa: BLE001 — never let control break convergence
+                seat_control = {"realized": [], "streamed": 0,
+                                "errors": [str(exc)]}
 
     workspaces = discover_workspaces([Path(d) for d in scan_dirs])
     # The roster, agent → worktree. Only this machine can say which folder an

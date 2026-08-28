@@ -699,3 +699,46 @@ class TestTmuxArgvShape:
             {"id": 1, "kind": "interrupt", "args": {}}, SEAT, r
         )
         assert out["status"] == "done", out
+
+
+# ---------------------------------------------------------------------------
+# One control leg per machine at a time — the timer and doorbell passes are
+# separate processes, and on 2026-08-28 23:03 two of them, 2s apart, both
+# pulled one pending action and typed the prompt twice.
+# ---------------------------------------------------------------------------
+
+
+class TestControlLock:
+    def test_second_holder_is_refused_not_blocked(self, tmp_path):
+        import fcntl
+
+        from mcp_hub.edge import ControlLock
+
+        path = tmp_path / "edge-control.lock"
+        other = open(path, "a+")
+        fcntl.flock(other.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            with ControlLock(path) as held:
+                assert held is False
+        finally:
+            fcntl.flock(other.fileno(), fcntl.LOCK_UN)
+            other.close()
+
+    def test_lock_is_released_on_exit(self, tmp_path):
+        from mcp_hub.edge import ControlLock
+
+        path = tmp_path / "edge-control.lock"
+        with ControlLock(path) as held:
+            assert held is True
+        with ControlLock(path) as held_again:
+            assert held_again is True
+
+    def test_lock_is_released_even_when_the_leg_raises(self, tmp_path):
+        from mcp_hub.edge import ControlLock
+
+        path = tmp_path / "edge-control.lock"
+        with pytest.raises(RuntimeError):
+            with ControlLock(path):
+                raise RuntimeError("wedged pane")
+        with ControlLock(path) as held:
+            assert held is True
