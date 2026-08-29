@@ -940,6 +940,8 @@ def _grade_tag_str(grade: str) -> str:
     """
     if grade in ("session-verified", "operator-verified"):
         return " ·verified"
+    if grade == "hub-authored":
+        return " ·hub"
     if grade == "asserted":
         return " ·asserted"
     return " ·ungraded"
@@ -1610,8 +1612,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         try:
             conn = _get_db(db_path)
             conn.execute(
-                "INSERT INTO messages (ts, from_agent, to_agent, body, priority) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO messages (ts, from_agent, to_agent, body, priority, "
+                "attribution) VALUES (?, ?, ?, ?, ?, 'hub-authored')",
                 (
                     time.time(),
                     "hub",
@@ -2606,7 +2608,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             ):
                 conn.execute(
                     "INSERT INTO messages (ts, from_agent, to_agent, body,"
-                    " priority) VALUES (?, 'hub', ?, ?, 'low')",
+                    " priority, attribution) VALUES (?, 'hub', ?, ?, 'low', "
+                    "'hub-authored')",
                     (now, name,
                      f"⚠ wake-binding DISPLACED at "
                      f"{time.strftime('%H:%M:%S', time.localtime(now))}: a "
@@ -4853,10 +4856,19 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         card_id: int = 0,
         agent: str = "",
         note: str = "",
+        ctx: Context | None = None,
     ) -> str:
         """Answer a decision card — the operator's leg. Closes the card and
         DMs the verdict to the asker (wake path included), so the answer
         travels without a relay.
+
+        This IS a console message path, so it stands behind the same door as
+        send/post/broadcast (card #269): with $MCP_HUB_OPERATOR_TOKEN set, a
+        call without the token is REFUSED and the card stays open — the tool
+        takes no from_agent, and before this any agent could close any card
+        and mint an operator verdict, wake meta and all. Unset, the verdict
+        row is graded `asserted` (an unchecked caller) and nothing else
+        changes.
 
         Args:
             decision: 'yes' | 'no' | 'defer' (free text allowed).
@@ -4864,6 +4876,10 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             agent: Alternative target: this agent's open card.
             note: Optional context for the asker.
         """
+        verdict = _verify_operator(ctx, "operator")
+        if verdict is not None and verdict[1]:
+            return verdict[1]
+        grade = verdict[0] if verdict is not None else "asserted"
         conn = _get_db(db_path)
         row = conn.execute(
             "SELECT * FROM decisions WHERE id = ? AND status = 'open'",
@@ -4885,15 +4901,15 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             + (f" — {note}" if note else "")
         )
         cur = conn.execute(
-            "INSERT INTO messages (ts, from_agent, to_agent, body, priority) "
-            "VALUES (?, 'operator', ?, ?, 'normal')",
-            (time.time(), row["agent"], body),
+            "INSERT INTO messages (ts, from_agent, to_agent, body, priority, "
+            "attribution) VALUES (?, 'operator', ?, ?, 'normal', ?)",
+            (time.time(), row["agent"], body, grade),
         )
         msg_id = cur.lastrowid
         conn.commit()
         outcome = await push_channel(
             agent=row["agent"],
-            content=f"DM from operator: {body}",
+            content=f"DM from operator{_grade_tag_str(grade)}: {body}",
             meta={"from_agent": "operator", "kind": "dm",
                   "priority": "normal", "drain_batch": "false"},
         )

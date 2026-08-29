@@ -27,6 +27,10 @@ from mcp_hub.server import (
 )
 
 TOKEN = "s3cret-console-token"
+CARD = (
+    "**DECISION**\n**ASK:** approve the widget rebuild?\n**WHY:** it is old\n"
+    "**VALUE:** 5/10\n**RISK:** 2/10"
+)
 
 
 @pytest.fixture
@@ -196,3 +200,54 @@ class TestOn:
     async def test_status_says_on(self, server):
         out = await _call(server, "hub_status", {})
         assert "Operator verification: ON" in out
+
+    async def test_decision_answer_without_token_is_refused_card_stays_open(
+        self, server, db,
+    ):
+        """decision_answer takes no from_agent and writes the verdict AS the
+        operator — a console message path, so it stands behind the same
+        door. Before this any agent could close any card as the operator."""
+        await _setup(server)
+        await _call(server, "decision_put", {"from_agent": "bob", "card": CARD})
+        out = await _call(server, "decision_answer",
+                          {"decision": "yes", "agent": "bob"},
+                          ctx=_FakeCtx(headers={}))
+        assert "REFUSED" in out, out
+        assert "No open decision cards" not in await _call(
+            server, "decision_list", {})
+        assert _rows(db, "operator") == []
+
+    async def test_decision_answer_with_token_is_operator_verified(
+        self, server, db,
+    ):
+        await _setup(server)
+        await _call(server, "decision_put", {"from_agent": "bob", "card": CARD})
+        out = await _call(server, "decision_answer",
+                          {"decision": "yes", "agent": "bob"},
+                          ctx=_FakeCtx(headers={OPERATOR_TOKEN_HEADER: TOKEN}))
+        assert "decided: yes" in out, out
+        grades = [g for _, g in _rows(db, "operator")]
+        assert grades == ["operator-verified"], grades
+        inbox = await _call(server, "get_messages", {"agent_name": "bob"})
+        assert "operator** ·verified" in inbox, inbox
+
+
+class TestHubAuthored:
+    def test_hub_authored_renders_as_hub_not_ungraded(self):
+        """The hub's own notices (wake-ack drop, binding displacement) are
+        its own acts; under NO GRADE = NOT VERIFIED they must not read as
+        pre-grading rows."""
+        assert _grade_tag_str("hub-authored") == " ·hub"
+
+    async def test_decision_answer_unset_token_grades_asserted(
+        self, server, db, monkeypatch,
+    ):
+        """Unset = today's behaviour, but the row is graded honestly rather
+        than left blank."""
+        monkeypatch.delenv(OPERATOR_TOKEN_ENV, raising=False)
+        await _setup(server)
+        await _call(server, "decision_put", {"from_agent": "bob", "card": CARD})
+        out = await _call(server, "decision_answer",
+                          {"decision": "yes", "agent": "bob"})
+        assert "decided: yes" in out, out
+        assert [g for _, g in _rows(db, "operator")] == ["asserted"]

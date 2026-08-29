@@ -147,6 +147,13 @@ console:  x-mcp-hub-operator-token: <secret>         (header, every request)
   exactly as before. That fallback is the rollout: the hub deploys ahead of
   the console wiring the header without going deaf to its operator.
 - `hub_status()` says which: `Operator verification: ON|OFF (…)`.
+- **`decision_answer` stands behind the same door.** It takes no
+  `from_agent` and writes the verdict DM *as* `operator` (operator wake meta
+  included), so before this any agent could close any card and mint a
+  verdict. Token set → refused without it, card stays open; unset → the
+  verdict row is graded `asserted`, nothing else changes.
+- The hub's own notices (`hub` sender: wake-ack drop, binding displacement)
+  carry `hub-authored` → ` ·hub`, so they never read as pre-grading rows.
 - Presenting the token under a non-operator name promotes nothing.
 
 **Every rendered name carries its grade** — `·verified` / `·asserted` /
