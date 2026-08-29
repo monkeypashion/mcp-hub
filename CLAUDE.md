@@ -139,7 +139,7 @@ console:  x-mcp-hub-operator-token: <secret>         (header, every request)
 ```
 
 - **Set** → an operator-named send/post/broadcast with the matching header
-  grades `operator-verified` (renders silent, like session-verified); absent
+  grades `operator-verified` (renders `·verified`, like session-verified); absent
   or wrong is **REFUSED before the record is written**, naming the header.
   A genuine console with the header unwired is refused the same way as a
   forgery, deliberately — wire it, or unset the token.
@@ -148,6 +148,17 @@ console:  x-mcp-hub-operator-token: <secret>         (header, every request)
   the console wiring the header without going deaf to its operator.
 - `hub_status()` says which: `Operator verification: ON|OFF (…)`.
 - Presenting the token under a non-operator name promotes nothing.
+
+**Every rendered name carries its grade** — `·verified` / `·asserted` /
+`·ungraded` — in every text surface (card #271). Verified was the silent
+case for one hour on 2026-08-29, and reliable-ai showed why that fails:
+every lossy hop (a quote, a truncated drain line, a paste, a client that
+drops the suffix) strips `·asserted` and the result reads as verified,
+one-directionally, always in the impostor's favour. A positive mark has
+something to LOSE. **Reader's rule, fail-closed: NO GRADE = NOT VERIFIED.**
+A name with nothing after it is a surface that predates the render or a
+client that dropped it — never a pass. `format="json"` carries
+`attribution` as a field and needs no rule.
 
 The grade authenticates the **sender of the row**, never the words relayed
 inside it — a verified console brief proves the console sent it, not that the

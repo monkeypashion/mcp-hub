@@ -919,20 +919,27 @@ def _msg_ref(message_id: int) -> str:
 def _grade_tag_str(grade: str) -> str:
     """Render an attribution grade beside the sender's name.
 
-    SILENCE MEANS SESSION-VERIFIED — the transport's own binding vouched
-    for the name. Everything weaker is marked: `asserted` (an unbound or
-    ephemeral caller named itself and the hub could not check) and
-    `ungraded` (a row written before grading existed). The grade was
-    recorded at five write sites and read at none (factory-operations,
-    2026-08-28): an asserted message and a verified one were byte-identical
-    to every reader, so the one signal separating a daemon's legitimate
-    ephemeral send from a forged one reached nobody — the fourth instance
-    in one evening of a control holding a value nothing was scheduled to
-    read. Rendering it makes "carries no stamp" impossible, which is what
-    reasoning from a stamp requires.
+    EVERY NAME CARRIES ITS GRADE: `verified` (the transport's own binding,
+    or the operator token, vouched for the name), `asserted` (an unbound or
+    ephemeral caller named itself and the hub could not check), `ungraded`
+    (a row written before grading existed). The grade was recorded at five
+    write sites and read at none (factory-operations, 2026-08-28): an
+    asserted message and a verified one were byte-identical to every reader,
+    so the one signal separating a daemon's legitimate ephemeral send from a
+    forged one reached nobody. The first render (e630fa3) made verified the
+    SILENT case — and reliable-ai showed within the hour why that fails
+    `report_survives_the_path_to_the_reader` (card #271, operator-approved
+    2026-08-29): every lossy hop — a quote, a truncated drain line, a paste,
+    a client that drops the suffix — strips `·asserted` and the result reads
+    as verified, one-directionally, always in the impostor's favour. A
+    positive token has something to LOSE, so it survives the path.
+
+    READER'S RULE, and it fails closed: NO GRADE = NOT VERIFIED. A name with
+    nothing after it is a surface that predates the render or a client that
+    dropped it — both exactly the case that must not read as verified.
     """
     if grade in ("session-verified", "operator-verified"):
-        return ""
+        return " ·verified"
     if grade == "asserted":
         return " ·asserted"
     return " ·ungraded"

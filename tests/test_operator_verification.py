@@ -182,16 +182,15 @@ class TestOn:
         assert "REFUSED" in out, out
         assert _rows(db, "operator-console") == []
 
-    async def test_verified_renders_silent_like_session_verified(self, server, db):
-        """Same scheme as every other grade today (card #271 changes the
-        scheme for all of them together, not this one alone)."""
-        assert _grade_tag_str("operator-verified") == ""
+    async def test_verified_renders_positively_like_session_verified(self, server, db):
+        """Card #271: every name carries its grade; no grade = not verified."""
+        assert _grade_tag_str("operator-verified") == " ·verified"
         await _setup(server)
         await _call(server, "send", {"from_agent": "operator-console",
                                      "to": "bob", "message": "go"},
                     ctx=_FakeCtx(headers={OPERATOR_TOKEN_HEADER: TOKEN}))
         out = await _call(server, "get_messages", {"agent_name": "bob"})
-        assert "operator-console" in out
+        assert "operator-console** ·verified" in out, out
         assert "·asserted" not in out and "·ungraded" not in out, out
 
     async def test_status_says_on(self, server):
