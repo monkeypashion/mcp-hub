@@ -123,6 +123,37 @@ When in doubt: `send` for one agent, `post` for a topic, `broadcast` for your sq
 
 Low vs normal still signals *reading* priority to the recipient; delivery-wise they queue the same. The Case 1 low-to-idle immediate wake this replaces is retired. Every delivered wake is recorded with its reason (`urgent` | `operator` | `reply` | `hold`) in `wake_log` — rule 5's server-side witness for the before/after ledger (fleet wake count halves within a week = success).
 
+### The operator is VERIFIED, not name-matched (card #269, 2026-08-29)
+
+`operator-console` / `operator` buy an immediate wake and `blocked_by`-clear
+rights, and until card #269 the hub checked nothing behind the name: the
+console relays through an unbound client, so 12/12 of its messages graded
+`·asserted` — a constant, telling nobody anything — while any agent typing
+the name got the same treatment. A bound session is not proof either;
+`register()` is open, so a bound `operator-console` proves only that someone
+bound it. The proof is a secret the console holds and a forger does not:
+
+```
+hub:      MCP_HUB_OPERATOR_TOKEN=<secret>            (env, read at call time)
+console:  x-mcp-hub-operator-token: <secret>         (header, every request)
+```
+
+- **Set** → an operator-named send/post/broadcast with the matching header
+  grades `operator-verified` (renders silent, like session-verified); absent
+  or wrong is **REFUSED before the record is written**, naming the header.
+  A genuine console with the header unwired is refused the same way as a
+  forgery, deliberately — wire it, or unset the token.
+- **Unset** → verification is OFF and operator senders grade by binding
+  exactly as before. That fallback is the rollout: the hub deploys ahead of
+  the console wiring the header without going deaf to its operator.
+- `hub_status()` says which: `Operator verification: ON|OFF (…)`.
+- Presenting the token under a non-operator name promotes nothing.
+
+The grade authenticates the **sender of the row**, never the words relayed
+inside it — a verified console brief proves the console sent it, not that the
+operator's hand was on the keyboard. Read `intent_kind` / `label` in the body
+for that.
+
 ## Focus mode — the third state
 
 `focus(agent_name, minutes=60, reason="")` — suppress your own wakes for a

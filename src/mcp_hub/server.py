@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -146,6 +147,66 @@ HOLD_SWEEP_INTERVAL_SECONDS = 60
 # blocking case rule 2 exists for; the sender is the signal, not the
 # priority field they remembered to set.
 _OPERATOR_SENDERS = frozenset({"operator-console", "operator"})
+
+# The operator's authority is VERIFIED, not name-matched (console card #269,
+# operator-approved 2026-08-29). A name in _OPERATOR_SENDERS buys an
+# immediate wake and blocked_by-clear rights, and until this shipped the hub
+# checked nothing behind it: the console relays through an unbound client,
+# so all 12/12 of its messages graded `asserted` — a constant, telling nobody
+# anything — while any agent that typed the name got the same treatment. A
+# bound session cannot be the proof either, because register() is open and
+# the name is claimable. The one thing a forger does not hold is a secret
+# the console does: $MCP_HUB_OPERATOR_TOKEN, presented per request in the
+# header below. Match → `operator-verified`; absent or wrong → REFUSED
+# before the record is written. UNSET → verification is OFF and the console
+# is graded exactly as before, so the hub can deploy ahead of the console
+# wiring the header without going deaf to its operator (a control whose
+# rollout breaks the thing it guards is the outage with a justification).
+# The token is read at call time (a process restart is not required to arm
+# it) and compared in constant time, like the /api/v1 operator token.
+OPERATOR_TOKEN_ENV = "MCP_HUB_OPERATOR_TOKEN"
+OPERATOR_TOKEN_HEADER = "x-mcp-hub-operator-token"
+
+
+def _operator_token_configured() -> str:
+    return os.environ.get(OPERATOR_TOKEN_ENV, "")
+
+
+def _presented_operator_token(ctx: Any) -> str:
+    """The token the calling request carried, or "". Only the streamable-http
+    transport has a request; stdio and the test harness have none, which reads
+    as "presented nothing" — never as "verified"."""
+    try:
+        req = ctx.request_context.request
+        headers = getattr(req, "headers", None)
+        if headers is None:
+            return ""
+        return str(headers.get(OPERATOR_TOKEN_HEADER) or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _verify_operator(ctx: Any, from_agent: str) -> tuple[str, str] | None:
+    """(grade, error) for an operator-named sender when verification is ON;
+    None when it is OFF or the sender is not an operator name, so the caller
+    falls through to the ordinary session-binding grade."""
+    if from_agent not in _OPERATOR_SENDERS:
+        return None
+    expected = _operator_token_configured()
+    if not expected:
+        return None
+    presented = _presented_operator_token(ctx)
+    if presented and secrets.compare_digest(presented, expected):
+        return "operator-verified", ""
+    return "asserted", (
+        f"REFUSED: from_agent='{from_agent}' claims operator authority but "
+        f"presented no valid operator token — this hub VERIFIES its operator "
+        f"({OPERATOR_TOKEN_ENV} is set; send the token in the "
+        f"{OPERATOR_TOKEN_HEADER} header). The record was not written. A "
+        "genuine console with the header unwired is refused the same way as "
+        "a forgery, deliberately: wire the header, or unset the token to turn "
+        "verification off."
+    )
 
 # Staleness on the decision board is judged by the ASK, never by the asking
 # lane's turn cadence (card #237, operator-approved 2026-08-28). The
@@ -870,7 +931,7 @@ def _grade_tag_str(grade: str) -> str:
     read. Rendering it makes "carries no stamp" impossible, which is what
     reasoning from a stamp requires.
     """
-    if grade == "session-verified":
+    if grade in ("session-verified", "operator-verified"):
         return ""
     if grade == "asserted":
         return " ·asserted"
@@ -1746,7 +1807,14 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         the caller is unbound/ephemeral (stop-hook, daemons — unchanged
         trust, by design). error is non-empty only when the session OWNS a
         different identity than it asserts — the one case that is provably a
-        mis-attribution at the tool boundary."""
+        mis-attribution at the tool boundary.
+
+        Operator names are graded by TOKEN when one is configured (card
+        #269) and never by binding: the name is claimable via register(),
+        so a bound `operator-console` proves only that someone bound it."""
+        verdict = _verify_operator(ctx, from_agent)
+        if verdict is not None:
+            return verdict
         if ctx is None:
             return "asserted", ""
         try:
@@ -5289,7 +5357,11 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             f"Total messages: {messages['c']}\n"
             f"Unread: {unread['c']}\n"
             f"Commit: {_resolve_commit()}\n"
-            f"Uptime: {uptime}s"
+            f"Uptime: {uptime}s\n"
+            f"Operator verification: "
+            + ("ON (operator senders must present the token)"
+               if _operator_token_configured()
+               else f"OFF ({OPERATOR_TOKEN_ENV} unset — operator senders graded by binding only)")
         )
 
     # ------------------------------------------------------------------
