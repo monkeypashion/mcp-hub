@@ -855,6 +855,36 @@ def _msg_ref(message_id: int) -> str:
     return refs.canonical(refs.make_ref("hub.msg/1", id=message_id))
 
 
+def _grade_tag_str(grade: str) -> str:
+    """Render an attribution grade beside the sender's name.
+
+    SILENCE MEANS SESSION-VERIFIED — the transport's own binding vouched
+    for the name. Everything weaker is marked: `asserted` (an unbound or
+    ephemeral caller named itself and the hub could not check) and
+    `ungraded` (a row written before grading existed). The grade was
+    recorded at five write sites and read at none (factory-operations,
+    2026-08-28): an asserted message and a verified one were byte-identical
+    to every reader, so the one signal separating a daemon's legitimate
+    ephemeral send from a forged one reached nobody — the fourth instance
+    in one evening of a control holding a value nothing was scheduled to
+    read. Rendering it makes "carries no stamp" impossible, which is what
+    reasoning from a stamp requires.
+    """
+    if grade == "session-verified":
+        return ""
+    if grade == "asserted":
+        return " ·asserted"
+    return " ·ungraded"
+
+
+def _grade_tag(row: Any) -> str:
+    try:
+        grade = row["attribution"]
+    except (IndexError, KeyError):
+        grade = ""
+    return _grade_tag_str(grade or "")
+
+
 def _parse_receipt_report(rendered_refs: str) -> set[int] | None:
     """The drain tools' `rendered_refs` argument, decoded.
 
@@ -2131,7 +2161,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         Bodies are clipped exactly as live pushes always were; the Stop
         drain plus delivery receipts own the rest."""
         unread = conn.execute(
-            """SELECT id, ts, from_agent, body, priority FROM messages
+            """SELECT id, ts, from_agent, body, priority, attribution FROM messages
                WHERE to_agent = ? AND read = 0 ORDER BY ts ASC""",
             (to,),
         ).fetchall()
@@ -2140,7 +2170,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             ts = time.strftime("%H:%M:%S", time.localtime(r["ts"]))
             prio_tag = f" [{r['priority']}]" if r["priority"] != "normal" else ""
             lines.append(
-                f"[{ts}] DM from {r['from_agent']} "
+                f"[{ts}] DM from {r['from_agent']}{_grade_tag(r)} "
                 f"⟨{_msg_ref(r['id'])}⟩{prio_tag}: {_clip_push(r['body'])}"
             )
         lines.extend(extra_lines or [])
@@ -3035,7 +3065,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 
         outcome = await push_channel(
             agent=to,
-            content=f"DM from {from_agent} ⟨{_msg_ref(message_id)}⟩: "
+            content=f"DM from {from_agent}{_grade_tag_str(grade)} ⟨{_msg_ref(message_id)}⟩: "
                     f"{_clip_push(message)}",
             # `source` is reserved by Claude Code's channel layer (it's the
             # channel server's name, "hub"). Use `from_agent` to avoid a
@@ -3256,7 +3286,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 if eligible:
                     outcome = await push_channel(
                         agent=author,
-                        content=f"BROADCAST from {from_agent} "
+                        content=f"BROADCAST from {from_agent}{_grade_tag_str(grade)} "
                                 f"⟨{_msg_ref(broadcast_id)}⟩: "
                                 f"{_clip_push(message)}",
                         meta={"from_agent": from_agent, "kind": "broadcast",
@@ -3313,7 +3343,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         async def _push_one(agent: str) -> None:
             push_results[agent] = await push_channel(
                 agent=agent,
-                content=f"BROADCAST from {from_agent} "
+                content=f"BROADCAST from {from_agent}{_grade_tag_str(grade)} "
                         f"⟨{_msg_ref(broadcast_id)}⟩: {_clip_push(message)}",
                 meta={
                     "from_agent": from_agent,
@@ -3698,7 +3728,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             ):
                 outcome = await push_channel(
                     agent=author,
-                    content=f"#{channel} from {from_agent} "
+                    content=f"#{channel} from {from_agent}{_grade_tag_str(grade)} "
                             f"⟨{_msg_ref(post_id)}⟩: {_clip_push(message)}",
                     meta={"from_agent": from_agent, "kind": "post",
                           "channel": channel, "priority": priority,
@@ -3739,7 +3769,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         async def _push_one(agent: str) -> None:
             push_results[agent] = await push_channel(
                 agent=agent,
-                content=f"#{channel} from {from_agent} "
+                content=f"#{channel} from {from_agent}{_grade_tag_str(grade)} "
                         f"⟨{_msg_ref(post_id)}⟩: {_clip_push(message)}",
                 meta={
                     "from_agent": from_agent,
@@ -3814,14 +3844,14 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         if since_id > 0:
             if from_agent:
                 rows = conn.execute(
-                    """SELECT id, ts, from_agent, body, priority FROM messages
+                    """SELECT id, ts, from_agent, body, priority, attribution FROM messages
                        WHERE channel = ? AND id > ? AND from_agent = ?
                        ORDER BY id ASC LIMIT ?""",
                     (channel, since_id, from_agent, limit),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    """SELECT id, ts, from_agent, body, priority FROM messages
+                    """SELECT id, ts, from_agent, body, priority, attribution FROM messages
                        WHERE channel = ? AND id > ?
                        ORDER BY id ASC LIMIT ?""",
                     (channel, since_id, limit),
@@ -3830,14 +3860,14 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             cutoff = time.time() - (since_minutes * 60)
             if from_agent:
                 rows = conn.execute(
-                    """SELECT id, ts, from_agent, body, priority FROM messages
+                    """SELECT id, ts, from_agent, body, priority, attribution FROM messages
                        WHERE channel = ? AND ts > ? AND from_agent = ?
                        ORDER BY ts ASC LIMIT ?""",
                     (channel, cutoff, from_agent, limit),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    """SELECT id, ts, from_agent, body, priority FROM messages
+                    """SELECT id, ts, from_agent, body, priority, attribution FROM messages
                        WHERE channel = ? AND ts > ?
                        ORDER BY ts ASC LIMIT ?""",
                     (channel, cutoff, limit),
@@ -3850,6 +3880,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                     "ref": _msg_ref(r["id"]),
                     "ts": r["ts"],
                     "from_agent": r["from_agent"],
+                    "attribution": (r["attribution"] or "") if "attribution" in r.keys() else "",
                     "body": r["body"],
                     "priority": r["priority"],
                 }
@@ -3864,7 +3895,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             ts = time.strftime("%H:%M:%S", time.localtime(r["ts"]))
             prio = r["priority"] if r["priority"] != "normal" else ""
             prio_tag = f" [{prio}]" if prio else ""
-            lines.append(f"[{ts}] **{r['from_agent']}** ⟨{_msg_ref(r['id'])}⟩"
+            lines.append(f"[{ts}] **{r['from_agent']}**{_grade_tag(r)} ⟨{_msg_ref(r['id'])}⟩"
                          f"{prio_tag}: {r['body']}")
         return "\n".join(lines)
 
@@ -3978,7 +4009,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             conn.commit()
 
         rows = conn.execute(
-            """SELECT id, ts, from_agent, body, priority, pushed_gen FROM messages
+            """SELECT id, ts, from_agent, body, priority, pushed_gen, attribution FROM messages
                WHERE to_agent = ? AND read = 0
                ORDER BY ts ASC LIMIT ?""",
             (agent_name, limit),
@@ -4051,7 +4082,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 if already_rendered:
                     seen_live += 1
                     lines.append(
-                        f"[{ts}] **{r['from_agent']}** ⟨{_msg_ref(r['id'])}⟩"
+                        f"[{ts}] **{r['from_agent']}**{_grade_tag(r)} ⟨{_msg_ref(r['id'])}⟩"
                         f"{prio_tag}: "
                         f"(already delivered live — {_summarise(body)})"
                     )
@@ -4070,7 +4101,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 else:
                     capped += 1
                     body = _summarise(body, COMPACT_SUMMARY_CHARS)
-            lines.append(f"[{ts}] **{r['from_agent']}** ⟨{_msg_ref(r['id'])}⟩"
+            lines.append(f"[{ts}] **{r['from_agent']}**{_grade_tag(r)} ⟨{_msg_ref(r['id'])}⟩"
                          f"{prio_tag}: {body}")
         if compact and (seen_live or capped or clipped):
             # Point at get_history, NOT get_messages: this very call marked
@@ -4103,7 +4134,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         cutoff = time.time() - (since_minutes * 60)
         conn = _get_db(db_path)
         rows = conn.execute(
-            """SELECT id, ts, from_agent, body, priority FROM messages
+            """SELECT id, ts, from_agent, body, priority, attribution FROM messages
                WHERE channel = ? AND ts > ?
                ORDER BY ts ASC LIMIT ?""",
             (_BROADCAST_CHANNEL, cutoff, limit),
@@ -4117,7 +4148,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             ts = time.strftime("%H:%M:%S", time.localtime(r["ts"]))
             prio = r["priority"] if r["priority"] != "normal" else ""
             prio_tag = f" [{prio}]" if prio else ""
-            lines.append(f"[{ts}] **{r['from_agent']}** ⟨{_msg_ref(r['id'])}⟩"
+            lines.append(f"[{ts}] **{r['from_agent']}**{_grade_tag(r)} ⟨{_msg_ref(r['id'])}⟩"
                          f"{prio_tag}: {r['body']}")
         return "\n".join(lines)
 
@@ -4299,7 +4330,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # one value, so an agent in three squads catches up on all three.
         placeholders = ",".join("?" * len(my_squads)) if my_squads else "NULL"
         rows = conn.execute(
-            f"""SELECT id, ts, from_agent, body, priority FROM messages
+            f"""SELECT id, ts, from_agent, body, priority, attribution FROM messages
                WHERE channel = ? AND id > ?
                  AND (audience = '' OR audience IN ({placeholders}))
                ORDER BY id ASC LIMIT ?""",  # noqa: S608 - placeholders are '?' only
@@ -4369,7 +4400,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 if r["id"] in receipted:
                     seen_live += 1
                     lines.append(
-                        f"[{ts}] **{r['from_agent']}** ⟨{_msg_ref(r['id'])}⟩"
+                        f"[{ts}] **{r['from_agent']}**{_grade_tag(r)} ⟨{_msg_ref(r['id'])}⟩"
                         f"{prio_tag}: "
                         f"(already delivered live — {_summarise(body)})"
                     )
@@ -4387,7 +4418,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 else:
                     capped += 1
                     body = _summarise(body, COMPACT_SUMMARY_CHARS)
-            lines.append(f"[{ts}] **{r['from_agent']}** ⟨{_msg_ref(r['id'])}⟩"
+            lines.append(f"[{ts}] **{r['from_agent']}**{_grade_tag(r)} ⟨{_msg_ref(r['id'])}⟩"
                          f"{prio_tag}: {body}")
         if compact and (seen_live or capped or clipped):
             # Point at get_history('#general'), not get_broadcasts_for_agent:
@@ -4813,13 +4844,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         if agent_or_channel.startswith("#"):
             channel = agent_or_channel[1:]
             rows = conn.execute(
-                """SELECT id, ts, from_agent, body FROM messages
+                """SELECT id, ts, from_agent, body, attribution FROM messages
                    WHERE channel = ? ORDER BY ts DESC LIMIT ?""",
                 (channel, limit),
             ).fetchall()
         else:
             rows = conn.execute(
-                """SELECT id, ts, from_agent, to_agent, channel, body FROM messages
+                """SELECT id, ts, from_agent, to_agent, channel, body, attribution FROM messages
                    WHERE from_agent = ? OR to_agent = ?
                    ORDER BY ts DESC LIMIT ?""",
                 (agent_or_channel, agent_or_channel, limit),
@@ -4833,13 +4864,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["ts"]))
             ref_bit = f" ⟨{_msg_ref(r['id'])}⟩"
             if "to_agent" in r.keys() and r["to_agent"]:
-                lines.append(f"[{ts}] {r['from_agent']} → {r['to_agent']}"
+                lines.append(f"[{ts}] {r['from_agent']}{_grade_tag(r)} → {r['to_agent']}"
                              f"{ref_bit}: {r['body']}")
             elif "channel" in r.keys() and r["channel"]:
-                lines.append(f"[{ts}] {r['from_agent']} → #{r['channel']}"
+                lines.append(f"[{ts}] {r['from_agent']}{_grade_tag(r)} → #{r['channel']}"
                              f"{ref_bit}: {r['body']}")
             else:
-                lines.append(f"[{ts}] {r['from_agent']}{ref_bit}: {r['body']}")
+                lines.append(f"[{ts}] {r['from_agent']}{_grade_tag(r)}{ref_bit}: {r['body']}")
         lines.reverse()
         return "\n".join(lines)
 

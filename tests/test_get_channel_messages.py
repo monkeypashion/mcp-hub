@@ -109,8 +109,11 @@ async def test_json_format_returns_structured_records(server):
     for r in records:
         # W3 added `ref` — the canonical lineage handle, so a machine reader
         # can build in_reply_to without deriving the encoding itself.
+        # ...and `attribution` (2026-08-28): the grade the hub recorded for
+        # the sender, so a machine reader can weight asserted vs verified.
         assert set(r.keys()) == {"id", "ref", "ts", "from_agent", "body",
-                                 "priority"}
+                                 "priority", "attribution"}
+        assert r["attribution"] == "asserted"  # no ctx in tests
         assert isinstance(r["id"], int)
         assert isinstance(r["ts"], (int, float))
         assert r["from_agent"] == "alice"
