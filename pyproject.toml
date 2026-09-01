@@ -8,7 +8,16 @@ version = "0.1.0"
 description = "Inter-agent messaging hub — connect multiple Claude sessions via MCP"
 requires-python = ">=3.11"
 dependencies = [
-    "fastmcp>=2.0.0",
+    # PINNED BELOW 4 — an unpinned floor is a landmine that detonates on
+    # whichever deploy happens to follow a major release, not on the change
+    # that "caused" it. 2026-09-01: the container rebuilt, resolved fastmcp
+    # 4.0.0, and crash-looped; the hub was down ~40 min. The commit being
+    # deployed was irrelevant — ANY rebuild after 4.0.0 shipped would have
+    # done it, and the previous image had simply been built before it existed.
+    # 3.4.4 is the version this repo's suite is green against.
+    # The build has NO LOCKFILE (Dockerfile: pip install -e .), so this
+    # ceiling is the only thing standing between a rebuild and a new major.
+    "fastmcp>=3.4.4,<4",
     "textual>=0.80",
 ]
 
