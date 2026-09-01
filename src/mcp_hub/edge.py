@@ -893,6 +893,70 @@ def realize_seat_action(
     return {"status": "done", "observed": sent, "pane_after": after}
 
 
+def held_lanes_path() -> Path:
+    """Where squad reads the hold mirror. Env override for tests."""
+    override = os.environ.get("MCP_HUB_HELD_FILE")
+    if override:
+        return Path(override)
+    return Path.home() / ".mcp-hub" / "held-lanes.json"
+
+
+def _hold_state(actions: list[dict[str, Any]], now: float) -> dict[str, Any] | None:
+    """The seat's live hold, from its action history — or None.
+
+    Newest-first: the first settled hold/release decides. A `release` that
+    lands after a `hold` ends it; a hold whose `until` has passed has already
+    released ITSELF and is not reported. Only an action the edge actually
+    carried out (`status == "done"`) counts — a pending or failed hold is an
+    ASK, and enforcing an ask would stop a lane nobody has confirmed stopping.
+    """
+    for a in sorted(actions, key=lambda r: r.get("id") or 0, reverse=True):
+        kind = a.get("kind")
+        if kind not in ("hold", "release") or a.get("status") != "done":
+            continue
+        if kind == "release":
+            return None
+        args = a.get("args") or {}
+        try:
+            until = float(args.get("until") or 0)
+        except (TypeError, ValueError):
+            return None
+        if until <= now:
+            return None  # expired: released itself, exactly as designed
+        return {
+            "until": until,
+            "reason": str(args.get("reason") or ""),
+            "release_condition": str(args.get("release_condition") or ""),
+        }
+    return None
+
+
+def write_held_mirror(held: dict[str, dict[str, Any]],
+                      path: Path | None = None) -> bool:
+    """Mirror the hub's holds to a local file squad can read with no network.
+
+    squad's `up_one`/`relaunch_agent` are the ENFORCEMENT point — lane
+    lifecycle is theirs, and a hold the sweeps do not honour is undone within
+    one heal interval. They must not make a network call to find out, so the
+    edge (which already talks to the hub every pass) leaves the answer on
+    disk, the way the statusline reads the daemon's snapshot.
+
+    Written atomically: squad may read this at any moment, and a half-written
+    file is a lane whose hold silently disappears. Returns False on any
+    failure — the caller reports it rather than assuming the mirror is fresh.
+    """
+    target = path or held_lanes_path()
+    payload = json.dumps({"generated": time.time(), "held": held}, indent=1)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(".tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(target)
+        return True
+    except OSError:
+        return False
+
+
 def seat_control_pass(
     api: Any, placements: list[dict[str, Any]], runner: Any,
     machine: str = "",
@@ -918,11 +982,18 @@ def seat_control_pass(
     realized: list[dict[str, Any]] = []
     streamed = 0
     errors: list[str] = []
+    # Rebuilt from scratch every pass, never merged into what is already on
+    # disk: a hold that has been released or has expired must DISAPPEAR from
+    # the mirror. Accumulating would make release the one operation the file
+    # cannot express, and a hold nothing can lift is the failure this verb's
+    # mandatory expiry exists to prevent.
+    held: dict[str, dict[str, Any]] = {}
 
     def _drive(seat_id: str, seat: dict[str, Any]) -> None:
         nonlocal streamed
         try:
-            for action in api.pull_seat_actions(seat_id):
+            actions = api.pull_seat_actions(seat_id)
+            for action in actions:
                 if action.get("status") != "pending":
                     continue
                 report = realize_seat_action(action, seat, runner)
@@ -930,6 +1001,13 @@ def seat_control_pass(
                 realized.append({"seat": seat_id, "id": action["id"],
                                  "kind": action.get("kind"),
                                  "status": report["status"]})
+            # Recomputed from the history AFTER this pass's actions settle,
+            # so a hold taken effect this very pass is mirrored immediately
+            # rather than one interval late — one interval is one heal cycle,
+            # which is exactly long enough for the sweep to undo it.
+            state = _hold_state(api.pull_seat_actions(seat_id), time.time())
+            if state:
+                held[seat_id] = state
         except Exception as exc:  # noqa: BLE001 — one seat must not stop the rest
             errors.append(f"{seat_id}: actions: {exc}")
 
@@ -996,7 +1074,14 @@ def seat_control_pass(
                 "session": spec.get("session") or identity,
             })
 
-    return {"realized": realized, "streamed": streamed, "errors": errors}
+    # Mirror LAST, once, after every seat has been driven — so the file is a
+    # snapshot of one consistent pass rather than a partial view squad could
+    # read mid-write. A failed write is REPORTED, never assumed away: squad
+    # fails open, so a stale mirror silently un-holds lanes.
+    if not write_held_mirror(held):
+        errors.append(f"held-mirror: could not write {held_lanes_path()}")
+    return {"realized": realized, "streamed": streamed, "errors": errors,
+            "held": sorted(held)}
 
 
 class SquadExecutor:

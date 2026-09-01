@@ -630,7 +630,14 @@ kill_daemon() {
 # path drifted self-heals, and clears the two ghosts a respawn leaves behind:
 # the sticky pane title and the dead session's scrollback.
 relaunch_agent() {
-  local a="$1"
+  local a="$1" hu
+  # A held lane must not be relaunched by heal either. up_one is the `up`
+  # door; this is heal's, and guarding only one of them would make the hold
+  # hold for exactly as long as it took heal to notice the lane was down.
+  if hu="$(held_until "$a")"; then
+    echo "$a HELD until $(date -d "@$hu" '+%H:%M' 2>/dev/null || echo "$hu") — $(held_reason "$a") (heal will not relaunch it)"
+    return 0
+  fi
   kill_daemon "$a"
   # Launch marker: heal's grace window reads this so nothing judges an agent
   # whose claude hasn't finished booting (there is no process to measure yet,
@@ -762,8 +769,54 @@ launch_agent_cmd() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# Holds — the console may stop a lane, and squad is the only thing that can
+# make that stick.
+#
+# A held lane is one the ceiling watcher stopped because it was burning far
+# more than its share of the usage window. The HOLD RECORD lives on the hub;
+# the edge mirrors it to a local file so this hot path needs no network (same
+# discipline as the statusline reading the daemon's snapshot).
+#
+# ⚠️ SQUAD IS THE ENFORCEMENT POINT, not the edge. Lane lifecycle is squad's:
+# `heal` runs every ~2 min and `up` starts any squad-class lane that is down.
+# So a hold that only stopped the process would be undone by this very
+# function inside two minutes, while the console went on announcing the lane
+# as stopped. Checking the record HERE is what makes the stop real.
+#
+# 🔴 FAILS OPEN, deliberately and in this direction only: a missing file, an
+# unreadable one, or no jq means NO lane is held. A dead edge must not be able
+# to freeze the fleet — an enforcement mechanism that fails closed turns its
+# own outage into an outage of everything. Each entry also carries its own
+# expiry, so even a stale mirror releases itself on schedule rather than
+# holding forever.
+HELD_FILE="${MCP_HUB_HELD_FILE:-$HOME/.mcp-hub/held-lanes.json}"
+
+held_until() { # agent -> prints the expiry if held RIGHT NOW, else nothing
+  local a="$1" now
+  [ -r "$HELD_FILE" ] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  now="$(date +%s)"
+  jq -r --arg a "$a" --argjson now "$now" '
+    (.held[$a] // empty) | select((.until // 0) > $now) | .until
+  ' "$HELD_FILE" 2>/dev/null | grep -q . || return 1
+  jq -r --arg a "$a" '.held[$a].until' "$HELD_FILE" 2>/dev/null
+}
+
+held_reason() { # agent -> the release condition the operator stated
+  jq -r --arg a "$1" '.held[$a].release_condition // "no condition recorded"' \
+    "$HELD_FILE" 2>/dev/null
+}
+
 up_one() {
-  local a="$1" dir
+  local a="$1" dir hu
+  # BEFORE the worktree check and before anything is launched: a held lane
+  # is not a failure, so this returns 0. `up` must not report an error for a
+  # deliberate, recorded, expiring stop.
+  if hu="$(held_until "$a")"; then
+    echo "$a HELD until $(date -d "@$hu" '+%H:%M' 2>/dev/null || echo "$hu") — $(held_reason "$a") (not started; releases itself)"
+    return 0
+  fi
   dir="$(untilde "$(field "$a" 2)")"
   [ -d "$dir" ] || { echo "!! $a: missing worktree $dir"; return 1; }
   if tm has-session -t "=$a" 2>/dev/null; then
