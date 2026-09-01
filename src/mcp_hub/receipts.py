@@ -57,14 +57,29 @@ TRANSCRIPT_WINDOW = 4 * 1024 * 1024
 # All anchored to line start so a ref cited mid-prose never matches. The
 # `<channel …>` opener may share the head's line or precede it — both shapes
 # occur in real transcripts, so the anchor tolerates an optional tag prefix.
+#
+# ⚠️ ANYTHING THE RENDER PUTS BETWEEN THE SENDER AND THE REF GOES HERE TOO.
+# The attribution grade (` ·verified` / ` ·asserted` / ` ·hub` / ` ·ungraded`,
+# e630fa3 + 9537ba2, 2026-08-29) landed in exactly that gap and matched
+# neither anchor, so from 07:06Z that day EVERY receipt silently stopped
+# being minted: `rendered_message_ids` returned [] on transcripts full of
+# live renders, every drain fell back to the legacy `pushed_gen` inference,
+# and the Stop hook re-printed messages the agent had already read. Measured
+# on one mcp-hub session, 2026-09-01: 6 distinct messages re-read, 18
+# reprints. Nothing failed and nothing logged — the extractor's whole output
+# is an optimisation, so a total miss reads exactly like a quiet inbox.
+# `test_receipts_track_the_render` pins the coupling by building its input
+# with the SERVER'S OWN render helpers: a future suffix breaks that test
+# instead of breaking delivery-receipts in silence.
+_GRADE = r"(?: ·[\w-]+)*"
 _TAG_HEAD_RE = re.compile(
     r"^(?:<channel\b[^>]*>\s*)?(?:\[\d{2}:\d{2}:\d{2}\] )?"
-    r"(?:DM|BROADCAST|.{0,80}? post) from \S+ ⟨hub\.msg/1\?id=(\d+)⟩",
+    r"(?:DM|BROADCAST|.{0,80}? post) from \S+" + _GRADE + r" ⟨hub\.msg/1\?id=(\d+)⟩",
     re.MULTILINE,
 )
 _DRAIN_LINE_RE = re.compile(
     r"^(?:<channel\b[^>]*>\s*)?"
-    r"\[\d{2}:\d{2}:\d{2}\] \*\*[^*]+\*\* ⟨hub\.msg/1\?id=(\d+)⟩",
+    r"\[\d{2}:\d{2}:\d{2}\] \*\*[^*]+\*\*" + _GRADE + r" ⟨hub\.msg/1\?id=(\d+)⟩",
     re.MULTILINE,
 )
 
@@ -80,6 +95,22 @@ def _tail(transcript_path: str | None, window: int) -> str:
             return f.read().decode("utf-8", errors="ignore")
     except OSError:
         return ""
+
+
+def _refs_in(text: str) -> set[int]:
+    """Message ids that a RENDER put in `text`, by the anchors above.
+
+    Split out from `rendered_message_ids` as a seam: the anchors are coupled
+    to server.py's render strings, and the only honest test of that coupling
+    builds its input from the server's own helpers and asserts on extraction
+    alone — no transcript, no JSON envelope, nothing that could pass for the
+    wrong reason. See `test_receipts_track_the_render`.
+    """
+    ids: set[int] = set()
+    for pattern in (_TAG_HEAD_RE, _DRAIN_LINE_RE):
+        for m in pattern.finditer(text):
+            ids.add(int(m.group(1)))
+    return ids
 
 
 def rendered_message_ids(
@@ -127,9 +158,7 @@ def rendered_message_ids(
             )
         if not isinstance(content, str) or "<channel" not in content:
             continue
-        for pattern in (_TAG_HEAD_RE, _DRAIN_LINE_RE):
-            for m in pattern.finditer(content):
-                ids.add(int(m.group(1)))
+        ids |= _refs_in(content)
     return sorted(ids)
 
 
