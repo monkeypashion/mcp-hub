@@ -808,6 +808,143 @@ held_reason() { # agent -> the release condition the operator stated
     "$HELD_FILE" 2>/dev/null
 }
 
+held_at() { # agent -> unix time the hold was ASKED FOR, or nothing
+  jq -r --arg a "$1" '(.held[$a].held_at // 0) | select(. > 0)' \
+    "$HELD_FILE" 2>/dev/null | grep -q . || return 1
+  jq -r --arg a "$1" '.held[$a].held_at' "$HELD_FILE" 2>/dev/null
+}
+
+# --- stopping a lane that is ALREADY RUNNING (#318, his ruling) -------------
+#
+# `up_one`/`relaunch_agent` refuse to START a held lane. That covers a lane
+# already down; it does nothing about the one the ceiling watcher actually
+# reaches for, which is RUNNING and burning its share right now.
+#
+# His ruling, in three parts: applied at the lane's NEXT TURN BOUNDARY, not
+# mid-turn; hard-stopped if still mid-turn ten minutes later; and the notice
+# must say that the one in-flight turn is LOST.
+#
+# ⭐ ONLY THE LANE'S OWN STOP HOOK CAN SEE A TURN BOUNDARY, so it leaves a
+# stamp (mcp_hub/hold.py) and this — which owns lane lifecycle — acts on it.
+# The hook cannot stop its own lane: it runs inside the process it would be
+# killing.
+HOLD_BOUNDARY_DIR="${MCP_HUB_HOLD_BOUNDARY_DIR:-$HOME/.mcp-hub/hold-boundary}"
+HOLD_HARD_STOP_AFTER="${MCP_HUB_HOLD_HARD_STOP_AFTER:-600}"   # his ten minutes
+
+boundary_reached() { # agent -> 0 if its Stop hook stamped a boundary
+  [ -f "$HOLD_BOUNDARY_DIR/$1.json" ]
+}
+
+# Marks a lane as "down because it is HELD", which is the fact release needs
+# and nothing else on the box records. Without it, a released lane is
+# indistinguishable from one the operator stopped by hand, and restarting the
+# second kind would undo a deliberate act.
+hold_stopped_flag() { echo "$HOME/.mcp-hub/hold-stopped-$(safe_name "$1")"; }
+
+hold_stop_lane() { # the stop itself, one door for both the clean and hard path
+  local a="$1"
+  mkdir -p "$HOME/.mcp-hub" 2>/dev/null
+  : > "$(hold_stopped_flag "$a")" 2>/dev/null || true
+  tm kill-session -t "=$a" 2>/dev/null || true
+  kill_daemon "$a"
+  rm -f "$HOLD_BOUNDARY_DIR/$a.json" 2>/dev/null || true
+}
+
+# One held lane. Prints exactly what it did and why; never silent, because a
+# lane that vanishes without a line is indistinguishable from one that died.
+hold_enforce_one() {
+  local a="$1" ha now waited
+  held_until "$a" >/dev/null || return 0           # not held — nothing to do
+  tm has-session -t "=$a" 2>/dev/null || return 0  # already down; the skip
+  pane_alive "$a" || return 0                      # in up_one covers restart
+
+  if boundary_reached "$a"; then
+    # The clean case, and the one his ruling asks for: the lane is between
+    # turns, so nothing is in flight and nothing is lost.
+    echo "$a HELD — stopping at its turn boundary ($(held_reason "$a"))"
+    hold_stop_lane "$a"
+    return 0
+  fi
+
+  # No boundary yet: the lane is mid-turn. Wait for it, up to his ten
+  # minutes, measured from when the hold was ASKED — not from when this pass
+  # first noticed, which would restart the clock every two minutes and the
+  # hard stop would never arrive.
+  if ! ha="$(held_at "$a")"; then
+    # An entry that cannot say when it started cannot be shown to have
+    # waited. Never hard-stop on an inferred clock: a mirror-format change
+    # would take out the fleet.
+    echo "$a HELD, mid-turn — no held_at in the mirror, so the 10-minute hard stop cannot be timed; waiting for a turn boundary"
+    return 0
+  fi
+  now="$(date +%s)"; waited=$(( now - ${ha%.*} ))
+  if [ "$waited" -lt "$HOLD_HARD_STOP_AFTER" ]; then
+    echo "$a HELD, mid-turn — waiting for its turn boundary (${waited}s of ${HOLD_HARD_STOP_AFTER}s before a hard stop)"
+    return 0
+  fi
+
+  # 🔴 THE HARD STOP. His words: that one in-flight turn is LOST, and the
+  # notice MUST SAY SO. A stop announced as clean when a turn died in it
+  # teaches the operator to distrust every other line this prints.
+  echo "!! $a HELD and still mid-turn after $((waited / 60))m — HARD-STOPPED. ⚠️ ITS IN-FLIGHT TURN IS LOST (not saved, not resumable — the work of that turn is gone; the conversation before it is kept). Release restarts it with $RESUME_FLAG. Condition: $(held_reason "$a")" >&2
+  hold_stop_lane "$a"
+}
+
+# --- release: the lane comes back, with its conversation (his ruling) ------
+#
+# "RELEASE = RESTART WITH --continue", his words. The earlier design said the
+# hold record simply expires and the ordinary sweep restores the lane; that is
+# true for a lane `up` would start anyway, and false for faculty, which `up`
+# skips — so a released faculty lane would sit down forever while every
+# surface reported it released. This restarts it explicitly instead, from the
+# flag the stop left behind.
+hold_release_pass() {
+  local a f args
+  for f in "$HOME"/.mcp-hub/hold-stopped-*; do
+    [ -e "$f" ] || continue
+    a="${f##*/hold-stopped-}"
+    # Still held? Nothing to do — the stop stands.
+    held_until "$a" >/dev/null && continue
+    # The roster is the authority on whether this agent still exists; a flag
+    # outliving its agent must not resurrect a retired lane.
+    # `field` prints nothing and still exits 0 for an unknown agent, so the
+    # emptiness is the test — an exit status here would always pass.
+    if [ -z "$(field "$a" 2)" ]; then
+      echo "hold released for '$a' but it is no longer on the roster — clearing the flag, starting nothing" >&2
+      rm -f "$f" 2>/dev/null || true
+      continue
+    fi
+    if tm has-session -t "=$a" 2>/dev/null; then
+      rm -f "$f" 2>/dev/null || true   # already back by some other route
+      continue
+    fi
+    args="$(field "$a" 4)"
+    case " $args " in
+      *" $RESUME_FLAG "*)
+        echo "$a RELEASED — restarting with $RESUME_FLAG (conversation kept)"
+        rm -f "$f" 2>/dev/null || true
+        up_one "$a" ;;
+      *)
+        # Named, never silent, and NOT restarted: starting it without the
+        # flag would come back blank, which is a lost conversation reported
+        # as a successful release.
+        echo "!! $a RELEASED but its roster args lack $RESUME_FLAG — NOT restarting, because it would come back with no conversation. Fix: $CMD resume on $a && $CMD start $a" >&2
+        rm -f "$f" 2>/dev/null || true ;;
+    esac
+  done
+}
+
+# Every held lane on the box. Fails open with everything else here: no
+# mirror, no jq, no held lanes = nothing to enforce and no output.
+hold_enforce_pass() {
+  [ -r "$HELD_FILE" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  local a
+  for a in $(jq -r '.held | keys[]?' "$HELD_FILE" 2>/dev/null); do
+    hold_enforce_one "$a"
+  done
+}
+
 up_one() {
   local a="$1" dir hu
   # BEFORE the worktree check and before anything is launched: a held lane
@@ -2620,6 +2757,14 @@ case "${1:-help}" in
             # Cockpit first: if the extension is invalid the operator sees NO
             # terminal panel, which hides every symptom heal is about to report.
             ext_align
+            # HOLD ENFORCEMENT FIRST, before any recovery leg. heal exists to
+            # bring lanes back; a held lane is one somebody deliberately wants
+            # DOWN, so deciding that after the sweeps have already relaunched
+            # it would make the two legs fight — and heal, running every ~2
+            # min, would win. Stopping first also means the loops below skip
+            # it naturally: it no longer has a session.
+            hold_enforce_pass
+            hold_release_pass
             healed=0
             relaunched=0
             # Agents this pass has already relaunched. The two recovery loops

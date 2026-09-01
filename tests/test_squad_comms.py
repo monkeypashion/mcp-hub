@@ -90,8 +90,15 @@ def _helpers(box, snippet: str) -> subprocess.CompletedProcess:
     src = SQUAD.read_text(encoding="utf-8")
     head = src.split('\ncase "${1:-help}" in', 1)[0]
     assert "arm_comms()" in head, "extraction boundary moved — fix this helper"
+    # Written to a FILE, never passed as an argument. Linux caps a single
+    # argv entry at MAX_ARG_STRLEN (128 KiB) regardless of total ARG_MAX, and
+    # squad's helper region crossed it on 2026-09-01: every test here failed
+    # at once with OSError "Argument list too long", which reads as a broken
+    # harness rather than a script that simply grew. A file has no such cliff.
+    script = home.parent / "_squad_head.sh"
+    script.write_text(head + "\n" + snippet, encoding="utf-8")
     return subprocess.run(
-        ["bash", "-c", head + "\n" + snippet],
+        ["bash", str(script)],
         capture_output=True,
         text=True,
         env={

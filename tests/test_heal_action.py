@@ -164,11 +164,23 @@ def test_the_advice_heal_prints_names_verbs_that_actually_EXIST():
     advice: it is confidently wrong at the moment somebody is already stuck,
     and nothing else in the tree couples the message to the dispatch.
     """
+    import re
+
     body = SQUAD.read_text(encoding="utf-8")
-    advice = [ln for ln in body.splitlines() if "Fix: $CMD resume on" in ln]
-    assert len(advice) == 2, \
-        f"expected the deaf-sweep and the escalation message, got {len(advice)}"
+    advice = [ln for ln in body.splitlines() if "Fix: $CMD " in ln]
+    # A floor, not an exact count: new advice lines are expected as squad
+    # grows (the hold's release leg added a third), and pinning the number
+    # made an unrelated change fail a test about verb existence. The floor
+    # is what keeps this from passing vacuously against zero lines — the
+    # failure mode that matters.
+    assert len(advice) >= 2, \
+        f"expected at least the deaf-sweep and escalation messages, got {len(advice)}"
     dispatch = body.split('case "${1:-help}" in', 1)[1]
-    for verb in ("resume", "restart"):
+    # Every verb ACTUALLY NAMED, extracted from the lines themselves rather
+    # than hardcoded here — a hardcoded pair cannot see a new message that
+    # recommends a verb nobody implemented, which is the whole point.
+    named = {v for ln in advice for v in re.findall(r"\$CMD (\w+)", ln)}
+    assert named, "no verbs extracted — the advice format changed"
+    for verb in sorted(named):
         assert f"\n  {verb})" in dispatch, \
             f"heal tells the operator to run `squad {verb}`, which is not a verb"

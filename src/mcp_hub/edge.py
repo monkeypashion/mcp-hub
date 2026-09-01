@@ -957,8 +957,19 @@ def _hold_state(actions: list[dict[str, Any]], now: float) -> dict[str, Any] | N
             return None
         if until <= now:
             return None  # expired: released itself, exactly as designed
+        # `held_at` is the hub's `requested_at` — WHEN THE HOLD WAS ASKED,
+        # not when this pass observed it. The operator's ten-minute grace
+        # runs from the ask, so measuring it from the mirror's own age would
+        # restart the clock on every edge pass and the hard stop would never
+        # arrive. Absent (an older hub, a row without it) is carried as 0 and
+        # read downstream as "cannot say", never as "just now".
+        try:
+            held_at = float(a.get("requested_at") or 0)
+        except (TypeError, ValueError):
+            held_at = 0.0
         return {
             "until": until,
+            "held_at": held_at,
             "reason": str(args.get("reason") or ""),
             "release_condition": str(args.get("release_condition") or ""),
         }

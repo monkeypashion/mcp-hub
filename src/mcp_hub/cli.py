@@ -581,6 +581,7 @@ def build_hook_response(
     stop_hook_active: bool = False,
     card_nag: bool = False,
     card_notice: str = "",
+    held_notice: str = "",
     defer_low: bool = False,
 ) -> dict[str, Any] | None:
     """Decide whether to emit a hook block and what the reason should be.
@@ -631,6 +632,7 @@ def build_hook_response(
         and is_online
         and not card_nag
         and not card_notice.strip()
+        and not held_notice.strip()
         and spool_age < DEFER_MAX_SECONDS
         and _all_low_priority(messages_text, broadcasts_text)
     ):
@@ -668,16 +670,27 @@ def build_hook_response(
     # card nag in particular gets exactly ONE shot per natural Stop: if the
     # agent's nag-response turn still lacks a card, we let it go rather than
     # loop.
-    if stop_hook_active and not has_content:
+    if stop_hook_active and not has_content and not held_notice.strip():
         return None
 
     # No work needed: online + nothing queued + no correction owed.
     # (Online — not ⚡ — is the gate: an idle agent legitimately lacks ⚡
     # between turns.)
-    if not has_content and is_online and not card_nag and not card_notice:
+    held_notice = held_notice.strip()
+
+    # A HELD LANE ALWAYS SURFACES, even on the happy path — empty inbox,
+    # online, nothing owed. Being stopped is the one thing an agent must not
+    # learn by having its pane disappear, and this is the last turn boundary
+    # it gets. It also outranks the loop backstop below for the same reason:
+    # a re-fired Stop on a held lane is still a lane about to be stopped.
+    if not has_content and is_online and not card_nag and not card_notice \
+            and not held_notice:
         return None
 
     parts: list[str] = []
+
+    if held_notice:
+        parts.extend([held_notice, ""])
 
     if has_content:
         parts.append("📬 Auto-checked at Stop boundary — queued items below:")
@@ -4667,6 +4680,31 @@ def stop_hook_command(args: argparse.Namespace) -> int:
     # dead/absent daemon is revived at the next turn regardless of hub health.
     _ensure_daemon_alive(name, args.hub_url)
 
+    # HOLD, turn-boundary leg (#318). This Stop IS the boundary the
+    # operator's ruling names, and this hook is the only thing that can see
+    # one — so it stamps the moment and squad stops the lane on its next
+    # pass. It does NOT stop the lane itself: it runs inside the process it
+    # would be killing, and this path must return 0 whatever happens.
+    #
+    # Local file reads only. No hub round-trip: the hold already travelled
+    # hub -> edge -> mirror, and making every turn boundary on every lane
+    # wait on the network would put the hub in the path of every turn end.
+    from mcp_hub import hold as _hold
+
+    held_notice = ""
+    try:
+        _entry = _hold.held_entry(name)
+        if _entry:
+            _hold.stamp_boundary(name)
+            held_notice = _hold.hook_notice(name, _entry)
+        else:
+            # Not held (or released, or expired): drop any stamp, or it
+            # would outlive its hold and make the NEXT one look as though
+            # it had already reached a boundary.
+            _hold.clear_boundary(name)
+    except Exception:  # noqa: BLE001 — a hold must never break a turn end
+        held_notice = ""
+
     # DECISION card leg: harvest the card (or its absence) from the turn
     # that just ended, ship it with the same hub round-trip below. Waiting
     # language without a card earns the one-shot authoring nag.
@@ -4728,6 +4766,7 @@ def stop_hook_command(args: argparse.Namespace) -> int:
         stop_hook_active=stop_hook_active,
         card_nag=card_nag,
         card_notice=card_notice,
+        held_notice=held_notice,
         # Opt-IN, and off by default: this is the one path that can decide
         # not to show an agent something the hub has already marked read, so
         # it ships dark and is turned on per box once its spool is trusted.
