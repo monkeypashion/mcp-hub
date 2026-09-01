@@ -5362,6 +5362,43 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                          f"{r['b'] / 1024:.0f} KiB")
         return "\n".join(lines)
 
+    def _transport_count() -> str:
+        """How many transports the session manager is holding.
+
+        THE INSTRUMENT FOR THE 798ms FLOOR, and it exists because nothing
+        outside the process can see it. `_can_deliver_push` iterates this set
+        ONCE PER BOUND SESSION, so `list_agents` costs O(sessions ×
+        transports). Prod (2026-09-01): `list_agents` p50 1020ms with a floor
+        of 798.3ms never beaten across 9,891 calls, and 94.1% of all
+        server-side time — while the same code profiles at ~7ms locally with
+        60 agents, because locally this set is EMPTY and the probe
+        short-circuits.
+
+        A floor that is never beaten is a FIXED cost, and the only fixed
+        quantity in that loop is this number. vps's procfs read (1.74 GiB
+        retained, VmHWM == VmRSS, CPU pegged, but sockets FLAT at 62) says
+        objects outlive their closed connections — consistent with transports
+        accumulating here and never being pruned. Consistent, NOT proven:
+        pymalloc retains freed arenas anyway, and the log's
+        6,146-created/40-closed is an artifact of terminations being
+        unlogged, not a measured closure count.
+
+        So this reports the number instead of inferring it. Roughly the seat
+        count means the leak theory is dead and the floor needs another
+        explanation; thousands and growing with uptime means it is the cause.
+        Cheap: len() of a dict, no iteration.
+
+        Never raises — a diagnostic that can break `hub_status` is worse than
+        no diagnostic, and stdio/test mode has no manager at all.
+        """
+        try:
+            instances = getattr(mcp.session_manager, "_server_instances", None)
+        except Exception:  # noqa: BLE001 — RuntimeError in stdio/test mode
+            return "n/a (no session manager)"
+        if instances is None:
+            return "n/a (manager exposes no instance set)"
+        return str(len(instances))
+
     @mcp.tool()
     def hub_status() -> str:
         """Get hub statistics — agents online, channels, message counts."""
@@ -5381,6 +5418,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             f"Unread: {unread['c']}\n"
             f"Commit: {_resolve_commit()}\n"
             f"Uptime: {uptime}s\n"
+            f"Transports: {_transport_count()}\n"
             f"Operator verification: "
             + ("ON (operator senders must present the token)"
                if _operator_token_configured()
