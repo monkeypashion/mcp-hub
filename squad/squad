@@ -1058,13 +1058,24 @@ session_of() {
 # what `up` would actually type — two builders drift, and the drift only
 # shows at launch time on a machine you are not looking at.
 launch_line() {
-  local a="$1" override="${2:-}" container args
+  local a="$1" container args
   if container="$(container_of "$a")"; then
     printf 'docker exec -it %s tmux attach -t %s\n' "$container" "$(session_of "$a")"
     return 0
   fi
-  args="${override:-$(field "$a" 4)}"
-  printf 'claude %s\n' "$args"
+  # An EMPTY override is "explicitly no args", never "no override given" —
+  # `${override:-...}` cannot tell those apart and silently restores the
+  # roster's. That is how `restart --fresh` on a seat whose only roster arg
+  # is `--continue` typed `claude --continue` into a brand-new worktree and
+  # died with "no previous conversation" (operator, 2026-09-01): the caller
+  # correctly computed "" and this line put it back. launch_agent_cmd makes
+  # exactly this distinction one layer up; making it differently here is
+  # what let the two disagree. Only a seat with no comms armed could see it
+  # — has_comms makes the override non-empty, so `:-` never fired.
+  if [ $# -ge 2 ]; then args="$2"; else args="$(field "$a" 4)"; fi
+  # No args at all must print bare `claude`, not `claude ` — the pane types
+  # this verbatim and a trailing space is a different command line.
+  if [ -n "$args" ]; then printf 'claude %s\n' "$args"; else printf 'claude\n'; fi
 }
 
 arm_comms() {
