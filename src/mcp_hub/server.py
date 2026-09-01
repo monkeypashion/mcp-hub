@@ -1480,7 +1480,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             "Three message primitives:\n"
             "- send(from, to, message, priority) — to one specific agent\n"
             "- post(from, channel, message, priority) — to a named channel\n"
-            "- broadcast(from, message, priority) — to the whole fleet\n\n"
+            "- broadcast(from, message, priority) — to YOUR SQUAD, not the fleet\n\n"
             "Priority is one of low|normal|urgent. Default is normal. "
             "WAKE-BATCHING (operator-signed, card #59): low and normal do "
             "NOT wake the recipient — the message queues and surfaces at "
@@ -2533,28 +2533,22 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     ) -> str:
         """Register this agent session with the hub.
 
-        Call this when your session starts. Sets you as 'online' and binds
-        your MCP session so the hub can push messages to you via the
-        `claude/channel` capability — if your Claude Code was launched with
-        `--channels` (or `--dangerously-load-development-channels`), incoming
-        messages will surface in your context without polling.
+        Call at session start. Sets you online and binds your MCP session
+        for channel-push wake (needs Claude Code launched with --channels).
 
         Args:
-            name: Your agent name (e.g. 'dreamteam-lead', 'reliable-ai-dev').
-            project: Project you're working on (e.g. 'dreamteam', 'mcp-hub').
-            squads: Comma-separated squads you belong to (e.g. 'dreamteam,hub').
-                  Broadcasts are confined to a squad, so this decides who hears
-                  you and whose chatter reaches you. NOT the project — one squad
-                  routinely spans several projects and even several orgs.
-                  You may belong to any number.
+            name: Your agent name (e.g. 'reliable-ai-dev').
+            project: Project you are working on.
+            squads: Comma-separated squads. Broadcasts are confined to a
+                  squad, so this decides who hears you. NOT the project —
+                  one squad routinely spans several projects and orgs.
 
-                  EMPTY PRESERVES what is stored — it means "no opinion", not
-                  "remove me", so an agent that hasn't learned to send this yet
-                  cannot silently drop out of its squads on a reconnect (and
-                  every agent reconnects constantly). Leaving is deliberate,
-                  via set_squads.
-            bio: Short description of your role/skills so other agents know what you do.
-            meta: Optional JSON metadata about this agent.
+                  EMPTY PRESERVES what is stored — it means "no opinion",
+                  not "remove me", so an agent that has not learned to send
+                  this cannot silently drop out of its squads on a
+                  reconnect. Leaving is deliberate, via set_squads.
+            bio: Short description of your role so others know what you do.
+            meta: Optional JSON metadata.
         """
         wanted = _parse_squads(squads)
         if _FLEET_SCOPE in wanted:
@@ -3081,22 +3075,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     ) -> str:
         """Send a direct message to another agent.
 
-        Wake-batching (card #59, operator-signed): low and normal do NOT
-        wake the recipient — the message queues and surfaces at their next
-        natural turn. Normal is held at most 10 minutes by the hold sweep
-        so nothing rots; LOW has no backstop wake (rule 4a, card #73 — low
-        never interrupts, though it rides along whenever a wake does fire).
-        Nothing is lost or reordered. Immediate wakes:
-
-        - "urgent": always wakes, unchanged. Use sparingly — it should
-          mean "blocking on you" or "production incident".
-        - any priority whose `in_reply_to` targets a message the recipient
-          sent in THEIR LAST TURN — an active conversation never slows.
-          The wake is drain-batched: ALL their queued unread DMs surface
-          in one channel event, in order.
-
-        So copy the ⟨ref⟩ into in_reply_to when you answer someone — it is
-        the latency lever now, not just lineage.
+        Priority and wake semantics (including the in_reply_to latency
+        lever) are in the hub's connect-time instructions — not repeated
+        here.
 
         Args:
             from_agent: Your agent name (must be registered).
@@ -3277,27 +3258,11 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         from_agent: str, message: str, priority: str = "normal",
         scope: str = "", in_reply_to: str = "", ctx: Context | None = None,
     ) -> str:
-        """Post a broadcast to your squad.
+        """Post a broadcast to YOUR SQUAD (not the fleet — see `scope`).
 
-        Broadcasts are global — they hit every connected agent regardless
-        of which channels they're paying attention to. Use this when the
-        message is for the whole fleet ("hub redeploying in 5 min";
-        "found a bug in shared infra"; "EOD"). For topical conversation
-        scoped to a subset of activity, use `post` to a named channel
-        instead. For a single recipient, use `send`.
-
-        Wake-batching (card #59, operator-signed): low AND normal persist
-        to the feed without waking anyone — recipients catch up at their
-        next natural turn; normal is held at most 10 minutes by the hold
-        sweep, LOW has no backstop wake (rule 4a — a flapping low lane
-        must never buy the fleet interrupts). Immediate wakes:
-
-        - "urgent": wake every connected recipient, unchanged. Use
-          sparingly — it should mean "everyone needs to stop what they're
-          doing."
-        - a broadcast whose `in_reply_to` targets something a recipient
-          said in their last turn wakes THAT ONE author immediately, any
-          priority — the thread stays fast without waking the squad.
+        For a topic, `post` to a named channel; for one recipient, `send`.
+        Priority and wake semantics are in the hub's connect-time
+        instructions, which every client already loads — not repeated here.
 
         Args:
             from_agent: Your agent name.
@@ -3777,17 +3742,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     ) -> str:
         """Post a message to a named channel.
 
-        The channel must already exist (use `create_channel` first). Same
-        wake-batching as `broadcast` (card #59): low and normal persist to
-        channel history without waking anyone — subscribers catch up at
-        their next turn; "urgent" wakes every connected SUBSCRIBER; a post
-        whose `in_reply_to` targets something a subscriber said in their
-        last turn wakes that one author immediately, any priority. Posting
-        subscribes you; reading stays open to everyone (delivery, not
-        confidentiality).
+        The channel must already exist (use `create_channel` first).
+        Posting subscribes you; reading stays open to everyone — this is
+        DELIVERY scoping, not confidentiality.
 
-        For global messages every agent should see, use `broadcast`. For
-        a single recipient, use `send`.
+        For your squad use `broadcast`; for one recipient, `send`.
+        Priority and wake semantics are in the hub's connect-time
+        instructions — not repeated here.
 
         Args:
             from_agent: Your agent name.
@@ -4068,28 +4029,26 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         Args:
             agent_name: Your agent name.
             limit: Max messages to return.
-            bind: If True (default), refresh the agent's wake-binding to the
-                  calling session — this is the drift self-heal property
-                  for normal interactive use. The Stop hook utility
-                  (mcp-hub stop-hook) passes bind=False because its
-                  streamablehttp_client is ephemeral: binding to it would
-                  overwrite the agent's real wake target with a session
-                  that's about to be DELETEd, silently breaking wake.
-            mark_idle: If True, set the agent's is_idle flag (used by the
-                  Case 1 wake-on-low-prio path so a low-prio DM to an idle
-                  recipient fires a wake). The Stop hook passes True
-                  because end-of-turn IS the idle transition. Default False
-                  for ordinary callers — they're in an active turn, not
-                  idle.
-            rendered_refs: The caller's delivery-receipt report — message
-                  ids (or hub.msg refs) whose renders its own transcript
-                  proves, comma-separated; the literal "none" for an
-                  explicit empty report. Recorded per (message, agent) and
-                  from then on the compact leg keys on that RECORD: receipt
-                  → one line, no receipt → full reprint. Default "" means
-                  "client too old to report" and keeps the legacy
-                  pushed_gen inference for that caller only.
+            bind: Refresh the wake-binding to the calling session
+                  (default True). Ephemeral clients MUST pass False.
+            mark_idle: Mark the agent idle — end-of-turn callers only.
+            rendered_refs: Delivery-receipt report: message ids or
+                  hub.msg refs this caller's transcript proves it
+                  rendered, comma-separated; "none" for an explicit
+                  empty report. Omit only if you cannot report.
         """
+        # WHY bind=False matters for ephemeral clients (kept here rather
+        # than in the docstring, which ships into every lane's context at
+        # every session): the Stop hook's streamablehttp_client is DELETEd
+        # when its block exits, so binding to it would overwrite the
+        # agent's real wake target with a session about to vanish, and
+        # wake would break silently. mark_idle exists for the same caller:
+        # end-of-turn IS the idle transition, so ordinary in-turn callers
+        # leave it False. rendered_refs is card #56 — recorded per
+        # (message, agent); the compact leg then keys on that RECORD
+        # (receipt -> one line, no receipt -> full reprint), and the empty
+        # default means "client too old to report", which keeps the legacy
+        # pushed_gen inference for that caller alone.
         now = time.time()
         conn = _get_db(db_path)
 
@@ -4313,45 +4272,30 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         rendered_refs: str = "",
         ctx: Context | None = None,
     ) -> str:
-        """Get broadcasts this agent hasn't seen yet, and advance their cursor.
+        """Get broadcasts this agent has not seen, and advance the cursor.
 
-        Used by Stop hooks (and any future "catch up since I was away" flow):
-        atomically returns broadcasts with id > the agent's
-        last_broadcast_seen_id, then bumps the cursor to the max id returned.
-        Same semantics as get_messages for DMs — read marks as seen, so the
-        same call repeated quickly returns nothing new.
-
-        Without this primitive, broadcasts would silently bypass drifted
-        agents (their session isn't bound, channel push doesn't reach them,
-        and the Stop hook only checked DM inbox). Now they catch up.
+        Returns broadcasts newer than the agent's cursor, then bumps it —
+        so repeating the call returns nothing new. Same read-marks-seen
+        semantics as get_messages.
 
         Args:
             agent_name: Your agent name (must be registered).
             limit: Max broadcasts to return.
-            bind: If True (default), refresh the agent's wake-binding to
-                  the calling session. The Stop hook utility passes
-                  bind=False because its streamablehttp_client is ephemeral
-                  and binding to it would clobber the agent's real wake
-                  target. See note on get_messages for full rationale.
-            compact: Stop-hook economy, mirroring get_messages: the first
-                  COMPACT_FULL_MESSAGES bodies are clipped at
-                  COMPACT_FULL_BODY_CHARS, the rest summarised to one line.
-                  Broadcasts turned out to be the unclipped half of the
-                  Stop-hook context tax (operator, 2026-07-26: multi-KB
-                  fleet broadcasts landing whole in every idle agent's
-                  context). Nothing is dropped, only shortened — the
-                  footer points at the full text.
-            rendered_refs: The caller's delivery-receipt report — same
-                  wire form and semantics as get_messages. In receipt mode
-                  the already-seen-live leg exists HERE TOO (receipts are
-                  per (message, agent), which is the per-recipient fact a
-                  shared broadcast row could never carry), and it replaces
-                  the broadcast_pending_* cursor-jump: a rendered row
-                  drains as one line instead of being silently absorbed —
-                  which also stops the jump absorbing queue-only rows
-                  (e.g. low-priority) that sat BELOW a pushed one. Default
-                  "" keeps the legacy jump for clients that don't report.
+            bind: Refresh the wake-binding to the calling session
+                  (default True). Ephemeral clients MUST pass False.
+            compact: Clip the first few bodies and summarise the rest.
+                  Nothing is dropped; the footer points at the full text.
+            rendered_refs: Delivery-receipt report — same wire form and
+                  semantics as get_messages.
         """
+        # WHY THIS PRIMITIVE EXISTS (kept out of the docstring, which is
+        # loaded into every lane at every session): without it, broadcasts
+        # silently bypassed drifted agents — an unbound session gets no
+        # channel push, and the Stop hook only checked the DM inbox. The
+        # compact leg is the other half: multi-KB fleet broadcasts were
+        # landing WHOLE in every idle agent's context (operator,
+        # 2026-07-26) and were the unclipped half of the Stop-hook context
+        # tax. See get_messages for the bind=False rationale.
         conn = _get_db(db_path)
         # READ THE RENDER EVIDENCE BEFORE ACKING. `wake_ack` below CLEARS the
         # pending expectation, so asking afterwards always answers "proven" —
@@ -4716,31 +4660,28 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     @mcp.tool()
     def decision_clear(from_agent: str, source: str = "stop-hook",
                        ctx: Context | None = None) -> str:
-        """The owner-notice channel, and nothing else: remind the agent at
-        each turn boundary that its ask is still open on the operator's
-        board. Writes NO state.
+        """The owner-notice channel, and nothing else. Writes NO state.
 
-        The turn-rate staleness clock this verb used to drive is retired
-        (card #237, operator-approved 2026-08-28). Its whole history was
-        one defect at three thresholds: instant evaporation (2026-07-26),
-        withdrawal at 3 strikes (~25 asks lost in a day, 2026-07-27 —
-        "the harder a blocked lane works, the faster it loses the ask it
-        is blocked on"), then demote-at-3-strikes, which softened the
-        consequence but kept the defective clock: strikes measured the
-        SENDER's turn rate and nothing else, so the board demoted a
-        6-minute-old top-scored ask from a lane that obediently stopped
-        restating, while a purged owner's 20-day card — no lane, no turns,
-        no strikes — read fresh forever. Measured live 2026-08-27, on the
-        curator's own card, filed while asking for this fix.
+        Reminds the agent at each turn boundary that its ask is still open
+        on the operator's board. Only reads cards of the given source.
 
-        Staleness now derives from the ASK's own age at read time
-        (DECISION_STALE_AFTER_SECONDS in decision_list); a quiet lane is
-        indistinguishable from a chatty one, by design. Only an operator
-        answer, an agent DECIDED (decision_resolve), or supersession by a
-        new ask closes a card — an unanswered ask is impossible to lose.
-
-        Only reads cards of the given source — an api-submitted service
-        card is not the agent's to be nagged about."""
+        An unanswered ask is impossible to lose: only an operator answer,
+        an agent DECIDED (decision_resolve), or supersession closes a card.
+        """
+        # The turn-rate staleness clock this verb used to drive is RETIRED
+        # (card #237, operator-approved 2026-08-28). Kept here, not in the
+        # description: its whole history was one defect at three thresholds
+        # — instant evaporation (2026-07-26), withdrawal at 3 strikes (~25
+        # asks lost in a day, 2026-07-27: "the harder a blocked lane works,
+        # the faster it loses the ask it is blocked on"), then
+        # demote-at-3-strikes, which softened the consequence and kept the
+        # defective clock. Strikes measured the SENDER's turn rate and
+        # nothing else, so the board demoted a 6-minute-old top-scored ask
+        # from a lane that obediently stopped restating, while a purged
+        # owner's 20-day card read fresh forever. Staleness now derives
+        # from the ASK's own age at read time (DECISION_STALE_AFTER_SECONDS
+        # in decision_list); a quiet lane is indistinguishable from a chatty
+        # one, by design.
         _grade, attr_err = _attribution(ctx, from_agent)
         if attr_err:
             return attr_err
@@ -4759,31 +4700,25 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     def decision_resolve(from_agent: str, verdict: str, source: str = "stop-hook",
                          card: int = 0,
                          ctx: Context | None = None) -> str:
-        """Close the agent's own open card WITH the verdict it just received
-        in-pane — the smart half of answer capture (operator, 2026-07-26:
-        "rather than relying on some flaky auto capture"). The agent that
-        processed the operator's answer records it: its closing turn ends
-        with `**DECIDED:** <verdict>` and the Stop hook ships it here. The
-        verdict is agent-recorded, so it is stored with that provenance —
-        distinct from a decision_answer verdict typed by the operator.
+        """Close the agent's own open card WITH the verdict it received.
 
-        `card` ASSERTS the intended target: the close proceeds only if the
-        agent's open card is exactly #card, and refuses naming both sides
-        otherwise. (Under the one-open-card-per-agent invariant it cannot
-        select a different row — it exists so a caller who knows which card
-        they mean cannot close whatever happens to be open instead.)
-        Without it, the agent's single open card is the target — and a
-        verdict STRING that names a DIFFERENT #id refuses the close
-        outright. Cards named in
-        prose were never targets, but callers believed they were: on
-        2026-08-28 the supersede-and-tidy pattern ("#852 superseded by
-        #858" filed seconds after #858 opened) closed the NEWER card six
-        times in one day, one of them a production-safety ask, while both
-        return strings read as success. A refusal that names the mismatch
-        is the only shape that teaches the caller which card it was about
-        to destroy. (A quoted #id that IS the open card proceeds; the
-        guard may false-positive on incidental #numbers, and that costs a
-        loud retry, never a wrong close.)"""
+        The agent that processed the operator's answer records it: its
+        closing turn ends `**DECIDED:** <verdict>` and the Stop hook ships
+        it here. Stored as agent-recorded — distinct provenance from a
+        decision_answer verdict typed by the operator.
+
+        🔴 `card` ASSERTS the target: the close proceeds only if the
+        agent's open card is exactly that one, and REFUSES when the two
+        disagree. A verdict STRING naming a different #id also refuses.
+        """
+        # WHY the refusal, kept out of the shipped description: cards named
+        # in PROSE were never targets, but callers believed they were. On
+        # 2026-08-28 the supersede-and-tidy pattern ("#852 superseded by
+        # #858", filed seconds after #858 opened) closed the NEWER card six
+        # times in one day — one of them a production-safety ask — while
+        # both return strings read as success. A refusal naming the
+        # mismatch is the only shape that teaches the caller which card it
+        # was about to destroy.
         _grade, attr_err = _attribution(ctx, from_agent)
         if attr_err:
             return attr_err
