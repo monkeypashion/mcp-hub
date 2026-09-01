@@ -445,6 +445,128 @@ def _extract_text(call_tool_result: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Deferred low-priority surfacing (bar 47)
+# ---------------------------------------------------------------------------
+#
+# A Stop-hook block is not free: emitting it continues the session, and that
+# continuation IS a model turn. Measured on one mcp-hub session, 2026-09-01:
+# 18 hook fires, 13 of them costing a turn, against 7 genuine operator
+# prompts — the hook spent twice the model turns its operator did, most of
+# them on a flapping `[low]` monitor.
+#
+# `low` already means "must never interrupt" on the hub side (card #73 gave
+# it no backstop wake). The Stop hook was surfacing it at every turn boundary
+# anyway, which put the interrupt back one layer down.
+#
+# So: a drain carrying ONLY low-priority items is spooled to a file and the
+# hook returns None — zero turns. THE SPOOL IS NOT A DELIVERY MECHANISM. It
+# is a holding pen whose contents ride the NEXT block, whatever triggers it.
+# Nothing is delivered by the file being written; something is delivered when
+# the next block prints it.
+#
+# THAT ORDERING IS THE WHOLE SAFETY ARGUMENT. The hub marked these messages
+# read during the drain, so a spool that could be silently forgotten would
+# recreate the PR #8 silent-loss bug exactly — "push success ≠ seen", one
+# layer out. Two guarantees close it:
+#   1. every later block prepends and clears the spool, so any traffic at all
+#      flushes it; and
+#   2. DEFER_MAX_SECONDS forces a block on its own, so a lane that receives
+#      nothing else NEVER holds a spool indefinitely. That is the hub's own
+#      HOLD_MAX_SECONDS reasoning at the client: batching may delay a
+#      message, never strand it.
+# Anything unparseable, any read/write failure, any doubt → block as before.
+# The failure direction is a wasted turn, never a lost message.
+
+DEFER_MAX_SECONDS = 1800.0  # 30 min: a spool this old blocks on its own
+
+# A rendered line's priority tag, anchored the way receipts.py anchors refs:
+# `[HH:MM:SS] **sender** ·grade ⟨ref⟩ [low]: body`. No tag means NORMAL —
+# get_messages only tags non-normal priorities — so an untagged line is
+# exactly the case that must still interrupt.
+_MSG_LINE_RE = re.compile(
+    r"^\[\d{2}:\d{2}:\d{2}\] \*\*[^*]+\*\*(?: ·[\w-]+)* ⟨[^⟩]+⟩(?: \[(\w+)\])?:",
+    re.MULTILINE,
+)
+
+
+def _all_low_priority(*texts: str) -> bool:
+    """True iff every rendered message line present is tagged `[low]`.
+
+    Fails CLOSED in every uncertain direction: no parseable line at all
+    (an unrecognised render, a footer-only drain) returns False, so the
+    caller blocks and the agent sees whatever it was. Only an affirmative
+    all-low reading defers.
+    """
+    seen = False
+    for text in texts:
+        for m in _MSG_LINE_RE.finditer(text or ""):
+            seen = True
+            if (m.group(1) or "normal").lower() != "low":
+                return False
+    return seen
+
+
+def _defer_spool(agent_name: str) -> pathlib.Path:
+    safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in agent_name)
+    return _state_dir() / f"deferred-{safe}.txt"
+
+
+def _spool_read(agent_name: str) -> tuple[str, float]:
+    """Spooled text and the age in seconds of the OLDEST entry (0.0 if none)."""
+    path = _defer_spool(agent_name)
+    try:
+        text = path.read_text(encoding="utf-8")
+        age = max(0.0, time.time() - path.stat().st_mtime_ns / 1e9)
+    except OSError:
+        return "", 0.0
+    if not text.strip():
+        return "", 0.0
+    # mtime tracks the LAST append; the first line carries the first append's
+    # clock so the bound measures how long the OLDEST item has waited — a
+    # steady trickle of low traffic must not keep resetting its own deadline.
+    first = text.split("\n", 1)[0]
+    if first.startswith("#spooled-at "):
+        try:
+            age = max(0.0, time.time() - float(first.split(" ", 1)[1]))
+        except ValueError:
+            pass
+    return text, age
+
+
+def _spool_append(agent_name: str, text: str) -> bool:
+    """Add a deferred drain to the spool. False if it could not be written —
+    the caller then blocks instead, because an unwritten spool is a lost
+    message."""
+    path = _defer_spool(agent_name)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
+        if not existing.strip():
+            existing = f"#spooled-at {time.time()}\n"
+        with path.open("w", encoding="utf-8") as fh:
+            fh.write(existing.rstrip("\n") + "\n" + text.rstrip("\n") + "\n")
+        return True
+    except OSError:
+        return False
+
+
+def _spool_take(agent_name: str) -> str:
+    """Return the spooled text and clear it. Cleared only after a successful
+    read, so a failure leaves the spool for the next block rather than
+    dropping it."""
+    text, _ = _spool_read(agent_name)
+    if not text:
+        return ""
+    try:
+        _defer_spool(agent_name).unlink()
+    except OSError:
+        pass
+    return "\n".join(
+        ln for ln in text.splitlines() if not ln.startswith("#spooled-at ")
+    ).strip()
+
+
+# ---------------------------------------------------------------------------
 # Hook output building
 # ---------------------------------------------------------------------------
 
@@ -459,6 +581,7 @@ def build_hook_response(
     stop_hook_active: bool = False,
     card_nag: bool = False,
     card_notice: str = "",
+    defer_low: bool = False,
 ) -> dict[str, Any] | None:
     """Decide whether to emit a hook block and what the reason should be.
 
@@ -485,9 +608,49 @@ def build_hook_response(
     on the first fire), so a content-less block would re-emit forever. When
     it's set and there's nothing new to surface, we let Stop proceed.
     """
+    # Bar 47: a spool held from earlier low-only drains rides THIS block,
+    # whatever triggered it. Taken before the has_content decision so spooled
+    # text alone can justify a block (the DEFER_MAX_SECONDS path), and so no
+    # branch below can return None while the spool still holds anything.
+    deferred = ""
+    spool_age = 0.0
+    if defer_low and agent_name:
+        _, spool_age = _spool_read(agent_name)
+
     has_messages = bool(messages_text.strip())
     has_broadcasts = bool(broadcasts_text.strip())
     has_content = has_messages or has_broadcasts
+
+    # Defer only a drain that is ENTIRELY low-priority, with nothing else
+    # owed. A card nag, an owner notice or an offline agent are corrections,
+    # not traffic — they interrupt regardless of what else is queued.
+    if (
+        defer_low
+        and agent_name
+        and has_content
+        and is_online
+        and not card_nag
+        and not card_notice.strip()
+        and spool_age < DEFER_MAX_SECONDS
+        and _all_low_priority(messages_text, broadcasts_text)
+    ):
+        blob = "\n".join(
+            p for p in (
+                "**Direct messages:**\n" + messages_text.strip()
+                if has_messages else "",
+                "**Broadcasts (since you last looked):**\n"
+                + broadcasts_text.strip() if has_broadcasts else "",
+            ) if p
+        )
+        if _spool_append(agent_name, blob):
+            return None
+        # Could not write the spool → fall through and block. The hub has
+        # already marked these read; the ONLY other copy is this text.
+
+    if defer_low and agent_name:
+        deferred = _spool_take(agent_name)
+        if deferred:
+            has_content = True
 
     # An open card makes the "you have no card" nag factually wrong — the
     # right prompt is the notice ("card #N still open / STALE"), which the
@@ -522,6 +685,13 @@ def build_hook_response(
             parts.extend(["", "**Direct messages:**", messages_text.strip()])
         if has_broadcasts:
             parts.extend(["", "**Broadcasts (since you last looked):**", broadcasts_text.strip()])
+        if deferred:
+            parts.extend([
+                "",
+                "**Held low-priority items (deferred so they cost no turn "
+                "of their own):**",
+                deferred,
+            ])
 
     if not is_online:
         rebind_args = [f'name="{agent_name}"']
@@ -4558,6 +4728,11 @@ def stop_hook_command(args: argparse.Namespace) -> int:
         stop_hook_active=stop_hook_active,
         card_nag=card_nag,
         card_notice=card_notice,
+        # Opt-IN, and off by default: this is the one path that can decide
+        # not to show an agent something the hub has already marked read, so
+        # it ships dark and is turned on per box once its spool is trusted.
+        defer_low=os.environ.get("MCP_HUB_DEFER_LOW", "").lower()
+        in ("1", "true", "yes"),
     )
 
     if response is None:
