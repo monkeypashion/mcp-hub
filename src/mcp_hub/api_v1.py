@@ -1170,8 +1170,15 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
     # as "never", and the whole category then looks forbidden (the
     # headless-pod lesson — a refusal justified by one mechanism outlived
     # the mechanism).
-    _PHASE1_VERBS = ("interrupt", "prompt")
+    _PHASE1_VERBS = ("interrupt", "prompt", "hold", "release")
     _PHASE2_VERBS = ("answer", "restart")
+    # A hold's expiry is MANDATORY and bounded (bar 14/42, 2026-09-01). The
+    # stored value is a release TIME, never a held flag — the same safety
+    # design as focus_until, for the same reason: a stop that can be left on
+    # forever is a silent-drop bug, and a lane nobody remembers holding is
+    # indistinguishable from a lane that died. 12h is long enough to span a
+    # usage window and short enough that forgetting is survivable.
+    _HOLD_MAX_SECONDS = 12 * 3600.0
     # An interrupt written during a stall must not land minutes later in the
     # middle of healthy work. The stored value is a REQUEST TIME and expiry
     # is derived, so a pending action cannot outlive this by being missed.
@@ -1291,6 +1298,45 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
                     "a prompt needs `args.text` — a prompt that types "
                     "nothing is a no-op wearing the word prompt",
                 )
+            if kind == "hold":
+                # `until` is required, not defaulted. A default would let a
+                # caller hold a lane open-endedly by omission, which is the
+                # one shape this verb must not have.
+                try:
+                    until = float(args.get("until"))
+                except (TypeError, ValueError):
+                    return _err(
+                        400,
+                        "a hold needs `args.until` — a unix timestamp when "
+                        "it releases ITSELF. It is required and not "
+                        "defaulted: a hold with no end is a stopped lane "
+                        "nobody remembers stopping, which is indis"
+                        "tinguishable from a dead one.",
+                    )
+                horizon = until - _now()
+                if horizon <= 0:
+                    return _err(
+                        400,
+                        f"`until` is in the past ({until}) — that would "
+                        f"release the moment it lands. Pass the window "
+                        f"reset time.",
+                    )
+                if horizon > _HOLD_MAX_SECONDS:
+                    return _err(
+                        400,
+                        f"`until` is {horizon / 3600:.1f}h out, over the "
+                        f"{_HOLD_MAX_SECONDS / 3600:.0f}h cap. Re-hold if "
+                        f"it is still needed — the cap is what makes a "
+                        f"forgotten hold survivable.",
+                    )
+                if not str(args.get("release_condition") or "").strip():
+                    return _err(
+                        400,
+                        "a hold needs `args.release_condition` — the words "
+                        "the held lane and the operator are both told. A "
+                        "stop whose end nobody can state reads as an "
+                        "ignoring lane, not a held one.",
+                    )
             # UPSERT, never queue: mashing the button re-states the ask.
             # Superseded intent is recorded as such rather than deleted, so
             # the trail shows what was asked and overtaken.
