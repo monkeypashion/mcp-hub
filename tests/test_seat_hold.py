@@ -154,3 +154,158 @@ def test_a_corrupt_mirror_means_nothing_is_held(tmp_path):
              "SQUAD_CONF": str(conf), "MCP_HUB_HELD_FILE": str(heldf)},
     )
     assert "HELD" not in p.stdout
+
+
+# --- leg 0: the hop that never happened ------------------------------------
+#
+# Everything above builds actions with `status="done"` by hand, which is the
+# state the mirror keys on — so the suite could be fully green while the one
+# transition that produces that state did not exist. It did not: the hub
+# wrote `hold` as PENDING, the edge's verb set was ("interrupt", "prompt"),
+# so `realize_seat_action` refused it as unrecognised, it never settled, and
+# `_hold_state` (which counts only `done`) therefore never reported a hold.
+# The mirror was rebuilt empty every pass and squad held nothing, on every
+# lane, from the moment 6490b1a shipped.
+#
+# The tests below exercise the real transition end to end, and pin the two
+# verb sets together so the vocabularies cannot drift apart again in silence.
+
+def test_the_hub_and_the_edge_agree_on_the_verb_set():
+    """A verb the hub can WRITE and the edge cannot EXECUTE is inert.
+
+    The two guards stay independent — that is deliberate, and this does not
+    merge them. But the vocabulary is one fact, and when it split, `hold`
+    was accepted, validated, stored, and silently never carried out.
+    """
+    from mcp_hub.api_v1 import SEAT_PHASE1_VERBS
+
+    assert set(SEAT_PHASE1_VERBS) == set(edge._SEAT_PHASE1_VERBS)
+
+
+@pytest.mark.parametrize("kind", ["hold", "release"])
+def test_a_control_verb_settles_done_through_the_edge(kind):
+    """The transition the mirror depends on, taken through the real code."""
+    action = {"id": 7, "kind": kind, "status": "pending",
+              "args": {"until": time.time() + 3600,
+                       "release_condition": "window resets at 18:00"}}
+    report = edge.realize_seat_action(
+        action, {"identity": "lane-1", "session": "lane-1"},
+        lambda argv: (0, "pane"), pause=lambda _s: None,
+    )
+    assert report["status"] == "done", report["observed"]
+
+
+def test_a_control_verb_sends_no_keystrokes():
+    """A hold must not type into the lane it is stopping."""
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        return 0, "pane"
+
+    edge.realize_seat_action(
+        {"id": 8, "kind": "hold", "status": "pending",
+         "args": {"until": time.time() + 3600, "release_condition": "x"}},
+        {"identity": "lane-1", "session": "lane-1"}, runner,
+        pause=lambda _s: None,
+    )
+    assert calls == []
+
+
+def test_a_hold_survives_a_pane_that_cannot_be_read():
+    """The wedged lane is the one most worth holding.
+
+    Fail-closed guards a BLIND KEYSTROKE. A control verb sends none, so
+    gating it on a readable pane would refuse a hold exactly when the lane
+    is stuck — which is when the ceiling watcher reaches for it.
+    """
+    report = edge.realize_seat_action(
+        {"id": 9, "kind": "hold", "status": "pending",
+         "args": {"until": time.time() + 3600, "release_condition": "x"}},
+        {"identity": "lane-1", "session": "lane-1"},
+        lambda argv: (1, "no server running"), pause=lambda _s: None,
+    )
+    assert report["status"] == "done"
+
+
+def test_a_keystroke_verb_still_fails_closed_on_an_unreadable_pane():
+    """Negative control: the split must not have loosened the older rule."""
+    report = edge.realize_seat_action(
+        {"id": 10, "kind": "prompt", "status": "pending",
+         "args": {"text": "hello"}},
+        {"identity": "lane-1", "session": "lane-1"},
+        lambda argv: (1, "no server running"), pause=lambda _s: None,
+    )
+    assert report["status"] == "refused"
+
+
+def test_a_pending_hold_reaches_the_mirror_in_one_pass(tmp_path, monkeypatch):
+    """End to end: what the hub actually writes, through to what squad reads.
+
+    This is the test whose absence let an inert hold ship green.
+    """
+    mirror = tmp_path / "held-lanes.json"
+    monkeypatch.setenv("MCP_HUB_HELD_FILE", str(mirror))
+    until = time.time() + 3600
+
+    class FakeApi:
+        def __init__(self):
+            # exactly what the hub stores on POST .../actions {kind: hold}
+            self.actions = [{"id": 1, "kind": "hold", "status": "pending",
+                             "args": {"until": until,
+                                      "release_condition": "window resets 18:00",
+                                      "reason": "over 1.5x fair share"}}]
+
+        def pull_seat_actions(self, seat):
+            return self.actions
+
+        def report_seat_action(self, seat, action_id, report):
+            for a in self.actions:
+                if a["id"] == action_id:
+                    a["status"] = report["status"]
+
+        def seat_watched(self, seat):
+            return False
+
+    out = edge.seat_control_pass(
+        FakeApi(), [{"seat": "lane-1", "desired": "running"}],
+        lambda argv: (0, "pane"),
+    )
+
+    assert out["errors"] == []
+    assert out["held"] == ["lane-1"]
+    written = json.loads(mirror.read_text())
+    assert written["held"]["lane-1"]["release_condition"] == "window resets 18:00"
+
+
+def test_a_pending_release_lifts_the_hold_in_the_same_pass(tmp_path, monkeypatch):
+    """Release has to settle too, or the only way out is the expiry."""
+    mirror = tmp_path / "held-lanes.json"
+    monkeypatch.setenv("MCP_HUB_HELD_FILE", str(mirror))
+    until = time.time() + 3600
+
+    class FakeApi:
+        def __init__(self):
+            self.actions = [
+                {"id": 1, "kind": "hold", "status": "done",
+                 "args": {"until": until, "release_condition": "c"}},
+                {"id": 2, "kind": "release", "status": "pending", "args": {}},
+            ]
+
+        def pull_seat_actions(self, seat):
+            return self.actions
+
+        def report_seat_action(self, seat, action_id, report):
+            for a in self.actions:
+                if a["id"] == action_id:
+                    a["status"] = report["status"]
+
+        def seat_watched(self, seat):
+            return False
+
+    out = edge.seat_control_pass(
+        FakeApi(), [{"seat": "lane-1", "desired": "running"}],
+        lambda argv: (0, "pane"),
+    )
+    assert out["held"] == []
+    assert json.loads(mirror.read_text())["held"] == {}

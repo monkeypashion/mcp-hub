@@ -728,14 +728,29 @@ class HubAPI:
 # -- seat control plane, edge leg (cards #144/#152, phase 1) ----------------
 #
 # The hub records INTENT; this is where a machine carries it out on its own
-# seats and reports what it OBSERVED. Phase 1 is `interrupt` and `prompt`.
+# seats and reports what it OBSERVED.
 #
 # Everything goes through the injected runner, exactly like SquadExecutor,
 # and for a sharper reason: this code sends KEYSTROKES to a live agent's
 # terminal. No import of subprocess here means no test path can type into a
 # real seat.
-
-_SEAT_PHASE1_VERBS = ("interrupt", "prompt")
+#
+# TWO KINDS OF VERB, and the split is load-bearing. A KEYSTROKE verb types
+# into a live pane, so it fails closed on an unreadable one. A CONTROL verb
+# types nothing: it settles a record the sweeps then honour, and gating it on
+# a readable pane would make a hold fail on a wedged lane — precisely the
+# lane most worth holding.
+#
+# 🔴 THE HUB'S VERB SET AND THIS ONE MUST AGREE. They are checked
+# independently on purpose (the hub refusing to WRITE an unknown verb and the
+# edge refusing to EXECUTE one are different guarantees), but a verb the hub
+# can write and the edge cannot execute is INERT: the action never settles,
+# so nothing downstream that keys on `done` ever fires. `hold` and `release`
+# shipped that way in 6490b1a — accepted, validated, mirrored by a mirror
+# that could never populate. tests/test_seat_hold.py pins the two sets equal.
+_SEAT_KEYSTROKE_VERBS = ("interrupt", "prompt")
+_SEAT_CONTROL_VERBS = ("hold", "release")
+_SEAT_PHASE1_VERBS = _SEAT_KEYSTROKE_VERBS + _SEAT_CONTROL_VERBS
 
 
 def _seat_tmux_argv(seat: dict[str, Any], args: list[str]) -> list[str]:
@@ -832,6 +847,25 @@ def realize_seat_action(
             "observed": {"why": f"'{kind}' is not a phase-1 seat verb "
                                 f"({', '.join(_SEAT_PHASE1_VERBS)}); the edge "
                                 f"executes nothing it does not recognise"},
+            "pane_after": None,
+        }
+
+    if kind in _SEAT_CONTROL_VERBS:
+        # No keystroke, so no pane. A hold does not act ON the terminal — it
+        # settles a record that squad's `up_one`/`relaunch_agent` consult
+        # before starting a lane, and that only counts once it reads `done`
+        # (see `_hold_state`). Capturing first would refuse a hold on a seat
+        # whose pane cannot be read, which is the wedged lane the ceiling
+        # watcher most wants stopped; and "fail closed" guards a BLIND
+        # KEYSTROKE, of which there is none here.
+        #
+        # The hub validated `until` and `release_condition` before writing
+        # this, and re-reads them from the stored args when it builds the
+        # mirror, so nothing is re-derived from what the edge echoes back.
+        return {
+            "status": "done",
+            "observed": {"recorded": kind,
+                         "note": "control-plane record; no keys were sent"},
             "pane_after": None,
         }
 

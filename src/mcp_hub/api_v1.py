@@ -41,6 +41,14 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from mcp_hub.server import purge_expired_memberships
 from mcp_hub.spec_guard import validate_spec
 
+# The seat control plane's closed verb set, at module scope so the edge's own
+# copy can be pinned against it by test. The two guards stay INDEPENDENT — the
+# hub refuses to write an unknown verb, the edge refuses to execute one — but
+# the VOCABULARY is one fact, and letting the two drift apart is what made
+# `hold` inert on arrival: the hub wrote it, the edge did not recognise it, so
+# it never settled and the mirror it fed could never populate.
+SEAT_PHASE1_VERBS = ("interrupt", "prompt", "hold", "release")
+
 SUBSTRATES = ("worktree", "docker")
 
 # ── The doorbell ─────────────────────────────────────────────────────────────
@@ -1170,7 +1178,7 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
     # as "never", and the whole category then looks forbidden (the
     # headless-pod lesson — a refusal justified by one mechanism outlived
     # the mechanism).
-    _PHASE1_VERBS = ("interrupt", "prompt", "hold", "release")
+    _PHASE1_VERBS = SEAT_PHASE1_VERBS
     _PHASE2_VERBS = ("answer", "restart")
     # A hold's expiry is MANDATORY and bounded (bar 14/42, 2026-09-01). The
     # stored value is a release TIME, never a held flag — the same safety
