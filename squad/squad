@@ -890,6 +890,115 @@ hold_enforce_one() {
   hold_stop_lane "$a"
 }
 
+# ===========================================================================
+# COMPACTION (goal 81, bars 50-52) — DETECT, ASK, and only then act.
+#
+# His words: "some automatic detection that doesn't auto compact or auto
+# clear. That's not what I want." So detection NEVER acts, the lane itself
+# decides, and the exec leg is OFF behind a flag until bar 52 is built.
+#
+# ctx% is NOT derived here and is not guessed: Claude Code hands each lane's
+# statusline `context_window.used_percentage`, the statusline renders it, and
+# the board already scrapes that rendered number. Detection reads what the
+# harness computed. (Per-lane WINDOW SIZE is a separate fact, needed only for
+# the --autocompact net, which is a token count.)
+COMPACT_ASK_PCT="${MCP_HUB_COMPACT_ASK_PCT:-50}"
+COMPACT_REASK_PCT="${MCP_HUB_COMPACT_REASK_PCT:-60}"
+# 🔴 BAR 52 IS NOT BUILT AND THIS STAYS 0. The exec leg types /clear or
+# /compact into a live pane, and `/clear` DESTROYS context — it must never
+# fire without the lane's own answer AFTER a flush. Flag exists so the leg
+# can be enabled in one place when 52 lands and reviewed as its own change.
+COMPACT_EXEC="${MCP_HUB_COMPACTION_EXEC:-0}"
+COMPACT_DOOR="${MCP_HUB_COMPACTION_DOOR:-operator-console}"
+
+# The lane's context percentage, from its own rendered statusline. Prints
+# nothing when the pane cannot be read or shows no ctx — ABSENCE, never 0:
+# a lane whose number we cannot see must not read as an empty context.
+compaction_ctx() {
+  tm capture-pane -p -t "$1" 2>/dev/null \
+    | grep -oE '[c]tx \[[^]]*\][[:space:]]*[0-9]+%' | tail -1 \
+    | grep -oE '[0-9]+' | tail -1
+}
+
+# ONCE PER LANE SESSION. Keyed by the session's start time, so a relaunch
+# re-arms the ask and a mere re-scrape does not. A flag keyed by agent alone
+# would fire once ever; keyed by nothing, once every two minutes.
+compaction_flag() {
+  local a="$1" st; st="$(agent_started "$a" 2>/dev/null)" || return 1
+  [ -n "$st" ] || return 1
+  printf '%s/.mcp-hub/compaction-%s-%s' "$HOME" "$(safe_name "$a")" "$st"
+}
+
+# One row through bar 53's door. First line is the CONTRACT and is exact;
+# anything after it is row body. Failure to write a row must never stop the
+# sweep — but it is reported, because a silent door is one nobody can audit.
+compaction_row() {
+  local seat="$1" step="$2" pct="$3" detail="${4:-}" hb
+  hb="$(hub_bin)" || return 1
+  [ -n "$hb" ] || return 1
+  { printf 'COMPACTION %s %s ctx=%s%%\n' "$seat" "$step" "$pct"
+    [ -n "$detail" ] && printf '%s\n' "$detail"
+  } | "$hb" send --to "$COMPACT_DOOR" --message - --priority low \
+        --cwd "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)" \
+        >/dev/null 2>&1 \
+    || echo "!! compaction: could not write the $step row for $seat" >&2
+}
+
+# The ask itself. Typed into the lane's own session, because the lane is the
+# only thing that knows what is worth keeping.
+COMPACT_ASK_TEXT="You are at %s%% of your context window. Flush anything worth keeping to memory NOW, then reply with one line: CLEAR (start fresh) or COMPACT (summarise and continue), and why. Nothing will be done to this session until you answer."
+
+compaction_one() {
+  local a="$1" pct flag threshold
+  pct="$(compaction_ctx "$a")"
+  [ -n "$pct" ] || return 0                 # unreadable = unmeasured, not 0
+  flag="$(compaction_flag "$a")" || return 0
+
+  # Re-ask threshold once the first ask has been made and gone unanswered.
+  threshold="$COMPACT_ASK_PCT"
+  [ -f "$flag" ] && threshold="$COMPACT_REASK_PCT"
+  [ "$pct" -ge "$threshold" ] 2>/dev/null || return 0
+  # Already re-asked at the higher mark? Then we are done for this session.
+  # Asked at both marks already — this session is done, answered or not.
+  # Nagging a third time is the "auto" behaviour he ruled out, one step
+  # removed.
+  [ -f "$flag.reask" ] && return 0
+
+  mkdir -p "$HOME/.mcp-hub" 2>/dev/null
+  compaction_row "$a" fire "$pct" "detected at ${pct}% (threshold ${threshold}%)"
+
+  # 🔴 IDLE ONLY, FAILING CLOSED. send-keys into a working lane appends to
+  # whatever is in its input box; into a 🔴 dialog it answers a question that
+  # is the operator's. A lane that is busy simply misses this pass and is
+  # caught at the re-ask.
+  local st; st="$(classify_agent "$a")"
+  if [ "$st" != "idle" ]; then
+    echo "$a at ${pct}% but $st — not asking this pass (idle only)"
+    return 0
+  fi
+
+  local text; text="$(printf "$COMPACT_ASK_TEXT" "$pct")"
+  # Two sends, as everywhere else in this file: `send-keys "<text>" Enter` in
+  # one call makes tmux read the literal as a KEY NAME wherever it matches.
+  tm send-keys -l -t "$a" "$text" 2>/dev/null || return 0
+  sleep 1
+  tm send-keys -t "$a" Enter 2>/dev/null || return 0
+
+  if [ "$threshold" = "$COMPACT_REASK_PCT" ]; then : > "$flag.reask"; else : > "$flag"; fi
+  compaction_row "$a" ask "$pct" "asked in-session at ${pct}%; awaiting CLEAR or COMPACT"
+  echo "$a: compaction ask sent at ${pct}%"
+}
+
+compaction_pass() {
+  # Bar 52's exec leg is not built; this pass detects and asks only.
+  local a
+  for a in $(squad_agents); do
+    tm has-session -t "=$a" 2>/dev/null || continue
+    pane_alive "$a" || continue
+    compaction_one "$a"
+  done
+}
+
 # --- release: the lane comes back, with its conversation (his ruling) ------
 #
 # "RELEASE = RESTART WITH --continue", his words. The earlier design said the
@@ -2730,6 +2839,36 @@ case "${1:-help}" in
             # The keep-alive daemons are detached (they outlive tmux), so kill
             # them explicitly via their pidfiles and clear the stale claim.
             for a in $(agents); do kill_daemon "$a"; done ;;
+  compaction) # goal 81 bars 50-52: detect at 50%, ASK the lane, never act.
+            # `--dry-run` reports what it would do and writes no rows and no
+            # keystrokes — the only safe way to inspect a leg that types into
+            # live panes.
+            if [ "${2:-}" = "--dry-run" ]; then
+              for a in $(squad_agents); do
+                tm has-session -t "=$a" 2>/dev/null || continue
+                pane_alive "$a" || continue
+                pct="$(compaction_ctx "$a")"
+                if [ -z "$pct" ]; then
+                  echo "$a: ctx UNMEASURED (no statusline number on the pane)"
+                  continue
+                fi
+                st="$(classify_agent "$a")"
+                f="$(compaction_flag "$a" 2>/dev/null || true)"
+                mark="asked=no"
+                [ -n "$f" ] && [ -f "$f" ] && mark="asked=yes"
+                [ -n "$f" ] && [ -f "$f.reask" ] && mark="asked=yes,reasked=yes"
+                echo "$a: ctx=${pct}% state=$st $mark (ask at ${COMPACT_ASK_PCT}%, re-ask at ${COMPACT_REASK_PCT}%)"
+              done
+              exit 0
+            fi
+            # One named lane, so the leg can be exercised end to end without
+            # a sweep typing into every idle pane on the box.
+            if [ -n "${2:-}" ]; then
+              a="$(need_agent "$2")" || exit 1
+              compaction_one "$a"
+            else
+              compaction_pass
+            fi ;;
   heal)     # Recovery for agents that are UP in tmux but broken on the hub:
             #   no-signal   -> status cache stale/missing: its WRITER (the
             #                  heartbeat daemon) is dead — respawn the daemon;
@@ -2765,6 +2904,10 @@ case "${1:-help}" in
             # it naturally: it no longer has a session.
             hold_enforce_pass
             hold_release_pass
+            # Detect-and-ask only; the exec leg is behind COMPACT_EXEC and is
+            # not built. Runs after the hold legs so a lane being stopped is
+            # not asked to compact on its way down.
+            compaction_pass
             healed=0
             relaunched=0
             # Agents this pass has already relaunched. The two recovery loops

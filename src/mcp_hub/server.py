@@ -5469,7 +5469,15 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 # CLI
 # ---------------------------------------------------------------------------
 
+# 🔴 A VERB REGISTERED IN cli.py's PARSER BUT MISSING HERE IS UNREACHABLE.
+# This set is the door: `mcp-hub <verb>` only delegates to the client CLI when
+# the verb is listed, so a parser entry alone gets "unrecognized arguments"
+# from the SERVER's parser — a message that names neither the real cause nor
+# this file. Same shape as the hold verb the hub could write and the edge
+# could not execute (2026-09-01): one vocabulary, two registries, and nothing
+# reporting the gap. tests/test_cli_subcommands_reachable.py pins them equal.
 _CLI_SUBCOMMANDS = {
+    "send",
     "stop-hook",
     "session-start",
     "session-rewake",

@@ -4294,6 +4294,58 @@ async def _set_focus(hub_url: str, name: str, minutes: int, reason: str) -> str:
             )) or ""
 
 
+async def _send_dm(hub_url: str, frm: str, to: str, message: str,
+                   priority: str, in_reply_to: str) -> str:
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    async with streamablehttp_client(
+        _ephemeral_hub_url(hub_url), timeout=15
+    ) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            return _extract_text(await session.call_tool(
+                "send",
+                {"from_agent": frm, "to": to, "message": message,
+                 "priority": priority, "in_reply_to": in_reply_to},
+            )) or ""
+
+
+def send_command(args: argparse.Namespace) -> int:
+    """Send one DM from the shell.
+
+    A CLI verb because squad — which is bash — needs to write rows through
+    doors that are hub DMs (the compaction door, card #53). Shelling out to
+    python from bash for every row would put an inline script in the hot
+    path of a sweep; this keeps one client and one place to change it.
+
+    Reads the body from `--message`, or from STDIN when it is `-`, so a
+    multi-line row does not have to survive shell quoting.
+    """
+    name = args.from_agent
+    if not name:
+        cwd = args.cwd or os.getcwd()
+        name, _project = _derive_agent_identity(cwd)
+        if not name:
+            print(f"no derived identity for {cwd} — pass --from", file=sys.stderr)
+            return 1
+    body = args.message
+    if body == "-":
+        body = sys.stdin.read()
+    if not body.strip():
+        print("refusing to send an empty message", file=sys.stderr)
+        return 1
+    try:
+        reply = asyncio.run(_send_dm(
+            args.hub_url, name, args.to, body, args.priority, args.in_reply_to,
+        ))
+    except Exception as exc:  # noqa: BLE001
+        print(f"!! send failed: {exc}", file=sys.stderr)
+        return 1
+    print(reply or f"sent to {args.to}")
+    return 0
+
+
 def focus_command(args: argparse.Namespace) -> int:
     """Do-not-disturb for one agent, for a bounded time.
 
@@ -7231,6 +7283,38 @@ def build_parser() -> argparse.ArgumentParser:
             "silencer you can leave on forever is a silent-drop bug."
         ),
     )
+    send_p = sub.add_parser(
+        "send",
+        help="Send one DM to another agent (for scripts and sweeps)",
+        description=(
+            "The shell's door to a hub DM. Exists because squad is bash and "
+            "needs to write rows through doors that are DMs — the compaction "
+            "door (bar 53) writes one per step. Body may be '-' to read "
+            "stdin, so a multi-line row need not survive shell quoting."
+        ),
+    )
+    send_p.add_argument("--to", required=True, help="Recipient agent name")
+    send_p.add_argument(
+        "--message", required=True,
+        help="Message body, or '-' to read it from stdin",
+    )
+    send_p.add_argument(
+        "--from", dest="from_agent", default=None,
+        help="Sender name (default: derived from --cwd)",
+    )
+    send_p.add_argument("--cwd", default=None, help="Worktree for identity derivation")
+    send_p.add_argument(
+        "--priority", default="normal", choices=["low", "normal", "urgent"],
+    )
+    send_p.add_argument(
+        "--in-reply-to", dest="in_reply_to", default="",
+        help="Ref of the message this answers (declared lineage + reply-wake)",
+    )
+    send_p.add_argument(
+        "--hub-url", default=DEFAULT_HUB_URL,
+        help="Hub base URL (default: $MCP_HUB_URL or built-in)",
+    )
+
     focus_p.add_argument(
         "minutes", nargs="?", type=int, default=60,
         help="How long to stay focused (default 60, capped at 480)",
@@ -7847,6 +7931,8 @@ def main(argv: list[str] | None = None) -> int:
         return squads_command(args)
     if args.subcommand == "machines":
         return machines_command(args)
+    if args.subcommand == "send":
+        return send_command(args)
     if args.subcommand == "focus":
         return focus_command(args)
     if args.subcommand == "voice-client":
