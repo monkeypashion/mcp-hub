@@ -1039,36 +1039,41 @@ for _, txt in seen:
 ' 2>/dev/null
 }
 
-# ONCE PER LANE SESSION. Keyed by the session's start time, so a relaunch
-# re-arms the ask and a mere re-scrape does not. A flag keyed by agent alone
-# would fire once ever; keyed by nothing, once every two minutes.
+# ONCE PER LANE SESSION, keyed by THE TRANSCRIPT'S OWN SESSION ID — the
+# filename of the newest *.jsonl in the lane's encoded dir. It already names
+# the session the tokens were read from, so the flag and the reading cannot
+# disagree, and a relaunch mints a new file and re-arms the ask by itself.
 #
-# ⭐ THE KEY IS COMPUTED, AND THE COMPUTATION JITTERS. `agent_started` is
-# `now - etimes`, and `ps -o etimes=` is TRUNCATED WHOLE SECONDS — so a lane
-# started at T+0.4s reads T on one pass and T+1 on the next, forever
-# alternating. A fresh key means a fresh flag, which means the lane is fired
-# at and ASKED AGAIN in the same session: the console flagged exactly this as
-# REPEAT on reliable-ai (20:17:57), and both lanes swept before the fix left
-# their evidence on disk as adjacent keys one second apart
-# (compaction-…-1788379296.fire beside compaction-…-1788379297).
+# ⭐ IT IS READ, NEVER COMPUTED, and that is the whole point. The first
+# version keyed on `agent_started` = `now - etimes`, and `ps -o etimes=` is
+# truncated WHOLE SECONDS: a lane started at T+0.4s reads T on one pass and
+# T+1 on the next, alternating forever. A different key is a different flag,
+# so every other sweep fired at the lane and ASKED IT AGAIN — the console
+# flagged exactly that as REPEAT on reliable-ai (20:17:57), and both lanes
+# swept before the fix left adjacent keys one second apart on disk
+# (compaction-...-1788379296.fire beside compaction-...-1788379297).
 #
-# So an EXISTING key within a few seconds IS this session, and is reused. The
-# slop is safe because a genuine relaunch moves the start time by minutes, not
-# seconds — the one thing the key must still distinguish.
-COMPACT_SESSION_SLOP="${MCP_HUB_COMPACT_SESSION_SLOP:-5}"
-compaction_flag() {
-  local a="$1" st base f k d
-  st="$(agent_started "$a" 2>/dev/null)" || return 1
-  [ -n "$st" ] || return 1
-  base="$HOME/.mcp-hub/compaction-$(safe_name "$a")-"
-  for f in "$base"*; do
+# A clock the key is derived from is a clock the key inherits the jitter of.
+# Read the identity instead of recomputing it. (Deputy's steer on #327: "the
+# transcript session id is the cleanest key".)
+compaction_session() {
+  local d f newest=""
+  d="$(compaction_dir "$1")" || return 1
+  [ -d "$d" ] || return 1
+  for f in "$d"/*.jsonl; do
     [ -e "$f" ] || continue
-    k="${f#"$base"}"; k="${k%%.*}"
-    case "$k" in ''|*[!0-9]*) continue ;; esac
-    d=$(( st > k ? st - k : k - st ))
-    if [ "$d" -le "$COMPACT_SESSION_SLOP" ]; then printf '%s%s' "$base" "$k"; return 0; fi
+    if [ -z "$newest" ] || [ "$f" -nt "$newest" ]; then newest="$f"; fi
   done
-  printf '%s%s' "$base" "$st"
+  [ -n "$newest" ] || return 1
+  f="${newest##*/}"
+  printf '%s' "${f%.jsonl}"
+}
+
+compaction_flag() {
+  local a="$1" sid
+  sid="$(compaction_session "$a" 2>/dev/null)" || return 1
+  [ -n "$sid" ] || return 1
+  printf '%s/.mcp-hub/compaction-%s-%s' "$HOME" "$(safe_name "$a")" "$sid"
 }
 
 # One row through bar 53's door. First line is the CONTRACT and is exact;
@@ -1245,8 +1250,14 @@ compaction_answer_leg() {
 }
 
 compaction_pass() {
+  # EVERY roster row with a live pane, faculty included (his ruling relayed
+  # 20:32, 2026-09-02: faculty seats were 58% of one hour's burn). NOT
+  # squad_agents() — that excludes class `faculty`, which hid squad-proxy and
+  # every ad-hoc `squad add` spike from a sweep whose whole subject is what a
+  # pane is BURNING. Grouping decides who hears a broadcast; it must not
+  # decide who gets measured.
   local a
-  for a in $(squad_agents); do
+  for a in $(agents); do
     tm has-session -t "=$a" 2>/dev/null || continue
     pane_alive "$a" || continue
     compaction_one "$a"
@@ -3099,7 +3110,7 @@ case "${1:-help}" in
             # keystrokes — the only safe way to inspect a leg that types into
             # live panes.
             if [ "${2:-}" = "--dry-run" ]; then
-              for a in $(squad_agents); do
+              for a in $(agents); do
                 tm has-session -t "=$a" 2>/dev/null || continue
                 pane_alive "$a" || continue
                 tok="$(compaction_tokens "$a" || true)"

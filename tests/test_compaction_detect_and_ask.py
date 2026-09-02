@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -62,11 +64,11 @@ def transcript(home: Path, worktree: Path, *, tokens=None, replies=()):
 
 
 def run(tmp_path, snippet, *, tokens=OVER, state_lines=None, agent="lane-a",
-        replies=(), env=None, ctx="16", jitter=False):
+        replies=(), env=None, ctx="16", jitter=False, klass="squad"):
     home = tmp_path
     (home / ".mcp-hub").mkdir(parents=True, exist_ok=True)
     conf = home / "squad.conf"
-    conf.write_text(f"{agent}|{home}||--continue|squad\n", encoding="utf-8")
+    conf.write_text(f"{agent}|{home}||--continue|{klass}\n", encoding="utf-8")
 
     transcript(home, home, tokens=tokens, replies=replies)
 
@@ -280,16 +282,44 @@ def test_the_same_session_is_not_asked_twice(tmp_path):
     assert keys(tmp_path).count("send-keys -l") == 1
 
 
-def test_a_jittering_clock_does_not_re_ask_the_same_session(tmp_path):
-    """The session key is COMPUTED as (now - etimes), and etimes is truncated
-    whole seconds — so it alternates by one between passes. Unfixed, every
-    other pass mints a fresh flag and asks the lane AGAIN: the console flagged
-    exactly this as REPEAT on reliable-ai, and the live box was left holding
-    two keys one second apart for one session."""
+def test_the_session_key_does_not_move_when_the_clock_does(tmp_path):
+    """THE repeat bug. The first key was COMPUTED as (now - etimes), and
+    `ps -o etimes=` is truncated whole seconds — so it alternated by one
+    between passes, minting a fresh flag and asking the lane AGAIN every
+    other sweep. The console flagged that as REPEAT on reliable-ai, and the
+    live box was left holding two keys one second apart for one session.
+
+    The key is now READ off the transcript (its session id), so a jittering
+    clock cannot move it. `jitter` drives the stub the way the real one
+    behaves."""
     run(tmp_path, "compaction_one lane-a\n" * 6, jitter=True)
     assert keys(tmp_path).count("send-keys -l") == 1
     assert rows(tmp_path).count(" fire ") == 1
     assert rows(tmp_path).count(" ask ") == 1
+
+
+def test_a_new_session_re_arms_the_ask(tmp_path):
+    """Stability must not become stickiness: a relaunch is a NEW transcript
+    file, and that lane has a fresh context worth asking about. This is the
+    property the old start-time key bought, and it survives the change."""
+    run(tmp_path, "compaction_one lane-a\n" * 3)
+    d = tmp_path / ".claude" / "projects" / str(tmp_path).replace("/", "-")
+    src = next(d.glob("*.jsonl"))
+    later = d / "99999999-aaaa-bbbb-cccc-dddddddddddd.jsonl"
+    later.write_bytes(src.read_bytes())
+    os.utime(later, (time.time() + 10, time.time() + 10))
+    run(tmp_path, "compaction_one lane-a\n" * 3)
+    assert keys(tmp_path).count("send-keys -l") == 2
+
+
+def test_a_faculty_lane_is_swept_too(tmp_path):
+    """Grouping decides who hears a broadcast; it must not decide who gets
+    MEASURED. squad_agents() excludes class `faculty`, which hid squad-proxy
+    and every ad-hoc spike from a sweep whose whole subject is what a pane is
+    burning (his ruling, relayed 2026-09-02 20:32)."""
+    p = run(tmp_path, "compaction_pass\n", klass="faculty")
+    assert "compaction ask sent" in p.stdout, p.stdout + p.stderr
+    assert "send-keys -l" in keys(tmp_path)
 
 
 # --- bar 52: no answer = no action, absolutely -------------------------------
