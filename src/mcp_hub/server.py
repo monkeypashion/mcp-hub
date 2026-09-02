@@ -4712,6 +4712,41 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         ask = (row["ask"] or "")[:80]
         return f"Card #{row['id']} still open on the operator's board: {ask}"
 
+    def _resolve_miss(conn, from_agent: str, card: int, source: str, open_row):
+        """Say WHY the target missed — closed, filtered, absent, not-yours.
+
+        🔴 All four used to return "you have no open card". On 2026-09-02
+        two lanes hit that string within an hour for DIFFERENT reasons —
+        a wrong `source` filter, and a card already closed — and one of
+        them reasonably diagnosed a redeploy-corrupted index and went
+        looking in the database. The alarming reading ("your card is
+        gone") and the reassuring one ("it is already decided") were the
+        same sentence, so the message did not lie so much as decline to
+        say anything. A not-found must name its NARROWING, never report
+        emptiness.
+        """
+        actual = conn.execute(
+            "SELECT id, agent, status, source FROM decisions WHERE id=?",
+            (card,),
+        ).fetchone()
+        if actual is None:
+            why = f"card #{card} does not exist"
+        elif actual["agent"] != from_agent:
+            why = f"card #{card} belongs to {actual['agent']}, not to you"
+        elif actual["status"] != "open":
+            why = (f"card #{card} is already {actual['status']} — it was "
+                   "closed before this call, and nothing was undone")
+        elif actual["source"] != source:
+            why = (f"card #{card} is source='{actual['source']}' but you "
+                   f"asked for source='{source}'. `source` filters on the "
+                   "CARD's origin, not your close's provenance — omit it "
+                   "and the default 'stop-hook' matches")
+        else:  # unreachable by construction; never a silent default
+            why = f"card #{card} did not match the {source} lookup"
+        also = (f"; your open {source} card is #{open_row['id']}" if open_row
+                else f"; you have no other open {source} card")
+        return f"REFUSED: {why}{also} — nothing was closed."
+
     @mcp.tool()
     def decision_resolve(from_agent: str, verdict: str, source: str = "stop-hook",
                          card: int = 0,
@@ -4726,6 +4761,12 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         🔴 `card` ASSERTS the target: the close proceeds only if the
         agent's open card is exactly that one, and REFUSES when the two
         disagree. A verdict STRING naming a different #id also refuses.
+
+        ⚠️ `source` FILTERS ON THE CARD'S OWN ORIGIN ('stop-hook' for
+        anything a turn harvested, 'api' for services). It is NOT the
+        provenance of your close — that is recorded automatically as
+        `[agent-recorded]` in the note, and you never pass it. Omit
+        `source` unless you are deliberately closing an 'api' card.
         """
         # WHY the refusal, kept out of the shipped description: cards named
         # in PROSE were never targets, but callers believed they were. On
@@ -4753,12 +4794,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 (from_agent, card, source),
             ).fetchone()
             if not target:
-                open_desc = (f"your open card is #{row['id']}" if row
-                             else "you have no open card")
-                return (
-                    f"REFUSED: card #{card} is not your open {source} card "
-                    f"({open_desc}) — nothing was closed."
-                )
+                return _resolve_miss(conn, from_agent, card, source, row)
             row = target
         if not row:
             return ""

@@ -643,3 +643,72 @@ async def test_card_raw_is_capped(server):
     import json as _json
     rows = _json.loads(await _call_tool(server, "decision_list", {"format": "json"}))
     assert len(rows[0]["raw"]) <= 4096
+
+
+# ---------------------------------------------------------------------------
+# The refusal must NAME ITS NARROWING (2026-09-02)
+#
+# All four of these returned the identical "you have no open card". Two lanes
+# hit that string within an hour for different reasons; one diagnosed a
+# redeploy-corrupted index off the back of it. The alarming reading and the
+# reassuring one must never be the same sentence.
+# ---------------------------------------------------------------------------
+
+
+async def test_resolve_says_ALREADY_CLOSED_not_no_open_card(server):
+    """The reassuring case. 'Already decided' and 'your card vanished' were
+    one sentence; this is the half that must stop causing investigations."""
+    await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
+    await _call_tool(
+        server, "decision_resolve", {"from_agent": "alice", "verdict": "yes"},
+    )
+    out = await _call_tool(                       # the same close, run twice
+        server, "decision_resolve",
+        {"from_agent": "alice", "verdict": "yes", "card": 1},
+    )
+    assert "REFUSED" in out
+    assert "already decided" in out
+    assert "nothing was undone" in out
+    assert "you have no open card" not in out
+
+
+async def test_resolve_names_the_SOURCE_MISMATCH_and_the_remedy(server):
+    """reliable-ai's exact call: source='agent-recorded' (the note's
+    provenance) used as if it named the card's origin."""
+    await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
+    out = await _call_tool(
+        server, "decision_resolve",
+        {"from_agent": "alice", "verdict": "yes", "card": 1,
+         "source": "agent-recorded"},
+    )
+    assert "REFUSED" in out
+    assert "source='stop-hook'" in out       # what the card actually IS
+    assert "source='agent-recorded'" in out  # what was asked for
+    assert "omit it" in out                  # the remedy, not just the fault
+    assert "nothing was closed" in out
+    # and the card is untouched
+    assert "approve the widget rebuild" in await _call_tool(
+        server, "decision_list", {})
+
+
+async def test_resolve_says_a_missing_card_DOES_NOT_EXIST(server):
+    await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
+    out = await _call_tool(
+        server, "decision_resolve",
+        {"from_agent": "alice", "verdict": "yes", "card": 4242},
+    )
+    assert "#4242 does not exist" in out
+    assert "#1" in out                       # what IS open is still named
+
+
+async def test_resolve_says_a_card_BELONGS_TO_someone_else(server):
+    await _call_tool(server, "decision_put", {"from_agent": "bob", "card": CARD_V2})
+    other = CARD_V2.replace("approve the widget rebuild", "alice's own ask")
+    await _call_tool(server, "decision_put", {"from_agent": "alice", "card": other})
+    out = await _call_tool(
+        server, "decision_resolve",
+        {"from_agent": "alice", "verdict": "yes", "card": 1},
+    )
+    assert "belongs to bob" in out
+    assert "nothing was closed" in out
+    assert "bob" in await _call_tool(server, "decision_list", {})  # untouched
