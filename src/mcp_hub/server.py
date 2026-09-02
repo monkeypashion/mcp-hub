@@ -5432,6 +5432,14 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # the residue is real and mechanical; zero at a long uptime means the
         # remainder is live sessions and the leak story is finished.
         # Counted, never inferred — the whole point.
+        #
+        # ⚠️ AND IT IS STILL A SELF-REPORTED GAUGE (vps, 2026-09-02). It has
+        # the same owner as the total it breaks down, and it trusts the same
+        # `is_terminated` accounting that `_reclaim_terminated` acts on — so
+        # if that accounting is wrong, this is CONFIDENTLY wrong in a way a
+        # bare total is not. It does not replace the independent instrument:
+        # the kernel's own socket count from procfs, which neither side of
+        # this investigation can talk into agreeing with it. Read the pair.
         try:
             held = list(instances.values())
             terminated = sum(1 for t in held if bool(getattr(t, "is_terminated", False)))
