@@ -895,19 +895,26 @@ hold_enforce_one() {
 #
 # His words: "some automatic detection that doesn't auto compact or auto
 # clear. That's not what I want." So detection NEVER acts, the lane itself
-# decides, and the exec leg is OFF behind a flag until bar 52 is built.
+# decides, and the exec leg only ever runs on an answer the lane gave.
 #
-# ctx% is NOT derived here and is not guessed: Claude Code hands each lane's
-# statusline `context_window.used_percentage`, the statusline renders it, and
-# the board already scrapes that rendered number. Detection reads what the
-# harness computed. (Per-lane WINDOW SIZE is a separate fact, needed only for
-# the --autocompact net, which is a token count.)
-COMPACT_ASK_PCT="${MCP_HUB_COMPACT_ASK_PCT:-50}"
-COMPACT_REASK_PCT="${MCP_HUB_COMPACT_REASK_PCT:-60}"
-# 🔴 BAR 52 IS NOT BUILT AND THIS STAYS 0. The exec leg types /clear or
-# /compact into a live pane, and `/clear` DESTROYS context — it must never
-# fire without the lane's own answer AFTER a flush. Flag exists so the leg
-# can be enabled in one place when 52 lands and reviewed as its own change.
+# ⭐⭐ THE INSTRUMENT IS THE TRANSCRIPT, NOT THE PANE'S PERCENT (deputy's
+# ruling on #327 ⟨18239⟩, 2026-09-02 16:45). Bars 50/51 tripped on
+# `context_window.used_percentage` as the statusline renders it, and that
+# number CANNOT carry a token cap: this very lane sat at 169,255 tokens
+# showing 16%, because Opus5 is a ~1M-token lane. A percent mark is a
+# different quantity on every model, and reading it as a token cap fails
+# SILENTLY and ONE-DIRECTIONALLY — a big-window lane never fires and reads
+# compliant. So the trip point reads absolute tokens straight out of the
+# lane's own transcript and needs NO model→window map at all.
+#
+# The percent is still carried on every row, because the console door shows
+# it and an operator reads it — but it DECIDES nothing.
+COMPACT_ASK_TOKENS="${MCP_HUB_COMPACT_ASK_TOKENS:-150000}"
+# 🔴 THE EXEC LEG IS OFF BY DEFAULT AND MUST STAY THAT WAY UNTIL ARMED
+# DELIBERATELY. It types /clear or /compact into a live pane, and `/clear`
+# DESTROYS context — "no answer = no action" is the safety property and is
+# absolute: nothing below reaches send-keys without a verdict the lane
+# itself wrote, after being told to flush.
 COMPACT_EXEC="${MCP_HUB_COMPACTION_EXEC:-0}"
 COMPACT_DOOR="${MCP_HUB_COMPACTION_DOOR:-operator-console}"
 
@@ -918,6 +925,118 @@ compaction_ctx() {
   tm capture-pane -p -t "$1" 2>/dev/null \
     | grep -oE '[c]tx \[[^]]*\][[:space:]]*[0-9]+%' | tail -1 \
     | grep -oE '[0-9]+' | tail -1
+}
+
+# The lane's Claude Code transcript directory: the worktree path with `/`
+# turned into `-`, which is how the client encodes it. Field 2 of the roster
+# IS that path, so no lane has to be asked and none can disagree.
+compaction_dir() {
+  local wt; wt="$(untilde "$(field "$1" 2)")"
+  [ -n "$wt" ] || return 1
+  printf '%s/.claude/projects/%s' "$HOME" "$(printf '%s' "$wt" | tr '/' '-')"
+}
+
+# ABSOLUTE context, in tokens, off the lane's own transcript — the bar's
+# instrument. The newest-mtime *.jsonl in the encoded dir IS the live
+# session (the session id is the filename), and the LAST assistant record
+# carrying usage holds the reading:
+#     input_tokens + cache_read_input_tokens + cache_creation_input_tokens
+# the same three fields the board's meter sums.
+#
+# 🔴 Prints NOTHING when there is no readable transcript: UNMEASURED, never
+# 0. A blind instrument reading as an empty context is the failure that
+# would make this leg type into a lane it has never measured.
+compaction_tokens() {
+  local d; d="$(compaction_dir "$1")" || return 0
+  [ -d "$d" ] || return 0
+  COMPACT_DIR="$d" python3 -c '
+import os, sys, json, glob
+d = os.environ["COMPACT_DIR"]
+fs = glob.glob(os.path.join(d, "*.jsonl"))
+if not fs: sys.exit(0)
+f = max(fs, key=os.path.getmtime)
+# Tail only. These files reach tens of MB and the reading is at the end;
+# a partial first line simply fails to parse and is skipped.
+try:
+    sz = os.path.getsize(f)
+    fh = open(f, "rb")
+except OSError: sys.exit(0)
+with fh:
+    fh.seek(max(0, sz - 4000000))
+    lines = fh.read().decode("utf-8", "ignore").splitlines()
+for line in reversed(lines):
+    if "\"usage\"" not in line: continue
+    try: rec = json.loads(line)
+    except Exception: continue
+    if rec.get("type") != "assistant": continue
+    u = (rec.get("message") or {}).get("usage") or {}
+    n = 0
+    for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
+        v = u.get(k)
+        if isinstance(v, int): n += v
+    if n > 0:
+        print(n)
+        break
+' 2>/dev/null
+}
+
+# The lane ANSWERS IN ITS OWN TRANSCRIPT, and that is where the answer is
+# read from — not by scraping the pane. The pane soft-wraps, scrolls and
+# re-renders; the transcript is timestamped, so "did they answer THIS ask"
+# is a comparison rather than a guess.
+#
+# Only ASSISTANT records after the ask are considered, which is what keeps
+# the leg from reading its own ask back: the ask arrives as a USER turn and
+# names both words.
+#
+# Prints CLEAR, COMPACT, AMBIGUOUS, or nothing. The first reply that names
+# either word IS the answer — later turns are the lane's ordinary work, and
+# scanning them all would eventually find both words and jam at AMBIGUOUS
+# forever. Naming both in the one reply is UNRESOLVED, and fails closed.
+compaction_answer() {
+  local d; d="$(compaction_dir "$1")" || return 0
+  [ -d "$d" ] || return 0
+  COMPACT_DIR="$d" COMPACT_SINCE="$2" python3 -c '
+import os, sys, json, glob, re, datetime
+d = os.environ["COMPACT_DIR"]
+try: since = float(os.environ["COMPACT_SINCE"])
+except ValueError: sys.exit(0)
+fs = glob.glob(os.path.join(d, "*.jsonl"))
+if not fs: sys.exit(0)
+f = max(fs, key=os.path.getmtime)
+try:
+    sz = os.path.getsize(f)
+    fh = open(f, "rb")
+except OSError: sys.exit(0)
+with fh:
+    fh.seek(max(0, sz - 4000000))
+    lines = fh.read().decode("utf-8", "ignore").splitlines()
+seen = []
+for line in lines:
+    if "\"assistant\"" not in line: continue
+    try: rec = json.loads(line)
+    except Exception: continue
+    if rec.get("type") != "assistant": continue
+    try:
+        ep = datetime.datetime.fromisoformat(
+            (rec.get("timestamp") or "").replace("Z", "+00:00")).timestamp()
+    except Exception: continue
+    if ep <= since: continue
+    content = (rec.get("message") or {}).get("content") or []
+    if isinstance(content, str): txt = content
+    else: txt = "\n".join(b.get("text", "") for b in content
+                          if isinstance(b, dict) and b.get("type") == "text")
+    if txt.strip(): seen.append((ep, txt))
+seen.sort()
+for _, txt in seen:
+    # Uppercase, word-bounded: the ask names these two tokens exactly, so
+    # prose ("unclear", "compaction") must not be read as a verdict.
+    c = re.search(r"\bCLEAR\b", txt) is not None
+    k = re.search(r"\bCOMPACT\b", txt) is not None
+    if c and k: print("AMBIGUOUS"); break
+    if c: print("CLEAR"); break
+    if k: print("COMPACT"); break
+' 2>/dev/null
 }
 
 # ONCE PER LANE SESSION. Keyed by the session's start time, so a relaunch
@@ -932,11 +1051,17 @@ compaction_flag() {
 # One row through bar 53's door. First line is the CONTRACT and is exact;
 # anything after it is row body. Failure to write a row must never stop the
 # sweep — but it is reported, because a silent door is one nobody can audit.
+#
+# `tok=` and `thr=` carry the quantity that actually DECIDED, now that the
+# instrument is tokens; `ctx=` keeps its position and meaning so the door's
+# existing parse is unaffected. An unreadable pane renders `ctx=?%`, never
+# `ctx=0%` — the same "absence is not zero" rule the reading itself follows.
 compaction_row() {
-  local seat="$1" step="$2" pct="$3" detail="${4:-}" hb
+  local seat="$1" step="$2" pct="$3" tok="$4" detail="${5:-}" hb
   hb="$(hub_bin)" || return 1
   [ -n "$hb" ] || return 1
-  { printf 'COMPACTION %s %s ctx=%s%%\n' "$seat" "$step" "$pct"
+  { printf 'COMPACTION %s %s ctx=%s%% tok=%s thr=%s\n' \
+      "$seat" "$step" "${pct:-?}" "$tok" "$COMPACT_ASK_TOKENS"
     [ -n "$detail" ] && printf '%s\n' "$detail"
   } | "$hb" send --to "$COMPACT_DOOR" --message - --priority low \
         --cwd "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)" \
@@ -946,51 +1071,157 @@ compaction_row() {
 
 # The ask itself. Typed into the lane's own session, because the lane is the
 # only thing that knows what is worth keeping.
-COMPACT_ASK_TEXT="You are at %s%% of your context window. Flush anything worth keeping to memory NOW, then reply with one line: CLEAR (start fresh) or COMPACT (summarise and continue), and why. Nothing will be done to this session until you answer."
+COMPACT_ASK_TEXT="Your context is at %s tokens, over the %s-token cap. Flush anything worth keeping to memory NOW, then reply with one line: CLEAR (start fresh) or COMPACT (summarise and continue), and why. Nothing will be done to this session until you answer."
+
+# Type a literal then Enter, as two sends. `send-keys "<text>" Enter` in one
+# call makes tmux read the literal as a KEY NAME wherever it matches one —
+# the bug that typed `-tmcp-hub-dev-vm-1` into two lanes on 2026-08-28.
+compaction_type() {
+  tm send-keys -l -t "$1" "$2" 2>/dev/null || return 1
+  sleep 1
+  tm send-keys -t "$1" Enter 2>/dev/null || return 1
+}
 
 compaction_one() {
-  local a="$1" pct flag threshold
-  pct="$(compaction_ctx "$a")"
-  [ -n "$pct" ] || return 0                 # unreadable = unmeasured, not 0
+  local a="$1" tok pct flag st text
+  # ⚠️ EVERY READ BELOW IS `|| true`-GUARDED, and that is load-bearing: this
+  # file runs under `set -euo pipefail`, and `compaction_ctx` exits 1 whenever
+  # the pane carries no ctx number (grep found nothing). Unguarded, one
+  # unreadable statusline does not skip that lane — it kills the whole heal
+  # pass, silently, from inside a loop. Absence must cost a `continue`.
+  tok="$(compaction_tokens "$a" || true)"
+  [ -n "$tok" ] || return 0             # no readable transcript = UNMEASURED
   flag="$(compaction_flag "$a")" || return 0
-
-  # Re-ask threshold once the first ask has been made and gone unanswered.
-  threshold="$COMPACT_ASK_PCT"
-  [ -f "$flag" ] && threshold="$COMPACT_REASK_PCT"
-  [ "$pct" -ge "$threshold" ] 2>/dev/null || return 0
-  # Already re-asked at the higher mark? Then we are done for this session.
-  # Asked at both marks already — this session is done, answered or not.
-  # Nagging a third time is the "auto" behaviour he ruled out, one step
-  # removed.
-  [ -f "$flag.reask" ] && return 0
+  pct="$(compaction_ctx "$a" || true)"
 
   mkdir -p "$HOME/.mcp-hub" 2>/dev/null
-  compaction_row "$a" fire "$pct" "detected at ${pct}% (threshold ${threshold}%)"
 
-  # 🔴 IDLE ONLY, FAILING CLOSED. send-keys into a working lane appends to
-  # whatever is in its input box; into a 🔴 dialog it answers a question that
-  # is the operator's. A lane that is busy simply misses this pass and is
-  # caught at the re-ask.
-  local st; st="$(classify_agent "$a")"
-  if [ "$st" != "idle" ]; then
-    echo "$a at ${pct}% but $st — not asking this pass (idle only)"
+  # Asked already? Everything after the ask is the answer leg's business.
+  if [ -f "$flag" ]; then
+    compaction_answer_leg "$a" "$flag" "$tok" "$pct"
     return 0
   fi
 
-  local text; text="$(printf "$COMPACT_ASK_TEXT" "$pct")"
-  # Two sends, as everywhere else in this file: `send-keys "<text>" Enter` in
-  # one call makes tmux read the literal as a KEY NAME wherever it matches.
-  tm send-keys -l -t "$a" "$text" 2>/dev/null || return 0
-  sleep 1
-  tm send-keys -t "$a" Enter 2>/dev/null || return 0
+  [ "$tok" -ge "$COMPACT_ASK_TOKENS" ] 2>/dev/null || return 0
 
-  if [ "$threshold" = "$COMPACT_REASK_PCT" ]; then : > "$flag.reask"; else : > "$flag"; fi
-  compaction_row "$a" ask "$pct" "asked in-session at ${pct}%; awaiting CLEAR or COMPACT"
-  echo "$a: compaction ask sent at ${pct}%"
+  # FIRE is a CROSSING, once per lane session — not a per-scan level log.
+  # Without this flag a lane that is merely busy re-fires every sweep, which
+  # is what the door counts as REPEAT.
+  if [ ! -f "$flag.fire" ]; then
+    compaction_row "$a" fire "$pct" "$tok" \
+      "detected at ${tok} tokens (cap ${COMPACT_ASK_TOKENS})"
+    : > "$flag.fire"
+  fi
+
+  # 🔴 IDLE ONLY, FAILING CLOSED. send-keys into a working lane appends to
+  # whatever is in its input box; into a 🔴 dialog it answers a question that
+  # is the operator's. A busy lane simply misses this pass and is asked at
+  # the next one — the crossing does not expire.
+  st="$(classify_agent "$a" || true)"
+  if [ "$st" != "idle" ]; then
+    echo "$a at ${tok} tokens but $st — not asking this pass (idle only)"
+    return 0
+  fi
+
+  text="$(printf "$COMPACT_ASK_TEXT" "$tok" "$COMPACT_ASK_TOKENS")"
+  compaction_type "$a" "$text" || return 0
+
+  # The flag CARRIES THE ASK TIME, because that is what makes an answer
+  # attributable: only assistant turns after this instant can be a reply to
+  # it. An empty marker would let anything the lane ever said count.
+  date +%s > "$flag"
+  compaction_row "$a" ask "$pct" "$tok" \
+    "asked in-session at ${tok} tokens; awaiting CLEAR or COMPACT"
+  echo "$a: compaction ask sent at ${tok} tokens"
+}
+
+# BAR 52 — the exec leg. Runs only for a lane that has already been asked,
+# and only ever on the verdict that lane wrote itself.
+compaction_answer_leg() {
+  local a="$1" flag="$2" tok="$3" pct="$4" since ans st before
+
+  # This session is finished with — answered and acted on, or answered and
+  # deliberately not acted on. Either way, nothing further is owed.
+  [ -f "$flag.closed" ] && return 0
+
+  # An exec already happened: all that is left is the NET row, once the
+  # transcript has actually moved. Reported when measured, never predicted —
+  # /compact's saving is not knowable before the next turn lands.
+  if [ -f "$flag.exec" ]; then
+    before="$(cat "$flag.exec" 2>/dev/null || true)"
+    if [ -z "$before" ]; then : > "$flag.closed"; return 0; fi
+    if [ "$tok" -lt "$before" ] 2>/dev/null; then
+      compaction_row "$a" net "$pct" "$tok" \
+        "recovered $(( before - tok )) tokens: ${before} -> ${tok}"
+      : > "$flag.closed"
+    fi
+    return 0
+  fi
+
+  # Read the verdict once, then remember it: re-scraping every pass would
+  # let a later turn of ordinary work change an answer already recorded.
+  if [ ! -f "$flag.answer" ]; then
+    since="$(cat "$flag" 2>/dev/null || true)"
+    [ -n "$since" ] || return 0
+    ans="$(compaction_answer "$a" "$since" || true)"
+    [ -n "$ans" ] || return 0           # not answered yet — that is not a no
+    printf '%s\n' "$ans" > "$flag.answer"
+    compaction_row "$a" answer "$pct" "$tok" "lane answered ${ans}"
+  fi
+  ans="$(cat "$flag.answer" 2>/dev/null || true)"
+
+  # BOTH words in one reply is UNRESOLVED, and unresolved fails closed. The
+  # lane is told, on the row, rather than being silently left alone.
+  if [ "$ans" = "AMBIGUOUS" ]; then
+    compaction_row "$a" exec "$pct" "$tok" \
+      "NOT EXECUTED: the reply named both CLEAR and COMPACT — unresolved, so nothing was typed"
+    echo "$a: answer named both CLEAR and COMPACT — no action (fail closed)"
+    : > "$flag.closed"
+    return 0
+  fi
+
+  # The leg is built and disarmed. The ANSWER is still recorded, which is
+  # the point: the Ledger can see what every lane chose long before anyone
+  # decides to let the keystroke through.
+  if [ "$COMPACT_EXEC" != "1" ]; then
+    compaction_row "$a" exec "$pct" "$tok" \
+      "NOT EXECUTED: answered ${ans}, exec leg disarmed (MCP_HUB_COMPACTION_EXEC=0)"
+    echo "$a: answered ${ans} — exec leg OFF (set MCP_HUB_COMPACTION_EXEC=1 to arm)"
+    : > "$flag.closed"
+    return 0
+  fi
+
+  # 🔴 THE SAME IDLE GUARD AS THE ASK, and for a stronger reason: this
+  # keystroke is `/clear`. A lane mid-turn is left alone and retried — the
+  # verdict is already banked, so waiting costs nothing.
+  st="$(classify_agent "$a" || true)"
+  if [ "$st" != "idle" ]; then
+    echo "$a: answered ${ans} but $st — not typing this pass (idle only)"
+    return 0
+  fi
+
+  local cmd
+  case "$ans" in
+    CLEAR)   cmd="/clear" ;;
+    COMPACT) cmd="/compact" ;;
+    # Anything else was never a verdict. Unreachable by construction, and
+    # still refused here rather than defaulted: a default in this position
+    # is a slash command chosen by the code instead of the lane.
+    *) compaction_row "$a" exec "$pct" "$tok" \
+         "NOT EXECUTED: unrecognised verdict '${ans}'"
+       : > "$flag.closed"; return 0 ;;
+  esac
+
+  # Row BEFORE the keystroke: if the send goes wrong, the record still says
+  # what was about to happen and at what reading.
+  compaction_row "$a" exec "$pct" "$tok" \
+    "typing ${cmd} at ${tok} tokens on the lane's own ${ans}"
+  compaction_type "$a" "$cmd" || { echo "!! $a: ${cmd} send-keys failed" >&2; return 0; }
+  printf '%s\n' "$tok" > "$flag.exec"
+  echo "$a: typed ${cmd} at ${tok} tokens (lane answered ${ans})"
 }
 
 compaction_pass() {
-  # Bar 52's exec leg is not built; this pass detects and asks only.
   local a
   for a in $(squad_agents); do
     tm has-session -t "=$a" 2>/dev/null || continue
@@ -2839,7 +3070,8 @@ case "${1:-help}" in
             # The keep-alive daemons are detached (they outlive tmux), so kill
             # them explicitly via their pidfiles and clear the stale claim.
             for a in $(agents); do kill_daemon "$a"; done ;;
-  compaction) # goal 81 bars 50-52: detect at 50%, ASK the lane, never act.
+  compaction) # goal 81 bars 50-52: detect at the token cap, ASK the lane,
+            # and act ONLY on the lane's own answer.
             # `--dry-run` reports what it would do and writes no rows and no
             # keystrokes — the only safe way to inspect a leg that types into
             # live panes.
@@ -2847,17 +3079,21 @@ case "${1:-help}" in
               for a in $(squad_agents); do
                 tm has-session -t "=$a" 2>/dev/null || continue
                 pane_alive "$a" || continue
-                pct="$(compaction_ctx "$a")"
-                if [ -z "$pct" ]; then
-                  echo "$a: ctx UNMEASURED (no statusline number on the pane)"
+                tok="$(compaction_tokens "$a" || true)"
+                if [ -z "$tok" ]; then
+                  echo "$a: tokens UNMEASURED (no readable transcript) — nothing would be done"
                   continue
                 fi
-                st="$(classify_agent "$a")"
+                pct="$(compaction_ctx "$a" || true)"
+                st="$(classify_agent "$a" || true)"
                 f="$(compaction_flag "$a" 2>/dev/null || true)"
                 mark="asked=no"
-                [ -n "$f" ] && [ -f "$f" ] && mark="asked=yes"
-                [ -n "$f" ] && [ -f "$f.reask" ] && mark="asked=yes,reasked=yes"
-                echo "$a: ctx=${pct}% state=$st $mark (ask at ${COMPACT_ASK_PCT}%, re-ask at ${COMPACT_REASK_PCT}%)"
+                if [ -n "$f" ] && [ -f "$f" ]; then
+                  mark="asked=yes,answer=$(cat "$f.answer" 2>/dev/null || echo pending)"
+                  [ -f "$f.exec" ] && mark="$mark,exec=done"
+                  [ -f "$f.closed" ] && mark="$mark,closed"
+                fi
+                echo "$a: tok=${tok} ctx=${pct:-?}% state=$st $mark (cap ${COMPACT_ASK_TOKENS}, exec=${COMPACT_EXEC})"
               done
               exit 0
             fi
@@ -2904,9 +3140,9 @@ case "${1:-help}" in
             # it naturally: it no longer has a session.
             hold_enforce_pass
             hold_release_pass
-            # Detect-and-ask only; the exec leg is behind COMPACT_EXEC and is
-            # not built. Runs after the hold legs so a lane being stopped is
-            # not asked to compact on its way down.
+            # Detect, ask, and — only on the lane's own answer, and only when
+            # COMPACT_EXEC is armed — execute. Runs after the hold legs so a
+            # lane being stopped is not asked to compact on its way down.
             compaction_pass
             healed=0
             relaunched=0

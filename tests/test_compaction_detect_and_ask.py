@@ -1,21 +1,27 @@
-"""Goal 81, bars 50/51: detect at 50%, ASK the lane, never act alone.
+"""Goal 81, bars 50/51/52: detect on TOKENS, ASK the lane, act only on its answer.
 
 His words: "some automatic detection that doesn't auto compact or auto clear.
 That's not what I want." So the properties under test are mostly NEGATIVE —
 what this must refuse to do:
 
   · never types into a lane that is not idle (working, waiting, unknown);
-  · never fires on a lane whose ctx cannot be read (unmeasured != 0%);
-  · never asks a third time;
-  · the exec leg (bar 52) is OFF and stays off until it is built.
+  · never fires on a lane whose transcript cannot be read (unmeasured != 0);
+  · never asks twice in one session;
+  · never types a slash command without a verdict the LANE wrote;
+  · never types one when the exec leg is disarmed;
+  · never resolves a reply that names both words.
 
-ctx% is not derived here: Claude Code hands the statusline
-`context_window.used_percentage` and the pane renders it. These stub the pane
-and assert on the KEYSTROKES, because the failure that matters is a keystroke
-that should not have been sent.
+The trip point is ABSOLUTE TOKENS off the lane's own transcript, not the
+statusline percent — a ~1M-window lane sat at 169,255 tokens showing 16%, so
+every percent mark this fleet had would have let it sail past a token cap
+unasked. These tests therefore write a real transcript fixture and assert on
+the KEYSTROKES, because the failure that matters is a keystroke that should
+not have been sent.
 """
 from __future__ import annotations
 
+import datetime
+import json
 import subprocess
 from pathlib import Path
 
@@ -23,18 +29,52 @@ import pytest
 
 SQUAD = Path(__file__).resolve().parents[1] / "squad" / "squad"
 
+# well under / well over the 150k cap
+UNDER, OVER = 40_000, 169_255
 
-def run(tmp_path, snippet, *, ctx="55", state_lines=None, agent="lane-a"):
+
+def assistant(ts, text, tokens):
+    """One assistant record. Usage is SPLIT across the three fields the
+    reading sums, so a version that counted only input_tokens would read a
+    169k lane as 2."""
+    msg = {"content": [{"type": "text", "text": text}]}
+    if tokens is not None:
+        msg["usage"] = {"input_tokens": 2,
+                        "cache_read_input_tokens": tokens - 2_043,
+                        "cache_creation_input_tokens": 2_041}
+    return {"type": "assistant", "timestamp": ts, "message": msg}
+
+
+def transcript(home: Path, worktree: Path, *, tokens=None, replies=()):
+    """Write the lane's Claude Code transcript the way the client encodes it:
+    ~/.claude/projects/<worktree with / -> ->/<session>.jsonl.
+
+    Every assistant turn carries the same reading, because a lane that
+    answers the ask has not thereby shrunk — the reading only moves once
+    something is actually executed."""
+    d = home / ".claude" / "projects" / str(worktree).replace("/", "-")
+    d.mkdir(parents=True, exist_ok=True)
+    rows = [assistant("2026-09-02T18:00:00.000Z", "working", tokens)]
+    rows += [assistant(ts, text, tokens) for ts, text in replies]
+    f = d / "05a50d0c-1111-2222-3333-444455556666.jsonl"
+    f.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    return f
+
+
+def run(tmp_path, snippet, *, tokens=OVER, state_lines=None, agent="lane-a",
+        replies=(), env=None, ctx="16"):
     home = tmp_path
     (home / ".mcp-hub").mkdir(parents=True, exist_ok=True)
     conf = home / "squad.conf"
     conf.write_text(f"{agent}|{home}||--continue|squad\n", encoding="utf-8")
 
+    transcript(home, home, tokens=tokens, replies=replies)
+
     bin_ = home / "bin"
     bin_.mkdir(exist_ok=True)
 
-    # The pane: a statusline carrying ctx, plus whatever state chrome the
-    # test wants classify_text to read.
+    # The pane: a statusline carrying ctx (decoration now, not the trigger),
+    # plus whatever state chrome the test wants classify_text to read.
     pane = f"⚡ 8/11 · Opus high · ctx [||||] {ctx}%\n" if ctx else "no statusline\n"
     pane += (state_lines or "")
     (bin_ / "tmux").write_text(
@@ -71,11 +111,11 @@ def run(tmp_path, snippet, *, ctx="55", state_lines=None, agent="lane-a"):
     assert "compaction_one()" in head, "extraction boundary moved"
     script = home / "_head.sh"
     script.write_text(head + "\n" + snippet, encoding="utf-8")
-    return subprocess.run(
-        ["bash", str(script)], capture_output=True, text=True,
-        env={"PATH": f"{bin_}:/usr/bin:/bin", "HOME": str(home),
-             "SQUAD_CONF": str(conf)},
-    )
+    e = {"PATH": f"{bin_}:/usr/bin:/bin", "HOME": str(home),
+         "SQUAD_CONF": str(conf)}
+    e.update(env or {})
+    return subprocess.run(["bash", str(script)], capture_output=True,
+                          text=True, env=e)
 
 
 def keys(tmp_path):
@@ -88,31 +128,95 @@ def rows(tmp_path):
     return f.read_text() if f.exists() else ""
 
 
-# --- the ask, when it is allowed --------------------------------------------
+def stamp(offset):
+    """An ISO timestamp `offset` seconds from now. The ask records the REAL
+    clock, so a fixture pinned to a literal date is in the past by the time
+    the suite runs and no reply is ever attributable to it."""
+    return (datetime.datetime.now(datetime.timezone.utc)
+            + datetime.timedelta(seconds=offset)).isoformat().replace(
+                "+00:00", "Z")
 
-def test_an_idle_lane_over_the_threshold_is_asked(tmp_path):
-    p = run(tmp_path, "compaction_one lane-a", ctx="55")
-    assert "compaction ask sent at 55%" in p.stdout
+
+def answered(text, *, offset=60):
+    """A reply the lane writes into its own transcript AFTER the ask."""
+    return ((stamp(offset), text),)
+
+
+ARMED = {"MCP_HUB_COMPACTION_EXEC": "1"}
+
+
+# --- the instrument ---------------------------------------------------------
+
+def test_the_reading_sums_all_three_usage_fields(tmp_path):
+    """input + cache_read + cache_creation — the same three the board sums.
+    Counting only input_tokens reads a 169k lane as 2."""
+    p = run(tmp_path, "compaction_tokens lane-a", tokens=OVER)
+    assert p.stdout.strip() == str(OVER)
+
+
+def test_a_lane_under_the_cap_is_left_alone(tmp_path):
+    p = run(tmp_path, "compaction_one lane-a", tokens=UNDER)
+    assert p.stdout.strip() == ""
+    assert "send-keys" not in keys(tmp_path)
+    assert rows(tmp_path) == ""
+
+
+def test_the_percent_does_not_decide(tmp_path):
+    """169,255 tokens on a ~1M lane renders 16%. Bars 50/51 tripped on the
+    percent and would never have fired here — that lane was this one."""
+    p = run(tmp_path, "compaction_one lane-a", tokens=OVER, ctx="16")
+    assert "compaction ask sent at 169255 tokens" in p.stdout
+
+
+def test_an_unreadable_transcript_is_UNMEASURED_not_zero(tmp_path):
+    """A lane we cannot measure must never present as an empty context —
+    that would make a blind instrument look like a healthy one."""
+    p = run(tmp_path, "compaction_one lane-a", tokens=None)
+    assert p.stdout.strip() == ""
+    assert rows(tmp_path) == ""
+    assert "send-keys" not in keys(tmp_path)
+
+
+# --- the ask ----------------------------------------------------------------
+
+def test_an_idle_lane_over_the_cap_is_asked(tmp_path):
+    p = run(tmp_path, "compaction_one lane-a")
+    assert "compaction ask sent at" in p.stdout
     assert "send-keys -l" in keys(tmp_path), "the ask text was never typed"
-    assert "COMPACTION lane-a ask ctx=55%" in rows(tmp_path)
+    assert "COMPACTION lane-a ask " in rows(tmp_path)
+
+
+def test_every_row_carries_the_tokens_and_the_cap(tmp_path):
+    """`ctx=` keeps its position for the door's existing parse; `tok=`/`thr=`
+    carry the quantity that actually decided."""
+    run(tmp_path, "compaction_one lane-a")
+    assert f"ctx=16% tok={OVER} thr=150000" in rows(tmp_path)
+
+
+def test_an_unreadable_pane_renders_ctx_as_a_question_mark(tmp_path):
+    """Absence is not zero here either — ctx=0% would read as an empty lane."""
+    run(tmp_path, "compaction_one lane-a", ctx="")
+    assert "ctx=?%" in rows(tmp_path)
 
 
 def test_the_fire_row_precedes_the_ask_row(tmp_path):
     """`fire` is detection; `ask` is delivery. An ask with no fire would hide
     the detections that never reached a lane."""
-    run(tmp_path, "compaction_one lane-a", ctx="55")
+    run(tmp_path, "compaction_one lane-a")
     body = rows(tmp_path)
-    assert body.index("fire ctx=55%") < body.index("ask ctx=55%")
+    assert body.index(" fire ") < body.index(" ask ")
 
 
-def test_the_ask_names_the_real_percentage(tmp_path):
-    run(tmp_path, "compaction_one lane-a", ctx="57")
-    assert "57% of your context window" in keys(tmp_path)
+def test_the_ask_names_the_real_reading_and_the_cap(tmp_path):
+    run(tmp_path, "compaction_one lane-a")
+    typed = keys(tmp_path)
+    assert f"at {OVER} tokens" in typed
+    assert "150000-token cap" in typed
 
 
 def test_the_ask_demands_a_flush_before_the_answer(tmp_path):
     """`/clear` destroys context; the flush is what makes it survivable."""
-    run(tmp_path, "compaction_one lane-a", ctx="55")
+    run(tmp_path, "compaction_one lane-a")
     typed = keys(tmp_path)
     assert "Flush anything worth keeping to memory" in typed
     assert "CLEAR" in typed and "COMPACT" in typed
@@ -122,14 +226,12 @@ def test_the_text_and_the_Enter_are_separate_sends(tmp_path):
     """`send-keys "<text>" Enter` makes tmux read the literal as a KEY NAME
     wherever it matches one — the bug that typed `-tmcp-hub-dev-vm-1` into two
     lanes on 2026-08-28."""
-    run(tmp_path, "compaction_one lane-a", ctx="55")
+    run(tmp_path, "compaction_one lane-a")
     lines = [ln for ln in keys(tmp_path).splitlines() if "send-keys" in ln]
     assert any("send-keys -l" in ln for ln in lines), lines
     assert any(ln.strip().endswith("Enter") and "send-keys -l" not in ln
                for ln in lines), lines
 
-
-# --- the ask, when it must NOT happen ---------------------------------------
 
 @pytest.mark.parametrize("chrome,why", [
     ("Nucleating… (1m 55s · ↓ 6.4k tokens)\n", "working"),
@@ -139,7 +241,7 @@ def test_a_lane_that_is_not_idle_is_never_typed_into(tmp_path, chrome, why):
     """The whole safety property. A send-keys into a working lane appends to
     its input box; into a dialog it answers a question that is the
     operator's."""
-    p = run(tmp_path, "compaction_one lane-a", ctx="55", state_lines=chrome)
+    p = run(tmp_path, "compaction_one lane-a", state_lines=chrome)
     assert "not asking this pass (idle only)" in p.stdout, why
     assert "send-keys" not in keys(tmp_path)
 
@@ -147,55 +249,164 @@ def test_a_lane_that_is_not_idle_is_never_typed_into(tmp_path, chrome, why):
 def test_a_busy_lane_STILL_records_the_detection(tmp_path):
     """Detection and delivery are separate facts — a fire with no ask is
     exactly the row that shows the ask never landed."""
-    run(tmp_path, "compaction_one lane-a", ctx="55",
+    run(tmp_path, "compaction_one lane-a",
         state_lines="Nucleating… (1m 55s · ↓ 6.4k tokens)\n")
-    assert "fire ctx=55%" in rows(tmp_path)
-    assert "ask ctx=" not in rows(tmp_path)
+    assert " fire " in rows(tmp_path)
+    assert " ask " not in rows(tmp_path)
 
 
-def test_a_lane_below_the_threshold_is_left_alone(tmp_path):
-    p = run(tmp_path, "compaction_one lane-a", ctx="34")
-    assert p.stdout.strip() == ""
-    assert "send-keys" not in keys(tmp_path)
-    assert rows(tmp_path) == ""
+def test_a_busy_lane_fires_ONCE_not_every_sweep(tmp_path):
+    """FIRE is a CROSSING, not a per-scan level log; the door counts a repeat
+    at the same threshold as REPEAT."""
+    run(tmp_path, "compaction_one lane-a\n" * 4,
+        state_lines="Nucleating… (1m 55s · ↓ 6.4k tokens)\n")
+    assert rows(tmp_path).count(" fire ") == 1
 
 
-def test_an_unreadable_ctx_is_UNMEASURED_not_zero(tmp_path):
-    """A pane we cannot read must never present as an empty context — that
-    would make a blind instrument look like a healthy one."""
-    p = run(tmp_path, "compaction_one lane-a", ctx="")
-    assert p.stdout.strip() == ""
-    assert rows(tmp_path) == ""
-
-
-# --- once per session, then the re-ask, then silence ------------------------
-
-def test_the_same_session_is_not_asked_twice_at_the_same_mark(tmp_path):
-    run(tmp_path, "compaction_one lane-a\ncompaction_one lane-a", ctx="55")
+def test_the_same_session_is_not_asked_twice(tmp_path):
+    run(tmp_path, "compaction_one lane-a\n" * 4)
     assert keys(tmp_path).count("send-keys -l") == 1
 
 
-def test_it_re_asks_once_at_sixty(tmp_path):
-    p = run(tmp_path, "compaction_one lane-a\ncompaction_one lane-a", ctx="62")
-    assert keys(tmp_path).count("send-keys -l") == 2, p.stdout
+# --- bar 52: no answer = no action, absolutely -------------------------------
+
+def test_an_unanswered_ask_never_reaches_send_keys(tmp_path):
+    """THE safety property, with the leg ARMED. The lane was asked and said
+    nothing; nothing may be typed, forever."""
+    p = run(tmp_path, "compaction_one lane-a\n" * 5, env=ARMED, replies=())
+    typed = keys(tmp_path)
+    assert "/clear" not in typed and "/compact" not in typed
+    assert " answer " not in rows(tmp_path)
+    assert " exec " not in rows(tmp_path)
+    assert p.returncode == 0
 
 
-def test_there_is_never_a_third_ask(tmp_path):
-    """Nagging past the re-ask is the 'auto' behaviour he ruled out, one step
-    removed."""
-    run(tmp_path, "compaction_one lane-a\n" * 4, ctx="70")
-    assert keys(tmp_path).count("send-keys -l") == 2
+def test_a_reply_that_names_neither_word_is_not_an_answer(tmp_path):
+    run(tmp_path, "compaction_one lane-a\n" * 3, env=ARMED,
+        replies=answered("Acknowledged, I will look at this shortly."))
+    typed = keys(tmp_path)
+    assert "/clear" not in typed and "/compact" not in typed
+    assert " answer " not in rows(tmp_path)
 
 
-# --- bar 52 is not built ----------------------------------------------------
+def test_prose_is_not_a_verdict(tmp_path):
+    """Word-bounded and uppercase: `unclear` and `compaction` are ordinary
+    words a lane writes constantly."""
+    run(tmp_path, "compaction_one lane-a\n" * 3, env=ARMED,
+        replies=answered("The compaction story is still unclear to me."))
+    assert " answer " not in rows(tmp_path)
+    assert "/clear" not in keys(tmp_path)
+
+
+def test_the_ask_itself_is_never_read_back_as_the_answer(tmp_path):
+    """The ask names both words and is typed into the lane. It arrives as a
+    USER turn, so only assistant turns are scanned — otherwise every ask
+    would answer itself AMBIGUOUS on the next pass."""
+    run(tmp_path, "compaction_one lane-a\n" * 3, env=ARMED)
+    assert "AMBIGUOUS" not in rows(tmp_path)
+    assert " answer " not in rows(tmp_path)
+
+
+def test_a_reply_from_BEFORE_the_ask_is_not_an_answer(tmp_path):
+    """Attribution is what the ask timestamp buys: a lane that happened to
+    write CLEAR an hour earlier has not answered this ask."""
+    run(tmp_path, "compaction_one lane-a\n" * 3, env=ARMED,
+        replies=answered("CLEAR", offset=-3600))
+    assert "/clear" not in keys(tmp_path)
+    assert " answer " not in rows(tmp_path)
+
+
+def test_both_words_in_one_reply_is_UNRESOLVED_and_fails_closed(tmp_path):
+    p = run(tmp_path, "compaction_one lane-a\n" * 3, env=ARMED,
+            replies=answered("CLEAR or COMPACT, whichever you prefer."))
+    assert "no action (fail closed)" in p.stdout
+    assert "AMBIGUOUS" in rows(tmp_path)
+    assert "NOT EXECUTED" in rows(tmp_path)
+    assert "/clear" not in keys(tmp_path) and "/compact" not in keys(tmp_path)
+
+
+# --- bar 52: the exec leg, disarmed and armed --------------------------------
 
 def test_the_exec_leg_is_off_by_default(tmp_path):
-    p = run(tmp_path, 'echo "exec=$COMPACT_EXEC"', ctx="55")
+    p = run(tmp_path, 'echo "exec=$COMPACT_EXEC"')
     assert "exec=0" in p.stdout
 
 
-def test_nothing_types_a_slash_command(tmp_path):
-    """bar 52 is unbuilt: no /clear or /compact may reach a pane."""
-    run(tmp_path, "compaction_one lane-a", ctx="55")
+def test_a_verdict_types_nothing_while_the_leg_is_disarmed(tmp_path):
+    """Disarmed still RECORDS the answer — the Ledger can see what lanes
+    chose long before anyone lets the keystroke through."""
+    p = run(tmp_path, "compaction_one lane-a\n" * 3,
+            replies=answered("COMPACT — the thread is still live."))
+    assert "exec leg OFF" in p.stdout
+    assert "lane answered COMPACT" in rows(tmp_path)
+    assert "MCP_HUB_COMPACTION_EXEC=0" in rows(tmp_path)
+    assert "/compact" not in keys(tmp_path)
+
+
+@pytest.mark.parametrize("verdict,cmd,other", [
+    ("COMPACT", "/compact", "/clear"),
+    ("CLEAR", "/clear", "/compact"),
+])
+def test_an_armed_leg_types_the_command_the_lane_chose(tmp_path, verdict, cmd, other):
+    p = run(tmp_path, "compaction_one lane-a\n" * 2, env=ARMED,
+            replies=answered(f"{verdict} — flushed to memory first."))
+    assert f"typed {cmd}" in p.stdout, p.stdout + p.stderr
     typed = keys(tmp_path)
-    assert "/clear" not in typed and "/compact" not in typed
+    assert cmd in typed
+    assert other not in typed
+    assert f"lane answered {verdict}" in rows(tmp_path)
+    assert f"typing {cmd}" in rows(tmp_path)
+
+
+def test_the_slash_command_is_typed_as_two_sends(tmp_path):
+    run(tmp_path, "compaction_one lane-a\n" * 2, env=ARMED,
+        replies=answered("COMPACT"))
+    lines = [ln for ln in keys(tmp_path).splitlines() if "send-keys" in ln]
+    assert any("send-keys -l" in ln and "/compact" in ln for ln in lines), lines
+
+
+def test_the_exec_row_precedes_the_keystroke(tmp_path):
+    """If the send goes wrong the record still says what was about to happen
+    and at what reading."""
+    run(tmp_path, "compaction_one lane-a\n" * 2, env=ARMED,
+        replies=answered("COMPACT"))
+    assert "typing /compact at" in rows(tmp_path)
+
+
+def test_an_armed_leg_still_refuses_a_lane_that_is_not_idle(tmp_path):
+    """`/clear` into a working pane is the worst keystroke in this file. The
+    lane is asked while idle and picks work up before the verdict is acted
+    on — the exec guard has to be checked at EXEC time, not inherited from
+    whatever the pane looked like at ask time."""
+    p = run(tmp_path,
+            "compaction_one lane-a\n"
+            'echo "Nucleating… (1m 55s · ↓ 6.4k tokens)" >> "$HOME/pane.txt"\n'
+            "compaction_one lane-a\n"
+            "compaction_one lane-a\n",
+            env=ARMED, replies=answered("CLEAR"))
+    assert "not typing this pass (idle only)" in p.stdout, p.stdout
+    assert "/clear" not in keys(tmp_path)
+    # the verdict is banked, so waiting costs nothing
+    assert "lane answered CLEAR" in rows(tmp_path)
+
+
+def test_the_command_is_typed_once_however_many_passes_run(tmp_path):
+    p = run(tmp_path, "compaction_one lane-a\n" * 6, env=ARMED,
+            replies=answered("COMPACT"))
+    assert keys(tmp_path).count("/compact") == 1, p.stdout
+
+
+def test_the_net_row_is_measured_after_the_fact_never_predicted(tmp_path):
+    """The saving is not knowable before the next turn lands, so the row is
+    written only once the transcript has actually moved."""
+    p = run(tmp_path, "compaction_one lane-a\n" * 3, env=ARMED,
+            replies=answered("COMPACT"))
+    assert "typed /compact" in p.stdout, p.stdout
+    assert " net " not in rows(tmp_path), "a net row before the reading moved"
+    # HOME (and so the flag set) survives; the lane's next turn now reads
+    # lower, which is the only thing that makes the saving measurable.
+    p = run(tmp_path, "compaction_one lane-a", env=ARMED,
+            replies=answered("COMPACT"), tokens=40_000)
+    body = rows(tmp_path)
+    assert " net " in body, body
+    assert f"recovered {OVER - 40_000} tokens" in body
