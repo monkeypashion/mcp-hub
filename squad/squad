@@ -1110,6 +1110,50 @@ compaction_type() {
   tm send-keys -t "$1" Enter 2>/dev/null || return 1
 }
 
+# ONCE PER CROSSING, NOT ONCE PER SESSION (operator-signed 2026-09-02 22:5x).
+#
+# 🔴 `/compact` does NOT end the session: it rewrites the conversation in
+# place, keeping the same transcript id and jsonl. So the session-keyed flag
+# — the right fix for the etimes jitter — left `.closed` standing forever,
+# and a lane got exactly ONE ask per session however far it grew after it.
+# Measured on mcp-hub-dev-vm-1: compacted 176,714 -> 87,054 at 20:42, then
+# climbed to 379,280 (2.5x the cap, HIGHER than before the compact) with the
+# cycle closed and no further ask. A relaunch re-armed it; a compact did not.
+#
+# A new cycle needs all three, and each rules out a way of re-asking wrongly:
+#   · the previous cycle CLOSED WITH A MEASURED NET — so a lane that never
+#     acted, answered ambiguously, or ran with exec disarmed stays closed
+#     rather than being re-asked on the same climb;
+#   · over the cap again — the ordinary condition;
+#   · and GROWN PAST THAT MEASURED FLOOR — so a compact landing still above
+#     the cap does not immediately re-ask. tok == net right after the exec,
+#     so re-arming waits for genuine new growth.
+# That keeps the anti-REPEAT guarantee (a cycle can only follow a COMPLETED,
+# MEASURED one) while restoring the protection the leg exists for.
+compaction_recross() {
+  local a="$1" flag="$2" tok="$3" net
+  [ -f "$flag.closed" ] || return 1
+  net="$(cat "$flag.closed" 2>/dev/null || true)"
+  # LEGACY CYCLE — closed by the version that wrote an EMPTY marker. Every
+  # cycle from the 2026-09-02 20:4x sweep is one of these, i.e. exactly the
+  # lanes this change exists to protect, so without a fallback the fix helps
+  # only lanes that compact AFTER it and leaves tonight's six needing a
+  # relaunch each. Fall back to the exec's BEFORE reading, which is a
+  # STRICTER bar than the real floor: it demands the lane climb back above
+  # where it stood before compacting, so a legacy cycle cannot thrash. No
+  # `.exec` means nothing was ever typed, and that stays closed.
+  if [ -z "$net" ]; then
+    [ -f "$flag.exec" ] || return 1
+    net="$(cat "$flag.exec" 2>/dev/null || true)"
+  fi
+  [ -n "$net" ] || return 1
+  [ "$tok" -ge "$COMPACT_ASK_TOKENS" ] 2>/dev/null || return 1
+  [ "$tok" -gt "$net" ] 2>/dev/null || return 1
+  rm -f "$flag" "$flag.fire" "$flag.answer" "$flag.exec" "$flag.closed" \
+     2>/dev/null || true
+  return 0
+}
+
 compaction_one() {
   local a="$1" tok pct flag st text
   # ⚠️ EVERY READ BELOW IS `|| true`-GUARDED, and that is load-bearing: this
@@ -1123,6 +1167,13 @@ compaction_one() {
   pct="$(compaction_ctx "$a" || true)"
 
   mkdir -p "$HOME/.mcp-hub" 2>/dev/null
+
+  # A COMPLETED cycle plus a fresh climb re-arms the lane, under the SAME
+  # session id. Must run BEFORE the short-circuit below, which would
+  # otherwise hand a closed cycle to the answer leg forever.
+  if compaction_recross "$a" "$flag" "$tok"; then
+    echo "$a: climbed to ${tok} tokens since its last compaction — re-arming"
+  fi
 
   # Asked already? Everything after the ask is the answer leg's business.
   if [ -f "$flag" ]; then
@@ -1181,7 +1232,11 @@ compaction_answer_leg() {
     if [ "$tok" -lt "$before" ] 2>/dev/null; then
       compaction_row "$a" net "$pct" "$tok" \
         "recovered $(( before - tok )) tokens: ${before} -> ${tok}"
-      : > "$flag.closed"
+      # THE MEASURED FLOOR GOES IN THE CLOSE MARKER. It is what lets a LATER
+      # climb be told apart from the residue of this one — see
+      # compaction_recross. An EMPTY marker (every other close path) means
+      # "closed without a measurement", and never re-arms.
+      printf '%s\n' "$tok" > "$flag.closed"
     fi
     return 0
   fi

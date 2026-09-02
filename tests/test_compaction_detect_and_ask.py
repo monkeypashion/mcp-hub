@@ -464,3 +464,99 @@ def test_the_net_row_is_measured_after_the_fact_never_predicted(tmp_path):
     body = rows(tmp_path)
     assert " net " in body, body
     assert f"recovered {OVER - 40_000} tokens" in body
+
+
+# ---------------------------------------------------------------------------
+# ONCE PER CROSSING, NOT ONCE PER SESSION (2026-09-02)
+#
+# `/compact` rewrites the conversation IN PLACE — same transcript id, same
+# jsonl — so the session-keyed flag left `.closed` standing and the lane was
+# never asked again however far it climbed. Measured on the author's own seat:
+# 176,714 -> 87,054 at 20:42, then back to 379,280 with the cycle closed and
+# no ask. Every test until now drove ONE crossing, which is exactly why this
+# was invisible.
+# ---------------------------------------------------------------------------
+
+SHRUNK = 60_000        # post-compact, below the cap
+CLIMB = 200_000        # a genuine second climb
+STILL_OVER = 160_000   # a compact that lands above the cap
+
+
+def _full_cycle(tmp_path):
+    """Drive fire -> ask -> answer -> exec, then a shrunk reading so the NET
+    row lands and the cycle closes with a measured floor."""
+    run(tmp_path, "compaction_one lane-a\n" * 3, env=ARMED,
+        replies=answered("COMPACT"))
+    run(tmp_path, "compaction_one lane-a\n", tokens=SHRUNK, env=ARMED,
+        replies=answered("COMPACT"))
+
+
+def test_a_second_climb_in_the_SAME_session_is_asked_again(tmp_path):
+    _full_cycle(tmp_path)
+    assert " net " in rows(tmp_path), "the cycle must close with a measurement"
+    assert rows(tmp_path).count(" ask ") == 1
+
+    # same session id throughout — the transcript filename never changes
+    run(tmp_path, "compaction_one lane-a\n" * 3, tokens=CLIMB, env=ARMED,
+        replies=answered("COMPACT"))
+
+    assert rows(tmp_path).count(" fire ") == 2, rows(tmp_path)
+    assert rows(tmp_path).count(" ask ") == 2, rows(tmp_path)
+    sessions = {f.name.split("compaction-lane-a-")[1].split(".")[0]
+                for f in (tmp_path / ".mcp-hub").glob("compaction-lane-a-*")}
+    assert len(sessions) == 1, f"re-arm must reuse the session key, got {sessions}"
+
+
+def test_a_compact_that_lands_ABOVE_the_cap_does_not_immediately_re_ask(tmp_path):
+    """The anti-thrash guard. Right after the exec tok == the measured floor,
+    so 'still over the cap' must NOT be enough on its own — re-arming waits
+    for growth PAST that floor, or the lane is asked again the moment it
+    finishes answering."""
+    run(tmp_path, "compaction_one lane-a\n" * 3, env=ARMED,
+        replies=answered("COMPACT"))
+    run(tmp_path, "compaction_one lane-a\n", tokens=STILL_OVER, env=ARMED,
+        replies=answered("COMPACT"))
+    assert " net " in rows(tmp_path)
+    before = rows(tmp_path).count(" ask ")
+
+    run(tmp_path, "compaction_one lane-a\n" * 3, tokens=STILL_OVER, env=ARMED,
+        replies=answered("COMPACT"))
+    assert rows(tmp_path).count(" ask ") == before, "re-asked without new growth"
+
+
+def test_a_cycle_closed_WITHOUT_a_measurement_never_re_arms(tmp_path):
+    """Exec disarmed: the answer is recorded and nothing is typed, so there is
+    no measured floor. That cycle is done for the session — re-arming it would
+    re-ask a lane about a climb it was already asked about."""
+    run(tmp_path, "compaction_one lane-a\n" * 3, replies=answered("COMPACT"))
+    assert "exec leg OFF" in rows(tmp_path) or " exec " in rows(tmp_path)
+    before = rows(tmp_path).count(" ask ")
+
+    run(tmp_path, "compaction_one lane-a\n" * 3, tokens=CLIMB,
+        replies=answered("COMPACT"))
+    assert rows(tmp_path).count(" ask ") == before, \
+        "a cycle with no measured net must not re-arm"
+
+
+def test_a_LEGACY_cycle_re_arms_off_the_exec_reading(tmp_path):
+    """Cycles closed by the previous version wrote an EMPTY marker — that is
+    every lane compacted on 2026-09-02, i.e. precisely the ones this change
+    protects. They fall back to the exec's BEFORE reading, a STRICTER bar:
+    the lane must climb back above where it stood before compacting."""
+    run(tmp_path, "compaction_one lane-a\n" * 3, env=ARMED,
+        replies=answered("COMPACT"))
+    run(tmp_path, "compaction_one lane-a\n", tokens=SHRUNK, env=ARMED,
+        replies=answered("COMPACT"))
+    flag = next((tmp_path / ".mcp-hub").glob("compaction-lane-a-*.closed"))
+    flag.write_text("")                      # what the old code left behind
+    before = rows(tmp_path).count(" ask ")
+
+    # below the pre-compact reading: still the residue of the old climb
+    run(tmp_path, "compaction_one lane-a\n" * 3, tokens=160_000, env=ARMED,
+        replies=answered("COMPACT"))
+    assert rows(tmp_path).count(" ask ") == before, "legacy bar is the exec reading"
+
+    # above it: an unambiguous new climb
+    run(tmp_path, "compaction_one lane-a\n" * 3, tokens=300_000, env=ARMED,
+        replies=answered("COMPACT"))
+    assert rows(tmp_path).count(" ask ") == before + 1, rows(tmp_path)
