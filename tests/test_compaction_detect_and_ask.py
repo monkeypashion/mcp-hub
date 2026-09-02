@@ -62,7 +62,7 @@ def transcript(home: Path, worktree: Path, *, tokens=None, replies=()):
 
 
 def run(tmp_path, snippet, *, tokens=OVER, state_lines=None, agent="lane-a",
-        replies=(), env=None, ctx="16"):
+        replies=(), env=None, ctx="16", jitter=False):
     home = tmp_path
     (home / ".mcp-hub").mkdir(parents=True, exist_ok=True)
     conf = home / "squad.conf"
@@ -98,8 +98,20 @@ def run(tmp_path, snippet, *, tokens=OVER, state_lines=None, agent="lane-a",
     # etimes must TRACK the clock: agent_started is (now - etimes), so a
     # constant here makes the session key drift a second at a time and
     # every call reads as a fresh session. Cost me two false failures.
-    (bin_ / "ps").write_text(
-        "#!/bin/bash\necho $(( $(date +%s) - 1788000000 ))\n")
+    # `jitter` reproduces the real clock: etimes is TRUNCATED whole seconds,
+    # so (now - etimes) alternates by one between passes and every other pass
+    # computes a different session key for the same session.
+    if jitter:
+        (bin_ / "ps").write_text(
+            "#!/bin/bash\n"
+            f'n=$(cat {home}/pscalls 2>/dev/null || echo 0)\n'
+            f'echo $(( n + 1 )) > {home}/pscalls\n'
+            "b=$(( $(date +%s) - 1788000000 ))\n"
+            '[ $(( n % 2 )) -eq 1 ] && b=$(( b - 1 ))\n'
+            "echo $b\n")
+    else:
+        (bin_ / "ps").write_text(
+            "#!/bin/bash\necho $(( $(date +%s) - 1788000000 ))\n")
     (bin_ / "ps").chmod(0o755)
     # the door: record rows instead of sending them
     (bin_ / "mcp-hub").write_text(
@@ -266,6 +278,18 @@ def test_a_busy_lane_fires_ONCE_not_every_sweep(tmp_path):
 def test_the_same_session_is_not_asked_twice(tmp_path):
     run(tmp_path, "compaction_one lane-a\n" * 4)
     assert keys(tmp_path).count("send-keys -l") == 1
+
+
+def test_a_jittering_clock_does_not_re_ask_the_same_session(tmp_path):
+    """The session key is COMPUTED as (now - etimes), and etimes is truncated
+    whole seconds — so it alternates by one between passes. Unfixed, every
+    other pass mints a fresh flag and asks the lane AGAIN: the console flagged
+    exactly this as REPEAT on reliable-ai, and the live box was left holding
+    two keys one second apart for one session."""
+    run(tmp_path, "compaction_one lane-a\n" * 6, jitter=True)
+    assert keys(tmp_path).count("send-keys -l") == 1
+    assert rows(tmp_path).count(" fire ") == 1
+    assert rows(tmp_path).count(" ask ") == 1
 
 
 # --- bar 52: no answer = no action, absolutely -------------------------------
