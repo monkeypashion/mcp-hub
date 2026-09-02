@@ -96,6 +96,41 @@ def test_an_unwritable_mirror_reports_false(tmp_path, monkeypatch):
 
 # --- leg 2: squad honours it (the leg that makes the stop real) ------------
 
+def _stub_bin(tmp_path):
+    """A fake `tmux` on PATH, so a start that is NOT held stays inert.
+
+    🔴 These tests run `squad start` for real, and four of them exist
+    precisely to prove the hold does NOT block — so squad went on to launch.
+    `tm` resolves tmux through PATH and $SOCK defaults to the shared `squad`
+    socket, so every such run created a REAL tmux session named `lane-a`,
+    beside the live fleet, holding a `claude --continue` sitting on the
+    trust-this-folder prompt in a pytest tmpdir. The operator's deputy killed
+    one twice on 2026-09-02 before it was traced here; its cwd was by then a
+    DELETED tmpdir, which is how a passing suite left a stray seat behind.
+
+    has-session exits 1 so squad believes the lane is down and takes the
+    start path under test; everything else succeeds and does nothing.
+    """
+    bindir = tmp_path / "stubbin"
+    bindir.mkdir(exist_ok=True)
+    stub = bindir / "tmux"
+    stub.write_text(
+        '#!/bin/sh\n'
+        'for a in "$@"; do\n'
+        '  [ "$a" = "has-session" ] && exit 1\n'
+        'done\n'
+        'exit 0\n',
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return bindir
+
+
+def _env(tmp_path, conf, heldf):
+    return {"PATH": f"{_stub_bin(tmp_path)}:/usr/bin:/bin", "HOME": str(tmp_path),
+            "SQUAD_CONF": str(conf), "MCP_HUB_HELD_FILE": str(heldf)}
+
+
 def run_squad(tmp_path, held: dict | None, agent="lane-a", verb="start"):
     conf = tmp_path / "squad.conf"
     conf.write_text(f"{agent}|{tmp_path}||--continue|squad\n", encoding="utf-8")
@@ -106,8 +141,7 @@ def run_squad(tmp_path, held: dict | None, agent="lane-a", verb="start"):
     return subprocess.run(
         ["bash", str(SQUAD), verb, agent],
         capture_output=True, text=True,
-        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path),
-             "SQUAD_CONF": str(conf), "MCP_HUB_HELD_FILE": str(heldf)},
+        env=_env(tmp_path, conf, heldf),
     )
 
 
@@ -150,8 +184,7 @@ def test_a_corrupt_mirror_means_nothing_is_held(tmp_path):
     p = subprocess.run(
         ["bash", str(SQUAD), "start", "lane-a"],
         capture_output=True, text=True,
-        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path),
-             "SQUAD_CONF": str(conf), "MCP_HUB_HELD_FILE": str(heldf)},
+        env=_env(tmp_path, conf, heldf),
     )
     assert "HELD" not in p.stdout
 
