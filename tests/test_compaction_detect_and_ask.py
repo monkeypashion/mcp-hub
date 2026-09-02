@@ -123,10 +123,10 @@ def test_the_text_and_the_Enter_are_separate_sends(tmp_path):
     wherever it matches one — the bug that typed `-tmcp-hub-dev-vm-1` into two
     lanes on 2026-08-28."""
     run(tmp_path, "compaction_one lane-a", ctx="55")
-    lines = [l for l in keys(tmp_path).splitlines() if "send-keys" in l]
-    assert any("send-keys -l" in l for l in lines), lines
-    assert any(l.strip().endswith("Enter") and "send-keys -l" not in l
-               for l in lines), lines
+    lines = [ln for ln in keys(tmp_path).splitlines() if "send-keys" in ln]
+    assert any("send-keys -l" in ln for ln in lines), lines
+    assert any(ln.strip().endswith("Enter") and "send-keys -l" not in ln
+               for ln in lines), lines
 
 
 # --- the ask, when it must NOT happen ---------------------------------------

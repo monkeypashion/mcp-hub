@@ -1350,10 +1350,11 @@ def _reclaim_terminated(manager: Any, sid: str = "") -> int:
     a far worse bug than the one being fixed — so `is_terminated` is the
     whole gate, and anything that cannot answer it is LEFT ALONE.
 
-    `sid` targets the session just deleted (O(1)); the sweep behind it is the
-    backstop for any terminated straggler, and runs only on DELETE — rare
-    next to tool calls, and exactly the moment one has just terminated.
-    Returns how many were reclaimed. Never raises.
+    Every call sweeps the whole set, and `sid` is now only a hint that the
+    caller has just terminated one — the straggler case (terminated with no
+    DELETE of its own) is why the sweep cannot be skipped. Runs only on
+    DELETE: rare next to tool calls, and exactly the moment one has just
+    terminated. Returns how many were reclaimed. Never raises.
     """
     dropped = 0
     try:
@@ -1368,7 +1369,22 @@ def _reclaim_terminated(manager: Any, sid: str = "") -> int:
             # is terminated is not evidence that it is.
             return t is not None and bool(getattr(t, "is_terminated", False))
 
-        keys = [sid] if sid and sid in instances else list(instances.keys())
+        # 🔴 THE SWEEP RUNS ON EVERY DELETE, AND THE FIRST VERSION DID NOT.
+        # It read `keys = [sid] if sid and sid in instances else list(...)`,
+        # so on the NORMAL path — session id present and known, which is very
+        # nearly every DELETE — only that one key was examined and the sweep
+        # behind it never ran at all. A backstop that fires only when the id
+        # is unreadable is a backstop for the case that almost never happens:
+        # the docstring claimed straggler coverage the code could not deliver.
+        # Anything terminated without a DELETE of its own was therefore held
+        # forever, exactly like the leak this function exists to close.
+        # ⇒ Cost of doing it right: one dict scan per DELETE. DELETEs are rare
+        # next to tool calls, and the set is small now that the bulk leak is
+        # shut — the O(1) targeting was guarding a price not worth paying.
+        # The gate is unchanged and is the only thing that matters: nothing is
+        # dropped unless it SAYS it is terminated, so a live-but-idle bound
+        # agent is never touched.
+        keys = list(instances.keys())
         for key in keys:
             if _gone(key):
                 instances.pop(key, None)
@@ -5406,7 +5422,22 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             return "n/a (no session manager)"
         if instances is None:
             return "n/a (manager exposes no instance set)"
-        return str(len(instances))
+        # THE BREAKDOWN EXISTS TO SETTLE ONE OPEN QUESTION, and it is worth
+        # saying which. After the DELETE-path reclaim shipped (e11bae2), vps
+        # measured the accumulation down 88% — 25.5/min to 3.03/min — but NOT
+        # to zero, and 20 minutes cannot separate a warm-up plateau from a
+        # slower leak. A bare total cannot either. This can: a STRAGGLER is a
+        # transport that says it is terminated and is still being held, which
+        # nothing but a reclaim ever removes. Persistent non-zero here means
+        # the residue is real and mechanical; zero at a long uptime means the
+        # remainder is live sessions and the leak story is finished.
+        # Counted, never inferred — the whole point.
+        try:
+            held = list(instances.values())
+            terminated = sum(1 for t in held if bool(getattr(t, "is_terminated", False)))
+        except Exception:  # noqa: BLE001 — a diagnostic must not break hub_status
+            return str(len(instances))
+        return f"{len(held)} (live {len(held) - terminated}, terminated-but-held {terminated})"
 
     @mcp.tool()
     def hub_status() -> str:
