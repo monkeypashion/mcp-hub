@@ -1122,8 +1122,11 @@ compaction_type() {
 #
 # A new cycle needs all three, and each rules out a way of re-asking wrongly:
 #   · the previous cycle CLOSED WITH A MEASURED NET — so a lane that never
-#     acted, answered ambiguously, or ran with exec disarmed stays closed
-#     rather than being re-asked on the same climb;
+#     acted, or ran with exec disarmed, stays closed rather than being
+#     re-asked on the same climb. An AMBIGUOUS close DOES record a floor
+#     (its reading at the time): nothing was typed, so there is no `.exec`
+#     to fall back on, and an empty marker there left the lane unprotected
+#     for the rest of its session — see the AMBIGUOUS branch below;
 #   · over the cap again — the ordinary condition;
 #   · and GROWN PAST THAT MEASURED FLOOR — so a compact landing still above
 #     the cap does not immediately re-ask. tok == net right after the exec,
@@ -1234,8 +1237,10 @@ compaction_answer_leg() {
         "recovered $(( before - tok )) tokens: ${before} -> ${tok}"
       # THE MEASURED FLOOR GOES IN THE CLOSE MARKER. It is what lets a LATER
       # climb be told apart from the residue of this one — see
-      # compaction_recross. An EMPTY marker (every other close path) means
-      # "closed without a measurement", and never re-arms.
+      # compaction_recross. The AMBIGUOUS path writes a floor too, for the
+      # same reason. An EMPTY marker (the remaining close paths — exec
+      # disarmed, unrecognised verdict, legacy empty `.exec`) means "closed
+      # without a measurement", and never re-arms.
       printf '%s\n' "$tok" > "$flag.closed"
     fi
     return 0
@@ -1259,7 +1264,18 @@ compaction_answer_leg() {
     compaction_row "$a" exec "$pct" "$tok" \
       "NOT EXECUTED: the reply named both CLEAR and COMPACT — unresolved, so nothing was typed"
     echo "$a: answer named both CLEAR and COMPACT — no action (fail closed)"
-    : > "$flag.closed"
+    # 🔴 THE FLOOR IS THE CURRENT READING, NOT AN EMPTY MARKER. Failing closed
+    # is about the KEYSTROKE — nothing is typed on an unresolved verdict — and
+    # it must not also disarm the lane for the rest of its session. An empty
+    # marker did exactly that: no `.exec` is ever written here (nothing was
+    # typed), so compaction_recross's legacy fallback finds nothing and the
+    # cycle can never re-arm under the same session id. Measured on
+    # vps-hetzner-dev-vm-1: answered AMBIGUOUS at 07:21:41Z, then climbed to
+    # 326k — 2.2x the cap — with no further ask, and only a relaunch fixed it.
+    # Writing $tok makes a LATER climb tellable from this one: recross demands
+    # tok > this reading, so the anti-repeat guarantee is kept (the same
+    # reading can never re-ask) while genuine growth is protected again.
+    printf '%s\n' "$tok" > "$flag.closed"
     return 0
   fi
 

@@ -560,3 +560,63 @@ def test_a_LEGACY_cycle_re_arms_off_the_exec_reading(tmp_path):
     run(tmp_path, "compaction_one lane-a\n" * 3, tokens=300_000, env=ARMED,
         replies=answered("COMPACT"))
     assert rows(tmp_path).count(" ask ") == before + 1, rows(tmp_path)
+
+
+# AN AMBIGUOUS ANSWER MUST NOT DISARM THE LANE FOR THE REST OF ITS SESSION
+#
+# Failing closed is about the KEYSTROKE: an unresolved verdict types nothing.
+# It used to also write an EMPTY `.closed`, and since nothing was typed there
+# is no `.exec` for the legacy fallback to read — so compaction_recross could
+# never re-arm that session id and only a relaunch fixed it. Measured on
+# vps-hetzner-dev-vm-1 2026-09-03: answered AMBIGUOUS 07:21:41Z, then ran 362
+# turns at ~326k avg (2.2x the cap) with no further ask.
+# ---------------------------------------------------------------------------
+
+BOTH = "CLEAR or COMPACT, whichever you prefer."
+
+
+def _ambiguous_cycle(tmp_path):
+    """fire -> ask -> answer AMBIGUOUS -> closed, with nothing typed."""
+    p = run(tmp_path, "compaction_one lane-a\n" * 3, env=ARMED,
+            replies=answered(BOTH))
+    assert "no action (fail closed)" in p.stdout
+    assert "/clear" not in keys(tmp_path) and "/compact" not in keys(tmp_path)
+
+
+def test_an_AMBIGUOUS_cycle_re_arms_on_genuine_growth(tmp_path):
+    """The regression this fix exists for. The floor is the reading at the
+    moment of the ambiguous close, so a real climb past it is asked about
+    again — under the SAME session id, with no relaunch."""
+    _ambiguous_cycle(tmp_path)
+    before = rows(tmp_path).count(" ask ")
+
+    run(tmp_path, "compaction_one lane-a\n" * 3, tokens=CLIMB, env=ARMED,
+        replies=answered("COMPACT"))
+
+    assert rows(tmp_path).count(" ask ") == before + 1, rows(tmp_path)
+    assert "/compact" in keys(tmp_path), "the re-armed cycle must reach exec"
+    sessions = {f.name.split("compaction-lane-a-")[1].split(".")[0]
+                for f in (tmp_path / ".mcp-hub").glob("compaction-lane-a-*")}
+    assert len(sessions) == 1, f"re-arm must reuse the session key, got {sessions}"
+
+
+def test_an_AMBIGUOUS_cycle_does_not_re_ask_at_the_SAME_reading(tmp_path):
+    """The anti-repeat half. Still over the cap is not new growth — otherwise
+    an unresolved lane is re-asked every single pass, which is the thrash the
+    empty marker was there to prevent."""
+    _ambiguous_cycle(tmp_path)
+    before = rows(tmp_path).count(" ask ")
+
+    run(tmp_path, "compaction_one lane-a\n" * 3, tokens=OVER, env=ARMED,
+        replies=answered(BOTH))
+
+    assert rows(tmp_path).count(" ask ") == before, \
+        "an ambiguous cycle re-asked without new growth"
+
+
+def test_an_AMBIGUOUS_close_records_its_reading_as_the_floor(tmp_path):
+    """The marker itself, not just the behaviour: an empty one is the bug."""
+    _ambiguous_cycle(tmp_path)
+    flag = next((tmp_path / ".mcp-hub").glob("compaction-lane-a-*.closed"))
+    assert flag.read_text().strip() == str(OVER), \
+        f"AMBIGUOUS must close with a measured floor, got {flag.read_text()!r}"
