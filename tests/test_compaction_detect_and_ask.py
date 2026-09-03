@@ -47,7 +47,19 @@ def assistant(ts, text, tokens):
     return {"type": "assistant", "timestamp": ts, "message": msg}
 
 
-def transcript(home: Path, worktree: Path, *, tokens=None, replies=()):
+def boundary(pre, post, *, offset=60):
+    """The record the CLIENT writes when it really compacts. `/compact` that
+    executes leaves this behind carrying the exact pre/post; the one typed
+    into cockpit and squad-proxy on 2026-09-03 left nothing, which is how we
+    know it never ran."""
+    return {"type": "system", "subtype": "compact_boundary",
+            "timestamp": stamp(offset),
+            "compactMetadata": {"trigger": "manual", "preTokens": pre,
+                                "postTokens": post, "durationMs": 118_000}}
+
+
+def transcript(home: Path, worktree: Path, *, tokens=None, replies=(),
+               compacted=None):
     """Write the lane's Claude Code transcript the way the client encodes it:
     ~/.claude/projects/<worktree with / -> ->/<session>.jsonl.
 
@@ -58,19 +70,22 @@ def transcript(home: Path, worktree: Path, *, tokens=None, replies=()):
     d.mkdir(parents=True, exist_ok=True)
     rows = [assistant("2026-09-02T18:00:00.000Z", "working", tokens)]
     rows += [assistant(ts, text, tokens) for ts, text in replies]
+    if compacted:
+        rows.append(boundary(*compacted))
     f = d / "05a50d0c-1111-2222-3333-444455556666.jsonl"
     f.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
     return f
 
 
 def run(tmp_path, snippet, *, tokens=OVER, state_lines=None, agent="lane-a",
-        replies=(), env=None, ctx="16", jitter=False, klass="squad"):
+        replies=(), env=None, ctx="16", jitter=False, klass="squad",
+        compacted=None):
     home = tmp_path
     (home / ".mcp-hub").mkdir(parents=True, exist_ok=True)
     conf = home / "squad.conf"
     conf.write_text(f"{agent}|{home}||--continue|{klass}\n", encoding="utf-8")
 
-    transcript(home, home, tokens=tokens, replies=replies)
+    transcript(home, home, tokens=tokens, replies=replies, compacted=compacted)
 
     bin_ = home / "bin"
     bin_.mkdir(exist_ok=True)
@@ -460,7 +475,8 @@ def test_the_net_row_is_measured_after_the_fact_never_predicted(tmp_path):
     # HOME (and so the flag set) survives; the lane's next turn now reads
     # lower, which is the only thing that makes the saving measurable.
     p = run(tmp_path, "compaction_one lane-a", env=ARMED,
-            replies=answered("COMPACT"), tokens=40_000)
+            replies=answered("COMPACT"), tokens=40_000,
+            compacted=(OVER, 40_000))
     body = rows(tmp_path)
     assert " net " in body, body
     assert f"recovered {OVER - 40_000} tokens" in body
@@ -488,7 +504,7 @@ def _full_cycle(tmp_path):
     run(tmp_path, "compaction_one lane-a\n" * 3, env=ARMED,
         replies=answered("COMPACT"))
     run(tmp_path, "compaction_one lane-a\n", tokens=SHRUNK, env=ARMED,
-        replies=answered("COMPACT"))
+        replies=answered("COMPACT"), compacted=(OVER, SHRUNK))
 
 
 def test_a_second_climb_in_the_SAME_session_is_asked_again(tmp_path):
@@ -515,7 +531,7 @@ def test_a_compact_that_lands_ABOVE_the_cap_does_not_immediately_re_ask(tmp_path
     run(tmp_path, "compaction_one lane-a\n" * 3, env=ARMED,
         replies=answered("COMPACT"))
     run(tmp_path, "compaction_one lane-a\n", tokens=STILL_OVER, env=ARMED,
-        replies=answered("COMPACT"))
+        replies=answered("COMPACT"), compacted=(OVER, STILL_OVER))
     assert " net " in rows(tmp_path)
     before = rows(tmp_path).count(" ask ")
 
@@ -546,7 +562,7 @@ def test_a_LEGACY_cycle_re_arms_off_the_exec_reading(tmp_path):
     run(tmp_path, "compaction_one lane-a\n" * 3, env=ARMED,
         replies=answered("COMPACT"))
     run(tmp_path, "compaction_one lane-a\n", tokens=SHRUNK, env=ARMED,
-        replies=answered("COMPACT"))
+        replies=answered("COMPACT"), compacted=(OVER, SHRUNK))
     flag = next((tmp_path / ".mcp-hub").glob("compaction-lane-a-*.closed"))
     flag.write_text("")                      # what the old code left behind
     before = rows(tmp_path).count(" ask ")
@@ -620,3 +636,129 @@ def test_an_AMBIGUOUS_close_records_its_reading_as_the_floor(tmp_path):
     flag = next((tmp_path / ".mcp-hub").glob("compaction-lane-a-*.closed"))
     assert flag.read_text().strip() == str(OVER), \
         f"AMBIGUOUS must close with a measured floor, got {flag.read_text()!r}"
+
+
+# ---------------------------------------------------------------------------
+# THE EXEC THAT DID NOTHING (2026-09-03)
+#
+# exec typed `/compact` into operator-cockpit-ui-agent (08:16:49) and
+# squad-proxy (08:16:46) while both were idle. NEITHER transcript carries a
+# compact_boundary after it: both show `user "/compact"` answered by the model
+# with "No response requested." — the TUI never parsed the leading slash and
+# the line went to the API as an ordinary prompt. A `/compact` that really
+# runs also writes `<command-name>/compact</command-name>` and then the
+# boundary; dreamteam's 13:03:50 exec has all of them (170527 -> 9731).
+#
+# The close leg only ever closed on `tok < before`. With no compaction that
+# comparison is never true, so the cycle stayed open, `.closed` was never
+# written, recross could never re-arm, and both lanes climbed to ~400k over
+# five hours with NOT ONE ROW saying anything. Every test above drove an exec
+# that WORKED, which is exactly why this was invisible.
+# ---------------------------------------------------------------------------
+
+LANDED_NOW = {"MCP_HUB_COMPACTION_EXEC": "1", "MCP_HUB_COMPACT_LANDED_AFTER": "0"}
+
+
+def _typed(tmp_path, **kw):
+    """fire -> ask -> answer COMPACT -> exec, with the command typed."""
+    p = run(tmp_path, "compaction_one lane-a\n" * 3, replies=answered("COMPACT"),
+            **kw)
+    assert "typed /compact" in p.stdout, p.stdout
+    return p
+
+
+def test_the_net_is_read_from_the_clients_own_compact_boundary(tmp_path):
+    """The exact pre/post, from the process that did the compacting — not a
+    reading this sweep happened to catch. The lane's CURRENT reading here is
+    still above `before`, so the old sampled close would have seen nothing."""
+    _typed(tmp_path, env=ARMED)
+    run(tmp_path, "compaction_one lane-a", env=ARMED, tokens=OVER + 5_000,
+        replies=answered("COMPACT"), compacted=(170_527, 9_731))
+
+    body = rows(tmp_path)
+    assert "recovered 160796 tokens: 170527 -> 9731 (compact_boundary)" in body, body
+    flag = next((tmp_path / ".mcp-hub").glob("compaction-lane-a-*.closed"))
+    assert flag.read_text().strip() == "9731", flag.read_text()
+
+
+def test_nothing_is_concluded_while_the_compaction_is_still_running(tmp_path):
+    """Real ones take 98-148s. Inside the window a missing boundary is not a
+    failed keystroke, and saying so would libel every slow compact."""
+    _typed(tmp_path, env=ARMED)
+    p = run(tmp_path, "compaction_one lane-a", env=ARMED,
+            replies=answered("COMPACT"))
+
+    assert "NOT COMPACTED" not in rows(tmp_path), rows(tmp_path)
+    assert "re-arming" not in p.stdout, p.stdout
+    assert not list((tmp_path / ".mcp-hub").glob("compaction-lane-a-*.closed"))
+
+
+def test_an_exec_that_never_compacted_is_re_armed_and_says_so(tmp_path):
+    """The backstop. No boundary and no drop, past the window: the keystroke
+    did not take, and the crossing is still owed an ask."""
+    _typed(tmp_path, env=ARMED)
+    asks = rows(tmp_path).count(" ask ")
+
+    p = run(tmp_path, "compaction_one lane-a", env=LANDED_NOW,
+            replies=answered("COMPACT"))
+    assert "NOT COMPACTED" in rows(tmp_path), rows(tmp_path)
+    assert "the keystroke did not take (attempt 1 of 2)" in rows(tmp_path)
+    assert "re-arming" in p.stdout, p.stdout
+
+    # re-armed means ASKED AGAIN, under the same session key
+    run(tmp_path, "compaction_one lane-a\n" * 2, env=LANDED_NOW,
+        replies=answered("COMPACT"))
+    assert rows(tmp_path).count(" ask ") == asks + 1, rows(tmp_path)
+    sessions = {f.name.split("compaction-lane-a-")[1].split(".")[0]
+                for f in (tmp_path / ".mcp-hub").glob("compaction-lane-a-*")}
+    assert len(sessions) == 1, f"re-arm must reuse the session key, got {sessions}"
+
+
+def test_a_failed_exec_is_not_retried_for_ever(tmp_path):
+    """A command that will not parse will not start parsing. After the cap the
+    leg stops TYPING — and keeps WATCHING: the floor is the measured reading,
+    so a genuine climb re-arms, exactly as after an AMBIGUOUS close."""
+    for _ in range(4):
+        run(tmp_path, "compaction_one lane-a\n" * 3, env=LANDED_NOW,
+            replies=answered("COMPACT"))
+
+    body = rows(tmp_path)
+    assert "GIVING UP on typing for this session after 2 failed execs" in body, body
+    flag = next((tmp_path / ".mcp-hub").glob("compaction-lane-a-*.closed"))
+    assert flag.read_text().strip() == str(OVER), flag.read_text()
+    assert body.count("attempt 1 of 2") == 1, "the cap must not reset itself"
+
+    asks = body.count(" ask ")
+    run(tmp_path, "compaction_one lane-a\n" * 3, env=LANDED_NOW,
+        replies=answered("COMPACT"))
+    assert rows(tmp_path).count(" ask ") == asks, "re-asked at the same reading"
+
+    run(tmp_path, "compaction_one lane-a\n" * 3, tokens=CLIMB, env=LANDED_NOW,
+        replies=answered("COMPACT"))
+    assert rows(tmp_path).count(" ask ") == asks + 1, "a real climb must re-arm"
+
+
+def test_a_dip_with_no_compaction_in_the_transcript_is_not_a_saving(tmp_path):
+    """⚠️ The false measurement. squad-proxy's reading fell 3,222 below its
+    `before` for SIX SECONDS at 08:17:06 on ordinary variation, with no
+    compaction anywhere in its transcript. A sampled close would have written
+    a `net` row claiming a saving for an act that never happened."""
+    _typed(tmp_path, env=ARMED)
+    run(tmp_path, "compaction_one lane-a", env=ARMED, tokens=OVER - 3_222,
+        replies=answered("COMPACT"))
+
+    assert " net " not in rows(tmp_path), rows(tmp_path)
+    assert not list((tmp_path / ".mcp-hub").glob("compaction-lane-a-*.closed"))
+
+
+def test_a_readable_transcript_outranks_the_sampled_drop(tmp_path):
+    """The ordering, stated on its own: when the client reports a compaction,
+    its numbers are the record — not whatever this sweep's reading happens to
+    be at the moment the row is written."""
+    _typed(tmp_path, env=ARMED)
+    run(tmp_path, "compaction_one lane-a", env=ARMED, tokens=61_234,
+        replies=answered("COMPACT"), compacted=(170_527, 9_731))
+
+    body = rows(tmp_path)
+    assert "170527 -> 9731 (compact_boundary)" in body, body
+    assert "61234" not in body, "the sample must not be reported as the net"
