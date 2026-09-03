@@ -79,7 +79,7 @@ def transcript(home: Path, worktree: Path, *, tokens=None, replies=(),
 
 def run(tmp_path, snippet, *, tokens=OVER, state_lines=None, agent="lane-a",
         replies=(), env=None, ctx="16", jitter=False, klass="squad",
-        compacted=None):
+        compacted=None, pane=None, pane_after=None):
     home = tmp_path
     (home / ".mcp-hub").mkdir(parents=True, exist_ok=True)
     conf = home / "squad.conf"
@@ -92,15 +92,20 @@ def run(tmp_path, snippet, *, tokens=OVER, state_lines=None, agent="lane-a",
 
     # The pane: a statusline carrying ctx (decoration now, not the trigger),
     # plus whatever state chrome the test wants classify_text to read.
-    pane = f"⚡ 8/11 · Opus high · ctx [||||] {ctx}%\n" if ctx else "no statusline\n"
-    pane += (state_lines or "")
+    if pane is None:
+        pane = (f"⚡ 8/11 · Opus high · ctx [||||] {ctx}%\n" if ctx
+                else "no statusline\n")
+        pane += (state_lines or "")
     (bin_ / "tmux").write_text(
         "#!/bin/bash\n"
         f'echo "$@" >> {home}/tmux.log\n'
+        # the literal landing is what "a dialog appeared afterwards" means
+        f'case "$*" in *"send-keys -l"*) touch {home}/literal_sent ;; esac\n'
         'for a in "$@"; do\n'
         '  case "$a" in\n'
         f'    has-session) exit 0 ;;\n'
-        f'    capture-pane) cat {home}/pane.txt; exit 0 ;;\n'
+        f'    capture-pane) if [ -f {home}/pane2.txt ] && [ -f {home}/literal_sent ];'
+    f' then cat {home}/pane2.txt; else cat {home}/pane.txt; fi; exit 0 ;;\n'
         f'    display-message) echo 12345; exit 0 ;;\n'
         '  esac\n'
         'done\n'
@@ -108,6 +113,8 @@ def run(tmp_path, snippet, *, tokens=OVER, state_lines=None, agent="lane-a",
     )
     (bin_ / "tmux").chmod(0o755)
     (home / "pane.txt").write_text(pane)
+    if pane_after is not None:
+        (home / "pane2.txt").write_text(pane_after)
 
     # pgrep/ps make agent_started answer, so the once-per-session flag has a key
     (bin_ / "pgrep").write_text("#!/bin/bash\necho 999\n")
@@ -762,3 +769,111 @@ def test_a_readable_transcript_outranks_the_sampled_drop(tmp_path):
     body = rows(tmp_path)
     assert "170527 -> 9731 (compact_boundary)" in body, body
     assert "61234" not in body, "the sample must not be reported as the net"
+
+
+# --- the dialog guard (card #381) -------------------------------------------
+#
+# 2026-09-03 11:01:47.714: compaction_type's Enter answered vps-hetzner's open
+# AskUserQuestion — "Do you authorise the EXPAND leg of #371 on prod-1 now?"
+# -> "Yes — apply the expand leg", recorded +0.009s later — and vps applied it
+# to prod-1. The lane was maximally `idle` by classify_text, because a lane
+# blocked on a dialog is not generating and the classifier's fall-through is
+# `else idle`: its permissive branch is also its blind branch.
+#
+# ⚠️ vps's actual rendered screen is NOT recoverable (its pane history had
+# rolled, and it declined to reconstruct one from memory). So none of the
+# fixtures below claims to BE that screen. They stand for the category the
+# allowlist exists for: a dialog matching no pattern anyone has written down.
+
+UNKNOWN_DIALOG = """\
+╭──────────────────────────────────────────────╮
+│ Which deployment window should I use?        │
+│                                              │
+│    Tonight 22:00                             │
+│    Tomorrow 06:00                            │
+╰──────────────────────────────────────────────╯
+"""
+
+# The real bypass dialog, copied from tests/test_seat.py — the denylist DOES
+# catch this one. It is here to prove the new guard did not lose ground that
+# the old classifier already held.
+BYPASS_DIALOG = """\
+  WARNING: Claude Code running in Bypass Permissions mode
+
+  ❯ 1. No, exit
+    2. Yes, I accept
+
+  Enter to confirm - Esc to cancel
+"""
+
+SAFE_PANE = """\
+────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────
+  ⚡ 8/11 · Opus high · ctx [||||] 16%
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+"""
+
+
+def test_an_unrecognised_dialog_is_never_typed_into(tmp_path):
+    """THE regression. This screen matches none of classify_text's dialog
+    patterns, so the old leg read it as idle and would have typed the ask and
+    pressed Enter into it — selecting whatever row was default. The guard is
+    an ALLOWLIST for exactly this reason: a denylist is only ever as good as
+    the dialog shape somebody already met."""
+    p = run(tmp_path, "compaction_one lane-a", pane=UNKNOWN_DIALOG)
+    assert "send-keys" not in keys(tmp_path), "a keystroke reached a dialog"
+    assert "NOT typing" in p.stderr
+
+
+def test_the_crossing_survives_a_refusal(tmp_path):
+    """Refusing to type must not consume the ask. No marker means the next
+    sweep asks again — a lane silenced by one badly-timed dialog would be the
+    same silent stall this whole leg exists to remove."""
+    run(tmp_path, "compaction_one lane-a", pane=UNKNOWN_DIALOG)
+    flags = list((tmp_path / ".mcp-hub").glob("compaction-lane-a-*"))
+    assert not any(f.suffix == "" and f.stat().st_size for f in flags), \
+        "the ask time was recorded for an ask that was never delivered"
+
+
+def test_the_known_bypass_dialog_is_still_refused(tmp_path):
+    """Ground the old classifier already held, held again."""
+    run(tmp_path, "compaction_one lane-a", pane=BYPASS_DIALOG)
+    assert "send-keys" not in keys(tmp_path)
+
+
+def test_a_pane_that_cannot_be_read_is_not_typed_into(tmp_path):
+    """Unreadable is not safe. The blind branch must not be the permissive
+    one — that equivalence is the whole defect."""
+    run(tmp_path, "compaction_one lane-a", pane="")
+    assert "send-keys" not in keys(tmp_path)
+
+
+def test_a_normal_idle_pane_is_still_typed_into(tmp_path):
+    """The guard has to let the ordinary case through, or it is just an
+    outage with a good excuse."""
+    p = run(tmp_path, "compaction_one lane-a", pane=SAFE_PANE)
+    assert "send-keys -l" in keys(tmp_path)
+    assert "compaction ask sent at" in p.stdout
+
+
+def test_the_enter_is_withheld_when_a_dialog_appears_after_the_literal(tmp_path):
+    """The gap between the literal and the Enter is ~1s of real time, and the
+    Enter is the half that ANSWERS a dialog. Checking once at the top would
+    leave that window open. An unsent line is visible and harmless; a pressed
+    default is neither."""
+    p = run(tmp_path, "compaction_one lane-a", pane=SAFE_PANE,
+            pane_after=UNKNOWN_DIALOG)
+    log = keys(tmp_path)
+    assert "send-keys -l" in log, "the literal should have been sent"
+    assert "Enter" not in log, "Enter was pressed into a dialog"
+    assert "Enter NOT sent" in p.stderr
+
+
+def test_the_exec_slash_command_goes_through_the_same_funnel(tmp_path):
+    """/compact is typed by a different leg. One guarded path and one
+    unguarded path is how a guard gets trusted and still loses."""
+    run(tmp_path, "compaction_one lane-a", pane=UNKNOWN_DIALOG,
+        replies=answered("COMPACT"), env=ARMED)
+    assert "send-keys" not in keys(tmp_path)
+    assert "/compact" not in keys(tmp_path)

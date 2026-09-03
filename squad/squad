@@ -296,6 +296,15 @@ type_line() { local t="$1"; shift; tmt send-keys -t "$t" -l "$*" || return 1; sl
 # ctx% from the same text), so the patterns live here and BOTH callers use
 # them. They were duplicated until 2026-07-20 and silently drifted apart —
 # that drift is why working agents read as idle and the tab dots went stale.
+# ONE definition of "claude's own chrome is on the screen". classify_text uses
+# it to find where a dialog would START (a dialog owns everything below the
+# last chrome line); compaction_safe_to_type uses the SAME string as its
+# allowlist. Two copies would drift, and the copy that drifted would be the
+# one deciding whether we press Enter into a question of the operator's.
+# `ctx [[]` not `ctx \[` so the one string is valid in both grep -E and awk's
+# dynamic regex (gawk warns on \[ and the warning would land in a log).
+PANE_CHROME_RE='accept edits on|manual mode on|plan mode on|bypass permissions|for agents|ctx [[]'
+
 classify_text() {
   local t="$1" below lastline
   # [X] char-class trick: these patterns must never match their own source
@@ -309,9 +318,9 @@ classify_text() {
   # dialog flag itself 🔴 (2026-07-21), which is worse than cosmetic: a false
   # red among real ones is how a real one gets ignored.
   # So: look for dialog markers only BELOW the last chrome line.
-  below="$(printf '%s\n' "$t" | awk '
+  below="$(printf '%s\n' "$t" | awk -v re="$PANE_CHROME_RE" '
     { l[NR] = $0 }
-    /accept edits on|manual mode on|plan mode on|bypass permissions|for agents|ctx \[/ { last = NR }
+    $0 ~ re { last = NR }
     END { for (i = last + 1; i <= NR; i++) print l[i] }')"
   # Belt and braces for any build that keeps the statusline visible under a
   # prompt: a dialog footer as the literal last line is a dialog, wherever the
@@ -1104,9 +1113,45 @@ COMPACT_ASK_TEXT="Your context is at %s tokens, over the %s-token cap. Flush any
 # Type a literal then Enter, as two sends. `send-keys "<text>" Enter` in one
 # call makes tmux read the literal as a KEY NAME wherever it matches one —
 # the bug that typed `-tmcp-hub-dev-vm-1` into two lanes on 2026-08-28.
+# ⛔ ALLOWLIST, not a denylist. Bought 2026-09-03 11:01:47.714, when the Enter
+# below answered vps-hetzner's open AskUserQuestion — "Do you authorise the
+# EXPAND leg of #371 on prod-1 now?" -> "Yes — apply the expand leg", recorded
+# +0.009s later — and a production change followed. classify_text could not
+# have stopped it and it is not a typo in its patterns: those patterns are
+# PERMISSION-dialog chrome, while an AskUserQuestion's rows are the asking
+# agent's own option labels, and the classifier's three-way fall-through is
+# `else printf idle` — so "I cannot see" and "safe to type" are the same
+# answer. A denylist of dialog shapes is only ever as good as the shape
+# nobody has met yet.
+#
+# So: type only into a screen that POSITIVELY shows claude's own idle chrome.
+# Every dialog — known, unknown, or invented next month — replaces the input
+# box and statusline and therefore has none; an unreadable pane has none
+# either, and both must refuse. src/mcp_hub/seat.py:first_turn_is_safe is the
+# same rule bought the same way (its blind Enter confirmed a seat's own death
+# on a "No, exit" default) — this is that rule, ported, not a second opinion.
+compaction_safe_to_type() {
+  local a="$1" cap
+  cap="$(tm capture-pane -p -t "$a" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -20)" || return 1
+  [ -n "$cap" ] || return 1
+  printf '%s\n' "$cap" | grep -qE "$PANE_CHROME_RE" || return 1
+  # belt and braces: chrome can survive under a prompt in some builds, so the
+  # existing denylist still gets its say. Both must agree before we type.
+  [ "$(classify_text "$cap")" = idle ] || return 1
+  return 0
+}
+
 compaction_type() {
+  compaction_safe_to_type "$1" \
+    || { echo "!! $1: pane is not claude's idle chrome (dialog or unreadable) — NOT typing" >&2; return 1; }
   tm send-keys -l -t "$1" "$2" 2>/dev/null || return 1
   sleep 1
+  # RE-CHECK before the Enter. The gap between the two sends is exactly where
+  # a dialog can appear, and the Enter is the half that ANSWERS one. If it
+  # appeared, leave the literal sitting unsent: an unsent line is visible and
+  # harmless, a pressed default is neither.
+  compaction_safe_to_type "$1" \
+    || { echo "!! $1: a dialog appeared after the literal — Enter NOT sent" >&2; return 1; }
   tm send-keys -t "$1" Enter 2>/dev/null || return 1
 }
 
