@@ -972,6 +972,15 @@ def _hold_state(actions: list[dict[str, Any]], now: float) -> dict[str, Any] | N
             "held_at": held_at,
             "reason": str(args.get("reason") or ""),
             "release_condition": str(args.get("release_condition") or ""),
+            # bar 59 — `kind` and `owner` have to survive the mirror or the
+            # lane cannot tell a brake from a hibernation, and `hold.py`
+            # applies the ceiling rule to both. Carried VERBATIM and never
+            # defaulted: an entry with no kind stays an entry with no kind,
+            # which reads downstream as "not exempt". Inventing "brake" here
+            # would be harmless today and wrong the moment a third kind
+            # exists.
+            "kind": str(args.get("kind") or ""),
+            "owner": str(args.get("owner") or ""),
         }
     return None
 

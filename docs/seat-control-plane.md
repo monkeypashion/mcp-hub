@@ -68,6 +68,55 @@ pane_after (text)`.
 - **One pending action per seat** (upsert semantics): mashing the button
   re-states, never queues five interrupts.
 
+### A hold carries a KIND and an OWNER (bar 59)
+
+`hold` is one mechanism serving two purposes that pull opposite ways:
+
+| kind | why the lane is stopped | ten-minute hard stop |
+|---|---|---|
+| `brake` | it is burning its share **now** | **yes** — waiting forever is what a brake cannot afford |
+| `hibernation` | it has **nothing open** | **never** — killing an in-flight turn reclaims a share nobody is spending |
+
+`args.kind` must be one of that closed set; an unrecognised value is
+**refused**, not carried. `args.owner` names the mechanism that placed it
+(`brake`, `hibernation-scanner`) and becomes mandatory the moment a kind is
+given.
+
+🔴 **Absent is not a third kind.** A hold with no `kind` keeps the
+pre-bar-59 behaviour — hard-stoppable. The exemption is a *positive* mark
+that something has to lose, the same fail-closed direction as the sender
+grades: **no kind = not exempt**. An older edge, an older mirror, or a
+hand-written hold is therefore never promoted into the exempt class by
+silence, and a format change cannot make the fleet quietly un-stoppable.
+
+Both fields travel hub → `edge._hold_state` → `held-lanes.json` →
+`hold.hard_stop_due`. They are carried verbatim at every hop and defaulted
+at none: an invented `brake` would be harmless today and wrong the moment a
+third kind exists.
+
+**Release is owner-scoped.** A release declaring `args.owner` may only lift a
+hold placed by that same owner — a hibernation scanner lifting a brake would
+hand a lane its share back in the middle of the window the brake was
+protecting, and neither mechanism would report anything wrong. A release
+with **no** `owner` is the operator's by-hand override and lifts anyone's,
+because a rule that could strand a lane held by a mechanism nobody can run
+any more would make the hold unsafe in exactly the way the expiry prevents.
+
+**The exempt list** (`MCP_HUB_HIBERNATION_EXEMPT`, comma-separated seat
+identities) names lanes that may never be parked. Enforced **at the write**:
+refusing at read time would leave a hold that `GET /actions`, the mirror and
+the console all report as live while nothing honours it. An exempt entry
+naming no known seat **refuses every hibernation** rather than being
+skipped — a typo there is a lane that believes it is protected and is not,
+and nothing reveals that until the lane it was written for is parked. An
+exempt lane can still be **braked**: the exemption is about having nothing
+to do, not about being stoppable.
+
+⚠️ **The hub half only.** The scanner that arms these holds from
+`GET /threads/{id}/hibernation-candidates` and releases them on bar
+assignment lives on the **console**, not here — that endpoint appears
+nowhere in this repo.
+
 ## Watch leg — the live view
 
 `POST /api/v1/seats/<identity>/watch` (operator token) declares a viewer,

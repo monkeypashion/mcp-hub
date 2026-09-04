@@ -1187,6 +1187,35 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
     # indistinguishable from a lane that died. 12h is long enough to span a
     # usage window and short enough that forgetting is survivable.
     _HOLD_MAX_SECONDS = 12 * 3600.0
+    # bar 59 — a hold's KIND decides whether the ten-minute ceiling rule
+    # reaches it. A BRAKE stops a lane burning its share right now, and its
+    # grace expires because waiting forever is what the brake cannot afford.
+    # A HIBERNATION parks a lane precisely because it has nothing open;
+    # hard-stopping it destroys an in-flight turn to reclaim a share nobody
+    # is spending. `hold.hard_stop_due` is where the difference lands, and it
+    # can only see it if the kind travels hub -> edge -> mirror -> lane.
+    #
+    # ABSENT is not a third kind: a hold with no kind keeps the pre-bar-59
+    # behaviour, so an older writer never lands in the exempt class by
+    # silence. The exemption is a POSITIVE mark, like the sender grades.
+    _HOLD_KINDS = ("brake", "hibernation")
+    # Lanes that may never be hibernated, by seat identity. Comma-separated.
+    #
+    # 🔴 Enforced AT THE WRITE. Refusing at read time would leave a recorded
+    # hold that `GET /actions`, the mirror and the operator console all
+    # report as live while nothing honours it — a hold that exists on every
+    # surface and in no behaviour is the "delivered live" mistake again.
+    #
+    # 🔴 An entry naming no known seat REFUSES the write, rather than being
+    # skipped. A typo here is a lane that believes it is protected and is
+    # not, and nothing reveals that until the lane it was meant to protect
+    # is parked. Fail closed: an exempt list we cannot fully resolve means
+    # we cannot say this seat is safe to hibernate.
+    _HIBERNATION_EXEMPT = tuple(
+        n.strip() for n in
+        os.environ.get("MCP_HUB_HIBERNATION_EXEMPT", "").split(",")
+        if n.strip()
+    )
     # An interrupt written during a stall must not land minutes later in the
     # middle of healthy work. The stored value is a REQUEST TIME and expiry
     # is derived, so a pending action cannot outlive this by being missed.
@@ -1202,6 +1231,37 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             "SELECT * FROM api_seats WHERE identity = ? AND archived = 0",
             (identity,),
         ).fetchone()
+
+    def _live_hold(seat: str) -> dict[str, Any] | None:
+        """The seat's live hold as the EDGE would compute it, or None.
+
+        Deliberately the same rule as `edge._hold_state`: newest first, only
+        `status = 'done'` counts, a later `release` ends it, an elapsed
+        `until` has already released itself. Two implementations of one rule
+        is two chances to disagree, so the shape is kept identical and
+        `test_hold_kind_and_owner.py` pins them against each other.
+
+        Used only to answer "whose hold is this?" at release time. It never
+        decides whether a lane is held — the mirror does that.
+        """
+        rows = db().execute(
+            "SELECT kind, args, status FROM api_seat_actions WHERE seat = ? "
+            "AND kind IN ('hold','release') AND status = 'done' "
+            "ORDER BY id DESC LIMIT 1",
+            (seat,),
+        ).fetchall()
+        if not rows or rows[0]["kind"] == "release":
+            return None
+        try:
+            args = json.loads(rows[0]["args"] or "{}")
+        except (TypeError, ValueError):
+            return None
+        try:
+            if float(args.get("until") or 0) <= _now():
+                return None
+        except (TypeError, ValueError):
+            return None
+        return args if isinstance(args, dict) else None
 
     def _expire_stale_actions(seat: str) -> None:
         """Age out pending intent. A PURGE would be wrong here — a vanished
@@ -1344,6 +1404,69 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
                         "the held lane and the operator are both told. A "
                         "stop whose end nobody can state reads as an "
                         "ignoring lane, not a held one.",
+                    )
+                hold_kind = str(args.get("kind") or "").strip()
+                if hold_kind and hold_kind not in _HOLD_KINDS:
+                    return _err(
+                        400,
+                        f"unknown hold kind '{hold_kind}'. The set is CLOSED: "
+                        f"{', '.join(_HOLD_KINDS)}. An unrecognised kind is "
+                        f"refused rather than carried, because every reader "
+                        f"downstream treats a kind it does not know as "
+                        f"'not hibernation' — so a typo would silently make "
+                        f"a parked lane hard-stoppable.",
+                    )
+                if hold_kind and not str(args.get("owner") or "").strip():
+                    return _err(
+                        400,
+                        f"a '{hold_kind}' hold needs `args.owner` — the "
+                        f"mechanism that placed it (e.g. 'brake', "
+                        f"'hibernation-scanner'). Release checks it, so a "
+                        f"hold with no owner is one that anything may lift, "
+                        f"including the mechanism that did not place it.",
+                    )
+                if hold_kind == "hibernation":
+                    unknown = [n for n in _HIBERNATION_EXEMPT
+                               if _seat_row(n) is None]
+                    if unknown:
+                        return _err(
+                            500,
+                            f"the hibernation exempt list names "
+                            f"{len(unknown)} seat(s) this hub does not know: "
+                            f"{', '.join(sorted(unknown))}. REFUSING every "
+                            f"hibernation until it resolves — an exempt "
+                            f"entry that matches nothing protects nothing, "
+                            f"and the lane it was written for would be "
+                            f"parked believing it was covered. Fix "
+                            f"MCP_HUB_HIBERNATION_EXEMPT.",
+                        )
+                    if identity in _HIBERNATION_EXEMPT:
+                        return _err(
+                            409,
+                            f"seat '{identity}' is on the hibernation exempt "
+                            f"list and may not be parked. It can still be "
+                            f"held by a brake — the exemption is about "
+                            f"having nothing to do, not about being "
+                            f"stoppable.",
+                        )
+            if kind == "release":
+                # Owner-releases-own. A hibernation scanner lifting a brake
+                # would hand a lane back its share in the middle of the
+                # window the brake was protecting, and neither mechanism
+                # would report anything wrong. The operator is not bound by
+                # this: `owner` absent from a release means the human is
+                # doing it by hand, which is the override.
+                live = _live_hold(identity)
+                held_by = str((live or {}).get("owner") or "")
+                asker = str(args.get("owner") or "").strip()
+                if held_by and asker and asker != held_by:
+                    return _err(
+                        409,
+                        f"this hold was placed by '{held_by}', not "
+                        f"'{asker}'. A mechanism releases its OWN holds. To "
+                        f"lift somebody else's, release without `args.owner` "
+                        f"— that is the operator's by-hand override, and it "
+                        f"is recorded as one.",
                     )
             # UPSERT, never queue: mashing the button re-states the ask.
             # Superseded intent is recorded as such rather than deleted, so

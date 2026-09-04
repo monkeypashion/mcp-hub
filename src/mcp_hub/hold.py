@@ -126,8 +126,24 @@ def hard_stop_due(entry: dict[str, Any], agent: str,
     `held_at` — an entry that cannot say when it started cannot be shown to
     have waited, and inferring one would let a mirror-format change hard-stop
     the fleet.
+
+    ⭐ False ALWAYS for `kind="hibernation"` (bar 59). The ten-minute ceiling
+    exists because a BRAKE is reaching for a lane that is burning its share
+    right now — waiting on it indefinitely is the thing the brake cannot
+    afford. A hibernation is the opposite case: the lane is parked precisely
+    BECAUSE it has nothing open, so there is no share to reclaim and killing
+    its in-flight turn destroys work to save nothing. Same mechanism, two
+    reasons, and the grace belongs to only one of them.
+
+    ABSENT kind keeps the old behaviour deliberately. An entry written by an
+    older edge, or a mirror this build has not seen, must not be promoted
+    into the exempt class by silence — the exemption is a positive mark, and
+    NO KIND = NOT EXEMPT, the same fail-closed direction as the sender
+    grades.
     """
     now = time.time() if now is None else now
+    if str(entry.get("kind") or "") == "hibernation":
+        return False
     if boundary_reached_at(agent):
         return False
     try:
@@ -151,6 +167,20 @@ def hook_notice(agent: str, entry: dict[str, Any]) -> str:
     until = float(entry.get("until") or 0)
     when = time.strftime("%H:%M", time.localtime(until)) if until else "?"
     reason = str(entry.get("reason") or "")
+    if str(entry.get("kind") or "") == "hibernation":
+        # A different sentence, because a lane told the BRAKE notice when it
+        # was merely parked reads it as a reprimand for overspending and
+        # goes looking for what it did wrong. It did nothing wrong: it ran
+        # out of open work. Say that.
+        return (
+            f"💤 THIS LANE IS HIBERNATING — it is being parked at this turn "
+            f"boundary, which is the one you have just reached.\n"
+            f"· Wakes: {when} at the latest, or when — {cond}\n"
+            + (f"· Reason: {reason}\n" if reason else "")
+            + "· This is NOT a stop for overspending, and no turn of yours "
+            "is lost: a parked lane is never hard-stopped mid-turn.\n"
+            "· You do not need to do anything. Do NOT start new work."
+        )
     return (
         f"⏸️ THIS LANE IS HELD — it is being stopped at this turn boundary, "
         f"which is the one you have just reached.\n"
