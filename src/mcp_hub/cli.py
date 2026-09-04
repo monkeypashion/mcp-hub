@@ -570,6 +570,19 @@ _LIVE_CLAIM_LINE_RE = re.compile(
 )
 
 
+# The section headers `_spool_append` writes into the blob, and the one the
+# render puts back on top of a taken spool. They are STRUCTURE, not content:
+# a spool of already-delivered lines is still entirely already-delivered, and
+# reading these as unknown shapes is what made the first version of this guard
+# a no-op on the one path that leaked (2026-09-04). Matched exactly — anything
+# else bolded is still an unknown line and still blocks.
+_SPOOL_SECTION_RE = re.compile(
+    r"^\*\*(?:Direct messages|Broadcasts \(since you last looked\)|"
+    r"Held low-priority items \(deferred so they cost no turn "
+    r"of their own\)):\*\*$"
+)
+
+
 def _all_already_delivered(*texts: str) -> bool:
     """True iff every line of the drain is one the hub says already rendered
     live in this lane's context.
@@ -594,6 +607,8 @@ def _all_already_delivered(*texts: str) -> bool:
         for raw in (text or "").splitlines():
             line = raw.strip()
             if not line:
+                continue
+            if _SPOOL_SECTION_RE.match(line):
                 continue
             if _MSG_LINE_RE.match(line):
                 if not _LIVE_CLAIM_LINE_RE.match(line):
@@ -780,12 +795,26 @@ def build_hook_response(
     # Only the block — the hub already marked these read when it rendered them
     # live, so there is nothing to spool and nothing to lose. One unclaimed
     # line makes the whole drain block exactly as before, which is how
-    # anything genuinely new still surfaces. A held spool always wins: it is
-    # the only copy of its contents.
-    if has_content and not deferred and _all_already_delivered(
-        messages_text, broadcasts_text
+    # anything genuinely new still surfaces.
+    #
+    # The spool is INCLUDED in the reading (2026-09-04). The first version
+    # skipped the guard whenever a spool had been taken — "a held spool always
+    # wins: it is the only copy of its contents" — and that is right for a
+    # genuine held low message and wrong for this one: spooled lines that are
+    # themselves `(already delivered live — …)` are the hub stating the full
+    # text already reached this context, so the guard's own "there is no
+    # only-copy to lose" argument covers them too. Both survivors of the first
+    # version leaked through exactly this path. A spool holding ONE genuine low
+    # item still reads False and still blocks, carrying the whole spool with it.
+    #
+    # `_spool_take` above has already unlinked the spool, so suppressing here
+    # discards it — deliberately, and only on an affirmative all-delivered
+    # reading of every line in it.
+    if has_content and _all_already_delivered(
+        messages_text, broadcasts_text, deferred
     ):
         has_messages = has_broadcasts = has_content = False
+        deferred = ""
 
     # An open card makes the "you have no card" nag factually wrong — the
     # right prompt is the notice ("card #N still open / STALE"), which the
