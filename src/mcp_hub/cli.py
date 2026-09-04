@@ -564,6 +564,52 @@ _MSG_LINE_RE = re.compile(
 )
 
 
+_LIVE_CLAIM_LINE_RE = re.compile(
+    r"^\[\d{2}:\d{2}:\d{2}\] \*\*[^*]+\*\*(?: ·[\w-]+)* ⟨[^⟩]+⟩(?: \[\w+\])?: "
+    r"\(already delivered live — ",
+)
+
+
+def _all_already_delivered(*texts: str) -> bool:
+    """True iff every line of the drain is one the hub says already rendered
+    live in this lane's context.
+
+    Bar 47 (g#24): such a drain re-prints what the agent has already read, and
+    it still arrives as a BLOCKING hook error — so it costs exactly one model
+    turn to acknowledge something with nothing to act on. Measured 2026-09-04:
+    12 of 12 drains across three lanes were entirely this.
+
+    Nothing can be lost here, which is what separates it from the low-priority
+    spool: an "already delivered live" line IS the hub's statement that the
+    full text already reached this context, and the hub marked it read when it
+    rendered it. There is no only-copy to keep.
+
+    Fails OPEN in every uncertain direction — an unparseable line, a body
+    continuation, a render shape we do not know, no message lines at all: the
+    caller blocks and the agent sees whatever it was. Only an affirmative
+    reading with every line accounted for suppresses.
+    """
+    seen = False
+    for text in texts:
+        for raw in (text or "").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if _MSG_LINE_RE.match(line):
+                if not _LIVE_CLAIM_LINE_RE.match(line):
+                    return False
+                seen = True
+                continue
+            # The render's own trailing note — "(1 already surfaced live —
+            # shortened to save context, and now marked read. …)". Anything
+            # else is a full body's continuation line, or a shape this parser
+            # does not know; either way, block.
+            if line.startswith("(") and line.endswith(")"):
+                continue
+            return False
+    return seen
+
+
 def _all_low_priority(*texts: str) -> bool:
     """True iff every rendered message line present is tagged `[low]`.
 
@@ -728,6 +774,18 @@ def build_hook_response(
         deferred = _spool_take(agent_name)
         if deferred:
             has_content = True
+
+    # Bar 47 (g#24; deputy ruling on #54, 2026-09-04): a drain whose every
+    # item is already-delivered carries nothing new, so suppress the BLOCK.
+    # Only the block — the hub already marked these read when it rendered them
+    # live, so there is nothing to spool and nothing to lose. One unclaimed
+    # line makes the whole drain block exactly as before, which is how
+    # anything genuinely new still surfaces. A held spool always wins: it is
+    # the only copy of its contents.
+    if has_content and not deferred and _all_already_delivered(
+        messages_text, broadcasts_text
+    ):
+        has_messages = has_broadcasts = has_content = False
 
     # An open card makes the "you have no card" nag factually wrong — the
     # right prompt is the notice ("card #N still open / STALE"), which the
