@@ -1955,6 +1955,52 @@ def _dig(data: Any, path: list[str]) -> Any:
     return data
 
 
+def hibernate_command(args: argparse.Namespace) -> int:
+    """One hibernate pass — `mcp-hub hibernate` (bar 59).
+
+    Query the console for candidates, park them, re-park the ones still
+    listed, release the ones that are not. The whole rule lives in
+    `mcp_hub.hibernate`; this is the door.
+    """
+    from mcp_hub.hibernate import ConsoleAPI, HubHolds, scan
+    from mcp_hub.operator_api import api_base
+
+    token = args.token or os.environ.get("MCP_HUB_OPERATOR_TOKEN", "")
+    if not token:
+        # A pass with no token would refuse every write one at a time and
+        # report a list of API errors. Say the one true thing instead.
+        print(
+            "hibernate: no operator token — set MCP_HUB_OPERATOR_TOKEN or "
+            "pass --token. Holds are operator-only by design: a machine "
+            "token here would let a seat park its neighbours.",
+            file=sys.stderr,
+        )
+        return 2
+
+    rep = scan(
+        ConsoleAPI(base_url=args.console_url),
+        # The hub URL points at /mcp for MCP clients; /api/v1 lives beside
+        # it. Passing the MCP url straight through 404s on every seat read
+        # and the pass reports "the seat list could not be read" — true, and
+        # for a reason nobody would guess from the message.
+        HubHolds(base_url=api_base(args.hub_url), token=token),
+        thread=args.thread,
+        dry_run=args.dry_run,
+    )
+    print(rep.line())
+    for lane in rep.held:
+        print(f"  parked   {lane}")
+    for lane in rep.re_held:
+        print(f"  re-held  {lane}")
+    for lane in rep.released:
+        print(f"  released {lane}")
+    for lane in rep.refused:
+        print(f"  REFUSED  {lane}")
+    # 🔴 A pass that could not ask is not a quiet fleet, and the exit code is
+    # the only part of this a timer reads.
+    return 0 if rep.asked else 1
+
+
 def edge_command(args: argparse.Namespace) -> int:
     """One edge reconcile pass — `mcp-hub edge apply`."""
     from mcp_hub.edge import (
@@ -7837,6 +7883,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="Pull, plan and print actions; execute nothing, report nothing",
     )
 
+    hib = sub.add_parser(
+        "hibernate",
+        help="Park lanes that have nothing open, and release them when a bar lands",
+        description=(
+            "One scanner pass for bar 59: read the console's candidate list "
+            "(GET /threads/{id}/hibernation-candidates — read-only; the "
+            "console never holds anyone), place a `kind=hibernation` hold "
+            "owned by `hibernation-scanner` on each candidate, RE-hold the "
+            "ones still listed as a fresh entry after a fresh query (never "
+            "an expiry bump), and release the ones that have dropped off — "
+            "which is what 'release on bar assignment' looks like from "
+            "here. An unreadable candidate list does NOTHING, not even "
+            "releases: with no list every held lane looks like a "
+            "non-candidate, and a blip would unpark the fleet."
+        ),
+    )
+    hib.add_argument(
+        "--thread", default="1",
+        help="Console thread whose candidates to read (default: 1)")
+    hib.add_argument(
+        "--console-url", default=os.environ.get(
+            "MCP_HUB_CONSOLE_URL", "http://127.0.0.1:8765"),
+        help="Console base URL (default: $MCP_HUB_CONSOLE_URL or localhost:8765)")
+    hib.add_argument(
+        "--hub-url", default=DEFAULT_HUB_URL,
+        help="Hub base URL (default: $MCP_HUB_URL or built-in)")
+    hib.add_argument(
+        "--token", default=None,
+        help="Operator token (default: $MCP_HUB_OPERATOR_TOKEN)")
+    hib.add_argument(
+        "--dry-run", action="store_true",
+        help="Say what the pass would hold and release; write nothing")
+
     capsules = sub.add_parser(
         "capsules",
         help="A whole SQUAD on docker: freeze it, then place it on a machine",
@@ -8081,6 +8160,8 @@ def main(argv: list[str] | None = None) -> int:
         return rebind_url_command(args)
     if args.subcommand == "edge":
         return edge_command(args)
+    if args.subcommand == "hibernate":
+        return hibernate_command(args)
     if args.subcommand == "workspaces":
         return workspaces_command(args)
     if args.subcommand == "seats":

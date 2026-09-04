@@ -112,10 +112,39 @@ and nothing reveals that until the lane it was written for is parked. An
 exempt lane can still be **braked**: the exemption is about having nothing
 to do, not about being stoppable.
 
-⚠️ **The hub half only.** The scanner that arms these holds from
-`GET /threads/{id}/hibernation-candidates` and releases them on bar
-assignment lives on the **console**, not here — that endpoint appears
-nowhere in this repo.
+### The scanner — `mcp-hub hibernate` (bar 59, the other half)
+
+`src/mcp_hub/hibernate.py`, one pass per invocation:
+**query → hold → 12h re-hold → release**.
+
+- **Query.** `GET /threads/{id}/hibernation-candidates` on the console,
+  read-only. Its recorded contract is *"the list mcp-hub's hibernate verb
+  reads; the console never holds anyone"* — the console offers a list and
+  places no hold. ⚠️ The endpoint being defined elsewhere is why this was
+  once thought to be the console's job; **a consumer never contains the
+  endpoint it consumes.**
+- **Hold.** `kind=hibernation`, `owner=hibernation-scanner`, `until` = now +
+  12h, carrying the candidate's OWN `why` and `release` so the hold's stated
+  reason stays falsifiable against the list that caused it.
+- 🔴 **Re-hold is a FRESH ENTRY AFTER A FRESH QUERY, never an expiry bump.**
+  Bumping an `until` keeps a lane parked on a reason nobody re-checked: the
+  hold outlives the fact that justified it and the lane cannot tell.
+- **Release** is what "release on bar assignment" looks like from here — the
+  bar lands, the console stops listing the lane, the next pass lets it go.
+  Owner-scoped, so the scanner can never lift a brake.
+- 🔴 **An unreadable candidate list does NOTHING — not even releases.** With
+  no list every held lane looks like a non-candidate, so a blip would unpark
+  the whole fleet and the next pass would re-park it. The 12h expiry is the
+  backstop that makes doing nothing safe: a scanner that stops running
+  releases the fleet by itself within half a day.
+- **An unresolvable exempt name refuses every hibernation that pass** — the
+  same rule as the write side, stated once and legibly instead of arriving
+  as N identical API errors. Releases still run: a typo must not strand a
+  lane already parked.
+
+`--dry-run` says what it would do and writes nothing. Holds are
+operator-token only: a machine token here would let a seat park its
+neighbours.
 
 ## Watch leg — the live view
 

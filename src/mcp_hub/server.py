@@ -5576,6 +5576,10 @@ _CLI_SUBCOMMANDS = {
     "machines",
     "focus",
     "seat-entry",
+    # bar 59's scanner. Here or it ships INERT: the console script checks
+    # THIS set before argparse ever runs, so a verb with a parser and a
+    # dispatch line and no entry here is read as a server flag and refused.
+    "hibernate",
     # Container-side /voice. Must be here or the `mcp-hub` console script
     # silently treats it as a server flag and never forwards it — which is
     # exactly what the reachability test caught.
