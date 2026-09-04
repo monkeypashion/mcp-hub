@@ -75,7 +75,11 @@ def transcript(home: Path, worktree: Path, *, tokens=None, replies=(),
     rows = [assistant("2026-09-02T18:00:00.000Z", "working", tokens)]
     rows += [assistant(ts, text, tokens) for ts, text in replies]
     if compacted:
-        rows.append(boundary(*compacted))
+        # (pre, post) or (pre, post, offset) — the third element puts the
+        # boundary BEFORE the ask, which is how "an older compaction is not
+        # this cycle's" gets tested at all.
+        rows.append(boundary(compacted[0], compacted[1],
+                             offset=compacted[2] if len(compacted) > 2 else 60))
     f = d / "05a50d0c-1111-2222-3333-444455556666.jsonl"
     f.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
     return f
@@ -161,6 +165,24 @@ def run(tmp_path, snippet, *, tokens=OVER, state_lines=None, agent="lane-a",
 def keys(tmp_path):
     log = tmp_path / "tmux.log"
     return log.read_text() if log.exists() else ""
+
+
+def commands_typed(tmp_path):
+    """The slash commands typed as their OWN literal, in order.
+
+    🔴 Substring-matching the tmux log stopped being able to answer this the
+    moment the ask itself started naming `/compact` and `/clear` (card #405).
+    A test that cannot tell the ASK from the KEYSTROKE would report "nothing
+    was typed" while the keystroke went in — the exact shape of failure this
+    file exists to catch."""
+    out = []
+    for ln in keys(tmp_path).splitlines():
+        if "send-keys -l" not in ln:
+            continue
+        last = ln.rsplit(" ", 1)[-1].strip()
+        if last in ("/compact", "/clear"):
+            out.append(last)
+    return out
 
 
 def rows(tmp_path):
@@ -258,7 +280,7 @@ def test_the_ask_demands_a_flush_before_the_answer(tmp_path):
     """`/clear` destroys context; the flush is what makes it survivable."""
     run(tmp_path, "compaction_one lane-a")
     typed = keys(tmp_path)
-    assert "Flush anything worth keeping to memory" in typed
+    assert "flush anything worth keeping to memory" in typed
     assert "CLEAR" in typed and "COMPACT" in typed
 
 
@@ -354,8 +376,7 @@ def test_an_unanswered_ask_never_reaches_send_keys(tmp_path):
     """THE safety property, with the leg ARMED. The lane was asked and said
     nothing; nothing may be typed, forever."""
     p = run(tmp_path, "compaction_one lane-a\n" * 5, env=ARMED, replies=())
-    typed = keys(tmp_path)
-    assert "/clear" not in typed and "/compact" not in typed
+    assert commands_typed(tmp_path) == []
     assert " answer " not in rows(tmp_path)
     assert " exec " not in rows(tmp_path)
     assert p.returncode == 0
@@ -364,8 +385,7 @@ def test_an_unanswered_ask_never_reaches_send_keys(tmp_path):
 def test_a_reply_that_names_neither_word_is_not_an_answer(tmp_path):
     run(tmp_path, "compaction_one lane-a\n" * 3, env=ARMED,
         replies=answered("Acknowledged, I will look at this shortly."))
-    typed = keys(tmp_path)
-    assert "/clear" not in typed and "/compact" not in typed
+    assert commands_typed(tmp_path) == []
     assert " answer " not in rows(tmp_path)
 
 
@@ -375,7 +395,7 @@ def test_prose_is_not_a_verdict(tmp_path):
     run(tmp_path, "compaction_one lane-a\n" * 3, env=ARMED,
         replies=answered("The compaction story is still unclear to me."))
     assert " answer " not in rows(tmp_path)
-    assert "/clear" not in keys(tmp_path)
+    assert commands_typed(tmp_path) == []
 
 
 def test_the_ask_itself_is_never_read_back_as_the_answer(tmp_path):
@@ -392,7 +412,7 @@ def test_a_reply_from_BEFORE_the_ask_is_not_an_answer(tmp_path):
     write CLEAR an hour earlier has not answered this ask."""
     run(tmp_path, "compaction_one lane-a\n" * 3, env=ARMED,
         replies=answered("CLEAR", offset=-3600))
-    assert "/clear" not in keys(tmp_path)
+    assert commands_typed(tmp_path) == []
     assert " answer " not in rows(tmp_path)
 
 
@@ -402,7 +422,7 @@ def test_both_words_in_one_reply_is_UNRESOLVED_and_fails_closed(tmp_path):
     assert "no action (fail closed)" in p.stdout
     assert "AMBIGUOUS" in rows(tmp_path)
     assert "NOT EXECUTED" in rows(tmp_path)
-    assert "/clear" not in keys(tmp_path) and "/compact" not in keys(tmp_path)
+    assert commands_typed(tmp_path) == []
 
 
 # --- bar 52: the exec leg, disarmed and armed --------------------------------
@@ -420,7 +440,7 @@ def test_a_verdict_types_nothing_while_the_leg_is_disarmed(tmp_path):
     assert "exec leg OFF" in p.stdout
     assert "lane answered COMPACT" in rows(tmp_path)
     assert "MCP_HUB_COMPACTION_EXEC=0" in rows(tmp_path)
-    assert "/compact" not in keys(tmp_path)
+    assert commands_typed(tmp_path) == []
 
 
 @pytest.mark.parametrize("verdict,cmd,other", [
@@ -431,9 +451,7 @@ def test_an_armed_leg_types_the_command_the_lane_chose(tmp_path, verdict, cmd, o
     p = run(tmp_path, "compaction_one lane-a\n" * 2, env=ARMED,
             replies=answered(f"{verdict} — flushed to memory first."))
     assert f"typed {cmd}" in p.stdout, p.stdout + p.stderr
-    typed = keys(tmp_path)
-    assert cmd in typed
-    assert other not in typed
+    assert commands_typed(tmp_path) == [cmd], f"other={other} leaked"
     assert f"lane answered {verdict}" in rows(tmp_path)
     assert f"typing {cmd}" in rows(tmp_path)
 
@@ -465,7 +483,7 @@ def test_an_armed_leg_still_refuses_a_lane_that_is_not_idle(tmp_path):
             "compaction_one lane-a\n",
             env=ARMED, replies=answered("CLEAR"))
     assert "not typing this pass (idle only)" in p.stdout, p.stdout
-    assert "/clear" not in keys(tmp_path)
+    assert commands_typed(tmp_path) == []
     # the verdict is banked, so waiting costs nothing
     assert "lane answered CLEAR" in rows(tmp_path)
 
@@ -473,7 +491,7 @@ def test_an_armed_leg_still_refuses_a_lane_that_is_not_idle(tmp_path):
 def test_the_command_is_typed_once_however_many_passes_run(tmp_path):
     p = run(tmp_path, "compaction_one lane-a\n" * 6, env=ARMED,
             replies=answered("COMPACT"))
-    assert keys(tmp_path).count("/compact") == 1, p.stdout
+    assert commands_typed(tmp_path) == ["/compact"], p.stdout
 
 
 def test_the_net_row_is_measured_after_the_fact_never_predicted(tmp_path):
@@ -607,7 +625,7 @@ def _ambiguous_cycle(tmp_path):
     p = run(tmp_path, "compaction_one lane-a\n" * 3, env=ARMED,
             replies=answered(BOTH))
     assert "no action (fail closed)" in p.stdout
-    assert "/clear" not in keys(tmp_path) and "/compact" not in keys(tmp_path)
+    assert commands_typed(tmp_path) == []
 
 
 def test_an_AMBIGUOUS_cycle_re_arms_on_genuine_growth(tmp_path):
@@ -621,7 +639,7 @@ def test_an_AMBIGUOUS_cycle_re_arms_on_genuine_growth(tmp_path):
         replies=answered("COMPACT"))
 
     assert rows(tmp_path).count(" ask ") == before + 1, rows(tmp_path)
-    assert "/compact" in keys(tmp_path), "the re-armed cycle must reach exec"
+    assert commands_typed(tmp_path) == ["/compact"], "the re-armed cycle must reach exec"
     sessions = {f.name.split("compaction-lane-a-")[1].split(".")[0]
                 for f in (tmp_path / ".mcp-hub").glob("compaction-lane-a-*")}
     assert len(sessions) == 1, f"re-arm must reuse the session key, got {sessions}"
@@ -880,7 +898,7 @@ def test_the_exec_slash_command_goes_through_the_same_funnel(tmp_path):
     run(tmp_path, "compaction_one lane-a", pane=UNKNOWN_DIALOG,
         replies=answered("COMPACT"), env=ARMED)
     assert "send-keys" not in keys(tmp_path)
-    assert "/compact" not in keys(tmp_path)
+    assert commands_typed(tmp_path) == []
 
 
 # --- the answer->exec deadline (deputy's #327 ruling, 2026-09-04) -----------
@@ -936,7 +954,7 @@ def test_the_deadline_lifts_a_guard_that_the_PANE_guard_RE_IMPOSES(tmp_path):
     assert "deadline reached, typing" in p.stdout, p.stdout + p.stderr
     assert "DEADLINE: answered COMPACT" in rows(tmp_path)
     # ...and the second guard still holds.
-    assert "/compact" not in keys(tmp_path), "the pane guard was bypassed"
+    assert commands_typed(tmp_path) == [], "the pane guard was bypassed"
     assert "not claude's idle chrome" in p.stderr, p.stderr
 
 
@@ -963,7 +981,7 @@ def test_a_busy_lane_INSIDE_the_deadline_is_still_left_alone(tmp_path):
             env=ARMED, replies=answered("COMPACT"))
     assert "not typing this pass (idle only)" in p.stdout
     assert "deadline reached" not in p.stdout
-    assert "/compact" not in keys(tmp_path)
+    assert commands_typed(tmp_path) == []
     assert "of 900s" in p.stdout, "the wait is not reported"
 
 
@@ -978,8 +996,8 @@ def test_a_lane_that_NEVER_ANSWERED_is_never_exec_d_however_long_it_waits(tmp_pa
             "compaction_one lane-a\n",
             env=DEADLINE_NOW)          # no replies => never answered
     assert "deadline reached" not in p.stdout
-    assert "/compact" not in keys(tmp_path)
-    assert "/clear" not in keys(tmp_path)
+    assert commands_typed(tmp_path) == []
+    assert commands_typed(tmp_path) == []
 
 
 def test_the_shipped_default_deadline_is_900_seconds(tmp_path):
@@ -990,3 +1008,103 @@ def test_the_shipped_default_deadline_is_900_seconds(tmp_path):
 
 def test_the_shipped_default_cap_is_the_measured_one(tmp_path):
     assert f'MCP_HUB_COMPACT_ASK_TOKENS:-{CAP}' in SQUAD.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# THE BOUNDED FLUSH-AND-PARK — card #405, HIS PRESS 2026-09-04 22:00:45Z
+# (hand=operator, said_at=press, verified, operator-token; executor
+# mcp-hub-dev-vm-1). The ask and the keystroke are ALIKE idle-gated, so a
+# lane that answers and then stays busy is reachable by neither. The lane is
+# the only actor that can stop a busy lane without anyone typing into it, so
+# the ask now instructs it to stop ITSELF — bounded: finish the step, flush,
+# park, then act. Guard 2 (never type into a live generation) is untouched.
+# ---------------------------------------------------------------------------
+
+def _ask_text(tmp_path):
+    """The ask exactly as it was typed into the pane."""
+    for line in keys(tmp_path).splitlines():
+        if "send-keys -l" in line and "context is at" in line:
+            return line
+    raise AssertionError(f"no ask was typed:\n{keys(tmp_path)}")
+
+
+def test_the_ask_carries_the_bounded_flush_and_park(tmp_path):
+    run(tmp_path, "compaction_one lane-a")
+    ask = _ask_text(tmp_path)
+    for clause in ("finish the step you are on",
+                   "flush anything worth keeping to memory",
+                   "park", "run /compact or /clear yourself"):
+        assert clause in ask, f"{clause!r} missing from the ask:\n{ask}"
+
+
+def test_the_bound_comes_FIRST_or_it_is_an_instruction_to_abandon_work(
+        tmp_path):
+    """BOUNDED is the load-bearing word. 'Compact yourself' with no bound
+    tells a lane halfway through a write to drop it."""
+    ask = (run(tmp_path, "compaction_one lane-a"), _ask_text(tmp_path))[1]
+    order = [ask.index("finish the step you are on"),
+             ask.index("flush anything worth keeping"),
+             ask.index("park"),
+             ask.index("run /compact or /clear yourself")]
+    assert order == sorted(order), f"the four steps are out of order:\n{ask}"
+    assert "do not abandon work mid-edit" in ask
+
+
+def test_the_asks_own_slash_commands_are_lowercase(tmp_path):
+    """The parser reads CLEAR/COMPACT uppercase and word-bounded. If the ask
+    capitalised its own commands, an echo of the ask would be a verdict."""
+    ask = (run(tmp_path, "compaction_one lane-a"), _ask_text(tmp_path))[1]
+    assert "/compact" in ask and "/clear" in ask
+    assert "/COMPACT" not in ask and "/CLEAR" not in ask
+
+
+def test_a_lane_that_compacted_ITSELF_is_never_typed_into(tmp_path):
+    """🔴 The race the approved instruction creates. The lane obeys and
+    compacts; the keystroke would then land on a session that no longer
+    holds what we measured, and `/clear` would destroy the context the lane
+    had just chosen to keep."""
+    run(tmp_path, "compaction_one lane-a")                    # the ask
+    p = run(tmp_path, "compaction_one lane-a", env=ARMED,
+            replies=answered("CLEAR"), tokens=SHRUNK,
+            compacted=(OVER, SHRUNK))
+    assert "compacted itself on the ask" in p.stdout, p.stdout
+    assert "typed /clear" not in p.stdout, "the lane was typed into anyway"
+    body = rows(tmp_path)
+    assert "THE LANE DID IT ITSELF" in body, body
+    assert f"recovered {OVER - SHRUNK} tokens" in body
+    assert not list((tmp_path / ".mcp-hub").glob("*.exec")), \
+        "an exec marker was written for a keystroke that never happened"
+
+
+def test_the_lane_needs_no_REPLY_to_have_obeyed(tmp_path):
+    """A lane that parks and compacts without replying has done the thing
+    that was asked. Refusing to notice for want of a reply would re-type a
+    command into a lane that already obeyed."""
+    run(tmp_path, "compaction_one lane-a")
+    p = run(tmp_path, "compaction_one lane-a", env=ARMED,
+            tokens=SHRUNK, compacted=(OVER, SHRUNK))
+    assert "compacted itself on the ask" in p.stdout, p.stdout
+    assert " answer " not in rows(tmp_path), "a verdict was invented"
+
+
+def test_a_self_compaction_still_records_the_floor_so_growth_re_arms(
+        tmp_path):
+    """Same measured floor as every other close — a later climb has to be
+    tellable from the residue of this one."""
+    run(tmp_path, "compaction_one lane-a")
+    run(tmp_path, "compaction_one lane-a", env=ARMED,
+        tokens=SHRUNK, compacted=(OVER, SHRUNK))
+    p = run(tmp_path, "compaction_one lane-a", env=ARMED, tokens=CLIMB,
+            compacted=(OVER, SHRUNK))
+    assert "re-arming" in p.stdout, p.stdout
+
+
+def test_a_boundary_from_BEFORE_the_ask_is_not_the_lane_obeying(tmp_path):
+    """The lane's own act has to be attributable to the ask. An older
+    compaction sitting in the transcript must not close a cycle opened after
+    it — that would leave a lane over the cap believing it had complied."""
+    run(tmp_path, "compaction_one lane-a")
+    p = run(tmp_path, "compaction_one lane-a", env=ARMED,
+            replies=answered("CLEAR"), compacted=(OVER, SHRUNK, -3_600))
+    assert "compacted itself on the ask" not in p.stdout, p.stdout
+    assert "typed /clear" in p.stdout, p.stdout

@@ -1117,7 +1117,30 @@ compaction_row() {
 
 # The ask itself. Typed into the lane's own session, because the lane is the
 # only thing that knows what is worth keeping.
-COMPACT_ASK_TEXT="Your context is at %s tokens, over the %s-token cap. Flush anything worth keeping to memory NOW, then reply with one line: CLEAR (start fresh) or COMPACT (summarise and continue), and why. Nothing will be done to this session until you answer."
+#
+# ⭐⭐ IT CARRIES A BOUNDED FLUSH-AND-PARK (card #405, HIS PRESS 2026-09-04
+# 22:00:45Z — hand=operator, said_at=press, verified, operator-token, read
+# first-hand off /cards/405/verdict; executor mcp-hub-dev-vm-1).
+#
+# 🔴 THE RESIDUAL IT EXISTS FOR: the ask and the keystroke are ALIKE
+# idle-gated, so a lane that answers and then stays genuinely busy is
+# reachable by neither and climbs without limit. Measured: a seat crossed
+# 150,223 at 20:42Z and sat at 273,234 for 2,042s across 17 busy passes.
+# Nothing this code is PERMITTED to do reaches that lane — guard 2 (never
+# type into a live generation) stands unweakened and is not up for
+# revisiting. So the lane is asked to stop ITSELF, which is the one actor
+# that can act on a busy lane without anyone typing into it.
+#
+# ⚠️ BOUNDED is the load-bearing word, and it is why the order is numbered.
+# "Compact yourself" with no bound is an instruction to abandon work
+# mid-edit; the bound is FINISH THE STEP -> flush -> park -> then act. A
+# lane that reads this while halfway through a write does the write.
+#
+# ⭐ The two verdict words are UPPERCASE and word-bounded in the parser, so
+# the slash commands are written in lowercase here ON PURPOSE: `/compact`
+# in the ask can never be mistaken for the lane's own COMPACT. Keep it that
+# way — capitalising them would make the ask its own answer.
+COMPACT_ASK_TEXT="Your context is at %s tokens, over the %s-token cap. DO IT YOURSELF, in this order, and nothing will be typed into your pane: (1) finish the step you are on — do not abandon work mid-edit; (2) flush anything worth keeping to memory; (3) park — take no new work, and write down where you got to; (4) run /compact or /clear yourself. Then reply with ONE line naming EXACTLY ONE of the two words COMPACT or CLEAR, and why. Naming both is unresolved and stops everything. If you would rather not run it yourself, reply anyway and the command you name is typed for you at your next quiet moment. Nothing is done to this session until you answer."
 
 # Type a literal then Enter, as two sends. `send-keys "<text>" Enter` in one
 # call makes tmux read the literal as a KEY NAME wherever it matches one —
@@ -1476,6 +1499,37 @@ compaction_answer_leg() {
     printf '%s\n' "$tok" > "$flag.closed"
     echo "!! $a: ${tries} execs typed and nothing compacted — needs an operator" >&2
     return 0
+  fi
+
+  # 🔴 DID THE LANE DO IT ITSELF? Since card #405 the ask INSTRUCTS it to,
+  # so this is now the expected path and not an edge case — and it has to be
+  # asked BEFORE anything is typed. A lane that compacted on the ask is a
+  # session that no longer holds what we measured; typing `/clear` into it
+  # then would destroy the context it had just chosen to keep, on a keystroke
+  # it had already made unnecessary. The approved instruction creates this
+  # race, so closing it is part of the same act, not a second one.
+  #
+  # Only `/compact` is detectable here, and that is enough: `/clear` mints a
+  # NEW session id, `compaction_flag` is keyed on that id, and the new session
+  # therefore has no flag and cannot be typed into on this cycle's verdict.
+  #
+  # No `.answer` is required. A lane that parks and compacts without replying
+  # has done the thing that was asked; refusing to notice because the reply is
+  # missing would re-type a command into a lane that already obeyed.
+  if [ ! -f "$flag.exec" ]; then
+    since="$(cat "$flag" 2>/dev/null || true)"
+    if [ -n "$since" ]; then
+      bnd="$(compaction_boundary_since "$a" "$since" || true)"
+      if [ -n "$bnd" ] && [ "$bnd" != "none" ]; then
+        compaction_row "$a" net "$pct" "${bnd#* }" \
+          "recovered $(( ${bnd% *} - ${bnd#* } )) tokens: ${bnd% *} -> ${bnd#* } (compact_boundary; THE LANE DID IT ITSELF on the ask's instruction — nothing was typed)"
+        # Same measured floor as every other close, so a later climb is
+        # tellable from this one and recross can re-arm on growth.
+        printf '%s\n' "${bnd#* }" > "$flag.closed"
+        echo "$a: compacted itself on the ask — ${bnd% *} -> ${bnd#* }, nothing typed"
+        return 0
+      fi
+    fi
   fi
 
   # Read the verdict once, then remember it: re-scraping every pass would
