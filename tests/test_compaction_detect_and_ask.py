@@ -31,7 +31,11 @@ import pytest
 
 SQUAD = Path(__file__).resolve().parents[1] / "squad" / "squad"
 
-# well under / well over the 150k cap
+# well under / well over the cap. CAP is the DEFAULT the script ships, and it
+# is asserted rather than duplicated as a literal: it moved 150000 -> 138111
+# on a measurement (deputy's #327 ruling, 2026-09-04) and will move again the
+# next time the climb is re-measured.
+CAP = 138_111
 UNDER, OVER = 40_000, 169_255
 
 
@@ -47,7 +51,19 @@ def assistant(ts, text, tokens):
     return {"type": "assistant", "timestamp": ts, "message": msg}
 
 
-def transcript(home: Path, worktree: Path, *, tokens=None, replies=()):
+def boundary(pre, post, *, offset=60):
+    """The record the CLIENT writes when it really compacts. `/compact` that
+    executes leaves this behind carrying the exact pre/post; the one typed
+    into cockpit and squad-proxy on 2026-09-03 left nothing, which is how we
+    know it never ran."""
+    return {"type": "system", "subtype": "compact_boundary",
+            "timestamp": stamp(offset),
+            "compactMetadata": {"trigger": "manual", "preTokens": pre,
+                                "postTokens": post, "durationMs": 118_000}}
+
+
+def transcript(home: Path, worktree: Path, *, tokens=None, replies=(),
+               compacted=None):
     """Write the lane's Claude Code transcript the way the client encodes it:
     ~/.claude/projects/<worktree with / -> ->/<session>.jsonl.
 
@@ -58,34 +74,42 @@ def transcript(home: Path, worktree: Path, *, tokens=None, replies=()):
     d.mkdir(parents=True, exist_ok=True)
     rows = [assistant("2026-09-02T18:00:00.000Z", "working", tokens)]
     rows += [assistant(ts, text, tokens) for ts, text in replies]
+    if compacted:
+        rows.append(boundary(*compacted))
     f = d / "05a50d0c-1111-2222-3333-444455556666.jsonl"
     f.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
     return f
 
 
 def run(tmp_path, snippet, *, tokens=OVER, state_lines=None, agent="lane-a",
-        replies=(), env=None, ctx="16", jitter=False, klass="squad"):
+        replies=(), env=None, ctx="16", jitter=False, klass="squad",
+        compacted=None, pane=None, pane_after=None):
     home = tmp_path
     (home / ".mcp-hub").mkdir(parents=True, exist_ok=True)
     conf = home / "squad.conf"
     conf.write_text(f"{agent}|{home}||--continue|{klass}\n", encoding="utf-8")
 
-    transcript(home, home, tokens=tokens, replies=replies)
+    transcript(home, home, tokens=tokens, replies=replies, compacted=compacted)
 
     bin_ = home / "bin"
     bin_.mkdir(exist_ok=True)
 
     # The pane: a statusline carrying ctx (decoration now, not the trigger),
     # plus whatever state chrome the test wants classify_text to read.
-    pane = f"⚡ 8/11 · Opus high · ctx [||||] {ctx}%\n" if ctx else "no statusline\n"
-    pane += (state_lines or "")
+    if pane is None:
+        pane = (f"⚡ 8/11 · Opus high · ctx [||||] {ctx}%\n" if ctx
+                else "no statusline\n")
+        pane += (state_lines or "")
     (bin_ / "tmux").write_text(
         "#!/bin/bash\n"
         f'echo "$@" >> {home}/tmux.log\n'
+        # the literal landing is what "a dialog appeared afterwards" means
+        f'case "$*" in *"send-keys -l"*) touch {home}/literal_sent ;; esac\n'
         'for a in "$@"; do\n'
         '  case "$a" in\n'
         f'    has-session) exit 0 ;;\n'
-        f'    capture-pane) cat {home}/pane.txt; exit 0 ;;\n'
+        f'    capture-pane) if [ -f {home}/pane2.txt ] && [ -f {home}/literal_sent ];'
+    f' then cat {home}/pane2.txt; else cat {home}/pane.txt; fi; exit 0 ;;\n'
         f'    display-message) echo 12345; exit 0 ;;\n'
         '  esac\n'
         'done\n'
@@ -93,6 +117,8 @@ def run(tmp_path, snippet, *, tokens=OVER, state_lines=None, agent="lane-a",
     )
     (bin_ / "tmux").chmod(0o755)
     (home / "pane.txt").write_text(pane)
+    if pane_after is not None:
+        (home / "pane2.txt").write_text(pane_after)
 
     # pgrep/ps make agent_started answer, so the once-per-session flag has a key
     (bin_ / "pgrep").write_text("#!/bin/bash\necho 999\n")
@@ -204,7 +230,7 @@ def test_every_row_carries_the_tokens_and_the_cap(tmp_path):
     """`ctx=` keeps its position for the door's existing parse; `tok=`/`thr=`
     carry the quantity that actually decided."""
     run(tmp_path, "compaction_one lane-a")
-    assert f"ctx=16% tok={OVER} thr=150000" in rows(tmp_path)
+    assert f"ctx=16% tok={OVER} thr={CAP}" in rows(tmp_path)
 
 
 def test_an_unreadable_pane_renders_ctx_as_a_question_mark(tmp_path):
@@ -225,7 +251,7 @@ def test_the_ask_names_the_real_reading_and_the_cap(tmp_path):
     run(tmp_path, "compaction_one lane-a")
     typed = keys(tmp_path)
     assert f"at {OVER} tokens" in typed
-    assert "150000-token cap" in typed
+    assert f"{CAP}-token cap" in typed
 
 
 def test_the_ask_demands_a_flush_before_the_answer(tmp_path):
@@ -460,7 +486,8 @@ def test_the_net_row_is_measured_after_the_fact_never_predicted(tmp_path):
     # HOME (and so the flag set) survives; the lane's next turn now reads
     # lower, which is the only thing that makes the saving measurable.
     p = run(tmp_path, "compaction_one lane-a", env=ARMED,
-            replies=answered("COMPACT"), tokens=40_000)
+            replies=answered("COMPACT"), tokens=40_000,
+            compacted=(OVER, 40_000))
     body = rows(tmp_path)
     assert " net " in body, body
     assert f"recovered {OVER - 40_000} tokens" in body
@@ -488,7 +515,7 @@ def _full_cycle(tmp_path):
     run(tmp_path, "compaction_one lane-a\n" * 3, env=ARMED,
         replies=answered("COMPACT"))
     run(tmp_path, "compaction_one lane-a\n", tokens=SHRUNK, env=ARMED,
-        replies=answered("COMPACT"))
+        replies=answered("COMPACT"), compacted=(OVER, SHRUNK))
 
 
 def test_a_second_climb_in_the_SAME_session_is_asked_again(tmp_path):
@@ -515,7 +542,7 @@ def test_a_compact_that_lands_ABOVE_the_cap_does_not_immediately_re_ask(tmp_path
     run(tmp_path, "compaction_one lane-a\n" * 3, env=ARMED,
         replies=answered("COMPACT"))
     run(tmp_path, "compaction_one lane-a\n", tokens=STILL_OVER, env=ARMED,
-        replies=answered("COMPACT"))
+        replies=answered("COMPACT"), compacted=(OVER, STILL_OVER))
     assert " net " in rows(tmp_path)
     before = rows(tmp_path).count(" ask ")
 
@@ -546,7 +573,7 @@ def test_a_LEGACY_cycle_re_arms_off_the_exec_reading(tmp_path):
     run(tmp_path, "compaction_one lane-a\n" * 3, env=ARMED,
         replies=answered("COMPACT"))
     run(tmp_path, "compaction_one lane-a\n", tokens=SHRUNK, env=ARMED,
-        replies=answered("COMPACT"))
+        replies=answered("COMPACT"), compacted=(OVER, SHRUNK))
     flag = next((tmp_path / ".mcp-hub").glob("compaction-lane-a-*.closed"))
     flag.write_text("")                      # what the old code left behind
     before = rows(tmp_path).count(" ask ")
@@ -620,3 +647,346 @@ def test_an_AMBIGUOUS_close_records_its_reading_as_the_floor(tmp_path):
     flag = next((tmp_path / ".mcp-hub").glob("compaction-lane-a-*.closed"))
     assert flag.read_text().strip() == str(OVER), \
         f"AMBIGUOUS must close with a measured floor, got {flag.read_text()!r}"
+
+
+# ---------------------------------------------------------------------------
+# THE EXEC THAT DID NOTHING (2026-09-03)
+#
+# exec typed `/compact` into operator-cockpit-ui-agent (08:16:49) and
+# squad-proxy (08:16:46) while both were idle. NEITHER transcript carries a
+# compact_boundary after it: both show `user "/compact"` answered by the model
+# with "No response requested." — the TUI never parsed the leading slash and
+# the line went to the API as an ordinary prompt. A `/compact` that really
+# runs also writes `<command-name>/compact</command-name>` and then the
+# boundary; dreamteam's 13:03:50 exec has all of them (170527 -> 9731).
+#
+# The close leg only ever closed on `tok < before`. With no compaction that
+# comparison is never true, so the cycle stayed open, `.closed` was never
+# written, recross could never re-arm, and both lanes climbed to ~400k over
+# five hours with NOT ONE ROW saying anything. Every test above drove an exec
+# that WORKED, which is exactly why this was invisible.
+# ---------------------------------------------------------------------------
+
+LANDED_NOW = {"MCP_HUB_COMPACTION_EXEC": "1", "MCP_HUB_COMPACT_LANDED_AFTER": "0"}
+
+
+def _typed(tmp_path, **kw):
+    """fire -> ask -> answer COMPACT -> exec, with the command typed."""
+    p = run(tmp_path, "compaction_one lane-a\n" * 3, replies=answered("COMPACT"),
+            **kw)
+    assert "typed /compact" in p.stdout, p.stdout
+    return p
+
+
+def test_the_net_is_read_from_the_clients_own_compact_boundary(tmp_path):
+    """The exact pre/post, from the process that did the compacting — not a
+    reading this sweep happened to catch. The lane's CURRENT reading here is
+    still above `before`, so the old sampled close would have seen nothing."""
+    _typed(tmp_path, env=ARMED)
+    run(tmp_path, "compaction_one lane-a", env=ARMED, tokens=OVER + 5_000,
+        replies=answered("COMPACT"), compacted=(170_527, 9_731))
+
+    body = rows(tmp_path)
+    assert "recovered 160796 tokens: 170527 -> 9731 (compact_boundary)" in body, body
+    flag = next((tmp_path / ".mcp-hub").glob("compaction-lane-a-*.closed"))
+    assert flag.read_text().strip() == "9731", flag.read_text()
+
+
+def test_nothing_is_concluded_while_the_compaction_is_still_running(tmp_path):
+    """Real ones take 98-148s. Inside the window a missing boundary is not a
+    failed keystroke, and saying so would libel every slow compact."""
+    _typed(tmp_path, env=ARMED)
+    p = run(tmp_path, "compaction_one lane-a", env=ARMED,
+            replies=answered("COMPACT"))
+
+    assert "NOT COMPACTED" not in rows(tmp_path), rows(tmp_path)
+    assert "re-arming" not in p.stdout, p.stdout
+    assert not list((tmp_path / ".mcp-hub").glob("compaction-lane-a-*.closed"))
+
+
+def test_an_exec_that_never_compacted_is_re_armed_and_says_so(tmp_path):
+    """The backstop. No boundary and no drop, past the window: the keystroke
+    did not take, and the crossing is still owed an ask."""
+    _typed(tmp_path, env=ARMED)
+    asks = rows(tmp_path).count(" ask ")
+
+    p = run(tmp_path, "compaction_one lane-a", env=LANDED_NOW,
+            replies=answered("COMPACT"))
+    assert "NOT COMPACTED" in rows(tmp_path), rows(tmp_path)
+    assert "the keystroke did not take (attempt 1 of 2)" in rows(tmp_path)
+    assert "re-arming" in p.stdout, p.stdout
+
+    # re-armed means ASKED AGAIN, under the same session key
+    run(tmp_path, "compaction_one lane-a\n" * 2, env=LANDED_NOW,
+        replies=answered("COMPACT"))
+    assert rows(tmp_path).count(" ask ") == asks + 1, rows(tmp_path)
+    sessions = {f.name.split("compaction-lane-a-")[1].split(".")[0]
+                for f in (tmp_path / ".mcp-hub").glob("compaction-lane-a-*")}
+    assert len(sessions) == 1, f"re-arm must reuse the session key, got {sessions}"
+
+
+def test_a_failed_exec_is_not_retried_for_ever(tmp_path):
+    """A command that will not parse will not start parsing. After the cap the
+    leg stops TYPING — and keeps WATCHING: the floor is the measured reading,
+    so a genuine climb re-arms, exactly as after an AMBIGUOUS close."""
+    for _ in range(4):
+        run(tmp_path, "compaction_one lane-a\n" * 3, env=LANDED_NOW,
+            replies=answered("COMPACT"))
+
+    body = rows(tmp_path)
+    assert "GIVING UP on typing for this session after 2 failed execs" in body, body
+    flag = next((tmp_path / ".mcp-hub").glob("compaction-lane-a-*.closed"))
+    assert flag.read_text().strip() == str(OVER), flag.read_text()
+    assert body.count("attempt 1 of 2") == 1, "the cap must not reset itself"
+
+    asks = body.count(" ask ")
+    run(tmp_path, "compaction_one lane-a\n" * 3, env=LANDED_NOW,
+        replies=answered("COMPACT"))
+    assert rows(tmp_path).count(" ask ") == asks, "re-asked at the same reading"
+
+    run(tmp_path, "compaction_one lane-a\n" * 3, tokens=CLIMB, env=LANDED_NOW,
+        replies=answered("COMPACT"))
+    assert rows(tmp_path).count(" ask ") == asks + 1, "a real climb must re-arm"
+
+
+def test_a_dip_with_no_compaction_in_the_transcript_is_not_a_saving(tmp_path):
+    """⚠️ The false measurement. squad-proxy's reading fell 3,222 below its
+    `before` for SIX SECONDS at 08:17:06 on ordinary variation, with no
+    compaction anywhere in its transcript. A sampled close would have written
+    a `net` row claiming a saving for an act that never happened."""
+    _typed(tmp_path, env=ARMED)
+    run(tmp_path, "compaction_one lane-a", env=ARMED, tokens=OVER - 3_222,
+        replies=answered("COMPACT"))
+
+    assert " net " not in rows(tmp_path), rows(tmp_path)
+    assert not list((tmp_path / ".mcp-hub").glob("compaction-lane-a-*.closed"))
+
+
+def test_a_readable_transcript_outranks_the_sampled_drop(tmp_path):
+    """The ordering, stated on its own: when the client reports a compaction,
+    its numbers are the record — not whatever this sweep's reading happens to
+    be at the moment the row is written."""
+    _typed(tmp_path, env=ARMED)
+    run(tmp_path, "compaction_one lane-a", env=ARMED, tokens=61_234,
+        replies=answered("COMPACT"), compacted=(170_527, 9_731))
+
+    body = rows(tmp_path)
+    assert "170527 -> 9731 (compact_boundary)" in body, body
+    assert "61234" not in body, "the sample must not be reported as the net"
+
+
+# --- the dialog guard (card #381) -------------------------------------------
+#
+# 2026-09-03 11:01:47.714: compaction_type's Enter answered vps-hetzner's open
+# AskUserQuestion — "Do you authorise the EXPAND leg of #371 on prod-1 now?"
+# -> "Yes — apply the expand leg", recorded +0.009s later — and vps applied it
+# to prod-1. The lane was maximally `idle` by classify_text, because a lane
+# blocked on a dialog is not generating and the classifier's fall-through is
+# `else idle`: its permissive branch is also its blind branch.
+#
+# ⚠️ vps's actual rendered screen is NOT recoverable (its pane history had
+# rolled, and it declined to reconstruct one from memory). So none of the
+# fixtures below claims to BE that screen. They stand for the category the
+# allowlist exists for: a dialog matching no pattern anyone has written down.
+
+UNKNOWN_DIALOG = """\
+╭──────────────────────────────────────────────╮
+│ Which deployment window should I use?        │
+│                                              │
+│    Tonight 22:00                             │
+│    Tomorrow 06:00                            │
+╰──────────────────────────────────────────────╯
+"""
+
+# The real bypass dialog, copied from tests/test_seat.py — the denylist DOES
+# catch this one. It is here to prove the new guard did not lose ground that
+# the old classifier already held.
+BYPASS_DIALOG = """\
+  WARNING: Claude Code running in Bypass Permissions mode
+
+  ❯ 1. No, exit
+    2. Yes, I accept
+
+  Enter to confirm - Esc to cancel
+"""
+
+SAFE_PANE = """\
+────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────
+  ⚡ 8/11 · Opus high · ctx [||||] 16%
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+"""
+
+
+def test_an_unrecognised_dialog_is_never_typed_into(tmp_path):
+    """THE regression. This screen matches none of classify_text's dialog
+    patterns, so the old leg read it as idle and would have typed the ask and
+    pressed Enter into it — selecting whatever row was default. The guard is
+    an ALLOWLIST for exactly this reason: a denylist is only ever as good as
+    the dialog shape somebody already met."""
+    p = run(tmp_path, "compaction_one lane-a", pane=UNKNOWN_DIALOG)
+    assert "send-keys" not in keys(tmp_path), "a keystroke reached a dialog"
+    assert "NOT typing" in p.stderr
+
+
+def test_the_crossing_survives_a_refusal(tmp_path):
+    """Refusing to type must not consume the ask. No marker means the next
+    sweep asks again — a lane silenced by one badly-timed dialog would be the
+    same silent stall this whole leg exists to remove."""
+    run(tmp_path, "compaction_one lane-a", pane=UNKNOWN_DIALOG)
+    flags = list((tmp_path / ".mcp-hub").glob("compaction-lane-a-*"))
+    assert not any(f.suffix == "" and f.stat().st_size for f in flags), \
+        "the ask time was recorded for an ask that was never delivered"
+
+
+def test_the_known_bypass_dialog_is_still_refused(tmp_path):
+    """Ground the old classifier already held, held again."""
+    run(tmp_path, "compaction_one lane-a", pane=BYPASS_DIALOG)
+    assert "send-keys" not in keys(tmp_path)
+
+
+def test_a_pane_that_cannot_be_read_is_not_typed_into(tmp_path):
+    """Unreadable is not safe. The blind branch must not be the permissive
+    one — that equivalence is the whole defect."""
+    run(tmp_path, "compaction_one lane-a", pane="")
+    assert "send-keys" not in keys(tmp_path)
+
+
+def test_a_normal_idle_pane_is_still_typed_into(tmp_path):
+    """The guard has to let the ordinary case through, or it is just an
+    outage with a good excuse."""
+    p = run(tmp_path, "compaction_one lane-a", pane=SAFE_PANE)
+    assert "send-keys -l" in keys(tmp_path)
+    assert "compaction ask sent at" in p.stdout
+
+
+def test_the_enter_is_withheld_when_a_dialog_appears_after_the_literal(tmp_path):
+    """The gap between the literal and the Enter is ~1s of real time, and the
+    Enter is the half that ANSWERS a dialog. Checking once at the top would
+    leave that window open. An unsent line is visible and harmless; a pressed
+    default is neither."""
+    p = run(tmp_path, "compaction_one lane-a", pane=SAFE_PANE,
+            pane_after=UNKNOWN_DIALOG)
+    log = keys(tmp_path)
+    assert "send-keys -l" in log, "the literal should have been sent"
+    assert "Enter" not in log, "Enter was pressed into a dialog"
+    assert "Enter NOT sent" in p.stderr
+
+
+def test_the_exec_slash_command_goes_through_the_same_funnel(tmp_path):
+    """/compact is typed by a different leg. One guarded path and one
+    unguarded path is how a guard gets trusted and still loses."""
+    run(tmp_path, "compaction_one lane-a", pane=UNKNOWN_DIALOG,
+        replies=answered("COMPACT"), env=ARMED)
+    assert "send-keys" not in keys(tmp_path)
+    assert "/compact" not in keys(tmp_path)
+
+
+# --- the answer->exec deadline (deputy's #327 ruling, 2026-09-04) -----------
+#
+# The idle guard above is right in the common case and catastrophic in the
+# tail: vps-hetzner-dev-vm-1 fired ON TIME at 151,191 on 2026-09-03 10:47Z
+# and still peaked at 455,166, because it answered and then never went idle
+# for 12,603s. No threshold reaches that — the ask does not fire twice — so
+# the WAIT is what gets bounded, and only after the lane has answered.
+
+DEADLINE_NOW = {"MCP_HUB_COMPACTION_EXEC": "1", "MCP_HUB_COMPACT_EXEC_DEADLINE": "0"}
+BUSY = "Nucleating… (1m 55s · ↓ 6.4k tokens)\n"
+
+
+def test_the_deadline_lifts_a_guard_that_the_PANE_guard_RE_IMPOSES(tmp_path):
+    """⭐⭐ THE DEADLINE IS INERT BY CONSTRUCTION, and this test exists so
+    nobody reads that as a bug OR as load-bearing.
+
+    MEASURED 2026-09-04, and it is stronger than "not enough on its own":
+    ``classify_agent`` IS ``classify_text(pane)``, and
+    ``compaction_safe_to_type`` requires chrome AND
+    ``classify_text(pane) == idle``. So guard 2 is a STRICT SUBSET of guard 1,
+    and every state in which the deadline lifts guard 1 is a state guard 2
+    then re-imposes. The set of keystrokes this deadline can buy is EMPTY.
+    Empirically the same: 0 deadline fires ever, and 20/20 exec-side blocks in
+    the heal journal were state `working`, never `waiting`, max 600s, all
+    self-resolved.
+
+    Guard 2 stays unweakened — it is what stops a /clear landing in a live
+    generation. The real residual is one guard UPSTREAM: the ASK is idle-gated
+    too (squad/squad:1370), so a lane that is never idle is never asked, never
+    answers, and nothing down here ever runs for it.
+
+    There are TWO guards between a verdict and a keystroke:
+
+      1. `classify_agent` != idle   — state chrome. THIS is what the
+         deadline bounds, because waiting on it forever is the 455k case.
+      2. `compaction_safe_to_type`  — refuses any pane that is not claude's
+         own idle chrome. THIS IS NOT BOUNDED AND MUST NOT BE. It is the
+         guard that stops a blind keypress landing in a dialog, and `/clear`
+         into a pane mid-generation is the worst keystroke in this file.
+
+    So a lane that is genuinely mid-turn is STILL not typed into after the
+    deadline: the deadline is reached, the attempt is made, and the pane
+    guard refuses it out loud. A deadline that could type into a working
+    pane would not be a deadline, it would be the thing every negative test
+    in this file was written to prevent."""
+    p = run(tmp_path,
+            "compaction_one lane-a\n"
+            f'echo "{BUSY.strip()}" >> "$HOME/pane.txt"\n'
+            "compaction_one lane-a\n",
+            env=DEADLINE_NOW, replies=answered("COMPACT"))
+    assert "deadline reached, typing" in p.stdout, p.stdout + p.stderr
+    assert "DEADLINE: answered COMPACT" in rows(tmp_path)
+    # ...and the second guard still holds.
+    assert "/compact" not in keys(tmp_path), "the pane guard was bypassed"
+    assert "not claude's idle chrome" in p.stderr, p.stderr
+
+
+def test_the_deadline_row_says_the_lane_was_not_idle(tmp_path):
+    """A keystroke into a busy pane must never look like an ordinary one in
+    the record — the row carries the wait and the state that was overridden."""
+    run(tmp_path,
+        "compaction_one lane-a\n"
+        f'echo "{BUSY.strip()}" >> "$HOME/pane.txt"\n'
+        "compaction_one lane-a\n",
+        env=DEADLINE_NOW, replies=answered("COMPACT"))
+    body = rows(tmp_path)
+    assert "typing anyway at the 0s bound" in body
+    assert "has not been idle since" in body
+
+
+def test_a_busy_lane_INSIDE_the_deadline_is_still_left_alone(tmp_path):
+    """The default 900s must not become 'type immediately'. Same setup, real
+    deadline: nothing is typed and the wait is reported."""
+    p = run(tmp_path,
+            "compaction_one lane-a\n"
+            f'echo "{BUSY.strip()}" >> "$HOME/pane.txt"\n'
+            "compaction_one lane-a\n",
+            env=ARMED, replies=answered("COMPACT"))
+    assert "not typing this pass (idle only)" in p.stdout
+    assert "deadline reached" not in p.stdout
+    assert "/compact" not in keys(tmp_path)
+    assert "of 900s" in p.stdout, "the wait is not reported"
+
+
+def test_a_lane_that_NEVER_ANSWERED_is_never_exec_d_however_long_it_waits(tmp_path):
+    """🔴 THE RESIDUAL THE DEPUTY WOULD NOT MOVE. The deadline starts at the
+    ANSWER. 'No answer = no action' is his own g81 wording, so a silent lane
+    is re-asked for ever and never typed into — even with the deadline at 0,
+    which would fire instantly if it were measured from the ask."""
+    p = run(tmp_path,
+            "compaction_one lane-a\n"
+            f'echo "{BUSY.strip()}" >> "$HOME/pane.txt"\n'
+            "compaction_one lane-a\n",
+            env=DEADLINE_NOW)          # no replies => never answered
+    assert "deadline reached" not in p.stdout
+    assert "/compact" not in keys(tmp_path)
+    assert "/clear" not in keys(tmp_path)
+
+
+def test_the_shipped_default_deadline_is_900_seconds(tmp_path):
+    """900s is the p90 of the MEASURED fire->exec lag. Pinned because a
+    default that drifts silently is how the tail came back."""
+    assert 'MCP_HUB_COMPACT_EXEC_DEADLINE:-900' in SQUAD.read_text(encoding="utf-8")
+
+
+def test_the_shipped_default_cap_is_the_measured_one(tmp_path):
+    assert f'MCP_HUB_COMPACT_ASK_TOKENS:-{CAP}' in SQUAD.read_text(encoding="utf-8")

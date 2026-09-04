@@ -296,6 +296,15 @@ type_line() { local t="$1"; shift; tmt send-keys -t "$t" -l "$*" || return 1; sl
 # ctx% from the same text), so the patterns live here and BOTH callers use
 # them. They were duplicated until 2026-07-20 and silently drifted apart —
 # that drift is why working agents read as idle and the tab dots went stale.
+# ONE definition of "claude's own chrome is on the screen". classify_text uses
+# it to find where a dialog would START (a dialog owns everything below the
+# last chrome line); compaction_safe_to_type uses the SAME string as its
+# allowlist. Two copies would drift, and the copy that drifted would be the
+# one deciding whether we press Enter into a question of the operator's.
+# `ctx [[]` not `ctx \[` so the one string is valid in both grep -E and awk's
+# dynamic regex (gawk warns on \[ and the warning would land in a log).
+PANE_CHROME_RE='accept edits on|manual mode on|plan mode on|bypass permissions|for agents|ctx [[]'
+
 classify_text() {
   local t="$1" below lastline
   # [X] char-class trick: these patterns must never match their own source
@@ -309,9 +318,9 @@ classify_text() {
   # dialog flag itself 🔴 (2026-07-21), which is worse than cosmetic: a false
   # red among real ones is how a real one gets ignored.
   # So: look for dialog markers only BELOW the last chrome line.
-  below="$(printf '%s\n' "$t" | awk '
+  below="$(printf '%s\n' "$t" | awk -v re="$PANE_CHROME_RE" '
     { l[NR] = $0 }
-    /accept edits on|manual mode on|plan mode on|bypass permissions|for agents|ctx \[/ { last = NR }
+    $0 ~ re { last = NR }
     END { for (i = last + 1; i <= NR; i++) print l[i] }')"
   # Belt and braces for any build that keeps the statusline visible under a
   # prompt: a dialog footer as the literal last line is a dialog, wherever the
@@ -909,7 +918,16 @@ hold_enforce_one() {
 #
 # The percent is still carried on every row, because the console door shows
 # it and an operator reads it — but it DECIDES nothing.
-COMPACT_ASK_TOKENS="${MCP_HUB_COMPACT_ASK_TOKENS:-150000}"
+# ⭐ 138111, NOT 150000 (deputy's ruling on #327 ⟨20193⟩, 2026-09-04, after
+# their own 30-70k cause was withdrawn on the measurement below). It is the
+# p90 of the MEASURED fire→exec token climb subtracted from the 180k ceiling:
+# 180000 - 41889. Measured over 65 POST-FIX episodes only — the ones after
+# c0c1b56/05be35b/f33ddeb landed 2026-09-03 09:41. Pre-fix episodes are
+# excluded on purpose: their 400k+ peaks were the AMBIGUOUS-disarm defect,
+# already fixed, and averaging a fixed defect back in would drag this number
+# far below anything the lane needs, compacting healthy lanes for nothing.
+# This NARROWS the old 150000; it never widens it.
+COMPACT_ASK_TOKENS="${MCP_HUB_COMPACT_ASK_TOKENS:-138111}"
 # 🔴 THE EXEC LEG IS OFF BY DEFAULT AND MUST STAY THAT WAY UNTIL ARMED
 # DELIBERATELY. It types /clear or /compact into a live pane, and `/clear`
 # DESTROYS context — "no answer = no action" is the safety property and is
@@ -1104,11 +1122,159 @@ COMPACT_ASK_TEXT="Your context is at %s tokens, over the %s-token cap. Flush any
 # Type a literal then Enter, as two sends. `send-keys "<text>" Enter` in one
 # call makes tmux read the literal as a KEY NAME wherever it matches one —
 # the bug that typed `-tmcp-hub-dev-vm-1` into two lanes on 2026-08-28.
+# ⛔ ALLOWLIST, not a denylist. Bought 2026-09-03 11:01:47.714, when the Enter
+# below answered vps-hetzner's open AskUserQuestion — "Do you authorise the
+# EXPAND leg of #371 on prod-1 now?" -> "Yes — apply the expand leg", recorded
+# +0.009s later — and a production change followed. classify_text could not
+# have stopped it and it is not a typo in its patterns: those patterns are
+# PERMISSION-dialog chrome, while an AskUserQuestion's rows are the asking
+# agent's own option labels, and the classifier's three-way fall-through is
+# `else printf idle` — so "I cannot see" and "safe to type" are the same
+# answer. A denylist of dialog shapes is only ever as good as the shape
+# nobody has met yet.
+#
+# So: type only into a screen that POSITIVELY shows claude's own idle chrome.
+# Every dialog — known, unknown, or invented next month — replaces the input
+# box and statusline and therefore has none; an unreadable pane has none
+# either, and both must refuse. src/mcp_hub/seat.py:first_turn_is_safe is the
+# same rule bought the same way (its blind Enter confirmed a seat's own death
+# on a "No, exit" default) — this is that rule, ported, not a second opinion.
+compaction_safe_to_type() {
+  local a="$1" cap
+  cap="$(tm capture-pane -p -t "$a" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -20)" || return 1
+  [ -n "$cap" ] || return 1
+  printf '%s\n' "$cap" | grep -qE "$PANE_CHROME_RE" || return 1
+  # belt and braces: chrome can survive under a prompt in some builds, so the
+  # existing denylist still gets its say. Both must agree before we type.
+  [ "$(classify_text "$cap")" = idle ] || return 1
+  return 0
+}
+
 compaction_type() {
+  compaction_safe_to_type "$1" \
+    || { echo "!! $1: pane is not claude's idle chrome (dialog or unreadable) — NOT typing" >&2; return 1; }
   tm send-keys -l -t "$1" "$2" 2>/dev/null || return 1
   sleep 1
+  # RE-CHECK before the Enter. The gap between the two sends is exactly where
+  # a dialog can appear, and the Enter is the half that ANSWERS one. If it
+  # appeared, leave the literal sitting unsent: an unsent line is visible and
+  # harmless, a pressed default is neither.
+  compaction_safe_to_type "$1" \
+    || { echo "!! $1: a dialog appeared after the literal — Enter NOT sent" >&2; return 1; }
   tm send-keys -t "$1" Enter 2>/dev/null || return 1
 }
+
+# ⭐⭐ DID THE COMPACTION ACTUALLY HAPPEN? The client says so itself, and it is
+# the only thing that can: `/compact` writes a `compact_boundary` system record
+# carrying `preTokens` and `postTokens` — the exact net, from the process that
+# performed it. Prints "<pre> <post>" for the first boundary at or after
+# `since`; the word `none` when the transcript IS readable and carries no such
+# boundary; and NOTHING AT ALL when it cannot be read.
+#
+# 🔴 Those last two must stay different answers. "The client says no
+# compaction happened" is a measurement; "I could not look" is not, and a leg
+# that collapsed them would call an unreadable lane a failed keystroke.
+#
+# 🔴 This exists because ON 2026-09-03 THE KEYSTROKE DID NOT TAKE. exec typed
+# `/compact` into operator-cockpit-ui-agent (08:16:49) and squad-proxy
+# (08:16:46) while both were idle, and NEITHER transcript carries a boundary
+# after it: the records show `user "/compact"` answered by the model with "No
+# response requested." — the TUI never parsed the leading slash, so the text
+# went to the API as an ordinary prompt. A `/compact` that really runs writes
+# the local-command records (`<command-name>/compact</command-name>`) and then
+# the boundary; dreamteam's 13:03:50 exec has all of them (170527 -> 9731).
+# Both lanes then climbed to ~400k for five hours with NOTHING said, because
+# the close leg was waiting on a drop that was never coming.
+#
+# It also replaces a SAMPLED close with a REPORTED one. The old test was
+# `tok < before` read on a two-minute sweep: squad-proxy's reading dipped to
+# 185223 (below its 188445) for SIX SECONDS at 08:17 on ordinary variation and
+# no compaction at all — catch that sample and the cycle closes on a false
+# measurement, miss it and it never closes. A number the client reports about
+# an act it performed is not a sample of anything.
+compaction_boundary_since() {
+  local d; d="$(compaction_dir "$1")" || return 0
+  [ -d "$d" ] || return 0
+  COMPACT_DIR="$d" COMPACT_SINCE="$2" python3 -c '
+import os, sys, json, glob, datetime
+d = os.environ["COMPACT_DIR"]
+try: since = float(os.environ["COMPACT_SINCE"])
+except ValueError: sys.exit(0)
+fs = glob.glob(os.path.join(d, "*.jsonl"))
+if not fs: sys.exit(0)
+f = max(fs, key=os.path.getmtime)
+# Tail only, like every other read here: these files reach tens of MB.
+try:
+    sz = os.path.getsize(f)
+    fh = open(f, "rb")
+except OSError: sys.exit(0)
+with fh:
+    # A WIDER TAIL THAN THE READING TAKES. The reading wants the last record
+    # and 4MB is plenty; this wants a record up to COMPACT_LANDED_AFTER old,
+    # and the busiest lane on this fleet writes ~13MB/hour — 4MB would scroll
+    # a real boundary out of view on a chatty lane and report `none`, which
+    # now MEANS "the keystroke did not take". This read only runs while a
+    # cycle is open, so the extra bytes cost nothing anyone can measure.
+    fh.seek(max(0, sz - 16000000))
+    lines = fh.read().decode("utf-8", "ignore").splitlines()
+for line in lines:
+    if "compact_boundary" not in line: continue
+    try: rec = json.loads(line)
+    except Exception: continue
+    if rec.get("subtype") != "compact_boundary": continue
+    ts = rec.get("timestamp") or ""
+    try:
+        t = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        continue
+    if t < since: continue
+    m = rec.get("compactMetadata") or {}
+    pre, post = m.get("preTokens"), m.get("postTokens")
+    if isinstance(pre, int) and isinstance(post, int):
+        print(pre, post)
+        break
+else:
+    # Readable, and it says no compaction. That is an answer, not a silence.
+    print("none")
+' 2>/dev/null
+}
+
+# When the exec keystroke was typed. `.exec` carries the READING (the legacy
+# re-arm bar reads it as a number), so the TIME comes from its mtime — the
+# file is written at the moment of the keystroke and never rewritten.
+compaction_exec_at() {
+  date -r "$1" +%s 2>/dev/null
+}
+
+# How long a compaction is given to appear before the keystroke is called
+# FAILED. Real ones on this fleet take 98-148s (measured across 22 boundaries),
+# so five minutes is roughly double the slowest — long enough that a slow
+# compact is never libelled, short enough that a lane is not left climbing.
+COMPACT_LANDED_AFTER="${MCP_HUB_COMPACT_LANDED_AFTER:-300}"
+# ⚠️ AND A CAP ON RETRYING IT. Re-arming a failed exec is right — the lane is
+# over the cap and nothing was done about it — but a keystroke that cannot be
+# parsed will not start parsing, and an uncapped retry would ask the lane every
+# five minutes forever. After this many failed execs in one session the cycle
+# closes on its MEASURED reading and re-arms only on genuine growth, exactly
+# like the AMBIGUOUS path: still watching, no longer typing.
+COMPACT_EXEC_TRIES="${MCP_HUB_COMPACT_EXEC_TRIES:-2}"
+# ⭐ ANSWER→EXEC DEADLINE (deputy's ruling on #327 ⟨20193⟩, 2026-09-04).
+# The idle guard below waits for a quiet pane before typing, and a lane that
+# never goes quiet is never typed into: measured on vps-hetzner-dev-vm-1
+# 2026-09-03 10:47Z, which fired ON TIME at 151,191 and still peaked at
+# 455,166 because answer→exec took 12,603s. A threshold cannot reach that —
+# no ask fires twice — so the wait itself is bounded. 900s is the p90 of the
+# measured fire→exec lag (max 12,603s), so the common case is untouched and
+# only the tail is forced.
+#
+# 🔴 THE DEADLINE STARTS AT THE ANSWER, NEVER AT THE ASK. A seat that has
+# NOT answered is re-asked forever and never exec'd — "no answer = no
+# action" is his own g81 wording and this deadline does not touch it. That
+# leaves a REAL residual, named here so nobody later reads it as an
+# oversight: a lane that simply never answers can still climb without limit,
+# and nothing in this file will stop it. Closing that needs his word, not a
+# deputy's ruling, because the fix is a keystroke nobody authorised.
+COMPACT_EXEC_DEADLINE="${MCP_HUB_COMPACT_EXEC_DEADLINE:-900}"
 
 # ONCE PER CROSSING, NOT ONCE PER SESSION (operator-signed 2026-09-02 22:5x).
 #
@@ -1153,7 +1319,7 @@ compaction_recross() {
   [ "$tok" -ge "$COMPACT_ASK_TOKENS" ] 2>/dev/null || return 1
   [ "$tok" -gt "$net" ] 2>/dev/null || return 1
   rm -f "$flag" "$flag.fire" "$flag.answer" "$flag.exec" "$flag.closed" \
-     2>/dev/null || true
+     "$flag.tries" 2>/dev/null || true
   return 0
 }
 
@@ -1220,29 +1386,95 @@ compaction_one() {
 # BAR 52 — the exec leg. Runs only for a lane that has already been asked,
 # and only ever on the verdict that lane wrote itself.
 compaction_answer_leg() {
-  local a="$1" flag="$2" tok="$3" pct="$4" since ans st before
+  local a="$1" flag="$2" tok="$3" pct="$4" since ans st before at bnd tries
+  # The recorded verdict, if there is one — the exec branch names it on its
+  # rows and runs BEFORE the block that reads it below.
+  ans="$(cat "$flag.answer" 2>/dev/null || true)"
 
   # This session is finished with — answered and acted on, or answered and
   # deliberately not acted on. Either way, nothing further is owed.
   [ -f "$flag.closed" ] && return 0
 
-  # An exec already happened: all that is left is the NET row, once the
-  # transcript has actually moved. Reported when measured, never predicted —
-  # /compact's saving is not knowable before the next turn lands.
+  # An exec already happened. Three questions, in this order: did the client
+  # say it compacted; failing that, has the reading moved; and failing BOTH,
+  # has the keystroke had long enough that its silence is a verdict?
   if [ -f "$flag.exec" ]; then
     before="$(cat "$flag.exec" 2>/dev/null || true)"
     if [ -z "$before" ]; then : > "$flag.closed"; return 0; fi
-    if [ "$tok" -lt "$before" ] 2>/dev/null; then
-      compaction_row "$a" net "$pct" "$tok" \
-        "recovered $(( before - tok )) tokens: ${before} -> ${tok}"
+    at="$(compaction_exec_at "$flag.exec" || true)"
+
+    # 1. THE CLIENT'S OWN REPORT OF THE ACT. `compact_boundary` carries the
+    # exact pre/post, written by the process that did the compacting. It
+    # outranks any reading this sweep could take, because it is not a sample.
+    if [ -n "$at" ]; then
+      bnd="$(compaction_boundary_since "$a" "$at" || true)"
+    else
+      bnd=""
+    fi
+    if [ -n "$bnd" ] && [ "$bnd" != "none" ]; then
+      compaction_row "$a" net "$pct" "${bnd#* }" \
+        "recovered $(( ${bnd% *} - ${bnd#* } )) tokens: ${bnd% *} -> ${bnd#* } (compact_boundary)"
       # THE MEASURED FLOOR GOES IN THE CLOSE MARKER. It is what lets a LATER
       # climb be told apart from the residue of this one — see
       # compaction_recross. The AMBIGUOUS path writes a floor too, for the
       # same reason. An EMPTY marker (the remaining close paths — exec
       # disarmed, unrecognised verdict, legacy empty `.exec`) means "closed
       # without a measurement", and never re-arms.
-      printf '%s\n' "$tok" > "$flag.closed"
+      printf '%s\n' "${bnd#* }" > "$flag.closed"
+      return 0
     fi
+
+    # 2. THE SAMPLED DROP — a FALLBACK, and only where the transcript could
+    # not be asked. ⚠️ It must never override a readable `none`: squad-proxy's
+    # reading dipped 3,222 tokens below its `before` for six seconds at
+    # 08:17:06 on ordinary variation, with no compaction anywhere in its
+    # transcript. Closing on that sample would have written a `net` row
+    # claiming a saving for an act that never happened — a record that agrees
+    # with the story instead of observing it, which is worse than the stall.
+    if [ -z "$bnd" ] && [ "$tok" -lt "$before" ] 2>/dev/null; then
+      compaction_row "$a" net "$pct" "$tok" \
+        "recovered $(( before - tok )) tokens: ${before} -> ${tok} (sampled; no readable transcript)"
+      printf '%s\n' "$tok" > "$flag.closed"
+      return 0
+    fi
+
+    # 3. STILL IN FLIGHT. A real compaction on this fleet takes 98-148s
+    # (measured across 22 boundaries), so nothing is concluded before the
+    # window is up. No row either: "it has not finished yet" is not news.
+    if [ -z "$at" ] || [ "$(( $(date +%s) - at ))" -lt "$COMPACT_LANDED_AFTER" ] 2>/dev/null; then
+      return 0
+    fi
+
+    # 4. 🔴 THE KEYSTROKE DID NOT TAKE — the backstop that never ran.
+    # exec typed its slash command and the client never performed one. Until
+    # now this fell off the end of the leg: no boundary and no drop meant
+    # `return 0` on every pass forever, so the cycle stayed open, `.closed`
+    # was never written, recross could never re-arm, and the lane climbed
+    # unasked with NOT ONE ROW saying so — operator-cockpit-ui-agent and
+    # squad-proxy to ~400k over five hours on 2026-09-03. An exec that did
+    # nothing must be as loud as one that worked.
+    tries="$(cat "$flag.tries" 2>/dev/null || echo 0)"
+    [ "$tries" -eq "$tries" ] 2>/dev/null || tries=0
+    tries=$(( tries + 1 ))
+    printf '%s\n' "$tries" > "$flag.tries"
+    compaction_row "$a" exec "$pct" "$tok" \
+      "NOT COMPACTED: ${ans:-the verdict}'s command was typed $(( $(date +%s) - at ))s ago and the transcript carries no compaction since — the keystroke did not take (attempt ${tries} of ${COMPACT_EXEC_TRIES})"
+    if [ "$tries" -lt "$COMPACT_EXEC_TRIES" ] 2>/dev/null; then
+      # RE-ARM, not close. The lane is over the cap and nothing was done about
+      # it, so the crossing is still owed an ask. `.tries` survives the reset:
+      # it is the only thing standing between this and an endless retry.
+      rm -f "$flag" "$flag.fire" "$flag.answer" "$flag.exec" 2>/dev/null || true
+      echo "$a: ${ans:-verdict} was typed but nothing compacted — re-arming (attempt ${tries} of ${COMPACT_EXEC_TRIES})"
+      return 0
+    fi
+    # The cap. A command that will not parse will not start parsing, so stop
+    # typing — but keep WATCHING: the floor is this reading, so genuine growth
+    # re-arms exactly as it does after an AMBIGUOUS close. Fail-closed on the
+    # keystroke must never mean fail-silent on the lane.
+    compaction_row "$a" exec "$pct" "$tok" \
+      "GIVING UP on typing for this session after ${tries} failed execs — needs an operator (relaunch, or type it in the pane). Floor recorded at ${tok}; a genuine climb past it re-arms the ask."
+    printf '%s\n' "$tok" > "$flag.closed"
+    echo "!! $a: ${tries} execs typed and nothing compacted — needs an operator" >&2
     return 0
   fi
 
@@ -1295,8 +1527,23 @@ compaction_answer_leg() {
   # verdict is already banked, so waiting costs nothing.
   st="$(classify_agent "$a" || true)"
   if [ "$st" != "idle" ]; then
-    echo "$a: answered ${ans} but $st — not typing this pass (idle only)"
-    return 0
+    # BOUNDED, not abandoned. The verdict is banked, so waiting normally
+    # costs nothing — but it stops being free once the lane has been
+    # climbing for the whole wait, which is the 455k case. Past the
+    # deadline the keystroke goes in on a busy pane deliberately: the lane
+    # asked for it, and a /clear it chose beats a context it can no longer
+    # hold. The age is taken from the ANSWER's own mtime, which is the
+    # moment the verdict was recorded.
+    local answered_at waited
+    answered_at="$(stat -c %Y "$flag.answer" 2>/dev/null || echo 0)"
+    waited=$(( $(date +%s) - answered_at ))
+    if [ "$answered_at" -eq 0 ] 2>/dev/null || [ "$waited" -lt "$COMPACT_EXEC_DEADLINE" ] 2>/dev/null; then
+      echo "$a: answered ${ans} but $st — not typing this pass (idle only) — waited ${waited}s of ${COMPACT_EXEC_DEADLINE}s"
+      return 0
+    fi
+    compaction_row "$a" exec "$pct" "$tok" \
+      "DEADLINE: answered ${ans} ${waited}s ago and the lane has not been idle since (${st}) — typing anyway at the ${COMPACT_EXEC_DEADLINE}s bound"
+    echo "$a: answered ${ans} ${waited}s ago, still $st — deadline reached, typing"
   fi
 
   local cmd
