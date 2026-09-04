@@ -1535,17 +1535,31 @@ def test_card_nag_suppressed_by_loop_backstop():
 
 
 def test_extract_decided_takes_last_line():
+    """CONTRACT CHANGED by card #943: the verdict is still the first line of
+    the return, but a receipt now follows it naming the mechanism and quoting
+    the line it was read from. A hook-made close and a hand-made one used to
+    be the same row, which is why fifteen fabricated verdicts were
+    indistinguishable from real ones for 39 days."""
     from mcp_hub.cli import _extract_decided
     turn = ("Operator said yes in the pane, proceeding.\n\n"
             "**DECIDED:** yes — arm it, gate stays dark\n")
-    assert _extract_decided(turn) == "yes — arm it, gate stays dark"
+    got = _extract_decided(turn)
+    assert got.split("\n")[0] == "yes — arm it, gate stays dark"
+    assert "auto-closed by stop-hook" in got
     assert _extract_decided("no marker here") == ""
 
 
 def test_card_beats_decided_when_both_present():
     """A turn that closes one ask and opens another: the new card wins the
-    put path (stop_hook_command only extracts DECIDED when no card)."""
+    put path (stop_hook_command only extracts DECIDED when no card).
+
+    Card #943 makes this belt-and-braces. The call site still forces
+    `decided = "" if card else ...`, so the card wins there as it always did;
+    but the extractor ALSO declines now, because a marker with a card after
+    it is not the turn's closing line. Two independent reasons to take the
+    put path, and the extractor's reason is the conservative one — an
+    ambiguous turn must not close a card."""
     from mcp_hub.cli import _extract_decided, _extract_decision_card
     turn = "**DECIDED:** yes\n\n**DECISION**\n**ASK:** next thing\n"
     assert _extract_decision_card(turn)
-    assert _extract_decided(turn) == "yes"
+    assert _extract_decided(turn) == ""

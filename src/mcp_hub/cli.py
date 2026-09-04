@@ -256,15 +256,90 @@ def _read_last_assistant_text(transcript_path: str | None) -> str:
     return ""
 
 
-_DECIDED_RE = re.compile(r"\*{0,2}DECIDED:\*{0,2}\s*(.+?)\s*$", re.M)
+# 🔴 THE MARKER MUST OWN ITS LINE (card #943, 2026-09-04).
+#
+# The first form of this pattern had no line anchor, so it matched the token
+# wherever it appeared — including quoted mid-sentence, inside backticks, and
+# inside a NEGATION. It closed cards with whatever followed the colon, so a
+# lane writing "I have emitted no `DECIDED:` line." closed its own card with
+# the verdict "` line.". That fabricated 15 in-pane operator verdicts across
+# 7 lanes between 2026-07-27 and 2026-09-04 — 39 days — and every one of them
+# was harvested from a sentence whose whole point was that no verdict was
+# being recorded. It hid that long because the corrupted row was never in
+# anybody's authorisation chain: every lane keyed authorisation to the
+# console or the pane, never to hub card state.
+#
+# Anchoring alone is not enough, because a line may legitimately BEGIN with
+# the token while discussing it. So three independent gates stand here, and
+# EVERY ONE FAILS TOWARD NOT CLOSING — the cost of missing a real verdict is
+# that the agent restates it; the cost of inventing one is a forged consent
+# record that reads exactly like a real one.
+# Three exact forms, every one of them BALANCED. The loose `\*{0,2}` form
+# accepted `DECIDED:** and stop` — consuming an unbalanced bold-close as if
+# it were the marker's own, and handing back the remainder as a verdict.
+# Unbalanced emphasis around the token is a tell that the line was torn out
+# of something, so it is refused rather than repaired.
+_DECIDED_RE = re.compile(
+    r"^[ \t]{0,3}(?:\*\*DECIDED:\*\*|\*\*DECIDED\*\*:|DECIDED:)"
+    r"[ \t]*(.+?)[ \t]*$"
+)
+
+# The scrape signature. A verdict harvested from mid-sentence begins with the
+# punctuation that closed the quotation it was torn out of — "` line.",
+# "** and nothing else", "' to the card". A real verdict starts with a word.
+_FRAGMENT_START_RE = re.compile(r"^[\s`'\"*)\]}>,;:.!?\u2018\u2019\u201c\u201d]")
 
 
 def _extract_decided(turn_text: str) -> str:
-    """The `**DECIDED:** <verdict>` closing marker, '' if none. The agent
-    that received an in-pane answer records the verdict itself (it just
-    understood and acted on it) — machinery only ships; last one wins."""
-    matches = list(_DECIDED_RE.finditer(turn_text))
-    return matches[-1].group(1).strip() if matches else ""
+    """The `**DECIDED:** <verdict>` closing marker, '' if none.
+
+    The agent that received an in-pane answer records the verdict itself (it
+    just understood and acted on it) — machinery only ships; last one wins.
+
+    Returns the verdict with a RECEIPT appended naming the mechanism and
+    quoting the line it was read from. A hook-made close and a hand-made one
+    used to be the same row, which is why a fabricated verdict was
+    indistinguishable from a real one for 39 days; the receipt makes every
+    automatic close falsifiable from the record alone, without needing the
+    transcript it was scraped from.
+    """
+    text = (turn_text or "").rstrip()
+    if not text:
+        return ""
+
+    lines = text.splitlines()
+    # Gate 1: the marker is a CLOSING marker — the convention, and the hook's
+    # own prompt, put it at the end of the turn. A match anywhere else is
+    # prose about the marker, not a verdict. This is the gate that would have
+    # stopped all fifteen on its own.
+    last = ""
+    last_idx = -1
+    for idx in range(len(lines) - 1, -1, -1):
+        if lines[idx].strip():
+            last, last_idx = lines[idx], idx
+            break
+    if last_idx < 0:
+        return ""
+
+    match = _DECIDED_RE.match(last)
+    if not match:
+        return ""
+
+    # Gate 2: not inside a fenced code block — a fence shows the marker as an
+    # EXAMPLE, which is the most natural way to write about it.
+    if sum(1 for ln in lines[:last_idx] if ln.lstrip().startswith("```")) % 2:
+        return ""
+
+    verdict = match.group(1).strip()
+    # Gate 3: a verdict is a verdict, not the back half of a sentence about
+    # one. Leading punctuation is the tell, and a candidate with no letter in
+    # it says nothing a reader could act on.
+    if not verdict or _FRAGMENT_START_RE.match(verdict):
+        return ""
+    if not any(ch.isalnum() for ch in verdict):
+        return ""
+
+    return f"{verdict}\n[auto-closed by stop-hook · read from: {last.strip()!r}]"
 
 
 def _extract_decision_card(turn_text: str) -> str:
