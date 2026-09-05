@@ -197,6 +197,63 @@ def _log_nag_event(agent_name: str, outcome: str, phrase: str) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# ACTIVITY RECORD — bar 47's second instrument (g#24)
+# ---------------------------------------------------------------------------
+#
+# ⭐⭐ WHY THIS EXISTS: bar 47 asks whether stop-hook drains and heartbeats cost
+# ZERO model turns, measured as "a lane with nothing to do shows zero turns for
+# that hour". Measured 2026-09-04, the transcript CANNOT answer that: a drain
+# that surfaces nothing writes NOTHING — the hook's output reaches the
+# transcript only as part of a turn. All 323 zero-turn hours found in 139
+# transcripts were therefore VACUOUS: they satisfy the wording while proving
+# nothing, because "drains are free" and "no drain happened" look identical.
+# A schema check confirmed no hub table records a drain either (wake_log is
+# wakes, delivery_receipts are renders).
+#
+# ⇒ So the counter has to be written where the drain HAPPENS, by the process
+# that performs it, whether or not anything surfaces. A counter that cannot
+# register success cannot report failure.
+#
+# ⚠️ THIS RECORDS THE ACT, NEVER THE COST. It says a drain occurred at a time,
+# and whether it surfaced anything; the turn count still comes from the
+# transcript. Closing bar 47 is the CROSS-REFERENCE of the two — hours where
+# this log shows activity AND the transcript shows zero turns — and neither
+# file can close it alone. Nothing here should ever be read as "drains are
+# free"; it is the half of the measurement that was missing.
+def _log_activity_event(agent_name: str, kind: str, **fields: object) -> None:
+    """Append one activity record. Fail-open: it must never block a Stop.
+
+    `kind` is "drain" (one per stop-hook invocation) or "beat" (one per agent
+    per UTC hour — see `_heartbeat_loop`; a per-beat line would be 1440/day
+    per lane and the measurement is hourly anyway). Volume is otherwise the
+    same order as `card-nag-log.jsonl`, so it is unrotated for the same
+    reason.
+    """
+    try:
+        path = _state_dir() / "activity-log.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {"ts": round(time.time(), 1), "agent": agent_name, "kind": kind}
+        record.update(fields)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def _log_beat_if_new_hour(agent_name: str, last_hour: str) -> str:
+    """Record that heartbeats were alive in this UTC hour; return the bucket.
+
+    Pure decision, extracted from `_heartbeat_loop` so the once-per-hour rule
+    is pinned by a test rather than asserted in a comment — the loop itself
+    needs a live MCP session to reach.
+    """
+    hour_now = time.strftime("%Y-%m-%dT%H", time.gmtime())
+    if hour_now != last_hour:
+        _log_activity_event(agent_name, "beat", hour=hour_now)
+    return hour_now
+
+
 def _card_nag_grace(agent_name: str, would_nag: bool) -> bool:
     """One nag, then one turn of grace. Returns whether the nag may fire.
 
@@ -5027,6 +5084,13 @@ def stop_hook_command(args: argparse.Namespace) -> int:
         )
     except Exception as exc:  # noqa: BLE001
         # Fail open — never block the agent on hub flakiness.
+        # Still RECORDED: a drain that could not reach the hub surfaced
+        # nothing and cost no turn, which is exactly the case the transcript
+        # cannot see. `error` lets the analysis exclude it deliberately
+        # rather than by never having heard of it.
+        _log_activity_event(name, "drain", surfaced=False, error=True,
+                            session=str(payload.get("session_id") or ""),
+                            backstop=stop_hook_active)
         print(f"[mcp-hub stop-hook] hub query failed: {exc!r}", file=sys.stderr)
         return 0
 
@@ -5054,6 +5118,15 @@ def stop_hook_command(args: argparse.Namespace) -> int:
         defer_low=os.environ.get("MCP_HUB_DEFER_LOW", "").lower()
         in ("1", "true", "yes"),
     )
+
+    # 🔴 LOGGED ON BOTH BRANCHES, AND THE `None` ONE IS THE POINT. A drain
+    # that surfaces nothing prints nothing, blocks nothing and leaves no
+    # transcript entry — it is invisible to every other instrument, which is
+    # precisely why bar 47 could not be measured. Recording only the noisy
+    # branch would rebuild the same blind spot in a new file.
+    _log_activity_event(name, "drain", surfaced=response is not None,
+                        session=str(payload.get("session_id") or ""),
+                        backstop=stop_hook_active)
 
     if response is None:
         return 0  # No block — Stop proceeds normally
@@ -5850,6 +5923,12 @@ async def _heartbeat_loop(hub_url: str, agent_name: str) -> bool:
     # break) and persisted per-box, so a restart during the daemon's own
     # downtime is still caught on reconnect.
     baseline_head = _source_head()
+    # Bar 47's beat half. One line per agent per UTC hour, not per beat: the
+    # measurement is hourly, and 1440 lines a day per lane would need rotation
+    # the nag-log pattern deliberately does without. In-process, so a daemon
+    # respawn may re-log the hour it lands in — harmless, this is a PRESENCE
+    # marker, never a count.
+    beat_hour = ""
     while True:
         try:
             async with streamablehttp_client(
@@ -5866,6 +5945,8 @@ async def _heartbeat_loop(hub_url: str, agent_name: str) -> bool:
                             )
                             _maybe_stamp_hub_restart(_extract_text(hb))
                             since_heartbeat = 0
+                            beat_hour = _log_beat_if_new_hour(
+                                agent_name, beat_hour)
                             if baseline_head is not None:
                                 head_now = _source_head()
                                 if (
