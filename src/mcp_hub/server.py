@@ -2427,9 +2427,27 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 continue
             extra = []
             if held_bc["n"]:
+                # ⚠️ THIS SENTENCE IS ABOUT A DIFFERENT COMPONENT'S FUTURE.
+                # This wake carries DM bodies only (see the query above);
+                # broadcast bodies are surfaced by the CLIENT's Stop-hook
+                # drain, deliberately — the drain owns bodies and receipts,
+                # a note line mints neither. Nothing couples the two, so the
+                # old wording ("they surface at this turn's end") was an
+                # UNCONDITIONAL promise about work this process does not do
+                # and cannot observe: when a lane's drain never ran, the
+                # reader was told to expect a delivery that was not coming
+                # and had no reason to go looking. Live specimen 2026-09-05,
+                # reliable-ai-dev-vm-1 — the footer said 3 waiting on two
+                # consecutive turns, nothing surfaced either time, and the
+                # missing row was a WITHDRAWAL of a fleet rule (charter 12:
+                # a cancellation must be as loud as the order it cancels).
+                # So: name whose job it is, and carry the recovery in the
+                # sentence itself. Do not restore a promise here.
                 extra.append(
                     f"({held_bc['n']} queued broadcast(s) also waiting — "
-                    f"they surface at this turn's end)"
+                    f"this wake carries DMs only; your Stop-hook drain "
+                    f"surfaces broadcasts. If they do not appear, pull them "
+                    f"with get_broadcasts_for_agent)"
                 )
             urgent_held = (held_dm["u"] or 0) or (held_bc["u"] or 0)
             outcome = await _wake_with_queue(
