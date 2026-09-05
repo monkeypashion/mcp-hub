@@ -55,6 +55,11 @@ class Report:
     quiet fleet."""
 
     asked: bool = False           # did the candidate query actually answer?
+    # ⚠️ A dry pass fills the SAME lists as a real one, so the counts read
+    # identically. On 2026-09-05 an unarmed run printed "held 7" having held
+    # nobody — a row that says a thing was done when it was not is the whole
+    # false-green shape, banner above it or not. The wording carries it.
+    dry: bool = False
     held: list[str] = field(default_factory=list)
     re_held: list[str] = field(default_factory=list)
     released: list[str] = field(default_factory=list)
@@ -64,9 +69,11 @@ class Report:
     def line(self) -> str:
         if not self.asked:
             return f"hibernate: no pass — {'; '.join(self.reasons)}"
+        w = "would hold" if self.dry else "held"
         parts = [
-            f"held {len(self.held)}", f"re-held {len(self.re_held)}",
-            f"released {len(self.released)}",
+            f"{w} {len(self.held)}",
+            f"{'would re-hold' if self.dry else 're-held'} {len(self.re_held)}",
+            f"{'would release' if self.dry else 'released'} {len(self.released)}",
         ]
         if self.refused:
             parts.append(f"REFUSED {len(self.refused)}")
@@ -93,7 +100,19 @@ class ConsoleAPI:
 
 
 class HubHolds:
-    """The hold-writing slice of /api/v1, under the OPERATOR token.
+    """The hold-writing slice of /api/v1, under the MANAGEMENT API token.
+
+    ⛔ 2026-09-05: this class shipped sending `x-mcp-hub-operator-token`, a
+    header `api_v1.auth()` NEVER READS — so every call, with any token, was
+    401 "missing bearer token". I read a 401 from a fake token as proof the
+    door worked; a 401 cannot tell a bad token from a bad SCHEME, and the
+    instrument I used could not have reported this failure. The scheme is
+    `Authorization: Bearer <token>`, exactly as `edge.HubAPI` already did.
+    ⚠️ TWO SECRETS, ONE WORD "operator". `MCP_HUB_API_TOKEN` (this one, and
+    `auth()`'s operator PRINCIPAL) is not `MCP_HUB_OPERATOR_TOKEN`, which
+    only grades operator-named sends and is read from its own header. I
+    recorded that distinction in the console's own source on 2026-09-03 and
+    then contradicted it here two days later.
 
     Same injected-client shape as `edge.HubAPI`, for the same reason: the
     whole loop is then testable in-process against the real API, with no
@@ -107,7 +126,7 @@ class HubHolds:
 
             client = httpx.Client(base_url=base_url or "", timeout=30)
         self._c = client
-        self._h = {"x-mcp-hub-operator-token": token}
+        self._h = {"Authorization": f"Bearer {token}"}
 
     def seats(self) -> list[str]:
         r = self._c.get("/api/v1/seats", headers=self._h)
@@ -164,7 +183,7 @@ def scan(console: ConsoleAPI, hub: HubHolds, *, thread: int | str = 1,
          dry_run: bool = False) -> Report:
     """One pass: fresh query, hold the candidates, release everyone else."""
     now = time.time() if now is None else now
-    rep = Report()
+    rep = Report(dry=dry_run)
 
     # 1. THE FRESH QUERY. If it cannot be answered, the pass does NOTHING —
     #    not even releases. With no list, every held lane looks like "no

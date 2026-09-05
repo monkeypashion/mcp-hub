@@ -1963,20 +1963,37 @@ def hibernate_command(args: argparse.Namespace) -> int:
     `mcp_hub.hibernate`; this is the door.
     """
     from mcp_hub.hibernate import ConsoleAPI, HubHolds, scan
-    from mcp_hub.operator_api import api_base
+    from mcp_hub.operator_api import TOKEN_FILE, api_base, resolve_token
 
-    token = args.token or os.environ.get("MCP_HUB_OPERATOR_TOKEN", "")
+    # ⛔ This read $MCP_HUB_OPERATOR_TOKEN until 2026-09-05 and would have
+    # refused on every correctly-configured box. The seat-action route checks
+    # the MANAGEMENT API token ($MCP_HUB_API_TOKEN, else ~/.mcp-hub/api.token)
+    # — `resolve_token` is that resolver and the one the rest of the CLI uses.
+    # The other name grades operator-named SENDS. Two secrets, one word.
+    token = args.token or resolve_token()
     if not token:
         # A pass with no token would refuse every write one at a time and
         # report a list of API errors. Say the one true thing instead.
         print(
-            "hibernate: no operator token — set MCP_HUB_OPERATOR_TOKEN or "
-            "pass --token. Holds are operator-only by design: a machine "
+            f"hibernate: no hub API token — set MCP_HUB_API_TOKEN, write "
+            f"{TOKEN_FILE}, or pass --token. The seat-action route is "
+            "operator-principal only (a machine token gets 403): a machine "
             "token here would let a seat park its neighbours.",
             file=sys.stderr,
         )
         return 2
 
+    # 🔴 SAFE BY DEFAULT, after this verb parked four live lanes at 01:0xZ on
+    # 2026-09-05 while I was probing its no-token refusal. `--token ""` is
+    # falsy, so it fell through to `resolve_token()`, this box HAS the API
+    # token in ~/.mcp-hub/api.token, and a command I believed could not write
+    # held vps-hetzner, dreamteam, features-json and reliable-ai. Released
+    # within the minute, owner-scoped.
+    # ⚠️ Arming a scanner is a DELIBERATE ACT and must not be the default a
+    # typo reaches. A bare `mcp-hub hibernate` now REPORTS; only `--arm`
+    # writes. --dry-run stays as the explicit spelling of the same thing.
+    if not args.arm:
+        args.dry_run = True
     rep = scan(
         ConsoleAPI(base_url=args.console_url),
         # The hub URL points at /mcp for MCP clients; /api/v1 lives beside
@@ -1987,13 +2004,17 @@ def hibernate_command(args: argparse.Namespace) -> int:
         thread=args.thread,
         dry_run=args.dry_run,
     )
+    if not args.arm:
+        print("hibernate: REPORT ONLY — nothing was written. "
+              "Pass --arm to place and release holds.")
     print(rep.line())
+    w = "would " if rep.dry else ""
     for lane in rep.held:
-        print(f"  parked   {lane}")
+        print(f"  {w}park    {lane}" if rep.dry else f"  parked   {lane}")
     for lane in rep.re_held:
-        print(f"  re-held  {lane}")
+        print(f"  {w}re-hold {lane}" if rep.dry else f"  re-held  {lane}")
     for lane in rep.released:
-        print(f"  released {lane}")
+        print(f"  would release {lane}" if rep.dry else f"  released {lane}")
     for lane in rep.refused:
         print(f"  REFUSED  {lane}")
     # 🔴 A pass that could not ask is not a quiet fleet, and the exit code is
@@ -7911,7 +7932,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Hub base URL (default: $MCP_HUB_URL or built-in)")
     hib.add_argument(
         "--token", default=None,
-        help="Operator token (default: $MCP_HUB_OPERATOR_TOKEN)")
+        help="Hub API token (default: $MCP_HUB_API_TOKEN, else ~/.mcp-hub/api.token)")
+    hib.add_argument(
+        "--arm", action="store_true",
+        help=("Actually place and release holds. WITHOUT THIS THE PASS ONLY "
+              "REPORTS — arming a scanner that parks live lanes is a "
+              "deliberate act, not the default a typo reaches"))
     hib.add_argument(
         "--dry-run", action="store_true",
         help="Say what the pass would hold and release; write nothing")

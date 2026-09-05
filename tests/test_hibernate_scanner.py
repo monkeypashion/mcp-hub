@@ -259,3 +259,77 @@ def test_the_verb_is_reachable_from_the_console_script():
     assert "hibernate" in _CLI_SUBCOMMANDS
     names = set(cli.build_parser()._subparsers._group_actions[0].choices)
     assert "hibernate" in names
+
+
+# ---------------------------------------------------------------------------
+# The wire, not the rule.
+#
+# ⛔ Every test above swaps `HubHolds` for `FakeHub`, which is right for the
+# RULE and blind to the DOOR — and the door is where this shipped broken on
+# 2026-09-04: the class sent `x-mcp-hub-operator-token`, a header
+# `api_v1.auth()` does not read, so every call was 401 whatever the token.
+# The check that "confirmed" it was a 401 from a deliberately fake token,
+# which is the same answer a bad scheme gives. An instrument that cannot
+# distinguish the failure cannot report it.
+# ---------------------------------------------------------------------------
+
+class RecordingClient:
+    """The httpx surface `HubHolds` actually uses, remembering headers."""
+
+    class _R:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._p = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._p
+
+    def __init__(self, payload=None):
+        self.payload = payload or {"seats": [{"identity": "a"}], "actions": []}
+        self.calls = []
+
+    def get(self, url, headers=None, **kw):
+        self.calls.append(("GET", url, dict(headers or {}), None))
+        return self._R(self.payload)
+
+    def post(self, url, headers=None, json=None, **kw):
+        self.calls.append(("POST", url, dict(headers or {}), json))
+        return self._R({})
+
+
+def _headers(client):
+    return [c[2] for c in client.calls]
+
+
+def test_the_scheme_is_bearer_because_that_is_what_auth_READS():
+    c = RecordingClient()
+    hub = HubHolds(token="sekrit", client=c)
+    hub.seats()
+    hub.hold("a", until=NOW + 60, reason="r", release_condition="c")
+    hub.release("a")
+    assert _headers(c), "no call was made, so nothing was pinned"
+    for h in _headers(c):
+        assert h.get("Authorization") == "Bearer sekrit"
+
+
+def test_the_header_that_never_worked_is_not_sent():
+    # Named explicitly: `api_v1.auth()` reads ONLY the bearer header, so this
+    # one is not merely redundant — sending it alone is a silent 401.
+    c = RecordingClient()
+    hub = HubHolds(token="sekrit", client=c)
+    hub.seats()
+    hub.release("a")
+    for h in _headers(c):
+        assert "x-mcp-hub-operator-token" not in {k.lower() for k in h}
+
+
+def test_every_write_carries_auth_not_just_the_first():
+    c = RecordingClient()
+    hub = HubHolds(token="t", client=c)
+    for seat in ("a", "b", "c"):
+        hub.hold(seat, until=NOW + 60, reason="r", release_condition="c")
+    assert len([h for h in _headers(c) if h.get("Authorization") == "Bearer t"]) == 3
