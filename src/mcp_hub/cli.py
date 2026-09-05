@@ -1085,17 +1085,44 @@ def _workspace_suffix(cwd: str) -> str | None:
     unlike the old committed marker, it cannot be dragged to another clone.
     Absent → unchanged derivation, so the existing fleet keeps its names.
 
+    🔴 THE ENTRY COVERS THE WHOLE WORKTREE, NOT JUST ITS TOP FOLDER (card
+    #432). This was exact path equality, while the derivation around it
+    resolves org/repo from the git remote — and git walks UP from cwd. So a
+    session one level down still derived the repo's name but lost the suffix,
+    and TWO clones of one repo collapsed onto ONE bare name the moment cwd
+    was a subdirectory. That is precisely the collision the suffixes exist to
+    prevent, rebuilt one directory below them. Sessions sit in subdirectories
+    routinely; the registered path is the exception, not the rule.
+
+    A descendant matches on PATH COMPONENTS, never on a string prefix, so
+    `/a/b` does not claim `/a/bc`. When several entries match, the LONGEST
+    (most specific) wins — that is what makes a nested worktree, e.g. a
+    submodule inside a clone that has its own entry, keep its own suffix
+    rather than inheriting its parent's.
+
+    An entry that normalises to the empty string (`"/"`) is skipped: it would
+    match every path on the machine and silently rename the whole fleet from
+    one stray character, which no legitimate config is asking for.
+
     Mirrored in statusline-command.js — change both or neither.
     """
     table = _load_hub_config().get("workspaces")
     if not isinstance(table, dict):
         return None
     target = _norm_path(cwd)
+    best_len = -1
+    best_suffix: str | None = None
     for path, suffix in table.items():
-        if isinstance(path, str) and isinstance(suffix, str) and suffix.strip():
-            if _norm_path(path) == target:
-                return suffix.strip()
-    return None
+        if not (isinstance(path, str) and isinstance(suffix, str) and suffix.strip()):
+            continue
+        root = _norm_path(path)
+        if not root:
+            continue
+        if target == root or target.startswith(root + os.sep):
+            if len(root) > best_len:
+                best_len = len(root)
+                best_suffix = suffix.strip()
+    return best_suffix
 
 
 def _resolve_squads(cwd: str) -> list[str]:

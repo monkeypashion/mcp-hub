@@ -159,9 +159,26 @@ process.stdin.on('end', () => {
           catch { return path.resolve(p).replace(/[/\\]+$/, ''); }
         };
         const target = norm(cwd);
+        // Card #432: an entry covers the WHOLE worktree, not just its top
+        // folder — this was exact equality, so a session one level down lost
+        // the suffix while the repo half of the name survived (git walks UP
+        // from cwd), collapsing two clones of one repo onto ONE bare name.
+        // Descendants match on path COMPONENTS (never a string prefix, so
+        // `/a/b` does not claim `/a/bc`); the LONGEST match wins, which is
+        // what lets a nested worktree with its own entry keep its own suffix.
+        // An entry normalising to '' ('/') is skipped: it would match every
+        // path on the machine. Mirrors cli.py's _workspace_suffix.
+        let bestLen = -1;
+        let bestSuffix = null;
         for (const [p, s] of Object.entries(table)) {
-          if (typeof s === 'string' && s.trim() && norm(p) === target) return s.trim();
+          if (typeof s !== 'string' || !s.trim()) continue;
+          const root = norm(p);
+          if (!root) continue;
+          if (target === root || target.startsWith(root + path.sep)) {
+            if (root.length > bestLen) { bestLen = root.length; bestSuffix = s.trim(); }
+          }
         }
+        if (bestSuffix) return bestSuffix;
       } catch { /* no config / unreadable → no suffix */ }
       return null;
     };
