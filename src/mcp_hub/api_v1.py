@@ -443,6 +443,22 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             return _err(403, "operator token required")
         return got
 
+    def actor_of(got: tuple[str, str]) -> str:
+        """Who a write is recorded as: the machine's NAME, else the grade.
+
+        A trail that names its actor from a LITERAL agrees with the code
+        exactly when the code is wrong — the constant survives a re-gating
+        that changes who can actually reach the route. `auth()` already knows
+        which credential came through the door, so the record says that.
+
+        ⚠️ Non-vacuous only where a MACHINE principal can reach the write.
+        Every current `seat_event` caller is behind `operator_only`, so this
+        returns the constant "operator" there by construction; it is honest
+        rather than attributive until such a path exists.
+        """
+        principal, name = got
+        return name or principal
+
     async def body_of(request: Request) -> dict:
         try:
             return await request.json()
@@ -1150,7 +1166,7 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
                 "DELETE FROM api_seats WHERE identity = ?", (identity,)
             )
             # The death-fact outlives the row it describes.
-            seat_event(identity, "purged", "operator-api")
+            seat_event(identity, "purged", actor_of(got))
             db().commit()
             return JSONResponse({"identity": identity, "purged": True})
         if active_placements("seat = ?", (identity,)):
@@ -1158,7 +1174,7 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
         db().execute(
             "UPDATE api_seats SET archived = 1 WHERE identity = ?", (identity,)
         )
-        seat_event(identity, "archived", "operator-api")
+        seat_event(identity, "archived", actor_of(got))
         db().commit()
         # After the commit: a doorbell that can break a write is worse than
         # no doorbell. The edge reconciles the disappearance promptly instead
@@ -1674,7 +1690,7 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
         db().execute(
             "UPDATE api_seats SET archived = 0 WHERE identity = ?", (identity,)
         )
-        seat_event(identity, "restored", "operator-api")
+        seat_event(identity, "restored", actor_of(got))
         db().commit()
         # Symmetric with archive: an asymmetric doorbell is how observers
         # drift out of sync with the record.

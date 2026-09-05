@@ -79,6 +79,18 @@ def _events(db_path: Path, identity: str) -> list[tuple[str, str]]:
         con.close()
 
 
+def _actors(db_path: Path, identity: str) -> list[tuple[str, str]]:
+    con = sqlite3.connect(db_path)
+    try:
+        return con.execute(
+            "SELECT event, actor FROM api_seat_events"
+            " WHERE identity = ? ORDER BY ts",
+            (identity,),
+        ).fetchall()
+    finally:
+        con.close()
+
+
 # ---------------------------------------------------------------------------
 # A1 — honest 409s at every creation path
 # ---------------------------------------------------------------------------
@@ -437,3 +449,50 @@ class TestSeatsCli:
             ("delete", "s1", False)
         ]
         assert "seats restore" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Bar 37 limb 2, hub half — the trail names the CREDENTIAL, not a literal
+# ---------------------------------------------------------------------------
+
+
+class TestActorComesFromAuth:
+    """`actor` was the literal "operator-api" at all three call sites, so the
+    trail asserted a constant instead of observing the door. Mutation: revert
+    `actor_of(got)` to `"operator-api"` → every assertion here fails.
+
+    ⚠️ SCOPE, stated because the bar's wording invites the wider claim: this
+    pins ONE path (the seat-event path). It is not "the hub attributes every
+    write". And every seat_event caller is behind `operator_only`, so the
+    honest value here is the GRADE — a machine principal cannot reach these
+    routes at all, which is why this alone cannot attribute a deputy write.
+    """
+
+    def test_archive_and_restore_record_the_authenticated_grade(self, rig):
+        c, db_path = rig
+        _machine(c)
+        _seat(c, "w1seat")
+        _archive(c)
+        r = c.post("/api/v1/seats/w1seat/restore", headers=OP)
+        assert r.status_code == 200, r.text
+        rows = _actors(db_path, "w1seat")
+        assert [e for e, _ in rows] == ["archived", "restored"]
+        assert {a for _, a in rows} == {"operator"}, rows
+
+    def test_purge_death_fact_names_the_grade_too(self, rig):
+        c, db_path = rig
+        _machine(c)
+        _seat(c, "w1purge")
+        r = c.delete("/api/v1/seats/w1purge?purge=true", headers=OP)
+        assert r.status_code == 200, r.text
+        rows = _actors(db_path, "w1purge")
+        assert rows == [("purged", "operator")], rows
+
+    def test_no_row_still_carries_the_old_literal(self, rig):
+        """The literal is gone from the trail entirely — a leftover call site
+        would keep writing "operator-api" and this catches it."""
+        c, db_path = rig
+        _machine(c)
+        _seat(c, "w1lit")
+        _archive(c, "w1lit")
+        assert "operator-api" not in {a for _, a in _actors(db_path, "w1lit")}
