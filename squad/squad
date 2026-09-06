@@ -928,6 +928,70 @@ hold_enforce_one() {
 # far below anything the lane needs, compacting healthy lanes for nothing.
 # This NARROWS the old 150000; it never widens it.
 COMPACT_ASK_TOKENS="${MCP_HUB_COMPACT_ASK_TOKENS:-138111}"
+
+# --- THE CAP ASK IS SQUAD-SCOPED (card #440, his press 14:28Z 2026-09-06) ----
+#
+# His words, typed 14:0xZ 2026-09-06, verbatim: "the auto compact thing is
+# running outside of this squad - I do not want the auto compact thing running
+# outside of this squad - its keeps clearing valuable contex when I I don't
+# want to lose it - restrict that feature to this dreamteam squad only - very
+# important!"
+#
+# ⭐ THE GATE LIVES IN `compaction_one`, THE ONE DOOR EVERY PATH USES — the
+# two-minute sweep, `squad compaction <lane>`, and the answer/exec leg all
+# funnel through it. Gating the sweep alone would leave the named-lane verb
+# still typing into an out-of-scope pane, and this codebase already paid for
+# that lesson: a silencer covering four of five routes is worse than none,
+# because it gets trusted.
+#
+# 🔴 FAIL CLOSED — an unreadable membership list asks NOBODY, never everybody.
+# The complaint being fixed is context destroyed on seats he did not want
+# touched, so "the hub was unreachable" must not resolve to fleet-wide asking.
+# The reverse default would turn every hub blip into the exact incident.
+#
+# Membership is read from the HUB, which is where it lives: `register`
+# preserves on empty and `set_squads` changes it thereafter, so
+# `squad_workspaces` in the config only SEEDS membership and cannot be the
+# authority here. Reading the config instead would scope this by workspace
+# type — grouping deciding capability, which is its own recorded mistake.
+COMPACT_ASK_SQUAD="${MCP_HUB_COMPACT_ASK_SQUAD:-dreamteam}"
+
+# The roster, fetched once per process: the sweep walks every agent and a
+# per-agent hub call would put ~14 round trips inside a two-minute timer.
+# "!" means "no usable roster": hub unreachable, unknown squad, or a squad
+# with no members. All three collapse to ASK NOBODY on purpose — they differ
+# in cause and not in the only thing this leg may do about them, and a
+# distinction that changes no behaviour is one more thing to get wrong.
+_COMPACT_SCOPE=""
+_COMPACT_SCOPE_SAID=""
+
+compaction_scope_load() {
+  if [ -n "$_COMPACT_SCOPE" ]; then return 0; fi
+  local hb out
+  hb="$(hub_bin)" || true
+  if [ -z "${hb:-}" ]; then _COMPACT_SCOPE="!"; else
+    out="$("$hb" squads members "$COMPACT_ASK_SQUAD" 2>/dev/null \
+           | awk 'NF{print $1}' | grep -E '^[a-z0-9][a-z0-9._-]*$')" || true
+    if [ -z "${out:-}" ]; then _COMPACT_SCOPE="!"; else _COMPACT_SCOPE="$out"; fi
+  fi
+  # Loud, but ONCE per process: repeating it per agent would bury the pass.
+  if [ "$_COMPACT_SCOPE" = "!" ] && [ -z "$_COMPACT_SCOPE_SAID" ]; then
+    _COMPACT_SCOPE_SAID=1
+    echo "!! squad '$COMPACT_ASK_SQUAD' membership UNREADABLE (hub unreachable, or the squad has no members) — asking NOBODY this pass" >&2
+  fi
+  return 0
+}
+
+compaction_scope_readable() { compaction_scope_load; [ "$_COMPACT_SCOPE" != "!" ]; }
+
+# 0 = this agent is in scope. Silent by design: the GATE is one door, the
+# REPORTING belongs to each caller, which knows whether a line is a row an
+# operator asked for or noise inside a timer.
+compaction_in_scope() {
+  compaction_scope_load
+  if [ "$_COMPACT_SCOPE" = "!" ]; then return 1; fi
+  printf '%s\n' "$_COMPACT_SCOPE" | grep -qx -- "$1"
+}
 # 🔴 THE EXEC LEG IS OFF BY DEFAULT AND MUST STAY THAT WAY UNTIL ARMED
 # DELIBERATELY. It types /clear or /compact into a live pane, and `/clear`
 # DESTROYS context — "no answer = no action" is the safety property and is
@@ -1348,6 +1412,10 @@ compaction_recross() {
 
 compaction_one() {
   local a="$1" tok pct flag st text
+  # SQUAD SCOPE FIRST — before any transcript read, any row, any keystroke
+  # (card #440). Out of scope means NOTHING happens for this lane: no ask, no
+  # typed /compact, no /clear, and no flag that a later pass could act on.
+  if ! compaction_in_scope "$a"; then return 0; fi
   # ⚠️ EVERY READ BELOW IS `|| true`-GUARDED, and that is load-bearing: this
   # file runs under `set -euo pipefail`, and `compaction_ctx` exits 1 whenever
   # the pane carries no ctx number (grep found nothing). Unguarded, one
@@ -1628,12 +1696,19 @@ compaction_pass() {
   # every ad-hoc `squad add` spike from a sweep whose whole subject is what a
   # pane is BURNING. Grouping decides who hears a broadcast; it must not
   # decide who gets measured.
-  local a
+  local a skipped=""
   for a in $(agents); do
     tm has-session -t "=$a" 2>/dev/null || continue
     pane_alive "$a" || continue
+    # The gate itself is inside compaction_one and is silent there; this is
+    # the REPORT. One row naming who was skipped, rather than a line per lane
+    # every two minutes — the scope has to be readable, not buried.
+    if ! compaction_in_scope "$a"; then skipped="$skipped $a"; continue; fi
     compaction_one "$a"
   done
+  if [ -n "$skipped" ]; then
+    echo "scope '$COMPACT_ASK_SQUAD' — not asked (out of squad):$skipped"
+  fi
 }
 
 # --- release: the lane comes back, with its conversation (his ruling) ------
@@ -3481,10 +3556,44 @@ case "${1:-help}" in
             # `--dry-run` reports what it would do and writes no rows and no
             # keystrokes — the only safe way to inspect a leg that types into
             # live panes.
+            # `--scope` answers card #440's deliverable on its own: WHO would
+            # and would not be asked, as a row rather than a belief. Every
+            # roster line, pane or no pane, because "not asked" is a fact
+            # about membership and must not be hidden by a lane being down.
+            if [ "${2:-}" = "--scope" ]; then
+              if ! compaction_scope_readable; then
+                echo "scope UNREADABLE — with the hub unreachable NOBODY is asked (fail closed)"
+                exit 1
+              fi
+              in_n=0; out_n=0
+              for a in $(agents); do
+                if compaction_in_scope "$a"; then
+                  in_n=$((in_n+1));  echo "$a: IN  '$COMPACT_ASK_SQUAD' — would be asked at the cap"
+                else
+                  out_n=$((out_n+1)); echo "$a: OUT '$COMPACT_ASK_SQUAD' — never asked, never typed into"
+                fi
+              done
+              echo "-- $in_n in scope, $out_n out (cap ${COMPACT_ASK_TOKENS}, exec=${COMPACT_EXEC})"
+              exit 0
+            fi
             if [ "${2:-}" = "--dry-run" ]; then
+              # Say WHY nothing would happen. Without this the unreachable-hub
+              # case prints "not in 'dreamteam'" against every lane, which is
+              # a claim about membership made by a pass that never read any.
+              if ! compaction_scope_readable; then
+                echo "scope UNREADABLE — nothing would be done for ANY lane (fail closed); membership was not read, so this is not a statement about who is in '$COMPACT_ASK_SQUAD'"
+                exit 0
+              fi
               for a in $(agents); do
                 tm has-session -t "=$a" 2>/dev/null || continue
                 pane_alive "$a" || continue
+                # Scope before tokens: an out-of-scope lane's token count is
+                # not a thing this leg would ever act on, and printing it
+                # invites the reader to think it might.
+                if ! compaction_in_scope "$a"; then
+                  echo "$a: OUT OF SCOPE (not in '$COMPACT_ASK_SQUAD') — nothing would be done"
+                  continue
+                fi
                 tok="$(compaction_tokens "$a" || true)"
                 if [ -z "$tok" ]; then
                   echo "$a: tokens UNMEASURED (no readable transcript) — nothing would be done"
@@ -3507,6 +3616,14 @@ case "${1:-help}" in
             # a sweep typing into every idle pane on the box.
             if [ -n "${2:-}" ]; then
               a="$(need_agent "$2")" || exit 1
+              # A person named this lane, so silence would read as "nothing to
+              # do" when the truth is "out of scope, deliberately".
+              if ! compaction_in_scope "$a"; then
+                if compaction_scope_readable; then
+                  echo "$a is not in squad '$COMPACT_ASK_SQUAD' — no ask and no typed command (card #440)"
+                fi
+                exit 0
+              fi
               compaction_one "$a"
             else
               compaction_pass
