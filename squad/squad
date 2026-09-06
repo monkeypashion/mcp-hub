@@ -1167,11 +1167,24 @@ compaction_flag() {
 # existing parse is unaffected. An unreadable pane renders `ctx=?%`, never
 # `ctx=0%` — the same "absence is not zero" rule the reading itself follows.
 compaction_row() {
-  local seat="$1" step="$2" pct="$3" tok="$4" detail="${5:-}" hb
+  local seat="$1" step="$2" pct="$3" tok="$4" detail="${5:-}" hb sid
   hb="$(hub_bin)" || return 1
   [ -n "$hb" ] || return 1
-  { printf 'COMPACTION %s %s ctx=%s%% tok=%s thr=%s\n' \
-      "$seat" "$step" "${pct:-?}" "$tok" "$COMPACT_ASK_TOKENS"
+  # DEFECT 66 (deputy ruling 2026-09-06 22:26Z): the door reads `session=`
+  # WHEREVER it sits on the line, and when it is present THE SESSION IS THE
+  # CYCLE — that is what lets a restart be told apart from a genuine re-fire,
+  # which four rows in the retained window could not be.
+  #
+  # ⚠️ ABSENT IS OMITTED, never `session=?`. The door's charset is
+  # [\w.:@/-]+, so a `?` would not bind and an empty `session=` would parse
+  # as no session at all — the SAME "absence is not zero" rule `ctx=?%`
+  # follows, applied where the reader is a regex rather than a human.
+  # `|| true` because compaction_session exits 1 on an unreadable transcript
+  # and this file runs under `set -euo pipefail`.
+  sid="$(compaction_session "$seat" 2>/dev/null || true)"
+  { printf 'COMPACTION %s %s ctx=%s%% tok=%s thr=%s%s\n' \
+      "$seat" "$step" "${pct:-?}" "$tok" "$COMPACT_ASK_TOKENS" \
+      "${sid:+ session=$sid}"
     [ -n "$detail" ] && printf '%s\n' "$detail"
   } | "$hb" send --to "$COMPACT_DOOR" --message - --priority low \
         --cwd "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)" \

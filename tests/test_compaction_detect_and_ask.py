@@ -266,6 +266,27 @@ def test_every_row_carries_the_tokens_and_the_cap(tmp_path):
     assert f"ctx=16% tok={OVER} thr={CAP}" in rows(tmp_path)
 
 
+def test_every_row_carries_the_session_id(tmp_path):
+    """DEFECT 66: the door treats the SESSION as the cycle when the line
+    carries one, which is the only thing that tells a lane RESTART apart from
+    a genuine second fire. Four rows in the retained window could not be
+    told apart precisely because the emitter sent no id."""
+    run(tmp_path, "compaction_one lane-a")
+    assert "session=05a50d0c-1111-2222-3333-444455556666" in rows(tmp_path)
+
+
+def test_an_unreadable_session_OMITS_the_field_rather_than_naming_it(tmp_path):
+    """The negative control, and the reason the field is omitted rather than
+    rendered `session=?` the way `ctx=?%` is: the door reads this one with a
+    regex ([\\w.:@/-]+), so `?` would not bind and a bare `session=` would
+    parse as NO session — silently making a restart look like a repeat again.
+    Absence must be absent, not a token that reads as a value."""
+    p = run(tmp_path, "compaction_session() { return 1; }\n"
+                      "compaction_row lane-a fire 15 141690")
+    assert "COMPACTION lane-a fire " in rows(tmp_path), p.stderr
+    assert "session=" not in rows(tmp_path)
+
+
 def test_an_unreadable_pane_renders_ctx_as_a_question_mark(tmp_path):
     """Absence is not zero here either — ctx=0% would read as an empty lane."""
     run(tmp_path, "compaction_one lane-a", ctx="")
