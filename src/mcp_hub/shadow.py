@@ -66,8 +66,20 @@ MATCH_PREFIX = 60
 # get_messages render. The ⟨ref⟩ segment is W3's lineage handle and OPTIONAL:
 # transcripts predating the wave carry lines without it, and a parser that
 # demanded it would go silently blind on exactly the history it audits.
+# ⚠️ ANYTHING THE RENDER PUTS BETWEEN THE SENDER AND THE REF GOES HERE TOO —
+# the same warning receipts.py carries, for the same defect. The attribution
+# grade (` ·verified` / ` ·asserted` / ` ·hub` / ` ·ungraded`, e630fa3 +
+# 9537ba2, 2026-08-29) landed in exactly that gap. receipts.py had its anchors
+# widened for it on 2026-09-01 (30f0a24); this module did not, and went blind
+# the day the grade shipped: `shadow-surface.jsonl` recorded its last entry at
+# 12:16:21Z on 2026-08-29 and nothing in the 8 days after. Nothing failed and
+# nothing logged — a diagnostic that records only disagreements reports a
+# clean inference and a dead parser with the same silence.
+# `test_parse_survives_the_attribution_grade` builds its input from the
+# SERVER'S OWN render helpers, so the next suffix breaks that test instead.
 _RENDERED_RE = re.compile(
     r"^\[(?P<ts>\d{2}:\d{2}:\d{2})\] \*\*(?P<agent>[^*]+)\*\*"
+    r"(?: ·[\w-]+)*"
     r"(?: ⟨(?P<ref>[^⟩]+)⟩)?"
     r"(?P<prio> \[[a-z]+\])?: (?P<rest>.*)$"
 )
