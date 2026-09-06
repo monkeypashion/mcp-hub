@@ -380,3 +380,37 @@ class TestZeroBehaviourChange:
         assert shadow.observed_renders(None) == []
         assert shadow.run_shadow("alice", _claimed_live("bob", BODY), None,
                                  path=tmp_path / "s.jsonl")
+
+
+def test_parse_survives_the_attribution_grade():
+    """The grade beside the sender must not blind the parser.
+
+    Built from the SERVER'S OWN render pieces — `_grade_tag_str` and
+    `_msg_ref` are what compose the line in get_messages — so a future
+    suffix breaks this test instead of breaking the diagnostic in silence.
+    That is the same coupling receipts.py pins with
+    `test_receipts_track_the_render`, and it is pinned here because the
+    identical defect hit BOTH modules and only one of them was fixed:
+    the grade shipped 2026-08-29 (e630fa3, 9537ba2), receipts.py got its
+    anchors widened on 09-01 (30f0a24), and shadow.py did not. Measured
+    consequence: `shadow-surface.jsonl` recorded its last entry at
+    2026-08-29 12:16:21Z and nothing for the 8 days after — every rendered
+    line stopped parsing, so the auditor reported a clean inference by
+    seeing nothing at all.
+    """
+    from mcp_hub.server import _grade_tag_str, _msg_ref
+
+    for grade in ("session-verified", "operator-verified", "asserted",
+                  "hub-authored", ""):
+        tag = _grade_tag_str(grade)
+        line = (f"[15:39:03] **alice**{tag} ⟨{_msg_ref(7)}⟩ [low]: "
+                f"(already delivered live — {BODY})")
+        parsed = shadow.parse_rendered_messages(line)
+        assert len(parsed) == 1, f"grade {grade!r} ({tag!r}) blinded the parser"
+        assert parsed[0]["agent"] == "alice"
+        assert parsed[0]["claimed_live"] is True
+        assert BODY in parsed[0]["handle"]
+
+    # Negative control: the parser must still reject a line that is not a
+    # render, or "it parses everything" would pass this test just as well.
+    assert shadow.parse_rendered_messages("just some prose ⟨hub.msg/1?id=7⟩") == []
