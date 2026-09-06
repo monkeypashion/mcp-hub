@@ -776,6 +776,7 @@ def build_hook_response(
     card_notice: str = "",
     held_notice: str = "",
     defer_low: bool = False,
+    trace: dict[str, object] | None = None,
 ) -> dict[str, Any] | None:
     """Decide whether to emit a hook block and what the reason should be.
 
@@ -811,6 +812,21 @@ def build_hook_response(
     if defer_low and agent_name:
         _, spool_age = _spool_read(agent_name)
 
+    # Bar 113: report the deferral decision to the caller so the drain record
+    # can carry it. A dict rather than a return value because every branch
+    # below already returns the hook payload, and bar 47 needs the field on
+    # the branches that return None — the suppressed drains ARE the saving,
+    # and they are exactly the ones no other instrument can see.
+    #
+    # 🔴 SEEDED UNCONDITIONALLY, and "off" is the point. A field written only
+    # when deferral is ON gives bar 47 a numerator with no denominator: every
+    # row would show an effect and there would be no control to measure it
+    # against. Same fault as the drain logger's own `surfaced=False` branch.
+    if trace is not None:
+        trace["defer_low"] = bool(defer_low)
+        trace["defer_effect"] = "none" if defer_low else "off"
+        trace["defer_held_s"] = 0.0
+
     has_messages = bool(messages_text.strip())
     has_broadcasts = bool(broadcasts_text.strip())
     has_content = has_messages or has_broadcasts
@@ -838,6 +854,8 @@ def build_hook_response(
             ) if p
         )
         if _spool_append(agent_name, blob):
+            if trace is not None:
+                trace["defer_effect"] = "spooled"
             return None
         # Could not write the spool → fall through and block. The hub has
         # already marked these read; the ONLY other copy is this text.
@@ -846,6 +864,9 @@ def build_hook_response(
         deferred = _spool_take(agent_name)
         if deferred:
             has_content = True
+            if trace is not None:
+                trace["defer_effect"] = "released"
+                trace["defer_held_s"] = round(spool_age, 1)
 
     # Bar 47 (g#24; deputy ruling on #54, 2026-09-04): a drain whose every
     # item is already-delivered carries nothing new, so suppress the BLOCK.
@@ -870,6 +891,11 @@ def build_hook_response(
     if has_content and _all_already_delivered(
         messages_text, broadcasts_text, deferred
     ):
+        if trace is not None and deferred:
+            # `_spool_take` has already unlinked it, so this drain DESTROYED
+            # held text. Deliberate (every line read as already-delivered),
+            # but a silent destroy is the one thing the record must not omit.
+            trace["defer_discarded"] = True
         has_messages = has_broadcasts = has_content = False
         deferred = ""
 
@@ -5129,6 +5155,7 @@ def stop_hook_command(args: argparse.Namespace) -> int:
 
     shadow.run_shadow(name, messages_text, payload.get("transcript_path"))
 
+    defer_trace: dict[str, object] = {}
     response = build_hook_response(
         agent_name=name,
         project=project,
@@ -5144,6 +5171,7 @@ def stop_hook_command(args: argparse.Namespace) -> int:
         # it ships dark and is turned on per box once its spool is trusted.
         defer_low=os.environ.get("MCP_HUB_DEFER_LOW", "").lower()
         in ("1", "true", "yes"),
+        trace=defer_trace,
     )
 
     # 🔴 LOGGED ON BOTH BRANCHES, AND THE `None` ONE IS THE POINT. A drain
@@ -5153,7 +5181,8 @@ def stop_hook_command(args: argparse.Namespace) -> int:
     # branch would rebuild the same blind spot in a new file.
     _log_activity_event(name, "drain", surfaced=response is not None,
                         session=str(payload.get("session_id") or ""),
-                        backstop=stop_hook_active)
+                        backstop=stop_hook_active,
+                        **defer_trace)
 
     if response is None:
         return 0  # No block — Stop proceeds normally

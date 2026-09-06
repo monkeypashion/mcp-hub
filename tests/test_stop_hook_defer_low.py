@@ -152,3 +152,70 @@ def test_the_age_bound_measures_the_oldest_item_not_the_newest():
 def test_an_unwritable_spool_blocks_rather_than_dropping(monkeypatch):
     monkeypatch.setattr(cli, "_spool_append", lambda *a, **k: False)
     assert build(messages_text=line(1, "low")) is not None
+
+
+# --- bar 113: the drain record must carry the deferral decision ------------
+#
+# Bar 47 is blocked as not closable from existing data: the saving IS the
+# suppressed drain, and a suppressed drain prints nothing, blocks nothing and
+# leaves no transcript entry. These pin the field that makes the data exist.
+
+def test_the_setting_is_recorded_even_when_deferral_is_OFF():
+    """The control, and the reason it is written unconditionally: a field
+    present only on deferred drains gives bar 47 a numerator with no
+    denominator — every row would show an effect and nothing would say how
+    many drains ran without one."""
+    t: dict[str, object] = {}
+    build(messages_text=line(1), defer_low=False, trace=t)
+    assert t["defer_low"] is False
+    assert t["defer_effect"] == "off"
+
+
+def test_a_suppressed_drain_records_that_it_was_spooled():
+    """The saving itself. This is the branch that returns None, so it is
+    invisible to every other instrument — which is precisely why bar 47
+    could not be measured from existing data."""
+    t: dict[str, object] = {}
+    assert build(messages_text=line(1, "low"), trace=t) is None
+    assert t["defer_low"] is True
+    assert t["defer_effect"] == "spooled"
+
+
+def test_a_drain_that_defers_nothing_records_none_not_spooled():
+    """The negative control against a constant-true field: deferral ON and a
+    normal message must NOT read as a saving. A field that says "spooled"
+    whenever the setting is on measures the setting, not the effect."""
+    t: dict[str, object] = {}
+    assert build(messages_text=line(1), trace=t) is not None
+    assert t["defer_effect"] == "none"
+
+
+def test_releasing_the_spool_records_the_effect_and_how_long_it_was_held():
+    t: dict[str, object] = {}
+    assert build(messages_text=line(1, "low")) is None      # spool it
+    assert build(messages_text=line(2), trace=t) is not None  # normal releases it
+    assert t["defer_effect"] == "released"
+    assert isinstance(t["defer_held_s"], float)
+
+
+def test_a_spool_DESTROYED_by_the_already_delivered_guard_is_recorded():
+    """`_spool_take` has already unlinked the file, so this drain throws held
+    text away. Deliberate — every line read as already-delivered — but a
+    silent destroy is the one thing the record must not omit, or the spool
+    becomes another place messages can vanish without a trace."""
+    def delivered(ref: int, prio: str = "") -> str:
+        # the marker opens the BODY, not a suffix on it
+        return line(ref, prio).replace(
+            ": body text", ": (already delivered live — full text above)")
+
+    t: dict[str, object] = {}
+    assert build(messages_text=delivered(1, "low")) is None   # spool it
+    build(messages_text=delivered(2), trace=t)                # takes, then discards
+    assert t.get("defer_discarded") is True
+
+
+def test_no_trace_is_a_no_op():
+    """Every existing caller passes no trace; the decision must be unchanged
+    by whether anyone is listening."""
+    assert build(messages_text=line(1, "low")) is None
+    assert build(messages_text=line(2)) is not None
