@@ -87,7 +87,7 @@ def transcript(home: Path, worktree: Path, *, tokens=None, replies=(),
 
 def run(tmp_path, snippet, *, tokens=OVER, state_lines=None, agent="lane-a",
         replies=(), env=None, ctx="16", jitter=False, klass="squad",
-        compacted=None, pane=None, pane_after=None):
+        compacted=None, pane=None, pane_after=None, members=None):
     home = tmp_path
     (home / ".mcp-hub").mkdir(parents=True, exist_ok=True)
     conf = home / "squad.conf"
@@ -145,9 +145,20 @@ def run(tmp_path, snippet, *, tokens=OVER, state_lines=None, agent="lane-a",
         (bin_ / "ps").write_text(
             "#!/bin/bash\necho $(( $(date +%s) - 1788000000 ))\n")
     (bin_ / "ps").chmod(0o755)
-    # the door: record rows instead of sending them
+    # the door: record rows instead of sending them.
+    # `squads members` is answered BEFORE the `cat`, and both halves matter:
+    # the compaction leg is squad-scoped (card #440), so a stub that stayed
+    # silent would fail the gate CLOSED and every keystroke assertion below
+    # would pass for the wrong reason — nothing typed because nothing was in
+    # scope. Answering it here keeps the real gate in the path under test.
+    # It must also not fall through to `cat`, which would sit on an inherited
+    # stdin waiting for an EOF that never comes.
+    roster = agent if members is None else members
     (bin_ / "mcp-hub").write_text(
-        f'#!/bin/bash\ncat >> {home}/rows.txt\necho "$@" >> {home}/rowargs.txt\n')
+        '#!/bin/bash\n'
+        f'if [ "$1" = squads ] && [ "$2" = members ]; then '
+        f'{{ [ -n "{roster}" ] && echo "{roster}"; }}; exit 0; fi\n'
+        f'cat >> {home}/rows.txt\necho "$@" >> {home}/rowargs.txt\n')
     (bin_ / "mcp-hub").chmod(0o755)
 
     head = SQUAD.read_text(encoding="utf-8").split(
@@ -1108,3 +1119,49 @@ def test_a_boundary_from_BEFORE_the_ask_is_not_the_lane_obeying(tmp_path):
             replies=answered("CLEAR"), compacted=(OVER, SHRUNK, -3_600))
     assert "compacted itself on the ask" not in p.stdout, p.stdout
     assert "typed /clear" in p.stdout, p.stdout
+
+
+# --- card #440: the ask is confined to one squad -------------------------
+#
+# His words, 2026-09-06: "I do not want the auto compact thing running
+# outside of this squad - its keeps clearing valuable contex". So the
+# property is the same NEGATIVE shape as the rest of this file: what must
+# not be typed, and into whose pane.
+
+
+def test_a_lane_outside_the_squad_is_never_typed_into(tmp_path):
+    """Far over the cap, idle, exec ARMED — every condition the ask needs,
+    and the only thing standing between this lane and a keystroke is its
+    membership. That is the whole point of the card."""
+    p = run(tmp_path, "compaction_one lane-a", pane=SAFE_PANE, env=ARMED,
+            members="somebody-else")
+    assert "send-keys" not in keys(tmp_path)
+    assert "compaction ask sent at" not in p.stdout
+
+
+def test_an_unreadable_membership_asks_NOBODY(tmp_path):
+    """Fail closed. An empty answer is the hub being unreachable, an unknown
+    squad, or a squad with no members — indistinguishable here, and all three
+    must refuse. The opposite default would turn every hub blip into the
+    incident this card exists to end."""
+    p = run(tmp_path, "compaction_one lane-a", pane=SAFE_PANE, env=ARMED,
+            members="")
+    assert "send-keys" not in keys(tmp_path)
+    assert "UNREADABLE" in p.stderr
+
+
+def test_the_in_scope_lane_still_gets_asked(tmp_path):
+    """The negative control's twin, and the reason the two above mean
+    anything: with membership the ONLY thing changed, the keystroke returns.
+    Without this, a gate that refused everything would pass both tests."""
+    p = run(tmp_path, "compaction_one lane-a", pane=SAFE_PANE,
+            members="lane-a")
+    assert "send-keys -l" in keys(tmp_path)
+    assert "compaction ask sent at" in p.stdout
+
+
+def test_the_scope_defaults_to_dreamteam_in_the_shipped_script(tmp_path):
+    """The squad NAME is his instruction, not a detail: asserted against the
+    script rather than duplicated as a literal, the same way the cap is."""
+    assert 'MCP_HUB_COMPACT_ASK_SQUAD:-dreamteam' in SQUAD.read_text(
+        encoding="utf-8")
