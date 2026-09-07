@@ -23,6 +23,12 @@ way to tell. Every pass asks the console again, and a lane that has stopped
 being a candidate is RELEASED rather than renewed. That is what "release on
 bar assignment" means in practice: the bar lands, the console stops listing
 the lane, and the next pass lets it go.
+
+⚠️ **A LANE STOPS BEING A CANDIDATE FOR MORE THAN ONE REASON**, and "the bar
+landed" is only one of them. The release therefore records the console's own
+`left_out[].why` as its `cause`, verbatim — see `HubHolds.release`. Read the
+cause before quoting a release as evidence for the bar; a release with
+`cause_source` = "absent from the console's left_out" says nothing about why.
 """
 
 from __future__ import annotations
@@ -37,6 +43,14 @@ from mcp_hub.edge import _hold_state
 # the hub, so this string is what stops the scanner lifting somebody's brake.
 OWNER = "hibernation-scanner"
 KIND = "hibernation"
+
+# Where a release's `cause` came from. Recorded beside the words themselves
+# because "the console said this" and "nobody said anything" are different
+# readings, and a blank `cause` alone cannot tell them apart — the same
+# empty-vs-never confusion that made me file a lifetime count of 0 twice
+# from a file that only holds NOW.
+CAUSE_FROM_CONSOLE = "console left_out"
+CAUSE_UNRECORDED = "absent from the console's left_out"
 
 # ⭐ TWELVE HOURS, from the accepted note ("rolling 12h re-hold"). It is the
 # expiry, not the policy: the policy is the re-hold above. The expiry exists
@@ -150,14 +164,34 @@ class HubHolds:
         )
         r.raise_for_status()
 
-    def release(self, seat: str) -> None:
+    def release(self, seat: str, *, cause: str = "",
+                cause_source: str = CAUSE_UNRECORDED) -> None:
         # `owner` is not decoration here: the hub refuses a release whose
         # owner differs from the hold's, which is what stops this scanner
         # lifting a brake and handing a lane its share back in the middle of
         # the window the brake was protecting.
+        #
+        # ⭐ 2026-09-07 — `cause` EXISTS SO BAR 59 CAN BE MEASURED AT ALL.
+        # The hold row carries `reason` and `release_condition`; the release
+        # row carried nothing but the owner, so six automatic releases could
+        # not be told apart from each other. The bar's clause is "released
+        # automatically WHEN IT IS ASSIGNED AN OPEN BAR", and the scanner
+        # releases whoever stopped being a candidate for ANY cause — a bar
+        # landing, an exemption changing, a seat vanishing, the console's
+        # list being regated. Without this field the clause is unevidenceable
+        # even on a day it genuinely works, which is not a bar being unmet,
+        # it is a bar that cannot be read.
+        #
+        # 🔴 The scanner does NOT decide the cause, it COPIES it. `cause` is
+        # the console's own `left_out[].why`, verbatim, and `cause_source`
+        # says where it came from — the alternative is a mechanism grading
+        # its own behaviour against the criterion it is judged by, which is
+        # marking your own homework in the one place it matters most.
         r = self._c.post(
             f"/api/v1/seats/{seat}/actions", headers=self._h,
-            json={"kind": "release", "args": {"owner": OWNER}},
+            json={"kind": "release", "args": {
+                "owner": OWNER, "cause": cause,
+                "cause_source": cause_source}},
         )
         r.raise_for_status()
 
@@ -200,6 +234,16 @@ def scan(console: ConsoleAPI, hub: HubHolds, *, thread: int | str = 1,
 
     cands = {str(c.get("lane")): c for c in (payload.get("candidates") or [])
              if c.get("lane")}
+
+    # THE CONSOLE ALREADY SAYS WHY EACH LANE IS NOT A CANDIDATE, and this
+    # scanner used to throw that away one line before the release that needed
+    # it. `left_out[].why` is the console's own sentence — "owns an open bar
+    # here", "exempt seat", "NO HUB SEAT ..." — and it is the only witness to
+    # the difference the bar's clause turns on. Read here, at the fresh query,
+    # so the words travelling into the release row are the ones from the same
+    # answer that decided the release.
+    left_out = {str(o.get("lane")): str(o.get("why") or "")
+                for o in (payload.get("left_out") or []) if o.get("lane")}
 
     # 2. AN EXEMPT LIST WE CANNOT FULLY RESOLVE REFUSES EVERY HIBERNATION.
     #    The hub enforces this at the write; refusing here too is not a
@@ -251,8 +295,14 @@ def scan(console: ConsoleAPI, hub: HubHolds, *, thread: int | str = 1,
         if dry_run:
             rep.released.append(seat)
             continue
+        why = left_out.get(seat, "")
         try:
-            hub.release(seat)
+            hub.release(
+                seat,
+                cause=why,
+                cause_source=(CAUSE_FROM_CONSOLE if seat in left_out
+                              else CAUSE_UNRECORDED),
+            )
         except Exception as exc:  # noqa: BLE001
             rep.reasons.append(f"{seat}: release refused ({exc})")
             continue

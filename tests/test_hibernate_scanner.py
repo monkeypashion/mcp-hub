@@ -11,7 +11,15 @@ from __future__ import annotations
 import pytest
 
 from mcp_hub import hibernate
-from mcp_hub.hibernate import KIND, OWNER, TTL_SECONDS, ConsoleAPI, HubHolds
+from mcp_hub.hibernate import (
+    CAUSE_FROM_CONSOLE,
+    CAUSE_UNRECORDED,
+    KIND,
+    OWNER,
+    TTL_SECONDS,
+    ConsoleAPI,
+    HubHolds,
+)
 
 NOW = 1_788_500_000.0
 
@@ -19,10 +27,10 @@ NOW = 1_788_500_000.0
 class FakeConsole:
     """The read-only candidate door. `boom` makes the pass unanswerable."""
 
-    def __init__(self, candidates=(), unknown=(), boom=False):
+    def __init__(self, candidates=(), unknown=(), boom=False, left_out=()):
         self.payload = {
             "candidates": [dict(c) for c in candidates],
-            "left_out": [],
+            "left_out": [dict(o) for o in left_out],
             "unknown_exempt_names": list(unknown),
         }
         self.boom = boom
@@ -68,8 +76,9 @@ class FakeHub:
             "release_condition": release_condition,
             "kind": KIND, "owner": OWNER})
 
-    def release(self, seat):
-        self._append(seat, "release", {"owner": OWNER})
+    def release(self, seat, *, cause="", cause_source=CAUSE_UNRECORDED):
+        self._append(seat, "release", {
+            "owner": OWNER, "cause": cause, "cause_source": cause_source})
 
     # -- what the tests read --------------------------------------------
     def holds(self, seat):
@@ -77,6 +86,10 @@ class FakeHub:
 
     def writes(self, seat):
         return [a["kind"] for a in self._actions.get(seat, [])]
+
+    def releases(self, seat):
+        return [a for a in self._actions.get(seat, [])
+                if a["kind"] == "release"]
 
 
 def held_by_scanner(until=NOW + 600):
@@ -148,6 +161,50 @@ def test_a_lane_that_stopped_being_a_candidate_is_RELEASED():
     rep = run(FakeConsole([]), hub)
     assert rep.released == ["lane-a"]
     assert hub.writes("lane-a")[-1] == "release"
+
+
+def test_the_release_records_the_CONSOLES_OWN_WORDS_for_why():
+    """Bar 59's clause is "released ... WHEN IT IS ASSIGNED AN OPEN BAR", and
+    a release row carrying only `owner` cannot say whether that is what
+    happened. The console already states the reason; the release copies it
+    VERBATIM, so a later reader partitions on the console's sentence and not
+    on this scanner's opinion of itself."""
+    hub = FakeHub(["lane-a"], existing={"lane-a": held_by_scanner()})
+    console = FakeConsole([], left_out=[
+        {"lane": "lane-a", "why": "owns an open bar here", "bars_open": 3}])
+    rep = run(console, hub)
+    assert rep.released == ["lane-a"]
+    args = hub.releases("lane-a")[-1]["args"]
+    assert args["owner"] == OWNER
+    assert args["cause"] == "owns an open bar here", "the words were not copied"
+    assert args["cause_source"] == CAUSE_FROM_CONSOLE
+
+
+def test_a_release_the_console_DID_NOT_EXPLAIN_says_so_and_does_not_guess():
+    """The negative control, and the whole point of the field: a lane that
+    vanished from BOTH lists is still released — releasing stays the safe
+    direction — but the row must not read as an assignment. Empty and never
+    are the same bytes unless something says which."""
+    hub = FakeHub(["lane-a"], existing={"lane-a": held_by_scanner()})
+    rep = run(FakeConsole([]), hub)          # left_out empty: nobody said why
+    assert rep.released == ["lane-a"], "an unexplained lane was left parked"
+    args = hub.releases("lane-a")[-1]["args"]
+    assert args["cause"] == ""
+    assert args["cause_source"] == CAUSE_UNRECORDED
+
+
+def test_a_cause_that_is_NOT_an_assignment_is_carried_unchanged():
+    """The scanner releases whoever stopped being a candidate for ANY cause.
+    An exemption change is not a bar landing, and the row has to keep them
+    apart — otherwise six releases read as six assignments, which is exactly
+    the reading this field exists to refuse."""
+    hub = FakeHub(["lane-a"], existing={"lane-a": held_by_scanner()})
+    console = FakeConsole([], left_out=[
+        {"lane": "lane-a", "why": "exempt seat"}])
+    run(console, hub)
+    args = hub.releases("lane-a")[-1]["args"]
+    assert args["cause"] == "exempt seat"
+    assert args["cause_source"] == CAUSE_FROM_CONSOLE
 
 
 def test_a_hold_that_is_NOT_the_scanners_is_never_released():
