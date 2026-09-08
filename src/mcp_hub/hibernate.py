@@ -88,6 +88,18 @@ class Report:
     released: list[str] = field(default_factory=list)
     refused: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
+    # ⭐ THE CONSOLE'S ANSWER, VERBATIM — the rows as they arrived, not a
+    # summary of them. Every count above reads identically whether the fleet
+    # is quiet or this scanner is blind to it, and for 94 passes nothing
+    # downstream could tell those apart. The rows themselves are the only
+    # witness: a report-only pass prints them, so a reader who KNOWS a lane
+    # has been quiet >= 60 min can see whether the console said so, whether
+    # it said so under a key this parser does not read, or whether it left
+    # the lane out and why. Held verbatim (no coercion, non-mappings
+    # included) — a row normalised on the way in cannot testify about its
+    # own shape.
+    candidates_seen: list[Any] = field(default_factory=list)
+    left_out_seen: list[Any] = field(default_factory=list)
 
     def line(self) -> str:
         if not self.asked:
@@ -259,7 +271,12 @@ def scan(console: ConsoleAPI, hub: HubHolds, *, thread: int | str = 1,
     #     `isinstance` rather than duck-typing: a row that is not a mapping
     #     at all would raise on `.get` and take the whole pass down with a
     #     traceback. Loud beats silent, but REFUSED-and-legible beats both.
+    #     Captured BEFORE the refusal below, and kept even when the pass
+    #     refuses: a pass that could not read its answer is exactly the pass
+    #     whose answer someone needs to look at.
     raw = payload.get("candidates") or []
+    rep.candidates_seen = list(raw)
+    rep.left_out_seen = list(payload.get("left_out") or [])
     usable = [c for c in raw if isinstance(c, dict) and c.get("lane")]
     cands = {str(c["lane"]): c for c in usable}
     unusable = [c for c in raw

@@ -2127,6 +2127,28 @@ def hibernate_command(args: argparse.Namespace) -> int:
         print(f"  would release {lane}" if rep.dry else f"  released {lane}")
     for lane in rep.refused:
         print(f"  REFUSED  {lane}")
+    # 🔴 THE ANSWER ITSELF, in the report-only pass. Every count above reads
+    # the same whether the fleet is quiet or this scanner is reading a live
+    # list under key names it does not know, and the first pass after the
+    # narrowed clause (2026-09-08) is the first one whose candidate list is
+    # expected to be non-empty AT ALL — so the counts cross that boundary
+    # unchanged and prove nothing either way. Print what the console actually
+    # said, verbatim, so the armed pass that follows is authorised by a human
+    # reading of these rows rather than by a number that cannot fail.
+    if rep.dry and rep.asked:
+        print(f"  console answered: {len(rep.candidates_seen)} candidate "
+              f"row(s), {len(rep.left_out_seen)} left out")
+        for row in rep.candidates_seen:
+            print("    candidate " + json.dumps(row, sort_keys=True,
+                                                default=str))
+        if not rep.candidates_seen:
+            print("    (NO candidate rows — the reading a quiet fleet and a "
+                  "blind scanner both produce. Check the left-out rows for a "
+                  "lane you KNOW has been quiet >= 60 min: absent from both "
+                  "lists means the console never considered it.)")
+        for row in rep.left_out_seen:
+            print("    left out  " + json.dumps(row, sort_keys=True,
+                                                default=str))
     # 🔴 A pass that could not ask is not a quiet fleet, and the exit code is
     # the only part of this a timer reads.
     return 0 if rep.asked else 1

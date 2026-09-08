@@ -367,6 +367,111 @@ def test_the_verb_is_reachable_from_the_console_script():
     assert "hibernate" in names
 
 
+# --- what the pass SAW, not what it counted -------------------------------
+#
+# The deputy's precondition for re-arming (⟨hub.msg/1?id=25541⟩): the first
+# armed pass runs only after a REPORT-ONLY pass has shown ≥1 candidate BY
+# NAME. The counts cannot carry that — `held 0` is what 94 empty passes
+# printed and also what a scanner reading a live list under unknown keys
+# would print. The rows are the only witness, so the pass must keep them.
+
+# The candidate row exactly as the console BUILDS it (squad-proxy-dev-vm-1,
+# app.py:3382-3421, confirmed 2026-09-08). Written out in full on purpose:
+# a fixture trimmed to the three keys this scanner reads could not fail the
+# way the live answer can.
+BUILT_ROW = {
+    "lane": "reliable-ai-dev-vm-1",
+    "why": ("owns no open bar on the active thread; active today but its "
+            "main transcript has been quiet >= 60 min (bar 59)"),
+    "reason": ("owns no open bar on the active thread; active today but its "
+               "main transcript has been quiet >= 60 min (bar 59)"),
+    "since": None,
+    "since_basis": "no turn recorded today",
+    "bars_open": 0,
+    "quiet_s": 3600,
+    "release": ("assignment of an open bar on this thread, or a "
+                "verdict/urgent naming the lane"),
+}
+BUILT_LEFT_OUT = {"lane": "mcp-hub-dev-vm-1",
+                  "why": "owns an open bar here", "bars_open": 1}
+
+
+def test_the_pass_KEEPS_the_consoles_rows_verbatim():
+    """Verbatim: the row as it arrived, extra keys and all. A row normalised
+    on the way in cannot testify about its own shape, which is the one
+    question these rows exist to answer."""
+    console = FakeConsole([BUILT_ROW], left_out=[BUILT_LEFT_OUT])
+    rep = run(console, FakeHub(["reliable-ai-dev-vm-1"]), dry_run=True)
+
+    assert rep.candidates_seen == [BUILT_ROW]
+    assert rep.left_out_seen == [BUILT_LEFT_OUT]
+    # The parse itself, against the BUILT keys rather than the docstring's:
+    # lane/why/release are the three this scanner reads, and they land.
+    assert rep.held == ["reliable-ai-dev-vm-1"]
+
+
+def test_the_rows_SURVIVE_the_refusal_that_needed_them():
+    """A pass that could not read its answer is exactly the pass whose
+    answer someone has to look at. Dropping the rows on the refusal path
+    would leave the reader with a key list and no way to see the row."""
+    rep = run(FakeConsole([{"name": "a", "why": "nothing open"}]),
+              FakeHub(["a"]))
+
+    assert rep.unparsable == 1
+    assert rep.candidates_seen == [{"name": "a", "why": "nothing open"}]
+
+
+def test_an_EMPTY_answer_and_a_populated_one_do_not_print_the_same():
+    """The counts are identical across this boundary; the rows are not."""
+    quiet = run(FakeConsole([]), FakeHub(["a"]), dry_run=True)
+    seen = run(FakeConsole([BUILT_ROW]), FakeHub(["reliable-ai-dev-vm-1"]),
+               dry_run=True)
+
+    assert quiet.candidates_seen == [] and seen.candidates_seen == [BUILT_ROW]
+
+
+def _report_only(monkeypatch, capsys, console, hub):
+    from mcp_hub import cli, operator_api
+    from mcp_hub import hibernate as hib
+
+    monkeypatch.setattr(hib, "ConsoleAPI", lambda **kw: console)
+    monkeypatch.setattr(hib, "HubHolds", lambda **kw: hub)
+    monkeypatch.setattr(operator_api, "resolve_token", lambda: "a-token")
+    args = cli.build_parser().parse_args(["hibernate", "--thread", "1"])
+    rc = cli.hibernate_command(args)
+    return rc, capsys.readouterr().out
+
+
+def test_the_report_only_pass_PRINTS_the_candidate_BY_NAME(monkeypatch,
+                                                           capsys):
+    """The deputy reads THIS output before authorising the armed pass, so
+    the lane's name and the console's own sentence have to be in it."""
+    hub = FakeHub(["reliable-ai-dev-vm-1"])
+    rc, out = _report_only(
+        monkeypatch, capsys,
+        FakeConsole([BUILT_ROW], left_out=[BUILT_LEFT_OUT]), hub)
+
+    assert rc == 0
+    assert "REPORT ONLY" in out
+    assert "reliable-ai-dev-vm-1" in out
+    assert "quiet >= 60 min (bar 59)" in out    # the console's words, verbatim
+    assert "owns an open bar here" in out       # and why a lane was left out
+    assert hub.writes("reliable-ai-dev-vm-1") == [], "a report wrote a hold"
+
+
+def test_an_empty_report_only_pass_SAYS_WHAT_THAT_READING_CANNOT_TELL(
+        monkeypatch, capsys):
+    """0 candidates is the reading a quiet fleet and a blind scanner share.
+    Printing it as a bare `held 0` is what made 94 passes unreadable."""
+    rc, out = _report_only(monkeypatch, capsys,
+                           FakeConsole([], left_out=[BUILT_LEFT_OUT]),
+                           FakeHub(["mcp-hub-dev-vm-1"]))
+
+    assert rc == 0
+    assert "0 candidate row(s)" in out and "NO candidate rows" in out
+    assert "mcp-hub-dev-vm-1" in out and "owns an open bar here" in out
+
+
 # ---------------------------------------------------------------------------
 # The wire, not the rule.
 #
