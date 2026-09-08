@@ -29,7 +29,12 @@ class FakeConsole:
 
     def __init__(self, candidates=(), unknown=(), boom=False, left_out=()):
         self.payload = {
-            "candidates": [dict(c) for c in candidates],
+            # Non-dict rows pass through VERBATIM. A fixture that coerces
+            # its input cannot test what the scanner does with malformed
+            # input — it would reject the bad row before the code under
+            # test ever saw it, and the guard would pass vacuously.
+            "candidates": [dict(c) if isinstance(c, dict) else c
+                           for c in candidates],
             "left_out": [dict(o) for o in left_out],
             "unknown_exempt_names": list(unknown),
         }
@@ -294,6 +299,50 @@ def test_a_quiet_pass_and_an_UNASKED_pass_do_not_read_the_same():
     assert quiet.asked is True and blind.asked is False
     assert quiet.line() != blind.line()
     assert "no pass" in blind.line()
+
+
+def test_a_quiet_pass_and_an_UNREADABLE_ROW_do_not_read_the_same():
+    """The third confusion, and the one the narrowed clause made reachable.
+
+    For 94 armed passes `candidates[]` was EMPTY, so no key name in it was
+    ever exercised against the live console. The moment the clause starts
+    returning rows, a row carrying its lane under a key this scanner does
+    not read would be dropped silently and the pass would print the same
+    `held 0, re-held 0, released 0` as a genuinely quiet fleet — a false
+    green arriving exactly when the bar's evidence depends on the opposite.
+    """
+    quiet = run(FakeConsole([]), FakeHub(["a"]))
+    garbled = run(FakeConsole([{"name": "a", "why": "nothing open"}]),
+                  FakeHub(["a"]))
+
+    assert quiet.line() != garbled.line()
+    assert garbled.unparsable == 1 and quiet.unparsable == 0
+    # It must not merely differ — it must not READ as a clean pass.
+    assert garbled.line().startswith("hibernate: NO USABLE ANSWER")
+    assert "name" in garbled.line()  # names the key it actually got
+
+
+def test_a_row_that_is_not_even_a_mapping_is_refused_not_raised():
+    """The guard must not need the malformed row to be well-formed. A bare
+    string here used to reach `.get` and take the pass down with a
+    traceback; a refusal that only works on tidy input is not a refusal."""
+    rep = run(FakeConsole(["just-a-string"]), FakeHub(["a"]))
+    assert rep.unparsable == 1
+    assert rep.line().startswith("hibernate: NO USABLE ANSWER")
+
+
+def test_an_unparsable_row_stops_the_RELEASES_too():
+    """A half-read list is worse than an unread one: releasing everyone who
+    is 'not in candidates' would unpark the very lanes still listed under
+    the key we failed to read. Same reasoning step 1 refuses a blip for."""
+    hub = FakeHub(["held-lane"], existing={"held-lane": {
+        "until": NOW + TTL_SECONDS, "kind": KIND, "owner": OWNER}})
+    rep = run(FakeConsole([{"name": "someone-else"}]), hub)
+
+    assert rep.released == [] and rep.held == []
+    assert hub.releases("held-lane") == [], "a half-read list unparked a lane"
+    assert hub.writes("held-lane") == ["hold"], "only the pre-existing hold"
+
 
 
 @pytest.mark.parametrize("cls,attr", [(ConsoleAPI, "candidates"),

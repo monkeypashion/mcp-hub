@@ -74,6 +74,15 @@ class Report:
     # nobody — a row that says a thing was done when it was not is the whole
     # false-green shape, banner above it or not. The wording carries it.
     dry: bool = False
+    # ⭐ CANDIDATE ROWS THE PARSER COULD NOT USE. Not a count for curiosity:
+    # `held 0, re-held 0, released 0` is what this pass printed for 94
+    # consecutive passes with a genuinely empty list, and a console row
+    # carrying its lane under a key this scanner does not read prints THE
+    # SAME LINE. The two readings are "the fleet is quiet" and "I cannot see
+    # the fleet", and nothing downstream could tell them apart until the
+    # narrowed clause (2026-09-08) made the list non-empty for the first
+    # time. A pass that cannot parse its answer REFUSES; it does not report.
+    unparsable: int = 0
     held: list[str] = field(default_factory=list)
     re_held: list[str] = field(default_factory=list)
     released: list[str] = field(default_factory=list)
@@ -83,6 +92,12 @@ class Report:
     def line(self) -> str:
         if not self.asked:
             return f"hibernate: no pass — {'; '.join(self.reasons)}"
+        if self.unparsable:
+            # Leads with the refusal on purpose. A reader who sees "held 0"
+            # first has already drawn the wrong conclusion by the time the
+            # reason arrives at the end of the line.
+            return ("hibernate: NO USABLE ANSWER — "
+                    + '; '.join(self.reasons))
         w = "would hold" if self.dry else "held"
         parts = [
             f"{w} {len(self.held)}",
@@ -232,8 +247,33 @@ def scan(console: ConsoleAPI, hub: HubHolds, *, thread: int | str = 1,
         return rep
     rep.asked = True
 
-    cands = {str(c.get("lane")): c for c in (payload.get("candidates") or [])
-             if c.get("lane")}
+    # 1b. A ROW WE CANNOT PARSE IS NOT AN ABSENT ROW — and for 94 passes the
+    #     difference was invisible, because the list was empty and every key
+    #     name below was therefore untested against the live console. The
+    #     narrowed clause makes `candidates[]` non-empty for the first time,
+    #     so a key-name mismatch across that boundary would land as a clean
+    #     "held 0" and be read as a quiet fleet. Refuse the whole pass —
+    #     releases included, because a partially-read list would unpark lanes
+    #     that are still candidates under a key we failed to read, which is
+    #     exactly the hazard step 1 refuses a network blip for.
+    #     `isinstance` rather than duck-typing: a row that is not a mapping
+    #     at all would raise on `.get` and take the whole pass down with a
+    #     traceback. Loud beats silent, but REFUSED-and-legible beats both.
+    raw = payload.get("candidates") or []
+    usable = [c for c in raw if isinstance(c, dict) and c.get("lane")]
+    cands = {str(c["lane"]): c for c in usable}
+    unusable = [c for c in raw
+                if not (isinstance(c, dict) and c.get("lane"))]
+    if unusable:
+        seen = sorted({str(k) for c in unusable if isinstance(c, dict)
+                       for k in c})
+        rep.unparsable = len(unusable)
+        rep.reasons.append(
+            f"{len(unusable)} of {len(raw)} candidate rows carry no `lane` "
+            f"(keys present: {', '.join(seen) or 'none'}) — nothing held and "
+            "nothing released this pass, because a list I cannot fully read "
+            "must not be reported as an empty one")
+        return rep
 
     # THE CONSOLE ALREADY SAYS WHY EACH LANE IS NOT A CANDIDATE, and this
     # scanner used to throw that away one line before the release that needed
