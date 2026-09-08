@@ -700,6 +700,108 @@ def test_an_AMBIGUOUS_close_records_its_reading_as_the_floor(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# A FLOOR THAT OUTLIVED ITS CONTEXT (2026-09-08, deputy's measurement)
+#
+# The floor above is the fix for the empty marker — but it records the reading
+# at the time of the ambiguous close, which is a HIGH one by construction. If
+# a compaction then lands by ANOTHER HAND, the context resets to a fraction of
+# it and "grown past the floor" asks the lane to climb back to a number from a
+# conversation it no longer has.
+#
+# Measured on operator-cockpit-ui-agent-dev-vm-1: AMBIGUOUS at 19:48:51Z 7 Sep
+# recorded floor 967,741; the harness compacted minutes later to ~150k; the
+# lane climbed to ~620k over the next 25 hours — 4.5x the cap — and was never
+# asked again, while 17 asks went to other lanes that day. Note the shape: the
+# climb stayed BELOW the stale floor the whole time, which is why every test
+# above passed. They all climb past it.
+# ---------------------------------------------------------------------------
+
+# below half of OVER (the re-floor trigger), and under the cap
+POST_COMPACT = 60_000
+# over the cap, but still UNDER the stale floor — the measured case, and the
+# only band in which this defect is visible at all
+CLIMB_UNDER_STALE_FLOOR = 150_000
+assert POST_COMPACT < OVER // 2 < CAP < CLIMB_UNDER_STALE_FLOOR < OVER
+
+
+def test_a_compaction_by_another_hand_re_floors_an_AMBIGUOUS_close(tmp_path):
+    """THE REGRESSION. The lane is over the cap and climbing, and the only
+    reason it goes unasked is a floor measured in a context that no longer
+    exists. Without the re-floor this asks nothing, forever, under this
+    session id."""
+    _ambiguous_cycle(tmp_path)
+    before = rows(tmp_path).count(" ask ")
+
+    # the harness compacts it — nothing this leg typed
+    p = run(tmp_path, "compaction_one lane-a\n", tokens=POST_COMPACT,
+            env=ARMED, compacted=(OVER, POST_COMPACT))
+    assert "re-floor" in p.stdout, p.stdout
+    assert "compact_boundary" in p.stdout, "the transcript outranks the sample"
+
+    # now a climb that is over the cap but BELOW the stale floor
+    run(tmp_path, "compaction_one lane-a\n" * 3,
+        tokens=CLIMB_UNDER_STALE_FLOOR, env=ARMED, replies=answered("COMPACT"))
+
+    assert rows(tmp_path).count(" ask ") == before + 1, rows(tmp_path)
+    assert commands_typed(tmp_path) == ["/compact"], \
+        "the re-armed cycle must reach exec"
+
+
+def test_the_re_floor_takes_the_boundary_reading_not_the_sample(tmp_path):
+    """The marker carries the CLIENT's post-compaction number, which is a
+    measurement, not this sweep's sample of it."""
+    _ambiguous_cycle(tmp_path)
+    run(tmp_path, "compaction_one lane-a\n", tokens=POST_COMPACT - 5_000,
+        env=ARMED, compacted=(OVER, POST_COMPACT))
+    flag = next((tmp_path / ".mcp-hub").glob("compaction-lane-a-*.closed"))
+    assert flag.read_text().strip() == str(POST_COMPACT), \
+        f"re-floor must take the boundary's post reading, got {flag.read_text()!r}"
+
+
+def test_a_halving_with_no_readable_boundary_still_re_floors(tmp_path):
+    """Deliberately ASYMMETRIC with the close leg, where `none` means the
+    keystroke did not take. Here the boundary can be hours old and out of the
+    16MB tail, so absence from the tail is not absence of the compaction —
+    and the cost of being wrong is one extra ask to a lane over the cap."""
+    _ambiguous_cycle(tmp_path)
+    p = run(tmp_path, "compaction_one lane-a\n", tokens=POST_COMPACT,
+            env=ARMED)                      # no boundary in the transcript
+    assert "sampled" in p.stdout, p.stdout
+    flag = next((tmp_path / ".mcp-hub").glob("compaction-lane-a-*.closed"))
+    assert flag.read_text().strip() == str(POST_COMPACT)
+
+
+def test_a_lane_climbing_under_its_floor_is_NOT_re_floored(tmp_path):
+    """The must-still-fire constraint, and the whole reason the trigger is
+    HALF the floor rather than any drop: an AMBIGUOUS lane that keeps climbing
+    with no compaction anywhere is still not re-asked on the same climb."""
+    _ambiguous_cycle(tmp_path)
+    before = rows(tmp_path).count(" ask ")
+
+    p = run(tmp_path, "compaction_one lane-a\n" * 3,
+            tokens=CLIMB_UNDER_STALE_FLOOR, env=ARMED,
+            replies=answered("COMPACT"))
+
+    assert "re-floor" not in p.stdout, p.stdout
+    assert rows(tmp_path).count(" ask ") == before, \
+        "re-asked on the same climb with no compaction"
+    flag = next((tmp_path / ".mcp-hub").glob("compaction-lane-a-*.closed"))
+    assert flag.read_text().strip() == str(OVER), "the floor moved with no compaction"
+
+
+def test_ordinary_variation_does_not_re_floor(tmp_path):
+    """The negative control on the threshold. squad-proxy's reading dipped
+    3,222 tokens below its own `before` at 08:17:06 on 2026-09-03 with no
+    compaction in its transcript. A re-floor on any dip would take that."""
+    _ambiguous_cycle(tmp_path)
+    p = run(tmp_path, "compaction_one lane-a\n", tokens=OVER - 3_222,
+            env=ARMED)
+    assert "re-floor" not in p.stdout, p.stdout
+    flag = next((tmp_path / ".mcp-hub").glob("compaction-lane-a-*.closed"))
+    assert flag.read_text().strip() == str(OVER)
+
+
+# ---------------------------------------------------------------------------
 # THE EXEC THAT DID NOTHING (2026-09-03)
 #
 # exec typed `/compact` into operator-cockpit-ui-agent (08:16:49) and

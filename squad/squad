@@ -1399,8 +1399,14 @@ COMPACT_EXEC_DEADLINE="${MCP_HUB_COMPACT_EXEC_DEADLINE:-900}"
 #     so re-arming waits for genuine new growth.
 # That keeps the anti-REPEAT guarantee (a cycle can only follow a COMPLETED,
 # MEASURED one) while restoring the protection the leg exists for.
+#
+# With one correction on the third condition: a floor is only a bar for the
+# context it was measured in. If the reading falls to under HALF the floor,
+# a compaction has landed by another hand and the floor is re-taken on the
+# new context — otherwise a lane can be left climbing against a number from
+# a conversation it no longer has. See the block inside the function.
 compaction_recross() {
-  local a="$1" flag="$2" tok="$3" net
+  local a="$1" flag="$2" tok="$3" net closed_at bnd
   [ -f "$flag.closed" ] || return 1
   net="$(cat "$flag.closed" 2>/dev/null || true)"
   # LEGACY CYCLE — closed by the version that wrote an EMPTY marker. Every
@@ -1416,6 +1422,68 @@ compaction_recross() {
     net="$(cat "$flag.exec" 2>/dev/null || true)"
   fi
   [ -n "$net" ] || return 1
+  # A floor that is not a number can only come from a corrupted marker, and
+  # the arithmetic below would take the whole sweep down with it.
+  [ "$net" -eq "$net" ] 2>/dev/null || return 1
+
+  # 🔴 A FLOOR CAN OUTLIVE THE CONTEXT IT MEASURED.
+  #
+  # The floors written when NOTHING was compacted — the AMBIGUOUS close and
+  # the give-up-after-N-execs close — record the reading AT THE TIME, which
+  # is by definition a HIGH one: the lane was over the cap, that is why it
+  # was asked. If a compaction then lands BY ANOTHER HAND (the harness's own
+  # auto-compact, or the operator typing /compact in the pane), the context
+  # resets to a fraction of that, and "grown past the floor" now demands the
+  # lane climb back to a number belonging to a conversation that no longer
+  # exists. Measured by the deputy on operator-cockpit-ui-agent-dev-vm-1
+  # (2026-09-08 20:4xZ): AMBIGUOUS at 19:48:51Z 7 Sep recorded floor 967,741;
+  # the harness compacted minutes later to ~150k; the lane then climbed to
+  # ~620k over 25 hours — 4.5x the cap — and was never asked again, while 17
+  # asks went to other lanes that day. Exactly the shape of the empty marker
+  # this floor replaced: failing closed on the KEYSTROKE must not disarm the
+  # LANE.
+  #
+  # So a reading far BELOW the floor is not growth and not jitter — it is a
+  # context that has been replaced, and the floor is re-taken on it.
+  #   · The trigger is HALF the floor, not any dip. The sampled-drop close
+  #     above records why: squad-proxy's reading dipped 3,222 tokens (0.3%)
+  #     on ordinary variation with no compaction anywhere. A halving is three
+  #     orders of magnitude past that, and it also keeps this read rare —
+  #     only a lane sitting below half its own floor pays for the transcript.
+  #   · The transcript is asked FIRST and outranks the sample, exactly as in
+  #     the close leg: the boundary carries the real post-compaction reading,
+  #     written by the process that did the compacting.
+  #   · A `none` is NOT taken as proof here, and that asymmetry with the
+  #     close leg is deliberate. There, `none` means "the keystroke did not
+  #     take" and is read seconds after the act. Here the boundary may be
+  #     hours old and the 16MB tail no longer reaches back to it, so absence
+  #     from the tail is not absence of the compaction. The cost of a wrong
+  #     re-floor is ONE extra ask to a lane that is over the cap anyway; the
+  #     cost of missing one is measured above, at 25 hours of silence.
+  #
+  # The anti-repeat guarantee is untouched: a lane CLIMBING without any
+  # compaction never drops below half its floor, so it is never re-floored,
+  # and it is still not re-asked on the same climb.
+  if [ "$tok" -lt "$(( net / 2 ))" ] 2>/dev/null; then
+    closed_at="$(date -r "$flag.closed" +%s 2>/dev/null || echo 0)"
+    bnd=""
+    if [ "$closed_at" -gt 0 ] 2>/dev/null; then
+      bnd="$(compaction_boundary_since "$a" "$closed_at" || true)"
+    fi
+    if [ -n "$bnd" ] && [ "$bnd" != "none" ]; then
+      echo "$a: re-floor ${net} -> ${bnd#* } — a compaction landed by another"\
+           "hand after this cycle closed (compact_boundary ${bnd% *} ->"\
+           "${bnd#* }); the old floor measured a context that is gone"
+      net="${bnd#* }"
+    else
+      echo "$a: re-floor ${net} -> ${tok} — the reading is under half the"\
+           "floor, so the context the floor measured is gone (sampled; no"\
+           "readable boundary since the close)"
+      net="$tok"
+    fi
+    printf '%s\n' "$net" > "$flag.closed"
+  fi
+
   [ "$tok" -ge "$COMPACT_ASK_TOKENS" ] 2>/dev/null || return 1
   [ "$tok" -gt "$net" ] 2>/dev/null || return 1
   rm -f "$flag" "$flag.fire" "$flag.answer" "$flag.exec" "$flag.closed" \
