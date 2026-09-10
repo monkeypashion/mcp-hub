@@ -22,6 +22,14 @@ HEAL_MAX_RELAUNCH="${SQUAD_HEAL_MAX_RELAUNCH:-2}"   # relaunches per heal pass (
 # Don't judge an agent younger than this — Claude Code needs to boot and
 # register, and the status cache it's judged on lags by up to 3 min.
 HEAL_GRACE_SECONDS="${SQUAD_HEAL_GRACE_SECONDS:-180}"
+# LIFETIME nudges per lane, not per pass. The strike flag above decays after
+# 10 min, so on a ~2min cadence a lane that never recovers cycles back into
+# `nudge` forever — measured 2026-09-10, 63 nudges to three lanes in 30 min
+# while the transport was dead. A nudge types a line into the pane and costs
+# that lane a turn, so an unbounded retry spends someone else's context to
+# re-send advice we already know did not work. Counter clears the moment the
+# lane reads healthy, so this bounds FAILURE, never normal operation.
+HEAL_MAX_NUDGES="${SQUAD_HEAL_MAX_NUDGES:-2}"
 SLICE="${SQUAD_SLICE:-}"                 # optional systemd user slice for ceilings; empty = none
 CMD="$(basename "$0")"                   # whatever you symlinked this as (help text only)
 SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"   # real script path (for tmux key bindings)
@@ -166,7 +174,7 @@ has_resume() {
 # the channel. So the operator — the only party who can fix it — is told
 # instead.
 heal_action() {
-  local state="$1" struck="$2" args="$3" idle="$4"
+  local state="$1" struck="$2" args="$3" idle="$4" nudges="${5:-0}"
   if [ "$state" = "no-signal" ] && [ "$struck" != 1 ]; then echo daemon; return; fi
   if [ "$idle" != 1 ]; then echo defer; return; fi
   if [ "$struck" = 1 ]; then
@@ -176,6 +184,14 @@ heal_action() {
     esac
     return
   fi
+  # Out of nudges. Reached only when the strike flag has DECAYED — i.e. this
+  # lane already took its nudges, stayed broken long enough for the 10-minute
+  # window to lapse, and is now circling back for another. `blocked` is the
+  # sibling case and the precedent: once repeating the advice cannot work,
+  # heal stops spending the agent's turns and spends a line on the operator
+  # instead. The difference is only WHICH fact rules it out — there the
+  # roster forbids the cure, here the nudge itself is measured not to be one.
+  if [ "${nudges:-0}" -ge "${HEAL_MAX_NUDGES:-2}" ]; then echo spent; return; fi
   echo nudge
 }
 
@@ -3839,6 +3855,22 @@ case "${1:-help}" in
               pane_alive "$a" || continue
               # Already relaunched by the deaf sweep in THIS pass — leave it be.
               case "$touched" in *" $a "*) continue ;; esac
+              # BRAKED/HELD: a held lane is one somebody deliberately wants
+              # DOWN, and its release condition frequently says so in words
+              # ("restarts itself at 23:00Z; do not heal or restart it by
+              # hand"). hold_enforce_pass above stops such a lane, but stopping
+              # is not instant and a brake that stops only the SESSION leaves
+              # the pane alive — so this loop could still reach it, judge the
+              # stop as breakage, and nudge the very lane a brake is holding.
+              # heal would then be arguing with the brake every two minutes,
+              # and heal runs more often. Skip it entirely: not judged, not
+              # nudged, not counted. Fails open exactly like held_until does —
+              # no mirror or no jq means no lane is held, so a dead edge can
+              # never silence heal for the whole fleet.
+              if [ -n "$(held_until "$a" 2>/dev/null)" ]; then
+                echo "$a: held by the brake — heal defers to it (release: $(held_reason "$a" 2>/dev/null))"
+                continue
+              fi
               # GRACE WINDOW. Every state below is read from the daemon's status
               # cache, which lags by up to 3 min, so an agent that just restarted
               # ALWAYS reads offline/unwakeable — judging it then guarantees a
@@ -3873,12 +3905,21 @@ case "${1:-help}" in
               fi
               sf="$(status_file "$a")"
               flag="$HOME/.mcp-hub/heal-flag-$(safe_name "$a")"
+              # Lifetime nudge tally. Deliberately a SEPARATE file from the
+              # strike flag: the flag is a 10-minute window and must keep
+              # decaying (it is what escalates a nudge to a relaunch), while
+              # this must NOT decay or it cannot bound a loop the decay itself
+              # creates.
+              ncnt="$HOME/.mcp-hub/heal-nudges-$(safe_name "$a")"
               state=""
               if [ -z "$(find "$sf" -mmin -3 2>/dev/null)" ]; then state="no-signal"
               elif grep -q '"online"[[:space:]]*:[[:space:]]*false' "$sf" 2>/dev/null; then state="offline"
               elif grep -q '"wakeable"[[:space:]]*:[[:space:]]*false' "$sf" 2>/dev/null; then state="unwakeable"
               fi
-              if [ -z "$state" ]; then rm -f "$flag"; continue; fi   # healthy — clear strikes
+              # healthy — clear strikes AND the lifetime tally. Recovery is the
+              # only reset: a lane that comes back gets its full budget again,
+              # so the cap can never accumulate across unrelated incidents.
+              if [ -z "$state" ]; then rm -f "$flag" "$ncnt"; continue; fi
               args="$(field "$a" 4)"
               # Every intervention below TOUCHES THE PANE, so none may run
               # unless the agent is idle:
@@ -3892,7 +3933,9 @@ case "${1:-help}" in
               st="$(classify_agent "$a")"
               struck=0; if [ -n "$(find "$flag" -mmin -10 2>/dev/null)" ]; then struck=1; fi
               idle=0; if [ "$st" = "idle" ]; then idle=1; fi
-              case "$(heal_action "$state" "$struck" "$args" "$idle")" in
+              nudged="$(cat "$ncnt" 2>/dev/null || echo 0)"
+              case "$nudged" in ''|*[!0-9]*) nudged=0 ;; esac
+              case "$(heal_action "$state" "$struck" "$args" "$idle" "$nudged")" in
               daemon)
                 # first strike: revive the daemon quietly — no agent turn spent.
                 # If the binding is also gone, the revived daemon writes an
@@ -3953,6 +3996,16 @@ case "${1:-help}" in
                 # blocked all post-deploy recovery behind it).
                 type_line "$a" "$nudge" \
                   || echo "!! $a: nudge send-keys failed/timed out (pane wedged?) — skipping" >&2
+                touch "$flag"
+                # Counted AFTER the send, so a nudge that never landed is not
+                # charged against a budget meant to bound turns actually spent.
+                echo $((nudged + 1)) > "$ncnt"
+                ;;
+              spent)
+                # Budget gone. Same contract as `blocked`: keep the strike
+                # window warm so this cannot decay back into the nudge, leave
+                # the pane alone, and tell the only party who can still act.
+                echo "!! $a: STILL $state after $nudged nudges — heal will not nudge it again (a nudge cannot revive a dead transport, and each one costs the lane a turn). A restart is the cure: $CMD restart $a --resume, once the hub is verified stable." >&2
                 touch "$flag"
                 ;;
               *)

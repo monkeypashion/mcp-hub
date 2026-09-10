@@ -33,7 +33,8 @@ COMMS = "--dangerously-load-development-channels server:hub"
 pytestmark = pytest.mark.skipif(not SQUAD.exists(), reason="squad script not present")
 
 
-def _action(state: str, struck: int, args: str, idle: int) -> str:
+def _action(state: str, struck: int, args: str, idle: int,
+            nudges: int = 0) -> str:
     """One verdict, from the real script.
 
     Sourced with `help` so the dispatch runs a branch that only prints usage —
@@ -41,8 +42,8 @@ def _action(state: str, struck: int, args: str, idle: int) -> str:
     """
     res = subprocess.run(
         ["bash", "-c",
-         'source "$1" help >/dev/null 2>&1; heal_action "$2" "$3" "$4" "$5"',
-         "_", str(SQUAD), state, str(struck), args, str(idle)],
+         'source "$1" help >/dev/null 2>&1; heal_action "$2" "$3" "$4" "$5" "$6"',
+         "_", str(SQUAD), state, str(struck), args, str(idle), str(nudges)],
         capture_output=True, text=True, timeout=60,
     )
     assert res.returncode == 0, res.stderr
@@ -151,7 +152,8 @@ def test_every_verdict_has_an_arm_in_the_pass_that_consumes_it():
     fn = body.split("heal_action() {", 1)[1].split("\n}", 1)[0]
     verdicts = {ln.split("echo", 1)[1].split(";")[0].strip()
                 for ln in fn.splitlines() if "echo " in ln}
-    assert verdicts == {"daemon", "defer", "relaunch", "blocked", "nudge"}, verdicts
+    assert verdicts == {"daemon", "defer", "relaunch", "blocked", "nudge",
+                        "spent"}, verdicts
     consumer = body.split('case "$(heal_action', 1)[1].split("\n              esac", 1)[0]
     for v in verdicts:
         assert f"\n              {v})" in consumer, \
@@ -184,3 +186,47 @@ def test_the_advice_heal_prints_names_verbs_that_actually_EXIST():
     for verb in sorted(named):
         assert f"\n  {verb})" in dispatch, \
             f"heal tells the operator to run `squad {verb}`, which is not a verb"
+
+
+# ---- the nudge budget (deputy ruling 2026-09-10, hub.msg id=26196) ---------
+#
+# The defect: the strike flag decays after 10 minutes, and that decay is
+# load-bearing — it is what escalates a nudge into a relaunch. But a lane whose
+# transport is dead never recovers, so every ~2min pass it eventually falls back
+# through the decayed flag into `nudge` again. Measured the night prod-1's
+# tailnet key expired: 63 nudges to three lanes in half an hour, each one a
+# typed line costing that lane a turn, none of which could work — a nudge asks
+# an agent to re-register over the very transport that is down.
+
+
+def _spent(nudges: int, struck: int = 0) -> str:
+    return _action("offline", struck, f"{RESUME} {COMMS}", 1, nudges)
+
+
+def test_the_first_two_nudges_are_still_sent():
+    """The budget bounds a failure loop; it must not make heal timid. Two is
+    the whole point of a retry — the first can race a transient reconnect."""
+    assert _spent(0) == "nudge"
+    assert _spent(1) == "nudge"
+
+
+def test_the_third_nudge_is_refused():
+    assert _spent(2) == "spent"
+    assert _spent(9) == "spent"
+
+
+def test_a_struck_lane_still_ESCALATES_rather_than_being_shut_up():
+    """`spent` must only replace the nudge, never the cure. Inside the strike
+    window a resume-capable lane is still relaunched however many nudges it has
+    already had — otherwise the budget would disable the one act that works."""
+    assert _spent(5, struck=1) == "relaunch"
+    # ...and a resume-less one still reports rather than repeating itself.
+    assert _action("offline", 1, COMMS, 1, 5) == "blocked"
+
+
+def test_the_budget_never_preempts_a_BUSY_lane_or_a_dead_daemon():
+    """Ordering: the cheap, pane-free and safety verdicts are decided before
+    the budget is consulted, so exhausting it cannot start typing at a busy
+    lane nor stop the daemon respawn."""
+    assert _action("offline", 0, COMMS, 0, 99) == "defer"
+    assert _action("no-signal", 0, COMMS, 1, 99) == "daemon"
