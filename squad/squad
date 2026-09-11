@@ -828,6 +828,39 @@ held_until() { # agent -> prints the expiry if held RIGHT NOW, else nothing
   jq -r --arg a "$a" '.held[$a].until' "$HELD_FILE" 2>/dev/null
 }
 
+# ...but a RESTART is the other direction, and must fail CLOSED (deputy's
+# ruling 2026-09-11, after hold 201). Both rules are one principle: NEVER ACT
+# ON STATE YOU CANNOT READ. Enforcement declines to STOP a lane it cannot
+# verify is held; release declines to START one it cannot verify is free.
+# Failing open here is not symmetrical with failing open there — an unheld
+# lane that stays down is visible and costs a pass, while a held lane that
+# comes back burns its share and reports a successful release while doing it.
+#
+# ⚠️ `held_until` cannot express this: it returns "not held" for BOTH "the
+# mirror says nobody" and "I have no mirror", and those are the same bytes.
+# The staleness case is worse than the missing one, because the file is right
+# there and reads clean — the same shape as the fleet snapshot rule, where a
+# stopped instrument must read `not reporting` and never `nothing to report`.
+HELD_STALE_AFTER="${MCP_HUB_HELD_STALE_AFTER:-300}"   # 10 edge passes at 30s
+
+held_mirror_unknown() { # 0 = CANNOT TELL what is held; 1 = the mirror is good
+  local gen now
+  [ -r "$HELD_FILE" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  # `generated` is the edge's own stamp, written with the snapshot. Absent is
+  # UNKNOWN, not fresh: a mirror from a writer too old to stamp it is exactly
+  # the one whose freshness nobody can vouch for.
+  gen="$(jq -r '.generated // empty' "$HELD_FILE" 2>/dev/null)"
+  case "$gen" in ''|null) return 0 ;; esac
+  now="$(date +%s)"
+  # awk, not $(( )): the stamp is a float and arithmetic expansion errors on
+  # one, which would return the WRONG answer loudly rather than this one.
+  [ "$(awk -v g="$gen" -v n="$now" -v s="$HELD_STALE_AFTER" \
+        'BEGIN { print (g <= 0 || n - g > s) ? "stale" : "fresh" }')" \
+     = "fresh" ] || return 0
+  return 1
+}
+
 held_reason() { # agent -> the release condition the operator stated
   jq -r --arg a "$1" '.held[$a].release_condition // "no condition recorded"' \
     "$HELD_FILE" 2>/dev/null
@@ -1818,6 +1851,19 @@ compaction_pass() {
 # flag the stop left behind.
 hold_release_pass() {
   local a f args
+  # BEFORE any flag is read: a release is a RESTART, and restarting a lane
+  # whose hold you cannot see is how a hold stops being one. The flags are
+  # left exactly where they are, so the release still happens on the first
+  # pass with a mirror worth reading — this defers the restart, it does not
+  # cancel it.
+  if held_mirror_unknown; then
+    for f in "$HOME"/.mcp-hub/hold-stopped-*; do
+      [ -e "$f" ] || continue
+      echo "!! held mirror is missing or stale (>${HELD_STALE_AFTER}s) — NOT restarting any held lane this pass. A hold nobody can read is not a hold that ended; the flags stand and release resumes when the mirror does." >&2
+      break
+    done
+    return 0
+  fi
   for f in "$HOME"/.mcp-hub/hold-stopped-*; do
     [ -e "$f" ] || continue
     a="${f##*/hold-stopped-}"

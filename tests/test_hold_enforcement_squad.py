@@ -193,6 +193,50 @@ def test_a_still_held_lane_is_not_released(tmp_path):
     assert (tmp_path / ".mcp-hub" / "hold-stopped-lane-a").exists()
 
 
+def test_a_stale_mirror_restarts_nobody(tmp_path):
+    """The 01:00:44Z shape, inverted. Release FAILS CLOSED where enforcement
+    fails open: an unreadable or stale mirror is not evidence that a hold
+    ended, and restarting on it is how a held lane comes back burning its
+    share while the pass reports a clean release."""
+    home, conf, heldf, bdir, bin_ = harness(
+        tmp_path, held={}, running=False, stopped_flag=True)
+    heldf.write_text(json.dumps({"generated": time.time() - 3600,
+                                 "held": {}}), encoding="utf-8")
+    p = call(home, conf, heldf, bdir, bin_, "hold_release_pass")
+    assert "RELEASED" not in p.stdout
+    assert "stale" in p.stderr
+    assert (tmp_path / ".mcp-hub" / "hold-stopped-lane-a").exists(), \
+        "the flag must survive — this DEFERS the release, never cancels it"
+
+
+def test_a_missing_mirror_restarts_nobody(tmp_path):
+    home, conf, heldf, bdir, bin_ = harness(
+        tmp_path, held={}, running=False, stopped_flag=True)
+    heldf.unlink()
+    p = call(home, conf, heldf, bdir, bin_, "hold_release_pass")
+    assert "RELEASED" not in p.stdout
+    assert (tmp_path / ".mcp-hub" / "hold-stopped-lane-a").exists()
+
+
+def test_a_mirror_with_no_generated_stamp_is_unknown_not_fresh(tmp_path):
+    """Absent is UNKNOWN. A writer too old to stamp the snapshot is exactly
+    the one whose freshness nobody can vouch for."""
+    home, conf, heldf, bdir, bin_ = harness(
+        tmp_path, held={}, running=False, stopped_flag=True)
+    heldf.write_text(json.dumps({"held": {}}), encoding="utf-8")
+    p = call(home, conf, heldf, bdir, bin_, "hold_release_pass")
+    assert "RELEASED" not in p.stdout
+
+
+def test_a_fresh_mirror_still_releases(tmp_path):
+    """The positive control. Without it the three above pass for a gate that
+    refuses everything, which is not a tightening but a break."""
+    h = harness(tmp_path, held={}, running=False, stopped_flag=True)
+    p = call(*h, "hold_release_pass")
+    assert "RELEASED" in p.stdout
+    assert "stale" not in p.stderr
+
+
 def test_a_lane_without_the_resume_flag_is_named_not_restarted_blank(tmp_path):
     """Coming back with no conversation is a loss reported as a release."""
     h = harness(tmp_path, held={}, args="", running=False, stopped_flag=True)
