@@ -22,9 +22,25 @@ jq_missing = not Path("/usr/bin/jq").exists()
 pytestmark = pytest.mark.skipif(jq_missing, reason="needs jq")
 
 
+def pace_body(used, elapsed):
+    return json.dumps({"checks": [{"used_percentage": used,
+                                   "window_elapsed_percentage": elapsed,
+                                   "margin": 0.0, "ok": used <= elapsed}]})
+
+
 def harness(tmp_path, *, held, agent="lane-a", args="--continue",
-            running=True, boundary=False, stopped_flag=False):
-    """Lay out a HOME, a roster and a mirror, then run one snippet."""
+            running=True, boundary=False, stopped_flag=False,
+            pace=pace_body(10, 90)):
+    """Lay out a HOME, a roster, a mirror and a pace, then run one snippet.
+
+    ⚠️ `pace` is not decoration. `hold_release_pass` now reads the week pace
+    before it restarts anything, and the default URL is the live console on
+    this machine — so a harness that did not pin it would send every release
+    test to a real service whose answer changes hourly, and the suite would
+    pass or fail on the fleet's actual burn. Default is FAR under the line, so
+    every pre-existing test means what it did before. `None` writes no file at
+    all, which is the unreadable case.
+    """
     home = tmp_path
     (home / ".mcp-hub").mkdir(parents=True, exist_ok=True)
     conf = home / "squad.conf"
@@ -33,6 +49,9 @@ def harness(tmp_path, *, held, agent="lane-a", args="--continue",
     heldf = home / "held.json"
     heldf.write_text(json.dumps({"generated": time.time(),
                                  "held": held or {}}), encoding="utf-8")
+
+    if pace is not None:
+        (home / "pace.json").write_text(pace, encoding="utf-8")
 
     bdir = home / "boundary"
     bdir.mkdir(exist_ok=True)
@@ -82,7 +101,9 @@ def call(home, conf, heldf, bdir, bin_, snippet):
         capture_output=True, text=True,
         env={"PATH": f"{bin_}:/usr/bin:/bin", "HOME": str(home),
              "SQUAD_CONF": str(conf), "MCP_HUB_HELD_FILE": str(heldf),
-             "MCP_HUB_HOLD_BOUNDARY_DIR": str(bdir)},
+             "MCP_HUB_HOLD_BOUNDARY_DIR": str(bdir),
+             # Never the live console. See `harness`.
+             "MCP_HUB_PACE_URL": f"file://{home}/pace.json"},
     )
 
 
@@ -266,3 +287,105 @@ def test_no_flags_at_all_is_a_quiet_no_op(tmp_path):
     h = harness(tmp_path, held={}, running=False)
     p = call(*h, "hold_release_pass")
     assert p.stdout.strip() == "" and p.stderr.strip() == ""
+
+
+# --- the week pace: a release is a restart, and a restart costs a lane -----
+#
+# His word 2026-09-11: while the week's used% is over its elapsed%, nobody
+# restarts a lane. Overnight the release pass spent five restarts on one lane
+# at each hour boundary while the week was already over the line.
+
+def test_over_the_line_defers_the_restart_and_keeps_the_flag(tmp_path):
+    """The defect itself. Over the line, a released lane is NOT restarted —
+    and the flag survives, so this defers the release rather than cancelling
+    it, exactly as the stale-mirror gate does."""
+    h = harness(tmp_path, held={}, running=False, stopped_flag=True,
+                pace=pace_body(61, 51.6))
+    p = call(*h, "hold_release_pass")
+    assert "RELEASED" not in p.stdout
+    assert "over the line" in p.stderr
+    assert "not restarting, flag kept" in p.stderr
+    assert "lane-a" in p.stderr, "the line must name the lane it held back"
+    assert (tmp_path / ".mcp-hub" / "hold-stopped-lane-a").exists()
+
+
+def test_under_the_line_restarts_exactly_as_before(tmp_path):
+    """MUST-FIRE, and the positive control for all three gates below: without
+    it they pass for a pace read that refuses everything, which is a break
+    wearing a tightening's clothes."""
+    h = harness(tmp_path, held={}, running=False, stopped_flag=True,
+                pace=pace_body(40, 51.6))
+    p = call(*h, "hold_release_pass")
+    assert "RELEASED" in p.stdout
+    assert "--continue" in p.stdout
+    assert "over the line" not in p.stderr
+
+
+def test_exactly_on_the_line_still_restarts(tmp_path):
+    """His rule is used% > elapsed%, margin 0. Equal is ON the line, and a
+    lane held back there would never be released by a pace that only ever
+    touches its own line from above."""
+    h = harness(tmp_path, held={}, running=False, stopped_flag=True,
+                pace=pace_body(51.6, 51.6))
+    p = call(*h, "hold_release_pass")
+    assert "RELEASED" in p.stdout
+
+
+def test_an_unreadable_pace_restarts_nobody(tmp_path):
+    """Fail closed, the same shape as the stale mirror: a pace nobody can read
+    is not evidence that we are under the line. `None` writes no file, so the
+    real curl fails the way an unreachable console does."""
+    h = harness(tmp_path, held={}, running=False, stopped_flag=True,
+                pace=None)
+    p = call(*h, "hold_release_pass")
+    assert "RELEASED" not in p.stdout
+    assert "unreadable" in p.stderr
+    assert (tmp_path / ".mcp-hub" / "hold-stopped-lane-a").exists()
+
+
+def test_a_non_numeric_pace_is_unreadable_not_zero(tmp_path):
+    """awk reads "n/a" as 0, which would report the fleet comfortably under a
+    line it never measured — the most expensive way for this gate to fail."""
+    h = harness(tmp_path, held={}, running=False, stopped_flag=True,
+                pace=json.dumps({"checks": [{"used_percentage": "n/a",
+                                             "window_elapsed_percentage": 51.6}]}))
+    p = call(*h, "hold_release_pass")
+    assert "RELEASED" not in p.stdout
+    assert "unreadable" in p.stderr
+
+
+def test_a_pace_payload_with_no_checks_is_unreadable(tmp_path):
+    """A shape change at the console must not read as `under`."""
+    h = harness(tmp_path, held={}, running=False, stopped_flag=True,
+                pace=json.dumps({"checks": [], "ok": True}))
+    p = call(*h, "hold_release_pass")
+    assert "RELEASED" not in p.stdout
+    assert "unreadable" in p.stderr
+
+
+def test_the_pace_is_not_consulted_when_there_is_nothing_to_release(tmp_path):
+    """Only a waiting release pays for the read. An unreachable console must
+    not make an empty pass noisy every two minutes."""
+    h = harness(tmp_path, held={}, running=False, pace=None)
+    p = call(*h, "hold_release_pass")
+    assert p.stdout.strip() == "" and p.stderr.strip() == ""
+
+
+def test_a_retired_agents_flag_is_still_cleared_over_the_line(tmp_path):
+    """The pace gate guards the RESTART, not the bookkeeping. A ghost flag
+    that outlives its agent starts nothing, so holding it back over the line
+    would only make it immortal."""
+    h = harness(tmp_path, held={}, running=False, pace=pace_body(61, 51.6))
+    (tmp_path / ".mcp-hub" / "hold-stopped-ghost-lane").write_text("")
+    p = call(*h, "hold_release_pass")
+    assert "no longer on the roster" in p.stderr
+    assert not (tmp_path / ".mcp-hub" / "hold-stopped-ghost-lane").exists()
+
+
+def test_a_still_held_lane_is_not_reported_as_over_the_line(tmp_path):
+    """It is not being released at all — naming it here would teach the
+    operator that the pace is what is keeping a held lane down."""
+    h = harness(tmp_path, held={"lane-a": held_entry()}, running=False,
+                stopped_flag=True, pace=pace_body(61, 51.6))
+    p = call(*h, "hold_release_pass")
+    assert "over the line" not in p.stderr

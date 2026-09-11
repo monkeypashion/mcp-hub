@@ -872,6 +872,47 @@ held_at() { # agent -> unix time the hold was ASKED FOR, or nothing
   jq -r --arg a "$1" '.held[$a].held_at' "$HELD_FILE" 2>/dev/null
 }
 
+# --- the week pace: a RELEASE IS A RESTART, and a restart costs a lane ------
+#
+# His word, 2026-09-11 (relayed ⟨hub.msg/1?id=26423⟩): "when we are ahead of
+# the curve like now 61% (51%) there is no reason to restart lanes — clearly
+# doing that we never drop back to the usage target."
+#
+# Overnight this cost five: each time a brake hold expired on the hour,
+# `hold_release_pass` restarted reliable-ai from its hold-stopped flag, and a
+# restart is a cold start plus an unasked sync run — five of them, zero bars,
+# while the week was already over its line. So while used% > elapsed%, a
+# release DEFERS: the flag stands and the restart happens on the first pass
+# after the line is met. Nothing is cancelled, exactly as with a stale mirror.
+#
+# Fail closed, the same shape as `held_mirror_unknown`: a pace nobody can read
+# is not evidence that we are under the line.
+PACE_URL="${MCP_HUB_PACE_URL:-http://127.0.0.1:8765/ceiling/pace}"
+PACE_MARGIN="${MCP_HUB_PACE_MARGIN:-0}"   # his line is used% <= elapsed%, flat
+PACE_TIMEOUT="${MCP_HUB_PACE_TIMEOUT:-5}"
+
+pace_verdict() { # prints over | under | unknown — never fails its caller
+  local body used elapsed
+  command -v jq   >/dev/null 2>&1 || { echo unknown; return 0; }
+  command -v curl >/dev/null 2>&1 || { echo unknown; return 0; }
+  body="$(curl -fsS --max-time "$PACE_TIMEOUT" "$PACE_URL" 2>/dev/null)" \
+    || { echo unknown; return 0; }
+  # checks[0] is the live credential's window — the same row the console's own
+  # `ok` is computed from. Read the two NAMED fields rather than that boolean:
+  # `ok` carries the endpoint's margin, and the line we were given is margin 0.
+  used="$(printf '%s' "$body" \
+    | jq -r '.checks[0].used_percentage // empty' 2>/dev/null)"
+  elapsed="$(printf '%s' "$body" \
+    | jq -r '.checks[0].window_elapsed_percentage // empty' 2>/dev/null)"
+  # A non-number is UNKNOWN, never zero: awk reads "n/a" as 0 and would report
+  # the fleet comfortably under a line it never measured.
+  case "$used"    in ''|*[!0-9.]*) echo unknown; return 0 ;; esac
+  case "$elapsed" in ''|*[!0-9.]*) echo unknown; return 0 ;; esac
+  # awk, not $(( )): both are floats and arithmetic expansion errors on one.
+  awk -v u="$used" -v e="$elapsed" -v m="$PACE_MARGIN" \
+      'BEGIN { print (u > e + m) ? "over" : "under" }'
+}
+
 # --- stopping a lane that is ALREADY RUNNING (#318, his ruling) -------------
 #
 # `up_one`/`relaunch_agent` refuse to START a held lane. That covers a lane
@@ -1850,7 +1891,7 @@ compaction_pass() {
 # surface reported it released. This restarts it explicitly instead, from the
 # flag the stop left behind.
 hold_release_pass() {
-  local a f args
+  local a f args pace=""
   # BEFORE any flag is read: a release is a RESTART, and restarting a lane
   # whose hold you cannot see is how a hold stops being one. The flags are
   # left exactly where they are, so the release still happens on the first
@@ -1880,6 +1921,18 @@ hold_release_pass() {
     fi
     if tm has-session -t "=$a" 2>/dev/null; then
       rm -f "$f" 2>/dev/null || true   # already back by some other route
+      continue
+    fi
+    # Last gate before the only line that starts anything. Read at most ONCE
+    # per pass, and only when there is a release actually waiting on it — not
+    # a request every two minutes for a glob that matched nothing.
+    [ -n "$pace" ] || pace="$(pace_verdict)"
+    if [ "$pace" != "under" ]; then
+      if [ "$pace" = "over" ]; then
+        echo "!! $a RELEASED but over the line — not restarting, flag kept (week used% > elapsed%). It comes back on the first pass after the line is met." >&2
+      else
+        echo "!! $a RELEASED but the week pace is unreadable — not restarting, flag kept. A pace nobody can read is not evidence we are under the line." >&2
+      fi
       continue
     fi
     args="$(field "$a" 4)"
