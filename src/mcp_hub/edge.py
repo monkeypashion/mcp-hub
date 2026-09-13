@@ -1278,13 +1278,25 @@ class DockerExecutor:
                 # command clones from the timer and fails from a terminal —
                 # the identical trap the credentials gate above documents.
                 hint = ""
+                # ⚠️ NEVER advise `set -a; . <envfile>; set +a` here. That
+                # EXECUTES the file instead of reading it, and a value shaped
+                # `N|secret` — which is the shape of a Coolify token — gets
+                # pipe-split by the shell, so `secret: command not found`
+                # puts the credential straight into the operator's transcript.
+                # Measured on this fleet 2026-09-13. The read-loop below is a
+                # READ: `export "$l"` is a single quoted word and is never
+                # re-parsed as code. `load_env_file()` is the same thing in
+                # Python, and is what the unit's EnvironmentFile already does.
                 if not self._environ.get(SEAT_GITHUB_TOKEN):
                     hint = (
                         f" {SEAT_GITHUB_TOKEN} is not set in this edge's "
                         f"environment, which is almost certainly why: the "
                         f"host does the cloning now, so the token has to be "
-                        f"HERE. If this is a hand-run: "
-                        f"`set -a; . ~/.mcp-hub/edge-env; set +a`"
+                        f"HERE. If this is a hand-run, READ the file, never "
+                        f"source it: "
+                        f"`while IFS= read -r l; do case \"$l\" in ''|\\#*) "
+                        f"continue;; esac; export \"$l\"; done "
+                        f"< ~/.mcp-hub/edge-env`"
                     )
                 return {"skipped": True, "reason": (
                     f"repo_mount: `git … {argv[-2] if len(argv) > 2 else ''}` "
@@ -1612,12 +1624,22 @@ class DockerExecutor:
                 # systemd unit loads ~/.mcp-hub/edge-env via EnvironmentFile
                 # and a shell does not, so the same command builds a live seat
                 # from the timer and a dead one from a terminal.
+                #
+                # ⚠️ The idiom below READS the file. Do not "simplify" it to
+                # `set -a; . ~/.mcp-hub/edge-env; set +a` — that EXECUTES it,
+                # and a `N|secret`-shaped value (a Coolify token) is pipe-split
+                # by the shell into `secret: command not found`, printing the
+                # credential. Measured on this fleet 2026-09-13. EnvironmentFile
+                # and `load_env_file()` both parse; only the shell evaluates.
                 return {**base, "skipped": True, "reason": (
                     f"none of the credentials this spec names is set in the "
                     f"edge's environment ({', '.join(wanted)}) — refusing to "
                     f"create a container that would exit 42 at its door. If "
-                    f"this is a hand-run, load the same file the timer does: "
-                    f"`set -a; . ~/.mcp-hub/edge-env; set +a`"
+                    f"this is a hand-run, READ the same file the timer does "
+                    f"(never source it): "
+                    f"`while IFS= read -r l; do case \"$l\" in ''|\\#*) "
+                    f"continue;; esac; export \"$l\"; done "
+                    f"< ~/.mcp-hub/edge-env`"
                 )}
             # THE LAST GATE BEFORE THE PREMISE BECOMES FALSE (W2.5). The hub
             # refuses such a spec at write time, but a spec stored BEFORE

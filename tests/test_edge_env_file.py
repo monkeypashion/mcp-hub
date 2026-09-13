@@ -184,3 +184,65 @@ def test_the_destination_is_the_CONTAINER_home_not_the_edge_hosts():
     that does not exist inside the image."""
     from mcp_hub.edge import SEAT_STATE_DIR
     assert SEAT_STATE_DIR == "/home/seat/.claude"
+
+
+def test_the_edge_never_advises_SOURCING_an_env_file():
+    """⚠️ A hand-run hint that says `set -a; . <envfile>; set +a` tells the
+    operator to EXECUTE the credential file rather than read it.
+
+    Measured on this fleet 2026-09-13: a value shaped `N|secret` — the shape
+    of a Coolify API token — is pipe-split by the shell, which then reports
+    `secret: command not found`, putting the credential into the transcript.
+    A lane leaked a live credential exactly this way, and the same fallout
+    printed a SECOND, unrelated one on a job-completion line.
+
+    This asserts on the SOURCE of edge.py rather than on a captured message
+    because the hint is emitted from two independent call sites and a third
+    could be added; the property must hold for the module, not for one path.
+    """
+    from pathlib import Path
+
+    import mcp_hub.edge as edge_mod
+
+    source = Path(edge_mod.__file__).read_text(encoding="utf-8")
+    advice = [
+        ln.strip()
+        for ln in source.splitlines()
+        if "set -a" in ln and not ln.strip().startswith("#")
+    ]
+    assert advice == [], (
+        "edge.py advises sourcing an env file outside a comment: "
+        f"{advice}. Read it instead — `while IFS= read -r l; do "
+        'export "$l"; done < file` — or use load_env_file().'
+    )
+
+
+def test_load_env_file_treats_shell_metacharacters_as_DATA():
+    """The parser is the safe counterpart to the advice above: values that
+    would be executed by a shell must survive as literal text.
+
+    `$(...)`, backticks and `|` are the three shapes that turn a read into an
+    execution. If this ever starts evaluating them, the module has grown the
+    defect it warns about.
+    """
+    import tempfile
+    from pathlib import Path
+
+    from mcp_hub.edge import load_env_file
+
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "edge-env"
+        p.write_text(
+            "# comment\n"
+            "COOLIFY_SHAPED=7|canary-aaa\n"
+            "SUBST=$(echo canary-bbb)\n"
+            "TICKS=`echo canary-ccc`\n"
+            "PLAIN=ordinary\n",
+            encoding="utf-8",
+        )
+        got = load_env_file(p)
+
+    assert got["COOLIFY_SHAPED"] == "7|canary-aaa"
+    assert got["SUBST"] == "$(echo canary-bbb)"
+    assert got["TICKS"] == "`echo canary-ccc`"
+    assert got["PLAIN"] == "ordinary"
