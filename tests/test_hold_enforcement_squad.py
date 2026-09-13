@@ -47,7 +47,7 @@ def pace_body(mode, used=84, elapsed=76.5):
 
 def harness(tmp_path, *, held, agent="lane-a", args="--continue",
             running=True, boundary=False, stopped_flag=False,
-            pace=pace_body("TURBO")):
+            pace=pace_body("TURBO"), members=None):
     """Lay out a HOME, a roster, a mirror and a pace, then run one snippet.
 
     ⚠️ `pace` is not decoration. `hold_release_pass` now reads the week pace
@@ -98,6 +98,30 @@ def harness(tmp_path, *, held, agent="lane-a", args="--continue",
         'exit 0\n'
     )
     (bin_ / "tmux").chmod(0o755)
+
+    # mcp-hub stub: the SQUAD MEMBERSHIP the controls are bounded by.
+    #
+    # ⚠️ Not decoration, and not optional. Since hub.msg 26539 the stop and
+    # the relaunch are gated on membership, and that gate FAILS CLOSED — so a
+    # harness with no stub would answer "membership unreadable", refuse every
+    # stop, and the suite would report the bound working when what it had
+    # actually proven is that an unreadable hub stops nothing.
+    #
+    # Default: the harness agent IS a member, so every pre-existing test still
+    # means exactly what it meant before the bound existed. `members=[]` makes
+    # the list UNREADABLE (squad's loader treats empty output as "!"), and
+    # `members=["someone-else"]` is readable-but-excluded — the two cases a
+    # single "no members" fixture would silently conflate.
+    hub_members = [agent] if members is None else list(members)
+    (bin_ / "mcp-hub").write_text(
+        "#!/bin/bash\n"
+        'if [ "$1" = "squads" ] && [ "$2" = "members" ]; then\n'
+        + "".join(f'  echo "{m}"\n' for m in hub_members)
+        + "  exit 0\n"
+        "fi\n"
+        "exit 0\n"
+    )
+    (bin_ / "mcp-hub").chmod(0o755)
     return home, conf, heldf, bdir, bin_
 
 
@@ -441,3 +465,89 @@ def test_a_still_held_lane_is_not_reported_as_over_the_line(tmp_path):
                 stopped_flag=True, pace=pace_body("SILENT"))
     p = call(*h, "hold_release_pass")
     assert "over the line" not in p.stderr
+
+
+# --- the squad bound on the controls (his ruling, hub.msg 26539) -----------
+#
+# "any controls like that should only apply to dreamteam" — the heal script's
+# hold/stop/restart pass bounded by squad membership, "a lane outside it is
+# never stopped, flagged or restarted, whatever held-lanes.json says".
+#
+# Measured cause, 2026-09-13: the pass had a scope gate on the ASK leg only.
+# It ran 363 times that day and named hub-voice-dev-vm-1 out-of-squad every
+# time, while the restart path started that same lane 81 times — 84 executed
+# starts of out-of-scope lanes in one day. The gate was not missing; it was
+# missing from the routes that ACT.
+
+
+def test_an_out_of_squad_lane_is_not_stopped_however_held_it_is(tmp_path):
+    """The held entry is fully valid and the boundary is reached: everything
+    except membership says stop. Only the bound prevents it."""
+    h = harness(tmp_path, held={"lane-a": held_entry()}, boundary=True,
+                members=["someone-else"])
+    p = call(*h, "hold_enforce_one lane-a")
+    assert "kill-session" not in (tmp_path / "tmux.log").read_text()
+    assert "NOT stopped" in p.stdout
+
+
+def test_an_out_of_squad_lane_is_not_relaunched(tmp_path):
+    """The other acting route. Gated at its own door, because heal reaches a
+    restart from two loops and guarding one is the 'four of five routes' bug."""
+    h = harness(tmp_path, held={}, members=["someone-else"])
+    p = call(*h, "relaunch_agent lane-a")
+    log = tmp_path / "tmux.log"
+    assert "respawn-pane" not in (log.read_text() if log.exists() else "")
+    assert "NOT relaunched" in p.stdout
+
+
+def test_the_refusal_names_the_lane_and_says_why(tmp_path):
+    """'log it and move on' — a bound that drops lanes silently is
+    indistinguishable from a heal that has stopped working."""
+    h = harness(tmp_path, held={"lane-a": held_entry()}, boundary=True,
+                members=["someone-else"])
+    p = call(*h, "hold_enforce_one lane-a")
+    assert "lane-a" in p.stdout
+    assert "squad-bounded" in p.stdout
+
+
+def test_unreadable_membership_stops_nobody(tmp_path):
+    """FAIL CLOSED. When the hub is unreachable every lane reads offline, so
+    an ungated pass would judge the whole fleet broken at once. Distinct from
+    the excluded case above: here membership was never read at all."""
+    h = harness(tmp_path, held={"lane-a": held_entry()}, boundary=True,
+                members=[])
+    p = call(*h, "hold_enforce_one lane-a")
+    assert "kill-session" not in (tmp_path / "tmux.log").read_text()
+    assert "NOT stopped" in p.stdout
+
+
+def test_unreadable_membership_relaunches_nobody(tmp_path):
+    h = harness(tmp_path, held={}, members=[])
+    p = call(*h, "relaunch_agent lane-a")
+    log = tmp_path / "tmux.log"
+    assert "respawn-pane" not in (log.read_text() if log.exists() else "")
+    assert "NOT relaunched" in p.stdout
+
+
+# --- MUST-FIRE: the bound must not become a way of never acting -----------
+#
+# His words: "a dreamteam lane held is still stopped at its boundary as
+# today." Without these two, every assertion above is satisfied by a gate
+# that refuses everything, which is the failure mode a fail-closed change is
+# most likely to ship.
+
+
+def test_must_fire_an_in_squad_lane_is_still_stopped_at_its_boundary(tmp_path):
+    h = harness(tmp_path, held={"lane-a": held_entry()}, boundary=True,
+                members=["lane-a", "someone-else"])
+    p = call(*h, "hold_enforce_one lane-a")
+    assert "kill-session" in (tmp_path / "tmux.log").read_text()
+    assert "stopping at its turn boundary" in p.stdout
+    assert "NOT stopped" not in p.stdout
+
+
+def test_must_fire_an_in_squad_lane_is_still_relaunched(tmp_path):
+    h = harness(tmp_path, held={}, members=["lane-a", "someone-else"])
+    p = call(*h, "relaunch_agent lane-a")
+    assert "respawn-pane" in (tmp_path / "tmux.log").read_text()
+    assert "NOT relaunched" not in p.stdout

@@ -663,6 +663,15 @@ relaunch_agent() {
     echo "$a HELD until $(date -d "@$hu" '+%H:%M' 2>/dev/null || echo "$hu") — $(held_reason "$a") (heal will not relaunch it)"
     return 0
   fi
+  # Outside the squad the controls apply to: never restarted. Gated at this
+  # door for the same reason as the held guard directly above — heal reaches
+  # a restart by more than one route (the deaf sweep and the judging loop),
+  # and a guard on only some of them is the "four of five routes" mistake
+  # this codebase has already paid for once.
+  if ! heal_in_scope "$a"; then
+    echo "$a: outside '$COMPACT_ASK_SQUAD' — NOT relaunched (controls are squad-bounded, hub.msg 26539)"
+    return 0
+  fi
   kill_daemon "$a"
   # Launch marker: heal's grace window reads this so nothing judges an agent
   # whose claude hasn't finished booting (there is no process to measure yet,
@@ -956,6 +965,15 @@ hold_stopped_flag() { echo "$HOME/.mcp-hub/hold-stopped-$(safe_name "$1")"; }
 
 hold_stop_lane() { # the stop itself, one door for both the clean and hard path
   local a="$1"
+  # His ruling: a lane outside the squad is never stopped, WHATEVER
+  # held-lanes.json says — so this refuses on membership, not on the mirror.
+  # Gated here because this is the one door both the clean boundary stop and
+  # the 10-minute hard stop use; gating the two callers instead would leave
+  # whichever path is added next silently unguarded.
+  if ! heal_in_scope "$a"; then
+    echo "$a: outside '$COMPACT_ASK_SQUAD' — NOT stopped (controls are squad-bounded, hub.msg 26539)"
+    return 0
+  fi
   mkdir -p "$HOME/.mcp-hub" 2>/dev/null
   : > "$(hold_stopped_flag "$a")" 2>/dev/null || true
   tm kill-session -t "=$a" 2>/dev/null || true
@@ -1096,6 +1114,25 @@ compaction_in_scope() {
   if [ "$_COMPACT_SCOPE" = "!" ]; then return 1; fi
   printf '%s\n' "$_COMPACT_SCOPE" | grep -qx -- "$1"
 }
+
+# 0 = this lane is inside the squad the CONTROLS apply to.
+#
+# His ruling, typed 2026-09-11 21:5xZ and relayed verbatim (hub.msg 26539):
+# "any controls like that should only apply to dreamteam" — naming the heal
+# script's hold/stop/restart pass and any hub-side hold, bounded by "the same
+# set as the roster pass's scope", and: a lane outside it is never stopped,
+# flagged or restarted, whatever held-lanes.json says; log it and move on.
+#
+# ⭐ DELIBERATELY THE SAME SET as the ask pass — a delegation, not a parallel
+# knob. Recomputing membership here would be a second thing to drift, and the
+# two would disagree on exactly the day it mattered; whichever verb was louder
+# would then win an argument nobody knew was happening.
+#
+# 🔴 FAIL CLOSED, the same direction as the ask pass and for a sharper reason:
+# when the hub is unreachable EVERY lane reads offline, so an ungated heal
+# would judge the whole fleet broken and restart all of it at once. Here
+# "membership unreadable" must mean touch NOBODY — never touch everybody.
+heal_in_scope() { compaction_in_scope "$1"; }
 # 🔴 THE EXEC LEG IS OFF BY DEFAULT AND MUST STAY THAT WAY UNTIL ARMED
 # DELIBERATELY. It types /clear or /compact into a live pane, and `/clear`
 # DESTROYS context — "no answer = no action" is the safety property and is
@@ -3879,6 +3916,10 @@ case "${1:-help}" in
             compaction_pass
             healed=0
             relaunched=0
+            # Lanes the squad bound skipped this pass. Named once, after the
+            # loops — one row rather than a line per lane every two minutes,
+            # which is the noise that made the unbounded pass hard to read.
+            hskip=""
             # Agents this pass has already relaunched. The two recovery loops
             # below iterate the SAME roster with no shared state, so without
             # this the escalation loop restarts an agent the deaf sweep just
@@ -3897,6 +3938,11 @@ case "${1:-help}" in
               for a in $(comms_agents); do
                 tm has-session -t "=$a" 2>/dev/null || continue
                 pane_alive "$a" || continue
+                # Squad bound, at the loop head and not just at the act: his
+                # ruling forbids FLAGGING an outside lane too, and every `!!`
+                # row below this point is a flag. Skipped lanes are named once
+                # per pass, after the loop — "log it and move on".
+                heal_in_scope "$a" || { hskip="$hskip $a"; continue; }
                 started="$(agent_started "$a")" || continue
                 [ -n "$started" ] || continue
                 [ "$started" -lt "$disrupt" ] || continue      # postdates it — stream is fine
@@ -3966,6 +4012,9 @@ case "${1:-help}" in
             for a in $(comms_agents); do
               tm has-session -t "=$a" 2>/dev/null || continue
               pane_alive "$a" || continue
+              # Squad bound — see the deaf sweep above. Same set, same reason:
+              # the nudge/defer/blocked rows below are all flags.
+              heal_in_scope "$a" || { hskip="$hskip $a"; continue; }
               # Already relaunched by the deaf sweep in THIS pass — leave it be.
               case "$touched" in *" $a "*) continue ;; esac
               # BRAKED/HELD: a held lane is one somebody deliberately wants
@@ -4131,6 +4180,12 @@ case "${1:-help}" in
               esac
               healed=$((healed+1))
             done
+            # "log it and move on" — the skipped lanes are NAMED. A bound that
+            # silently drops lanes is indistinguishable from a heal that has
+            # stopped working, and the operator would have no way to tell.
+            if [ -n "$hskip" ]; then
+              echo "scope '$COMPACT_ASK_SQUAD' — not healed (out of squad):$(printf '%s' "$hskip" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//' | sed 's/^/ /')"
+            fi
             [ "$healed" = 0 ] && echo "all up agents healthy — nothing to heal" || true ;;
   model)    # squad model [agent] <name> — switch an agent's model without
             # opening claude's picker. `/model <name>` takes the name directly;
