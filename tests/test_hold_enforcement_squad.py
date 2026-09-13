@@ -22,15 +22,32 @@ jq_missing = not Path("/usr/bin/jq").exists()
 pytestmark = pytest.mark.skipif(jq_missing, reason="needs jq")
 
 
-def pace_body(used, elapsed):
-    return json.dumps({"checks": [{"used_percentage": used,
-                                   "window_elapsed_percentage": elapsed,
-                                   "margin": 0.0, "ok": used <= elapsed}]})
+def pace_body(mode, used=84, elapsed=76.5):
+    """The console's real /ceiling/pace shape, with the WEEK fields deliberately
+    left OVER the line (84 > 76.5 — the live reading at 00:19Z 13 Sep).
+
+    That is the instrument, not decoration: under his revised rule the served
+    `mode` and the week comparison DISAGREE, so a body whose week fields agreed
+    with its mode could not tell a gate reading `mode` from one still reading
+    used% vs elapsed%. Pass `mode=None` for a payload that carries no verdict.
+    """
+    week_ok = used <= elapsed
+    body = {"checks": [{"used_percentage": used,
+                        "window_elapsed_percentage": elapsed,
+                        "margin": 0.0, "ok": week_ok,
+                        "daily": {"share": 9.6, "spent_today": 0,
+                                  "ok": mode == "TURBO",
+                                  "basis": "00:00Z reading"}}],
+            "ok": week_ok,
+            "asserts": "used% <= window-elapsed% + margin, per live credential"}
+    if mode is not None:
+        body["mode"] = mode
+    return json.dumps(body)
 
 
 def harness(tmp_path, *, held, agent="lane-a", args="--continue",
             running=True, boundary=False, stopped_flag=False,
-            pace=pace_body(10, 90)):
+            pace=pace_body("TURBO")):
     """Lay out a HOME, a roster, a mirror and a pace, then run one snippet.
 
     ⚠️ `pace` is not decoration. `hold_release_pass` now reads the week pace
@@ -38,8 +55,9 @@ def harness(tmp_path, *, held, agent="lane-a", args="--continue",
     this machine — so a harness that did not pin it would send every release
     test to a real service whose answer changes hourly, and the suite would
     pass or fail on the fleet's actual burn. Default is FAR under the line, so
-    every pre-existing test means what it did before. `None` writes no file at
-    all, which is the unreadable case.
+    every pre-existing test means what it did before — the default is TURBO,
+    the console's "under today's share". `None` writes no file at all, which is
+    the unreachable case.
     """
     home = tmp_path
     (home / ".mcp-hub").mkdir(parents=True, exist_ok=True)
@@ -289,18 +307,24 @@ def test_no_flags_at_all_is_a_quiet_no_op(tmp_path):
     assert p.stdout.strip() == "" and p.stderr.strip() == ""
 
 
-# --- the week pace: a release is a restart, and a restart costs a lane -----
+# --- the pace gate: a release is a restart, and a restart costs a lane -----
 #
-# His word 2026-09-11: while the week's used% is over its elapsed%, nobody
-# restarts a lane. Overnight the release pass spent five restarts on one lane
-# at each hour boundary while the week was already over the line.
+# His word 2026-09-11: while we are over the line, nobody restarts a lane. The
+# release pass had spent five restarts on one lane at each hour boundary.
+#
+# ⭐ His rule REVISED 2026-09-12 20:3xZ: the week line (used% vs elapsed%) is a
+# TARGET; the brake is a DAILY share, and the console serves that verdict as a
+# top-level `mode` — TURBO under, SILENT over. This gate reads `mode` and does
+# not recompute the line, so every body below carries week fields that are OVER
+# (84 > 76.5) while its mode varies. A gate still reading the old predicate
+# fails every TURBO case here; one reading `mode` passes them all.
 
-def test_over_the_line_defers_the_restart_and_keeps_the_flag(tmp_path):
-    """The defect itself. Over the line, a released lane is NOT restarted —
-    and the flag survives, so this defers the release rather than cancelling
-    it, exactly as the stale-mirror gate does."""
+def test_silent_defers_the_restart_and_keeps_the_flag(tmp_path):
+    """MUST-FIRE. Over the day's share, a released lane is NOT restarted — and
+    the flag survives, so this defers the release rather than cancelling it,
+    exactly as the stale-mirror gate does."""
     h = harness(tmp_path, held={}, running=False, stopped_flag=True,
-                pace=pace_body(61, 51.6))
+                pace=pace_body("SILENT"))
     p = call(*h, "hold_release_pass")
     assert "RELEASED" not in p.stdout
     assert "over the line" in p.stderr
@@ -309,29 +333,34 @@ def test_over_the_line_defers_the_restart_and_keeps_the_flag(tmp_path):
     assert (tmp_path / ".mcp-hub" / "hold-stopped-lane-a").exists()
 
 
-def test_under_the_line_restarts_exactly_as_before(tmp_path):
-    """MUST-FIRE, and the positive control for all three gates below: without
-    it they pass for a pace read that refuses everything, which is a break
-    wearing a tightening's clothes."""
+def test_turbo_restarts_the_lane(tmp_path):
+    """MUST-FIRE, and the positive control for every gate below: without it
+    they all pass for a pace read that refuses everything, which is a break
+    wearing a tightening's clothes.
+
+    It is also the DEFECT this commit fixes. The week fields in this body are
+    over the line (84 > 76.5) — the live 00:19Z reading — so the old predicate
+    parked this lane while the served mode was TURBO."""
     h = harness(tmp_path, held={}, running=False, stopped_flag=True,
-                pace=pace_body(40, 51.6))
+                pace=pace_body("TURBO"))
     p = call(*h, "hold_release_pass")
     assert "RELEASED" in p.stdout
     assert "--continue" in p.stdout
     assert "over the line" not in p.stderr
 
 
-def test_exactly_on_the_line_still_restarts(tmp_path):
-    """His rule is used% > elapsed%, margin 0. Equal is ON the line, and a
-    lane held back there would never be released by a pace that only ever
-    touches its own line from above."""
+def test_the_week_line_no_longer_decides_anything(tmp_path):
+    """The week fields are now a TARGET. Stated separately from the must-fire
+    above because it is a distinct claim: not merely that TURBO restarts, but
+    that the strongest possible week-line objection — `checks[0].ok` false,
+    top-level `ok` false, used% seven points over — cannot override it."""
     h = harness(tmp_path, held={}, running=False, stopped_flag=True,
-                pace=pace_body(51.6, 51.6))
+                pace=pace_body("TURBO", used=99, elapsed=10))
     p = call(*h, "hold_release_pass")
     assert "RELEASED" in p.stdout
 
 
-def test_an_unreadable_pace_restarts_nobody(tmp_path):
+def test_an_unreachable_console_restarts_nobody(tmp_path):
     """Fail closed, the same shape as the stale mirror: a pace nobody can read
     is not evidence that we are under the line. `None` writes no file, so the
     real curl fails the way an unreachable console does."""
@@ -343,21 +372,44 @@ def test_an_unreadable_pace_restarts_nobody(tmp_path):
     assert (tmp_path / ".mcp-hub" / "hold-stopped-lane-a").exists()
 
 
-def test_a_non_numeric_pace_is_unreadable_not_zero(tmp_path):
-    """awk reads "n/a" as 0, which would report the fleet comfortably under a
-    line it never measured — the most expensive way for this gate to fail."""
+def test_a_payload_with_no_mode_is_unknown_not_under(tmp_path):
+    """MUST-FIRE. The console before 22:08Z 12 Sep served exactly this shape,
+    and so does any rollback to it. A missing verdict must read UNKNOWN — the
+    absent field defaulting to "" and falling through to `under` is the whole
+    failure mode this case exists to pin."""
     h = harness(tmp_path, held={}, running=False, stopped_flag=True,
-                pace=json.dumps({"checks": [{"used_percentage": "n/a",
-                                             "window_elapsed_percentage": 51.6}]}))
+                pace=pace_body(None))
+    p = call(*h, "hold_release_pass")
+    assert "RELEASED" not in p.stdout
+    assert "unreadable" in p.stderr
+    assert (tmp_path / ".mcp-hub" / "hold-stopped-lane-a").exists()
+
+
+def test_an_unrecognised_mode_is_unknown_not_under(tmp_path):
+    """Only the two named values decide. A third mode invented next month must
+    not be able to start a lane by being unfamiliar — an allow-list, not a
+    SILENT-check with everything else passing."""
+    h = harness(tmp_path, held={}, running=False, stopped_flag=True,
+                pace=pace_body("PAUSED"))
     p = call(*h, "hold_release_pass")
     assert "RELEASED" not in p.stdout
     assert "unreadable" in p.stderr
 
 
-def test_a_pace_payload_with_no_checks_is_unreadable(tmp_path):
-    """A shape change at the console must not read as `under`."""
+def test_the_mode_is_read_case_insensitively(tmp_path):
+    """Normalising case is not a fail-open: the allow-list still admits only
+    the two values after it. Pinned so a lowercase serve does not park the
+    fleet on a cosmetic difference."""
     h = harness(tmp_path, held={}, running=False, stopped_flag=True,
-                pace=json.dumps({"checks": [], "ok": True}))
+                pace=pace_body("turbo"))
+    p = call(*h, "hold_release_pass")
+    assert "RELEASED" in p.stdout
+
+
+def test_a_non_json_body_is_unknown(tmp_path):
+    """A console serving an error page reads as no verdict at all."""
+    h = harness(tmp_path, held={}, running=False, stopped_flag=True,
+                pace="<html>502 Bad Gateway</html>")
     p = call(*h, "hold_release_pass")
     assert "RELEASED" not in p.stdout
     assert "unreadable" in p.stderr
@@ -375,7 +427,7 @@ def test_a_retired_agents_flag_is_still_cleared_over_the_line(tmp_path):
     """The pace gate guards the RESTART, not the bookkeeping. A ghost flag
     that outlives its agent starts nothing, so holding it back over the line
     would only make it immortal."""
-    h = harness(tmp_path, held={}, running=False, pace=pace_body(61, 51.6))
+    h = harness(tmp_path, held={}, running=False, pace=pace_body("SILENT"))
     (tmp_path / ".mcp-hub" / "hold-stopped-ghost-lane").write_text("")
     p = call(*h, "hold_release_pass")
     assert "no longer on the roster" in p.stderr
@@ -386,6 +438,6 @@ def test_a_still_held_lane_is_not_reported_as_over_the_line(tmp_path):
     """It is not being released at all — naming it here would teach the
     operator that the pace is what is keeping a held lane down."""
     h = harness(tmp_path, held={"lane-a": held_entry()}, running=False,
-                stopped_flag=True, pace=pace_body(61, 51.6))
+                stopped_flag=True, pace=pace_body("SILENT"))
     p = call(*h, "hold_release_pass")
     assert "over the line" not in p.stderr
