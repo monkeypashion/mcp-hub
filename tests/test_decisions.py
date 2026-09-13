@@ -249,9 +249,13 @@ async def test_clear_with_nothing_open_is_silent(server):
     assert await _call_tool(server, "decision_clear", {"from_agent": "alice"}) == ""
 
 
-async def test_stop_hook_clear_never_touches_api_cards(server):
-    """A service-submitted card is not the agent's to auto-withdraw — the
-    agent's turn ending says nothing about the service's ask."""
+async def test_stop_hook_clear_NOTICES_an_api_card(server):
+    """Was: "a stop-hook clear never touches an api card" — written when
+    clear could WITHDRAW. It cannot: this verb has written no state since
+    card #237, so the thing that test protected the service's ask FROM no
+    longer exists, while the source filter it used went on suppressing the
+    one thing clear still does. The ask is still not the agent's to
+    withdraw; it IS the agent's to be reminded of."""
     await _call_tool(
         server, "decision_put",
         {"from_agent": "suggestion-service", "card": CARD_V2, "source": "api"},
@@ -259,7 +263,9 @@ async def test_stop_hook_clear_never_touches_api_cards(server):
     out = await _call_tool(
         server, "decision_clear", {"from_agent": "suggestion-service"},
     )
-    assert out == ""  # stop-hook-source clear finds nothing
+    assert "still open on the operator's board" in out
+    assert "source='api'" in out  # and it says which door, rather than lying
+    # unchanged and load-bearing: notice is not withdrawal, the card stands
     assert "suggestion-service" in await _call_tool(server, "decision_list", {})
 
 
@@ -586,7 +592,13 @@ async def test_resolve_with_nothing_open_is_silent(server):
     assert out == ""
 
 
-async def test_resolve_never_touches_api_cards(server):
+async def test_resolve_closes_an_api_card_and_says_which_door(server):
+    """Was: "resolve never touches api cards". That silence is the defect
+    reported 2026-09-13 — an agent holding a verdict for its own card could
+    not record it, because the card had come in the other door. An agent
+    may close ITS OWN card whichever door filed it; the receipt names the
+    door so the widening does not trade a silent miss for a silent
+    surprise."""
     await _call_tool(
         server, "decision_put",
         {"from_agent": "svc", "card": CARD_V2, "source": "api"},
@@ -594,8 +606,9 @@ async def test_resolve_never_touches_api_cards(server):
     out = await _call_tool(
         server, "decision_resolve", {"from_agent": "svc", "verdict": "yes"},
     )
-    assert out == ""
-    assert "svc" in await _call_tool(server, "decision_list", {})
+    assert "resolved" in out and "source='api'" in out
+    # and it is really closed — not merely reported closed
+    assert "svc" not in await _call_tool(server, "decision_list", {})
 
 
 # ---------------------------------------------------------------------------

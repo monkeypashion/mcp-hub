@@ -4537,11 +4537,72 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     #
     # The card is authored by the agent (or a service) — the hub stores it
     # PARSED so triage machinery can rank cards without re-parsing prose.
-    # One OPEN card per agent: put() upserts, so a restated ask updates in
+    # One OPEN card per AGENT: put() upserts, so a restated ask updates in
     # place. Lifecycle: open -> decided (operator answered, asker DM'd) or
     # withdrawn (agent moved on — its next turn carried no card).
+    #
+    # 🔴 That invariant was written here on day one and the code did not
+    # implement it: every lookup below was `agent=? AND status='open' AND
+    # source=?`, i.e. one open card per (agent, SOURCE). So an ask filed by
+    # the Stop hook and restated through a service were invisible to each
+    # other — the restate superseded nothing, two rows sat open under one
+    # name, and resolve could only ever offer the older face, which is how
+    # a ruling on the newer card became unrecordable (2026-09-13, reported
+    # by reliable-ai-dev). `source` records WHICH DOOR a card came in; it
+    # was never a partition of the board, and it no longer narrows a
+    # lookup. Where it disagrees with the card it found, the reply SAYS SO
+    # rather than falling silent. decision_answer — the operator's plane —
+    # was already agent-scoped and newest-first, so this was divergence
+    # between the two planes, not a design. See
+    # tests/test_decision_cross_source.py.
     # NOTE: none of these tools call touch_session — decision_put/clear
     # arrive from the Stop hook's EPHEMERAL client by design.
+
+    def _open_card(conn, agent: str, card_id: int = 0):
+        """The agent's open card — NEWEST first, never source-filtered.
+
+        ORDER BY is not decoration here. The old (agent, source) partition
+        left PAIRS of open rows under one name in the live board, and an
+        unordered fetchone() over that state returns the oldest — exactly
+        the face a restatement was trying to replace, and the one a verdict
+        is least likely to be about.
+        """
+        if card_id:
+            return conn.execute(
+                "SELECT id, ask, source FROM decisions "
+                "WHERE agent=? AND id=? AND status='open'",
+                (agent, card_id),
+            ).fetchone()
+        return conn.execute(
+            "SELECT id, ask, source FROM decisions WHERE agent=? "
+            "AND status='open' ORDER BY updated_at DESC, id DESC",
+            (agent,),
+        ).fetchone()
+
+    def _crossed_door(row, source: str) -> str:
+        """Say when the card found came in a different door than named.
+
+        `source` stopped narrowing the lookup; a caller who passed one is
+        owed the difference out loud, or the widening just trades a silent
+        miss for a silent surprise.
+        """
+        if not row or not source or row["source"] == source:
+            return ""
+        return (f" [filed via source='{row['source']}', not '{source}' — "
+                "`source` names the card's door, and no longer narrows]")
+
+    def _other_open(conn, agent: str, keep_id: int) -> str:
+        """Name the agent's OTHER open cards, if the old defect left any."""
+        rows = conn.execute(
+            "SELECT id FROM decisions WHERE agent=? AND status='open' "
+            "AND id<>? ORDER BY id",
+            (agent, keep_id),
+        ).fetchall()
+        if not rows:
+            return ""
+        ids = ", ".join(f"#{r['id']}" for r in rows)
+        return (f" ⚠️ You have {len(rows)} other open card(s): {ids} — pass "
+                "card=<id> to close one of those instead.")
 
     @mcp.tool()
     def decision_put(
@@ -4589,11 +4650,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         }))
         conn = _get_db(db_path)
         superseded_id: int | None = None
-        open_row = conn.execute(
-            "SELECT id, ask FROM decisions WHERE agent = ? AND status = 'open' "
-            "AND source = ?",
-            (from_agent, source),
-        ).fetchone()
+        open_row = _open_card(conn, from_agent)
         # A DIFFERENT ask is a new card, not a restatement — supersede the
         # old row instead of overwriting it, or ask A's history vanishes
         # from the ledger the moment the agent moves on to ask B. "Different"
@@ -4663,7 +4720,10 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         """The owner-notice channel, and nothing else. Writes NO state.
 
         Reminds the agent at each turn boundary that its ask is still open
-        on the operator's board. Only reads cards of the given source.
+        on the operator's board — whichever door filed it. `source` names
+        the door you expect and no longer narrows the lookup: a notice that
+        went silent because the card came in the other door is the failure
+        this channel exists to prevent.
 
         An unanswered ask is impossible to lose: only an operator answer,
         an agent DECIDED (decision_resolve), or supersession closes a card.
@@ -4686,15 +4746,12 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         if attr_err:
             return attr_err
         conn = _get_db(db_path)
-        row = conn.execute(
-            "SELECT id, ask FROM decisions "
-            "WHERE agent=? AND status='open' AND source=?",
-            (from_agent, source),
-        ).fetchone()
+        row = _open_card(conn, from_agent)
         if row is None:
             return ""
         ask = (row["ask"] or "")[:80]
-        return f"Card #{row['id']} still open on the operator's board: {ask}"
+        return (f"Card #{row['id']} still open on the operator's board: {ask}"
+                f"{_crossed_door(row, source)}")
 
     @mcp.tool()
     def decision_resolve(from_agent: str, verdict: str, source: str = "stop-hook",
@@ -4725,22 +4782,14 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         conn = _get_db(db_path)
         # Select-then-update so the resolved card's ID is known — the lineage
         # edge needs a subjectable fact, and rowcount can't name one.
-        row = conn.execute(
-            "SELECT id, ask FROM decisions WHERE agent=? AND status='open' "
-            "AND source=?",
-            (from_agent, source),
-        ).fetchone()
+        row = _open_card(conn, from_agent)
         if card:
-            target = conn.execute(
-                "SELECT id, ask FROM decisions WHERE agent=? AND id=? "
-                "AND status='open' AND source=?",
-                (from_agent, card, source),
-            ).fetchone()
+            target = _open_card(conn, from_agent, card_id=card)
             if not target:
                 open_desc = (f"your open card is #{row['id']}" if row
                              else "you have no open card")
                 return (
-                    f"REFUSED: card #{card} is not your open {source} card "
+                    f"REFUSED: card #{card} is not an open card of yours "
                     f"({open_desc}) — nothing was closed."
                 )
             row = target
@@ -4779,7 +4828,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # wrong closes in one day read as six successes (2026-08-28).
         return (
             f"Card #{row['id']} resolved ({(row['ask'] or '')[:60]}): "
-            f"{verdict}"
+            f"{verdict}{_crossed_door(row, source)}"
+            f"{_other_open(conn, from_agent, row['id'])}"
         )
 
     @mcp.tool()
