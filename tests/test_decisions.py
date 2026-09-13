@@ -249,9 +249,13 @@ async def test_clear_with_nothing_open_is_silent(server):
     assert await _call_tool(server, "decision_clear", {"from_agent": "alice"}) == ""
 
 
-async def test_stop_hook_clear_never_touches_api_cards(server):
-    """A service-submitted card is not the agent's to auto-withdraw — the
-    agent's turn ending says nothing about the service's ask."""
+async def test_stop_hook_clear_NOTICES_an_api_card(server):
+    """Was: "a stop-hook clear never touches an api card" — written when
+    clear could WITHDRAW. It cannot: this verb has written no state since
+    card #237, so the thing it was protecting the service's ask from no
+    longer exists, while the source filter it used went on suppressing the
+    one thing clear still does. An owner notice that stays silent because
+    the card came in the other door is the whole failure (2026-09-13)."""
     await _call_tool(
         server, "decision_put",
         {"from_agent": "suggestion-service", "card": CARD_V2, "source": "api"},
@@ -259,7 +263,8 @@ async def test_stop_hook_clear_never_touches_api_cards(server):
     out = await _call_tool(
         server, "decision_clear", {"from_agent": "suggestion-service"},
     )
-    assert out == ""  # stop-hook-source clear finds nothing
+    assert "#1 still open" in out
+    assert "api" in out  # and it names the door, since one was assumed
     assert "suggestion-service" in await _call_tool(server, "decision_list", {})
 
 
@@ -586,7 +591,14 @@ async def test_resolve_with_nothing_open_is_silent(server):
     assert out == ""
 
 
-async def test_resolve_never_touches_api_cards(server):
+async def test_resolve_closes_an_api_card_and_says_which_door(server):
+    """Was: "resolve never touches api cards" — it returned "" instead, and
+    a card that cannot be closed by the agent whose name is on it cannot be
+    closed at all: the ruling on #998 had nowhere to land (2026-09-13).
+    A card is keyed by the AGENT it is filed under, not by the door; the
+    protection that remains is the one that always mattered — someone
+    else's card is still untouchable (test_resolve_says_a_card_BELONGS_TO_
+    someone_else) — and crossing a door is reported, never silent."""
     await _call_tool(
         server, "decision_put",
         {"from_agent": "svc", "card": CARD_V2, "source": "api"},
@@ -594,8 +606,9 @@ async def test_resolve_never_touches_api_cards(server):
     out = await _call_tool(
         server, "decision_resolve", {"from_agent": "svc", "verdict": "yes"},
     )
-    assert out == ""
-    assert "svc" in await _call_tool(server, "decision_list", {})
+    assert "#1 resolved" in out
+    assert "source='api'" in out
+    assert "svc" not in await _call_tool(server, "decision_list", {})
 
 
 # ---------------------------------------------------------------------------
@@ -672,22 +685,23 @@ async def test_resolve_says_ALREADY_CLOSED_not_no_open_card(server):
     assert "you have no open card" not in out
 
 
-async def test_resolve_names_the_SOURCE_MISMATCH_and_the_remedy(server):
+async def test_a_WRONG_source_no_longer_refuses_it_just_reports(server):
     """reliable-ai's exact call: source='agent-recorded' (the note's
-    provenance) used as if it named the card's origin."""
+    provenance) used as if it named the card's origin. It used to be
+    REFUSED with a lecture about the remedy; the remedy was "omit it", and
+    the honest version of that is to stop making the argument load-bearing.
+    The close proceeds and the receipt names both doors."""
     await _call_tool(server, "decision_put", {"from_agent": "alice", "card": CARD_V2})
     out = await _call_tool(
         server, "decision_resolve",
         {"from_agent": "alice", "verdict": "yes", "card": 1,
          "source": "agent-recorded"},
     )
-    assert "REFUSED" in out
+    assert "REFUSED" not in out
+    assert "#1 resolved" in out
     assert "source='stop-hook'" in out       # what the card actually IS
-    assert "source='agent-recorded'" in out  # what was asked for
-    assert "omit it" in out                  # the remedy, not just the fault
-    assert "nothing was closed" in out
-    # and the card is untouched
-    assert "approve the widget rebuild" in await _call_tool(
+    assert "'agent-recorded'" in out         # what was asked for
+    assert "approve the widget rebuild" not in await _call_tool(
         server, "decision_list", {})
 
 
