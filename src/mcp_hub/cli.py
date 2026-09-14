@@ -241,7 +241,20 @@ def _log_activity_event(agent_name: str, kind: str, **fields: object) -> None:
         pass
 
 
-def _log_beat_if_new_hour(agent_name: str, last_hour: str) -> str:
+def _elapsed_ms(t0: float) -> float:
+    """Milliseconds since `t0`, a `time.monotonic()` reading. Bar 145.
+
+    ⚠️ ALWAYS FROM A MONOTONIC BASE. A duration differenced from wall-clock
+    readings can come back NEGATIVE across an NTP step or a resume, and a
+    negative outlier does not announce itself in a median — it quietly drags
+    one. The field this writes is what bar 401 reads, so the guarantee it
+    needs is "never a clock artifact", not "usually about right".
+    """
+    return round((time.monotonic() - t0) * 1000, 1)
+
+
+def _log_beat_if_new_hour(agent_name: str, last_hour: str,
+                          elapsed_ms: float | None = None) -> str:
     """Record that heartbeats were alive in this UTC hour; return the bucket.
 
     Pure decision, extracted from `_heartbeat_loop` so the once-per-hour rule
@@ -250,7 +263,10 @@ def _log_beat_if_new_hour(agent_name: str, last_hour: str) -> str:
     """
     hour_now = time.strftime("%Y-%m-%dT%H", time.gmtime())
     if hour_now != last_hour:
-        _log_activity_event(agent_name, "beat", hour=hour_now)
+        fields: dict[str, object] = {"hour": hour_now}
+        if elapsed_ms is not None:
+            fields["elapsed_ms"] = elapsed_ms
+        _log_activity_event(agent_name, "beat", **fields)
     return hour_now
 
 
@@ -5075,6 +5091,13 @@ def _resolve_agent_identity(
 
 def stop_hook_command(args: argparse.Namespace) -> int:
     """Run the stop-hook subcommand. Always returns 0 (fail-open)."""
+    # Bar 145's instrument. Clock starts HERE, at the top of the call, so the
+    # recorded span is the whole drain the agent waits on — stdin read, daemon
+    # heal, hub round-trip and render — not just the part after identity
+    # resolves. `monotonic`, never `time.time()`: this is a DURATION, and a
+    # wall-clock that steps (NTP, suspend) would corrupt exactly the tail that
+    # a p95 is made of.
+    t0 = time.monotonic()
     # Read stdin ONCE — both agent identity (cwd marker) and the
     # stop_hook_active loop-backstop flag come from this single payload.
     payload = _read_hook_stdin()
@@ -5164,6 +5187,7 @@ def stop_hook_command(args: argparse.Namespace) -> int:
         # cannot see. `error` lets the analysis exclude it deliberately
         # rather than by never having heard of it.
         _log_activity_event(name, "drain", surfaced=False, error=True,
+                            elapsed_ms=_elapsed_ms(t0),
                             session=str(payload.get("session_id") or ""),
                             backstop=stop_hook_active)
         print(f"[mcp-hub stop-hook] hub query failed: {exc!r}", file=sys.stderr)
@@ -5202,6 +5226,7 @@ def stop_hook_command(args: argparse.Namespace) -> int:
     # precisely why bar 47 could not be measured. Recording only the noisy
     # branch would rebuild the same blind spot in a new file.
     _log_activity_event(name, "drain", surfaced=response is not None,
+                        elapsed_ms=_elapsed_ms(t0),
                         session=str(payload.get("session_id") or ""),
                         backstop=stop_hook_active,
                         **defer_trace)
@@ -6018,13 +6043,24 @@ async def _heartbeat_loop(hub_url: str, agent_name: str) -> bool:
                     since_heartbeat = HEARTBEAT_INTERVAL_SECONDS
                     while True:
                         if since_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
+                            beat_t0 = time.monotonic()
                             hb = await session.call_tool(
                                 "heartbeat", {"agent_name": agent_name}
                             )
+                            beat_ms = _elapsed_ms(beat_t0)
                             _maybe_stamp_hub_restart(_extract_text(hb))
                             since_heartbeat = 0
+                            # ⚠️ DENOMINATOR, because this field is easy to
+                            # misread: the beat LINE is one per UTC hour, but
+                            # this duration is the ONE heartbeat call that
+                            # happened to open the hour — a sample of size 1,
+                            # not a summary of the ~60 calls in it. Read as
+                            # "beats were this fast at the top of the hour",
+                            # never as the hour's latency. The drain records
+                            # are one-per-call and are the population bar 401
+                            # should read.
                             beat_hour = _log_beat_if_new_hour(
-                                agent_name, beat_hour)
+                                agent_name, beat_hour, beat_ms)
                             if baseline_head is not None:
                                 head_now = _source_head()
                                 if (

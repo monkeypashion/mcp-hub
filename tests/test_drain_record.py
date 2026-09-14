@@ -177,3 +177,87 @@ def test_the_record_carries_no_turn_count():
     rec = _records()[0]
     assert "turns" not in rec
     assert "cost" not in rec
+
+
+# --- bar 145: the per-call duration field ----------------------------------
+#
+# ⭐ WHY THESE EXIST. Bar 145 was first drafted as "median and p95 duration per
+# call" and was measured UNPERFORMABLE: the corpus carried no per-call duration
+# and no start/end pair, and no amount of effort makes a corpus gain a field
+# retroactively. The bar was re-drafted into the INSTRUMENT (this field) and the
+# ANALYSIS (bar 401, which reads it). These tests guard the instrument, and the
+# one that matters most is the SILENT drain — same reason as the top of the
+# file: it is the case every other instrument is blind to, so it is the one
+# where a missing duration would go unnoticed.
+
+def test_every_drain_record_carries_an_elapsed_ms(capsys):
+    """"Per-call duration on EVERY call" — including the silent drain, which
+    is the population bar 401 has to read."""
+    with patch("mcp_hub.cli._query_hub", side_effect=_quiet_hub()):
+        cli.stop_hook_command(_args())
+
+    rec = _records()[0]
+    assert "elapsed_ms" in rec, "a drain with no duration is the old corpus"
+    assert isinstance(rec["elapsed_ms"], (int, float))
+    assert rec["elapsed_ms"] >= 0
+
+
+def test_a_hub_failure_still_carries_a_duration(capsys):
+    """The error branch is a real call that really took time. Dropping the
+    field there would bias the population toward the fast path — a failed
+    round-trip is usually the SLOW one, so its absence would pull p95 down
+    precisely where bar 401 is looking."""
+    with patch("mcp_hub.cli._query_hub", side_effect=ConnectionError("boom")):
+        cli.stop_hook_command(_args())
+
+    rec = _records()[0]
+    assert rec["error"] is True
+    assert rec["elapsed_ms"] >= 0
+
+
+def test_the_duration_is_monotonic_not_wall_clock():
+    """⭐⭐ THE GUARANTEE THAT MATTERS. A duration differenced from wall-clock
+    readings goes NEGATIVE across an NTP step or a resume, and a negative
+    outlier does not announce itself in a median — it silently drags one. This
+    pins the base to `time.monotonic`, so the p95 bar 401 reports cannot be a
+    clock artifact. Asserted by making wall-clock jump BACKWARDS a full hour
+    while monotonic advances normally."""
+    with patch("mcp_hub.cli.time.time", side_effect=[1000.0, 1000.0 - 3600.0,
+                                                     1000.0 - 3600.0]):
+        with patch("mcp_hub.cli.time.monotonic", side_effect=[5.0, 5.25]):
+            ms = cli._elapsed_ms(cli.time.monotonic())
+
+    assert ms == 250.0, "duration must come from monotonic, not the wall clock"
+    assert ms >= 0
+
+
+def test_a_beat_carries_the_duration_of_the_call_that_opened_the_hour():
+    """The beat line is one per UTC hour; the duration on it is the ONE
+    heartbeat call that opened that hour — a sample of size 1, not a summary
+    of the hour. Pinned here so the caveat is a test, not a comment."""
+    hour = cli._log_beat_if_new_hour("alice", "", 12.5)
+
+    rec = _records()[0]
+    assert rec["kind"] == "beat"
+    assert rec["hour"] == hour
+    assert rec["elapsed_ms"] == 12.5
+
+
+def test_a_beat_without_a_measured_call_omits_the_field_rather_than_faking_one():
+    """ABSENT is not ZERO. A caller that did not time its call must leave the
+    field off; writing 0.0 would put a fabricated fast sample into the very
+    population bar 401 takes a median of."""
+    cli._log_beat_if_new_hour("alice", "", None)
+
+    rec = _records()[0]
+    assert rec["kind"] == "beat"
+    assert "elapsed_ms" not in rec
+
+
+def test_the_same_hour_does_not_log_a_second_beat():
+    """The once-per-hour rule still holds with the new argument — a duration
+    must not become a reason to write more lines."""
+    hour = cli._log_beat_if_new_hour("alice", "", 1.0)
+    cli._log_beat_if_new_hour("alice", hour, 2.0)
+
+    assert len(_records()) == 1
