@@ -253,6 +253,67 @@ FOCUS_DEFAULT_MINUTES = 60
 # silent-drop failure mode this codebase keeps re-learning.
 FOCUS_MAX_MINUTES = 480
 
+# ---------------------------------------------------------------------------
+# Transcript-mtime activity — a heartbeat-like reading of the kind of busy the
+# hub cannot otherwise see (Tim, 2026-09-17).
+#
+# The daemon stats its lane's transcripts every beat and reports the newest
+# mtime; the hub stores it alongside THE WALL-CLOCK TIME THE REPORT ARRIVED,
+# and that second column is the whole reason this instrument does not lie.
+#
+# A lane that stops reporting — dead daemon, a hub older than the daemon, a
+# machine that went away — leaves transcript_mtime frozen at its last value.
+# A reader computing now() - transcript_mtime then gets a number that grows
+# smoothly forever and reads as a DEEPENING QUIET. It is nothing of the sort:
+# it is an instrument that stopped being written. Same rule as
+# FLEET_STALE_SECONDS on the fleet snapshot and the decisions cache — a stale
+# reading reports as NOT REPORTING, never as a resting lane.
+#
+# Three beats at the daemon's 60s cadence, matching the tolerance
+# heartbeat_touch already applies before it stops believing a binding
+# (UNDELIVERABLE_BEATS_TO_DROP): one missed beat is a blip, three is a lane
+# that has stopped talking.
+TRANSCRIPT_STALE_SECONDS = 180.0
+
+
+def _transcript_quiet(
+    mtime: float, count: int, reported_at: float, now: float
+) -> str:
+    """Render one lane's transcript reading, or "" when there is none.
+
+    Four states, kept apart deliberately, because three of them would
+    otherwise collapse into "quiet" and only one of those would be true:
+
+      never reported  -> ""                 no daemon on this lane, or one
+                                            older than this feature. Renders
+                                            NOTHING: the absence of a
+                                            measurement is not a measurement,
+                                            and a blank says so where a "0m"
+                                            would claim a reading.
+      stale report    -> "✍ not reporting"  the daemon stopped. The stored
+                                            mtime is still sitting there,
+                                            still frozen, still divisible.
+      reported, blind -> "✍ no transcripts" the daemon is alive and found
+                                            nothing to stat. A scan that can
+                                            see nothing must say so rather
+                                            than read as a resting lane.
+      measured        -> "✍ 3m"             time since the newest transcript
+                                            write. The only state that is
+                                            actually an activity reading.
+    """
+    if reported_at <= 0:
+        return ""
+    if (now - reported_at) > TRANSCRIPT_STALE_SECONDS:
+        return " ✍ not reporting"
+    if count <= 0:
+        return " ✍ no transcripts"
+    if mtime <= 0:
+        # Reported a count but no usable timestamp — nonsense rather than
+        # quiet, and named as such instead of rendered as a fresh write.
+        return " ✍ no transcripts"
+    return f" ✍ {_fmt_minutes(max(0.0, now - mtime))}"
+
+
 # broadcast(scope=...) takes a SQUAD NAME, so one word has to be reserved for
 # "everyone". A squad actually called "fleet" would make `scope="fleet"` mean
 # two things at once, so the name is refused at the point of joining rather
@@ -888,6 +949,22 @@ def init_db(db_path: Path = DB_PATH) -> None:
     for col_sql in (
         "ALTER TABLE agents ADD COLUMN focus_until REAL NOT NULL DEFAULT 0",
         "ALTER TABLE agents ADD COLUMN focus_reason TEXT NOT NULL DEFAULT ''",
+    ):
+        try:
+            conn.execute(col_sql)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+    # Transcript-mtime activity. See TRANSCRIPT_STALE_SECONDS for why
+    # transcript_reported_at exists as its own column: without it, a lane that
+    # stops reporting is indistinguishable from one that has gone quiet, and
+    # the frozen mtime keeps producing a plausible, growing, wrong answer.
+    for col_sql in (
+        "ALTER TABLE agents ADD COLUMN transcript_mtime REAL NOT NULL DEFAULT 0",
+        "ALTER TABLE agents ADD COLUMN transcript_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE agents ADD COLUMN transcript_reported_at REAL NOT NULL "
+        "DEFAULT 0",
     ):
         try:
             conn.execute(col_sql)
@@ -3051,6 +3128,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             return "No agents registered."
 
         lines = []
+        now = time.time()
         for r in rows:
             status = "🟢" if r["status"] == "online" else "⚫"
             # ⚡ marks agents we can wake RIGHT NOW — not merely "has a registry
@@ -3091,7 +3169,20 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             # from "offline", and those look identical without this.
             left = _focus_remaining(r["name"])
             focus = f" 🔕 {_fmt_minutes(left)}" if left > 0 else ""
-            line = f"{status} **{r['name']}**{wake}{idle}{focus}"
+            # ✍ is time since this lane's newest transcript write — the third
+            # thing on this line that is NOT the other two. 🟢 is "registered",
+            # ⚡ is "a wake would land", ✍ is "the lane is actually doing
+            # something". A lane can be all three, or 🟢⚡ with an hour of
+            # silence behind it, and that combination is exactly what nothing
+            # here could previously show. Blank means no reading, never a
+            # quiet one — see _transcript_quiet.
+            scribe = _transcript_quiet(
+                r["transcript_mtime"],
+                r["transcript_count"],
+                r["transcript_reported_at"],
+                now,
+            )
+            line = f"{status} **{r['name']}**{wake}{idle}{focus}{scribe}"
             if r["project"]:
                 line += f" ({r['project']})"
             if r["bio"]:
@@ -5276,7 +5367,11 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         return f"pong ({time.strftime('%H:%M:%S')})"
 
     @mcp.tool()
-    def heartbeat(agent_name: str) -> str:
+    def heartbeat(
+        agent_name: str,
+        transcript_mtime: float = 0.0,
+        transcript_count: int = 0,
+    ) -> str:
         """Out-of-session liveness signal from the agent's heartbeat daemon.
 
         The daemon (spawned by an async SessionStart hook) calls this every
@@ -5295,6 +5390,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         Args:
             agent_name: The agent name from the project's hub-agent.json
                 marker. Daemon reads it and passes it here.
+            transcript_mtime: Epoch seconds of the newest write across this
+                lane's Claude Code transcripts, as the daemon stat()ed them
+                this beat. Per-CWD, not per-lane — sessions sharing a
+                directory share the reading (see _transcript_activity).
+            transcript_count: How many transcripts that scan actually saw.
+                0 means the scan found nothing to measure, which is BLIND and
+                is stored as such; it must never be read as a quiet lane.
         """
         # Every reply carries this hub PROCESS's nonce so the heartbeat daemon
         # can detect a genuine hub RESTART (nonce changed across a reconnect →
@@ -5307,7 +5409,56 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # when the binding is gone. Structured `hub_boot=<id>` so the daemon
         # parses a token, not prose.
         boot_tag = f" [hub_boot={registry.boot_id}]"
+
+        # heartbeat_touch first: it is in-memory registry work, and running it
+        # here lets the whole beat settle into ONE write and ONE commit below
+        # rather than two. That matters because this is the hottest write path
+        # the hub has — every lane, every 60s, forever — and the loan purge
+        # already taught this codebase what an extra unconditional write on a
+        # hot path costs: it took a write lock on a read path and surfaced
+        # immediately as `database is locked`. Adding a second fsync per beat
+        # per lane to carry a nice-to-have reading would be the same trade.
         outcome = registry.heartbeat_touch(agent_name)
+
+        # The activity reading is recorded on EVERY outcome, not just the
+        # refreshed one.
+        #
+        # It is about the lane's PROCESS; the binding outcome is about its
+        # socket. They fail independently, and where they diverge is exactly
+        # where this signal earns its keep: wake_architecture §6 records a
+        # seat with no bound MCP session reading OFFLINE FOREVER while working
+        # perfectly well. Gating the write on "refreshed" would blind the
+        # instrument in the one situation it was built to see.
+        #
+        # All three columns are written unconditionally, including a blind
+        # scan (count 0). Skipping the write there would leave
+        # transcript_reported_at stale and make a live-but-blind daemon
+        # indistinguishable from no daemon at all; storing the zero keeps
+        # "reporting, and seeing nothing" a state a reader can name.
+        #
+        # last_seen rides the same UPDATE on the refreshed path only — it
+        # means "the hub heard from a live binding", which is precisely what
+        # the other three outcomes did not establish.
+        #
+        # UPDATE ... WHERE name = ? is a no-op for an unknown agent, so a
+        # heartbeat never conjures a row.
+        now = time.time()
+        conn = _get_db(db_path)
+        cols = ("transcript_mtime = ?, transcript_count = ?, "
+                "transcript_reported_at = ?")
+        params: tuple = (
+            max(0.0, float(transcript_mtime or 0.0)),
+            max(0, int(transcript_count or 0)),
+            now,
+        )
+        if outcome == "refreshed":
+            cols += ", last_seen = ?"
+            params += (now,)
+        conn.execute(
+            f"UPDATE agents SET {cols} WHERE name = ?", params + (agent_name,)
+        )
+        conn.commit()
+
         if outcome == "unbound":
             return f"heartbeat ignored — '{agent_name}' has no binding{boot_tag}"
         if outcome == "undeliverable":
@@ -5327,13 +5478,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 "(undeliverable); agent marked offline — the interactive "
                 f"session must register() to rebind{boot_tag}"
             )
-        # refreshed — keep last_seen in sync for list_agents ordering.
-        conn = _get_db(db_path)
-        conn.execute(
-            "UPDATE agents SET last_seen = ? WHERE name = ?",
-            (time.time(), agent_name),
-        )
-        conn.commit()
+        # refreshed — last_seen was carried by the single UPDATE above, which
+        # keeps list_agents' ordering fresh without a second commit.
         return f"heartbeat ok ({time.strftime('%H:%M:%S')}){boot_tag}"
 
     @mcp.tool()
