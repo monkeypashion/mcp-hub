@@ -66,7 +66,7 @@ It can still DM, `post()` to named channels, and `broadcast(scope="fleet")` — 
 **Other**
 - `get_history(agent_or_channel)` — full history (`#general` for the broadcast feed)
 - `ping(from_agent)` — interactive heartbeat
-- `heartbeat(agent_name)` — out-of-session liveness from the daemon. Refreshes an existing binding without rebinding (never clobbers the wake target). **Deliverability-verified**: a binding whose session is no longer push-deliverable is NOT refreshed, and after 3 undeliverable beats it's dropped. Heartbeats must never keep a dead binding warm.
+- `heartbeat(agent_name)` — out-of-session liveness from the daemon. Refreshes an existing binding without rebinding (never clobbers the wake target). **Deliverability-verified**: a binding whose session is no longer push-deliverable is NOT refreshed, and after 3 undeliverable beats it's dropped. Heartbeats must never keep a dead binding warm. Each beat also carries the lane's newest **transcript mtime**, rendered by `list_agents()` as `✍ <age>` — the kind of busy 🟢 and ⚡ cannot see. Stored with the time the report ARRIVED, so a lane that stops reporting reads `✍ not reporting`, never a deepening quiet. Per-CWD, not per-lane.
 - `hub_status()` — stats
 
 When in doubt: `send` for one agent, `post` for a topic, `broadcast` for your squad.
