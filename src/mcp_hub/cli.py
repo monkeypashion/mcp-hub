@@ -813,6 +813,11 @@ def build_hook_response(
     Stop proceeds normally. This is the steady-state happy path: most Stop
     fires are no-op when the agent is up-to-date.
 
+    An open card's OWNER NOTICE is not actionable on its own, so it no
+    longer buys a block: it rides the next block that has real content
+    (2026-09-18). It was costing one model turn on every natural Stop for
+    as long as any card stayed open — the operator saw every answer twice.
+
     `stop_hook_active` is Claude Code's flag for "this Stop is firing because
     a prior Stop-hook block already fired". It's a loop backstop: a re-fire
     has no fresh content (DMs were marked read, the broadcast cursor advanced
@@ -921,6 +926,14 @@ def build_hook_response(
     # strikes. Live specimen 2026-07-27: the nag told this repo's own agent
     # to file a card while its #79 sat open (and then evaporated).
     card_notice = card_notice.strip()
+    # ...and a turn that ASKED for it still gets it. The notice stops buying
+    # a block below, but a turn whose own words said "waiting on you" is not
+    # a quiet turn: with one open card per agent, an agent waiting on
+    # something NEW has to know the old card is the one on the board before
+    # it can restate or supersede. That case is rate-limited by
+    # `_card_nag_grace` already; an ordinary quiet turn is not, which is
+    # exactly why the two must not share a gate.
+    notice_answers_a_waiting_turn = bool(card_notice and card_nag)
     if card_notice:
         card_nag = False
 
@@ -944,8 +957,44 @@ def build_hook_response(
     # learn by having its pane disappear, and this is the last turn boundary
     # it gets. It also outranks the loop backstop below for the same reason:
     # a re-fired Stop on a held lane is still a lane about to be stopped.
-    if not has_content and is_online and not card_nag and not card_notice \
-            and not held_notice:
+    # ⭐ THE OWNER NOTICE NO LONGER BUYS A BLOCK OF ITS OWN (2026-09-18).
+    #
+    # `card_notice` used to sit in this condition, so an agent with an open
+    # card blocked on EVERY natural Stop whether or not anything else was
+    # owed. A block costs one model turn (the bar 47 comment below measured
+    # that), so the operator saw every single answer twice for as long as any
+    # card stayed open — reported first-hand by slipstream-dev-vm-1 in the
+    # operator's own words, "every time I ask you a question I am getting x2
+    # replies".
+    #
+    # MEASURED BEFORE CHANGING IT, from this box's own drain records
+    # (~/.mcp-hub/activity-log.jsonl, kind=drain, `surfaced`): over 14 hours,
+    # lanes WITH an open card blocked on 100% of their natural Stops (25/25;
+    # per-lane 12/12, 6/6, 4/4), against 36% (54/150) for lanes without one.
+    # The loop backstop above then correctly returned None on each follow-up
+    # Stop, which is why the cost was exactly one extra turn per turn and not
+    # a runaway — a doubling, matching the report.
+    #
+    # WHY IT IS SAFE TO DROP, and this is the whole argument: the notice is
+    # CONTEXT, not a correction. `decision_clear` writes NO state (its
+    # docstring says so), the notice's own text says "if you're still
+    # waiting, nothing is needed", and a card is closed only by an operator
+    # answer, a DECIDED, or supersession — never by decay. So a turn spent
+    # to deliver it is a turn spent to say nothing is needed, and the cost
+    # falls hardest on the lane least able to act, which is the same
+    # inversion the retired strike clock died of (server.py decision_clear).
+    #
+    # NOTHING IS LOST AND NOTHING NEEDS SPOOLING: unlike a drained DM, the
+    # notice is DERIVED, not consumed — every Stop re-reads it from the open
+    # card. It is still assembled below, so it rides the next block that has
+    # real content, which is the bar 47 spool's ordering without the spool.
+    if (not has_content and is_online and not card_nag
+            and not notice_answers_a_waiting_turn and not held_notice):
+        if card_notice and trace is not None:
+            # The suppressed notices ARE the saving; bar 47's rule applies
+            # here too — a branch that returns None is exactly the one no
+            # other instrument can see.
+            trace["notice_deferred"] = True
         return None
 
     parts: list[str] = []
