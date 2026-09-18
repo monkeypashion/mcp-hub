@@ -395,6 +395,12 @@ class SettingsApp(App):
         # thing", 2026-07-28). Awaiting the removal fixes the timing; this makes
         # a collision impossible even if the timing changes again.
         self._gen = 0
+        # One entry per poll group while its thread is running, and the
+        # earliest the group may start again. See `_poll_guarded`: a thread
+        # worker cannot be cancelled, so `exclusive=True` is not re-entrancy
+        # protection and a poll slower than its own interval STACKS.
+        self._poll_running: set[str] = set()
+        self._poll_gap_until: dict[str, float] = {}
 
     # ---- layout ----
 
@@ -1087,11 +1093,56 @@ class SettingsApp(App):
         # rather than on `selected`.
         self.call_later(self.refresh_detail)
 
+    # ---- polling: a tick that outlasts its interval must not stack ----
+
+    # Backpressure ceiling. A run that took longer than its interval buys a
+    # gap of its own length before the next one starts, so a slow poll spends
+    # at most half its time scanning — capped, because a pathological run must
+    # not freeze the board for minutes.
+    POLL_MAX_GAP = 30.0
+
+    def _poll_guarded(self, group: str, work, *, force: bool = False) -> None:
+        """Run `work` on a thread, skipping the tick if the last one is still in.
+
+        `exclusive=True` does NOT do this. Cancelling a THREAD worker only sets
+        a flag — Textual hands the callable to `run_in_executor`, and the
+        executor thread runs to completion, `subprocess.run` and all. So a poll
+        whose work outlasts its interval starts a second copy, then a third,
+        for as long as the app is open, and the group looks protected the whole
+        time.
+
+        Measured on dev-vm-1, 2026-09-17: `squad board --json` takes 9-12s
+        against a 3s tick, giving 3-4 concurrent scans and 70,344 execs in 15s
+        — 63% of all process creation on the operator's working machine. The
+        script's runtime grows with the fleet, so the interval cannot be
+        chosen once and left; the gap below is measured from the last run.
+        """
+        if group in self._poll_running:
+            return
+        if not force and self._now() < self._poll_gap_until.get(group, 0.0):
+            return
+        self._poll_running.add(group)
+
+        def run() -> None:
+            started = self._now()
+            try:
+                work()
+            finally:
+                # The gap is the OVERRUN's cost, not a new refresh policy: a
+                # run inside its interval sets no gap at all, so a healthy box
+                # polls exactly as it always did.
+                took = self._now() - started
+                gap = min(took, self.POLL_MAX_GAP)
+                self._poll_gap_until[group] = self._now() + gap
+                self._poll_running.discard(group)
+
+        self.run_worker(run, thread=True, group=group, exclusive=True)
+
     # ---- the workspace registry ----
 
-    def _poll_workspaces(self) -> None:
-        self.run_worker(self._collect_workspaces, thread=True,
-                        group="workspace-poll", exclusive=True)
+    def _poll_workspaces(self, *, force: bool = False) -> None:
+        self._poll_guarded("workspace-poll", self._collect_workspaces,
+                           force=force)
 
     def _collect_workspaces(self) -> None:
         try:
@@ -1150,12 +1201,11 @@ class SettingsApp(App):
 
     # ---- the live board ----
 
-    def _poll_board(self) -> None:
+    def _poll_board(self, *, force: bool = False) -> None:
         """Collect on a WORKER THREAD — the scan captures a pane per agent and
         the UI must never wait on it (group of its own: a poll must not cancel
         an in-flight settings write, or vice versa)."""
-        self.run_worker(self._collect_board, thread=True,
-                        group="board-poll", exclusive=True)
+        self._poll_guarded("board-poll", self._collect_board, force=force)
 
     def _collect_board(self) -> None:
         roster = self._read_roster()
@@ -1192,8 +1242,7 @@ class SettingsApp(App):
         exclusive, and a 60s network call landing mid-scan would drop the
         board's refresh on the floor.
         """
-        self.run_worker(self._send_presence, thread=True,
-                        group="presence-ping", exclusive=True)
+        self._poll_guarded("presence-ping", self._send_presence)
 
     def _send_presence(self) -> None:
         try:
@@ -2050,10 +2099,14 @@ class SettingsApp(App):
 
     async def action_reload(self) -> None:
         await self.refresh_detail()
+        # `force`: the operator asked. The backpressure gap exists to stop a
+        # TIMER hammering a slow scan, and a hand on a key is not that — a
+        # Reload that silently did nothing for 12s would read as a dead panel.
+        # The in-flight guard still holds: there is no second copy to start.
         if self._board_for is not None or self._roster_for is not None:
-            self._poll_board()
+            self._poll_board(force=True)
         if self._workspaces_for is not None:
-            self._poll_workspaces()
+            self._poll_workspaces(force=True)
         self._set_status("reloaded")
 
     def action_narrow(self) -> None:
