@@ -39,7 +39,7 @@ import subprocess
 import sys
 import time
 from dataclasses import replace
-from typing import Any
+from typing import Any, NamedTuple
 
 # Fallback is the Tailscale-only prod endpoint — the public FQDN was
 # deliberately cut 2026-05-29 (a domain 404 is correct, not an outage), but
@@ -1171,6 +1171,90 @@ def _claude_memory_dir(cwd: str) -> pathlib.Path:
         pathlib.Path.home() / ".claude" / "projects"
         / _claude_project_dirname(cwd) / "memory"
     )
+
+
+# ---------------------------------------------------------------------------
+# Transcript mtime — the activity signal the hub cannot otherwise see.
+#
+# The hub knows two states: "in a turn" (a tool call arrived) and "idle" (the
+# Stop hook flipped a flag). CLAUDE.md's focus-mode section records the gap
+# between them — a lane babysitting a deploy is idle-at-the-keyboard and
+# operationally busy, and nothing in the hub can see that kind of busy.
+#
+# Claude Code appends to its transcript on every turn, so the newest mtime
+# across a project's transcripts is a liveness reading that costs one stat()
+# per file and never reads a byte of content. Transcripts run to tens of MB
+# (_read_last_assistant_text tails for exactly that reason); this scan opens
+# nothing.
+#
+# SCOPE, stated here because it is the thing that would otherwise lie
+# silently: this is per-CWD, not per-LANE. Every session that has ever run in
+# one directory shares one encoded project dir, so the max is "something
+# happened in this tree", never "THIS agent worked". Measured on dev-vm-1
+# 2026-09-17: 70 transcripts in one dir, two of them written 60s apart by two
+# live sessions on the same cwd and the same branch. Scoping to the daemon's
+# own session was the obvious alternative and is worse: the singleton is
+# old-wins (see _claim_singleton), so the surviving daemon routinely OUTLIVES
+# the session that spawned it, and a session-scoped path would pin the
+# measurement to a transcript nobody writes any more and report a
+# permanently resting lane. A conflated reading degrades honestly; a
+# confidently dead instrument does not.
+# ---------------------------------------------------------------------------
+
+
+class TranscriptActivity(NamedTuple):
+    """One scan's result. `count == 0` means BLIND, never idle."""
+
+    newest: float  # epoch seconds of the newest transcript write, 0.0 if none
+    count: int     # transcripts stat()ed; 0 = nothing found to measure
+
+
+def _transcript_activity(cwd: str | None = None) -> TranscriptActivity:
+    """Newest transcript mtime for the project at `cwd` on this machine.
+
+    `count == 0` is the case every caller has to keep separate from a quiet
+    lane: a missing dir, an unreadable one, or a project never opened on this
+    box produces the same "no recent write" as a lane that is genuinely
+    resting, and only the count tells the two apart. Returning 0.0 as though
+    it were a timestamp is how a blind instrument gets read as a measurement.
+
+    ⚠️ The daemon calls this with no argument, so the reading depends on the
+    daemon's CWD — and unlike the rest of the daemon that is a NEW dependency,
+    because the daemon takes its identity from an explicit `--name` and never
+    from the cwd (_resolve_agent_identity, path 1). It holds by construction:
+    every spawn path inherits the cwd of a hook already running in the agent's
+    project dir, and the respawn chain inherits it again. Measured 2026-09-17:
+    the dev-vm-1 daemon sits in the repo, and the seat daemons sit in
+    /home/seat/work, which is likewise their agent's project dir.
+
+    It also fails LOUDLY rather than quietly if that ever stops holding: a
+    wrong cwd almost always resolves to a directory with no transcripts, which
+    surfaces as "no transcripts" on the lane's row instead of a plausible
+    quiet time.
+    """
+    d = (
+        pathlib.Path.home() / ".claude" / "projects"
+        / _claude_project_dirname(cwd or os.getcwd())
+    )
+    newest = 0.0
+    count = 0
+    try:
+        with os.scandir(d) as it:
+            for entry in it:
+                if not entry.name.endswith(".jsonl"):
+                    continue
+                try:
+                    mtime = entry.stat().st_mtime
+                except OSError:
+                    # One unreadable file must not void the whole scan — a
+                    # partial reading with an honest count beats no reading.
+                    continue
+                count += 1
+                if mtime > newest:
+                    newest = mtime
+    except OSError:
+        return TranscriptActivity(0.0, 0)
+    return TranscriptActivity(newest, count)
 
 
 def _is_safe_memory_filename(name: str) -> bool:
@@ -5457,12 +5541,25 @@ def _parse_fleet_rows(agents_text: str) -> list[dict[str, Any]]:
         proj_m = re.search(r"\(([^)]*)\)", tail)
         sess_m = re.search(r"⚡×(\d+)", head)
         next_m = re.search(r"(?i)next:\s*(.+)$", bio)
+        # `activity` carries the hub's RENDERED transcript reading — "3m",
+        # "not reporting", "no transcripts" — deliberately, rather than the
+        # raw mtime it was computed from.
+        #
+        # The raw number is the dangerous thing to hand a downstream. A lane
+        # that stops reporting leaves its mtime frozen, and any reader doing
+        # the obvious `now - mtime` gets a quiet time that grows forever and
+        # looks entirely plausible. Carrying the verdict keeps that judgement
+        # in the one place that holds the arrival time needed to make it
+        # (server._transcript_quiet) instead of inviting every board, panel
+        # and statusline to re-derive it and re-acquire the same bug.
+        act_m = re.search(r"✍\s*([^(]+?)\s*(?=\(|$)", head)
         rows.append({
             "name": name_m.group(1).strip(),
             "project": proj_m.group(1) if proj_m else "",
             "wakeable": "⚡" in head,
             "idle": "💤" in head,
             "sessions": int(sess_m.group(1)) if sess_m else 1,
+            "activity": act_m.group(1) if act_m else "",
             "next": next_m.group(1).strip() if next_m else "",
         })
     return rows
@@ -5632,6 +5729,63 @@ def _source_head(src_dir: pathlib.Path | None = None) -> str | None:
     return head if out.returncode == 0 and head else None
 
 
+async def _call_heartbeat(
+    session: Any, agent_name: str, send_transcript: bool
+) -> tuple[str, bool]:
+    """One heartbeat, carrying the transcript reading when the hub accepts it.
+
+    Returns (reply_text, send_transcript) — the flag latches OFF the first
+    time a hub rejects the extra arguments, so a daemon running newer code
+    than the deployed hub pays the rejected call once rather than every beat.
+
+    ⚠️ MEASURED 2026-09-17, against a hub built from the pre-change tree: the
+    old hub does NOT reject. FastMCP accepted the two unknown arguments,
+    returned `heartbeat ok` with isError False, and silently discarded them.
+    So on the skew that actually ships — new daemon, not-yet-redeployed hub —
+    this fallback never fires, the beat was never at risk, and the lane simply
+    renders no ✍ marker at all because transcript_reported_at stays 0. That is
+    the honest "never reported" state, not a quiet one
+    (test_list_agents_stays_silent_for_a_lane_that_never_reported).
+
+    The fallback is kept as insurance against a STRICTER validator — a
+    different mcp SDK version, or a FastMCP configured to forbid extra fields
+    — which is a mode this has not ruled out and cannot cheaply detect. It is
+    worth the dead branch because of what the heartbeat IS: it holds the
+    lane's binding alive, and heartbeat_touch drops that binding after three
+    consecutive misses, so a beat turning into an error would cost the lane
+    its wake target in about three minutes to protect a reading that is merely
+    nice to have. Skew itself is routine — a commit to master redeploys the
+    hub while every machine keeps running its own tree, and the daemon
+    singleton is old-wins, so the survivor is the OLDEST one.
+
+    Latching on any tool error (not just an argument rejection) is deliberate
+    bluntness: the degraded state is a plain heartbeat, which is exactly what
+    this daemon sent before the feature existed, and a respawn re-enables it.
+    """
+    if send_transcript:
+        activity = _transcript_activity()
+        result = await session.call_tool(
+            "heartbeat",
+            {
+                "agent_name": agent_name,
+                "transcript_mtime": activity.newest,
+                "transcript_count": activity.count,
+            },
+        )
+        if not getattr(result, "isError", False):
+            return _extract_text(result), True
+        print(
+            "[mcp-hub heartbeat] hub REJECTED the transcript-activity "
+            "arguments; falling back to a plain heartbeat for this daemon's "
+            "lifetime. Note this is NOT ordinary version skew — a hub built "
+            "before the feature accepts and ignores them (measured "
+            "2026-09-17), so reaching here means a strict validator.",
+            file=sys.stderr,
+        )
+    result = await session.call_tool("heartbeat", {"agent_name": agent_name})
+    return _extract_text(result), False
+
+
 async def _heartbeat_loop(hub_url: str, agent_name: str) -> bool:
     """Long-lived loop: connect to hub, ping `heartbeat(agent_name)` every
     HEARTBEAT_INTERVAL_SECONDS. On any connection error, sleep and reconnect.
@@ -5670,6 +5824,10 @@ async def _heartbeat_loop(hub_url: str, agent_name: str) -> bool:
     # break) and persisted per-box, so a restart during the daemon's own
     # downtime is still caught on reconnect.
     baseline_head = _source_head()
+    # Daemon-lifetime, deliberately OUTSIDE the reconnect loop: a hub that
+    # rejected these arguments is the same hub after a blip, and re-probing
+    # every reconnect would reintroduce the per-beat cost the latch removes.
+    send_transcript = True
     while True:
         try:
             async with streamablehttp_client(
@@ -5681,10 +5839,10 @@ async def _heartbeat_loop(hub_url: str, agent_name: str) -> bool:
                     since_heartbeat = HEARTBEAT_INTERVAL_SECONDS
                     while True:
                         if since_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
-                            hb = await session.call_tool(
-                                "heartbeat", {"agent_name": agent_name}
+                            hb_text, send_transcript = await _call_heartbeat(
+                                session, agent_name, send_transcript
                             )
-                            _maybe_stamp_hub_restart(_extract_text(hb))
+                            _maybe_stamp_hub_restart(hb_text)
                             since_heartbeat = 0
                             if baseline_head is not None:
                                 head_now = _source_head()
