@@ -181,7 +181,9 @@ def test_loop_stands_down_when_another_daemon_owns_the_agent(
 
     session = _FakeSession()
     _patch_transport(monkeypatch, session)
-    monkeypatch.setattr(cli, "_is_live_daemon", lambda pid: True)
+    monkeypatch.setattr(
+        cli, "_is_live_daemon", lambda pid, expect_cwd=None: True
+    )
 
     import asyncio
 
@@ -198,4 +200,5 @@ def test_loop_stands_down_when_another_daemon_owns_the_agent(
 
     assert respawn is False, "standing down must not respawn a successor"
     assert session.calls == [], "beat must not go out once the claim is lost"
-    assert cli._heartbeat_pidfile("alice").read_text(encoding="utf-8") == "999999"
+    held = cli._heartbeat_pidfile("alice").read_text(encoding="utf-8")
+    assert cli._parse_claim(held)[0] == 999999

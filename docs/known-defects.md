@@ -1,8 +1,15 @@
 # Known defects
 
-Defects measured but not yet fixed. Each entry names the **must-fire** condition
-a fix has to satisfy, so a later change can be judged against the defect rather
-than against someone's memory of it.
+Each entry names the **must-fire** condition a fix has to satisfy, so a later
+change can be judged against the defect rather than against someone's memory of
+it. Fixed entries are kept, not deleted — the must-fire is what a regression
+would be caught by.
+
+| # | Defect | State |
+|---|---|---|
+| 1 | `tests/test_seat_hold.py` fails open onto the shared fleet socket | **OPEN** |
+| 2 | Heartbeat singleton claimed once, never re-validated | ✅ fixed 2026-09-19 |
+| 2a | A PID alone cannot say whose daemon it is | ✅ fixed 2026-09-19 |
 
 ## 1. `tests/test_seat_hold.py` fails OPEN onto the shared fleet socket
 
@@ -86,7 +93,7 @@ because without the fix the loop does not fail, it reconnects forever: with the
 check removed the test times out, with it the test returns in ~1s. Both states
 were run.
 
-### 2a. `_daemon_alive_for` cannot tell WHICH agent a live daemon serves
+### 2a. `_daemon_alive_for` cannot tell WHICH agent a live daemon serves — ✅ FIXED
 
 `_is_live_daemon` does more than a bare PID check — it reads `/proc/<pid>/cmdline`
 and requires `heartbeat-daemon`. But a daemon launched **without `--name`** (the
@@ -102,13 +109,33 @@ nothing to read.
 **Must-fire:** the pidfile carries the agent name alongside the PID, and the
 liveness check compares the claim against what the holder says it is.
 
-⚠️ **Still OPEN after the §2 fix.** `_still_owns_singleton` re-reads the same
-PID-only pidfile, so it inherits this blind spot exactly: a recycled PID that
-lands on another lane's daemon reads as "a live owner" and would make the
-rightful daemon stand down. Closing it needs the pidfile FORMAT to change
-(`<pid> <agent>`), which touches `_release_singleton`, `_daemon_alive_for` and
-the tests that assert the file's exact contents — deliberately not bundled into
-the §2 fix.
+**Fixed 2026-09-19.** The claim is now `<pid> <agent> <cwd>`.
+
+The agent name satisfies the must-fire and makes the file readable by a human,
+but the **CWD is what the check actually compares**, because it is the input
+identity was derived FROM and it reads back off the live holder with a single
+`readlink` — no git, no subprocess, on a path the Stop hook takes at every turn
+boundary. `_is_live_daemon(pid, expect_cwd)` now returns False for a live
+heartbeat daemon running from a different directory, so a recycled PID no
+longer suppresses a lane's self-heal.
+
+Conservative on both unknowns, so nothing that used to be honoured stops being
+honoured: a legacy claim (no recorded cwd) and an unreadable `/proc/<pid>/cwd`
+(not Linux, or another user's process) both defer to the live owner exactly as
+before.
+
+⚠️ **Migration.** Every pidfile written before this commit holds a bare PID.
+`_parse_claim` reads those as `(pid, None, None)` and they are honoured
+unchanged; they upgrade the next time each daemon writes its own claim. Reading
+them as garbage would have made every daemon on the fleet declare every claim
+stale at once and take it over — mass duplication, i.e. §2 fleet-wide. Covered
+by `test_parse_claim_accepts_legacy_pid_only_file`.
+
+The identity comparison is asserted in BOTH directions
+(`test_holder_cwd_matches_distinguishes_two_nameless_daemons`,
+`test_recycled_pid_on_another_lanes_daemon_is_not_this_agents_owner`): a test
+that only checks the mismatch would pass against a probe that rejects
+everything.
 
 *Reported by `slipstream-dev-vm-1`, who measured the nameless daemon and asked
 rather than deleting the pidfile. Their lane was being served correctly — the

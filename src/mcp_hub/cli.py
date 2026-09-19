@@ -5537,8 +5537,90 @@ def _heartbeat_pidfile(agent_name: str) -> pathlib.Path:
     return _state_dir() / f"heartbeat-{safe}.pid"
 
 
-def _is_live_daemon(pid: int) -> bool:
+def _format_claim(pid: int, agent_name: str, *, getcwd=os.getcwd) -> str:
+    """Render a pidfile's contents: `<pid> <agent> <cwd>`.
+
+    The PID alone cannot answer "whose daemon is this?". A daemon launched the
+    normal SessionStart way carries no `--name` in argv and derives its identity
+    from its CWD, so a recycled PID landing on ANOTHER lane's daemon satisfies a
+    bare liveness+argv probe and silently suppresses this lane's self-heal.
+
+    The agent name is recorded because the must-fire condition asks for it and
+    it makes the file readable by a human. The CWD is what the check actually
+    compares, because it is the input identity was derived FROM and it can be
+    read back off the live holder with one `readlink` — no git, no subprocess,
+    on a path the Stop hook takes at every turn boundary.
+
+    Agent names are sanitized to `[a-z0-9_-]` so they never contain a space; a
+    CWD may, which is why the parser splits only twice and keeps the rest.
+    """
+    return f"{pid} {agent_name} {getcwd()}"
+
+
+def _parse_claim(text: str) -> tuple[int, str | None, str | None] | None:
+    """Parse a pidfile into `(pid, agent, cwd)`; None if it is not a claim.
+
+    LEGACY: a bare `<pid>` (every pidfile written before 2026-09-19) parses to
+    `(pid, None, None)` and is honoured as before. Treating those as garbage
+    would make every daemon on the fleet declare every claim stale at once and
+    take it over — mass duplication, the exact defect this file guards. They
+    upgrade themselves the next time each daemon writes its own claim.
+    """
+    parts = text.strip().split(" ", 2)
+    try:
+        pid = int(parts[0])
+    except (IndexError, ValueError):
+        return None
+    agent = parts[1] if len(parts) > 1 and parts[1] else None
+    cwd = parts[2] if len(parts) > 2 and parts[2] else None
+    return pid, agent, cwd
+
+
+def _read_claim(pidfile: pathlib.Path) -> tuple[int, str | None, str | None] | None:
+    """Read and parse a pidfile; None if missing, unreadable or malformed."""
+    try:
+        return _parse_claim(pidfile.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def _holder_cwd_matches(pid: int, expect_cwd: str | None) -> bool:
+    """True if `pid` is running from `expect_cwd` — i.e. it is the daemon this
+    claim was written by, not an unrelated process that inherited its PID.
+
+    Conservative on BOTH unknowns: no recorded cwd (a legacy claim) or no
+    readable `/proc/<pid>/cwd` (not Linux, or another user's process) returns
+    True, deferring to the live owner exactly as before the cwd was recorded.
+    Only a cwd we can read AND that disagrees is a mismatch.
+    """
+    if expect_cwd is None:
+        return True
+    try:
+        return os.readlink(f"/proc/{pid}/cwd") == expect_cwd
+    except OSError:
+        return True
+
+
+def _daemon_cmdline(pid: int) -> str | None:
+    """`pid`'s argv as a space-joined string, or None when /proc is unreadable.
+
+    Its own function so the identity checks above it can be tested without a
+    real heartbeat daemon to point at. None means "cannot tell", never "not a
+    daemon" — on a box without /proc the caller falls back to bare liveness.
+    """
+    try:
+        raw = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes()
+    except (FileNotFoundError, OSError):
+        return None
+    return raw.replace(b"\x00", b" ").decode("utf-8", "replace")
+
+
+def _is_live_daemon(pid: int, expect_cwd: str | None = None) -> bool:
     """True if `pid` is a live process that looks like a heartbeat daemon.
+
+    `expect_cwd` is the CWD recorded in the claim being checked. When given, a
+    live heartbeat daemon running from a DIFFERENT directory is not this
+    agent's daemon, and reports False so the caller reclaims the stale file.
 
     Conservative: returns False whenever identity is uncertain (so a recycled
     PID belonging to an unrelated process is treated as 'not a daemon' and the
@@ -5577,12 +5659,12 @@ def _is_live_daemon(pid: int) -> bool:
     # When /proc is available (Linux), confirm it's actually a heartbeat
     # daemon. Elsewhere (e.g. macOS) trust liveness — the leak this guards
     # against is Windows-only anyway.
-    cmdline = pathlib.Path(f"/proc/{pid}/cmdline")
-    try:
-        data = cmdline.read_bytes().replace(b"\x00", b" ").decode("utf-8", "replace")
-    except (FileNotFoundError, OSError):
+    data = _daemon_cmdline(pid)
+    if data is None:
         return True
-    return "heartbeat-daemon" in data
+    if "heartbeat-daemon" not in data:
+        return False
+    return _holder_cwd_matches(pid, expect_cwd)
 
 
 def _claim_singleton(agent_name: str, *, getpid=os.getpid) -> pathlib.Path | None:
@@ -5610,11 +5692,14 @@ def _claim_singleton(agent_name: str, *, getpid=os.getpid) -> pathlib.Path | Non
         try:
             fd = os.open(str(pidfile), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
-            try:
-                prev = int(pidfile.read_text(encoding="utf-8").strip())
-            except (FileNotFoundError, ValueError, OSError):
-                prev = None
-            if prev is not None and prev != getpid() and _is_live_daemon(prev):
+            claim = _read_claim(pidfile)
+            prev = claim[0] if claim else None
+            prev_cwd = claim[2] if claim else None
+            if (
+                prev is not None
+                and prev != getpid()
+                and _is_live_daemon(prev, prev_cwd)
+            ):
                 return None  # a live daemon already owns this agent — stand down
             # Stale/garbage/own-PID — drop it and retry the atomic create.
             try:
@@ -5626,7 +5711,7 @@ def _claim_singleton(agent_name: str, *, getpid=os.getpid) -> pathlib.Path | Non
             continue
         else:
             with os.fdopen(fd, "w") as f:
-                f.write(str(getpid()))
+                f.write(_format_claim(getpid(), agent_name))
             return pidfile
     # Couldn't settle the claim (extreme contention) — fail open and run.
     return pidfile
@@ -5655,12 +5740,9 @@ def _still_owns_singleton(agent_name: str, *, getpid=os.getpid) -> bool:
     - pidfile names a live daemon -> stand down, the successor owns the agent
     - pidfile names a dead pid    -> take it over
     """
-    pidfile = _heartbeat_pidfile(agent_name)
-    try:
-        if int(pidfile.read_text(encoding="utf-8").strip()) == getpid():
-            return True
-    except (FileNotFoundError, ValueError, OSError):
-        pass
+    claim = _read_claim(_heartbeat_pidfile(agent_name))
+    if claim is not None and claim[0] == getpid():
+        return True
     # Missing, garbage, or someone else's: let the claim logic adjudicate.
     # It stands down only for a *live* owner, and never against our own pid.
     return _claim_singleton(agent_name, getpid=getpid) is not None
@@ -5669,11 +5751,10 @@ def _still_owns_singleton(agent_name: str, *, getpid=os.getpid) -> bool:
 def _release_singleton(pidfile: pathlib.Path, *, getpid=os.getpid) -> None:
     """Remove the pidfile on clean exit, but only if it still names us — so we
     never delete a successor daemon's claim."""
-    try:
-        owner = int(pidfile.read_text(encoding="utf-8").strip())
-    except (FileNotFoundError, ValueError, OSError):
+    claim = _read_claim(pidfile)
+    if claim is None:
         return
-    if owner == getpid():
+    if claim[0] == getpid():
         try:
             pidfile.unlink()
         except OSError:
@@ -5686,12 +5767,10 @@ def _daemon_alive_for(agent_name: str) -> bool:
     Cheap check (reuses the singleton's liveness probe) so the Stop hook can
     decide whether to self-heal a missing/dead daemon at a turn boundary.
     """
-    pidfile = _heartbeat_pidfile(agent_name)
-    try:
-        prev = int(pidfile.read_text(encoding="utf-8").strip())
-    except (FileNotFoundError, ValueError, OSError):
+    claim = _read_claim(_heartbeat_pidfile(agent_name))
+    if claim is None:
         return False
-    return _is_live_daemon(prev)
+    return _is_live_daemon(claim[0], claim[2])
 
 
 def _spawn_daemon_detached(agent_name: str, hub_url: str) -> None:

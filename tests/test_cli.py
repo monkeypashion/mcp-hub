@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -16,6 +17,7 @@ from unittest.mock import patch
 
 import pytest
 
+from mcp_hub import cli
 from mcp_hub.cli import (
     _claim_singleton,
     _daemon_alive_for,
@@ -23,8 +25,11 @@ from mcp_hub.cli import (
     _discover_agent_from_marker,
     _ensure_daemon_alive,
     _extract_text,
+    _format_claim,
     _heartbeat_pidfile,
+    _holder_cwd_matches,
     _is_live_daemon,
+    _parse_claim,
     _parse_org_repo,
     _parse_squads_for_status,
     _parse_status_from_agents,
@@ -987,7 +992,7 @@ def test_claim_singleton_wins_when_no_prior(tmp_path, monkeypatch):
     monkeypatch.setenv("MCP_HUB_STATE_DIR", str(tmp_path))
     pf = _claim_singleton("alice", getpid=lambda: 4242)
     assert pf is not None
-    assert pf.read_text(encoding="utf-8") == "4242"
+    assert _parse_claim(pf.read_text(encoding="utf-8"))[0] == 4242
 
 
 def test_claim_singleton_creates_state_dir_if_missing(tmp_path, monkeypatch):
@@ -1011,8 +1016,8 @@ def test_claim_singleton_stands_down_for_live_owner(tmp_path, monkeypatch):
         result = _claim_singleton("alice", getpid=lambda: 2222)
 
     assert result is None
-    live.assert_called_once_with(1111)
-    assert pf_path.read_text(encoding="utf-8") == "1111"  # incumbent untouched
+    live.assert_called_once_with(1111, None)  # legacy claim: no cwd recorded
+    assert _parse_claim(pf_path.read_text(encoding="utf-8"))[0] == 1111  # incumbent untouched
 
 
 def test_claim_singleton_takes_over_dead_owner(tmp_path, monkeypatch):
@@ -1026,7 +1031,7 @@ def test_claim_singleton_takes_over_dead_owner(tmp_path, monkeypatch):
         result = _claim_singleton("alice", getpid=lambda: 2222)
 
     assert result is not None
-    assert pf_path.read_text(encoding="utf-8") == "2222"
+    assert _parse_claim(pf_path.read_text(encoding="utf-8"))[0] == 2222
 
 
 def test_claim_singleton_takes_over_garbage_pidfile(tmp_path, monkeypatch):
@@ -1038,7 +1043,7 @@ def test_claim_singleton_takes_over_garbage_pidfile(tmp_path, monkeypatch):
 
     result = _claim_singleton("alice", getpid=lambda: 2222)
     assert result is not None
-    assert pf_path.read_text(encoding="utf-8") == "2222"
+    assert _parse_claim(pf_path.read_text(encoding="utf-8"))[0] == 2222
 
 
 def test_claim_singleton_is_race_safe_second_caller_stands_down(tmp_path, monkeypatch):
@@ -1052,7 +1057,7 @@ def test_claim_singleton_is_race_safe_second_caller_stands_down(tmp_path, monkey
     with patch("mcp_hub.cli._is_live_daemon", return_value=True):
         second = _claim_singleton("alice", getpid=lambda: 2222)
     assert second is None
-    assert first.read_text(encoding="utf-8") == "1111"
+    assert _parse_claim(first.read_text(encoding="utf-8"))[0] == 1111
 
 
 def test_still_owns_singleton_true_for_own_pidfile(tmp_path, monkeypatch):
@@ -1085,7 +1090,7 @@ def test_still_owns_singleton_reclaims_when_pidfile_missing(
     monkeypatch.setenv("MCP_HUB_STATE_DIR", str(tmp_path))
     assert not _heartbeat_pidfile("alice").exists()
     assert _still_owns_singleton("alice", getpid=lambda: 4242) is True
-    assert _heartbeat_pidfile("alice").read_text(encoding="utf-8") == "4242"
+    assert _parse_claim(_heartbeat_pidfile("alice").read_text(encoding="utf-8"))[0] == 4242
 
 
 def test_still_owns_singleton_takes_over_dead_owner(tmp_path, monkeypatch):
@@ -1094,7 +1099,7 @@ def test_still_owns_singleton_takes_over_dead_owner(tmp_path, monkeypatch):
     _heartbeat_pidfile("alice").write_text("9999", encoding="utf-8")
     with patch("mcp_hub.cli._is_live_daemon", return_value=False):
         assert _still_owns_singleton("alice", getpid=lambda: 4242) is True
-    assert _heartbeat_pidfile("alice").read_text(encoding="utf-8") == "4242"
+    assert _parse_claim(_heartbeat_pidfile("alice").read_text(encoding="utf-8"))[0] == 4242
 
 
 def test_release_singleton_removes_pidfile_when_owner(tmp_path, monkeypatch):
@@ -1116,7 +1121,7 @@ def test_release_singleton_keeps_successor_claim(tmp_path, monkeypatch):
 
     _release_singleton(pf_path, getpid=lambda: 2222)
     assert pf_path.exists()
-    assert pf_path.read_text(encoding="utf-8") == "3333"
+    assert _parse_claim(pf_path.read_text(encoding="utf-8"))[0] == 3333
 
 
 def test_release_singleton_missing_pidfile_is_noop(tmp_path, monkeypatch):
@@ -1124,6 +1129,86 @@ def test_release_singleton_missing_pidfile_is_noop(tmp_path, monkeypatch):
     monkeypatch.setenv("MCP_HUB_STATE_DIR", str(tmp_path))
     pf_path = _heartbeat_pidfile("alice")
     _release_singleton(pf_path, getpid=lambda: 2222)  # must not raise
+
+
+# --- defect 2a: a PID alone cannot say WHOSE daemon it is -------------------
+# A daemon launched the normal SessionStart way carries no --name in argv and
+# derives its identity from its CWD. So a recycled PID that lands on ANOTHER
+# lane's daemon passed the old liveness+argv probe, and that lane's self-heal
+# stayed suppressed indefinitely. The claim now records the CWD it was written
+# from, and the probe reads it back off the live holder.
+
+
+def test_claim_round_trips_pid_agent_and_cwd(tmp_path, monkeypatch):
+    """Pins the on-disk format. Agent names are sanitized so they cannot
+    contain a space; a CWD can, so the parser must keep the rest intact."""
+    text = _format_claim(4242, "alice", getcwd=lambda: "/home/me/my repo")
+    assert text == "4242 alice /home/me/my repo"
+    assert _parse_claim(text) == (4242, "alice", "/home/me/my repo")
+
+
+def test_parse_claim_accepts_legacy_pid_only_file():
+    """MIGRATION SAFETY. Every pidfile written before 2026-09-19 holds a bare
+    PID. Reading those as garbage would make every daemon on the fleet declare
+    every claim stale at once and take it over — mass duplication, the very
+    defect the singleton exists to prevent."""
+    assert _parse_claim("2528703") == (2528703, None, None)
+    assert _parse_claim("  219469\n") == (219469, None, None)
+    assert _parse_claim("") is None
+    assert _parse_claim("not-a-pid alice /tmp") is None
+
+
+def test_holder_cwd_matches_is_conservative_when_it_cannot_tell(monkeypatch):
+    """Both unknowns defer to the live owner, exactly as before the CWD was
+    recorded: a legacy claim (no cwd) and an unreadable /proc entry."""
+    assert _holder_cwd_matches(1234, None) is True  # legacy claim
+    monkeypatch.setattr(
+        "os.readlink", lambda _p: (_ for _ in ()).throw(OSError("denied"))
+    )
+    assert _holder_cwd_matches(1234, "/somewhere") is True
+
+
+def test_holder_cwd_matches_distinguishes_two_nameless_daemons(monkeypatch):
+    """The measured shape: two nameless daemons, told apart only by cwd."""
+    monkeypatch.setattr(
+        "os.readlink", lambda _p: "/home/monke/Projects/code/monkeypashion/slipstream-testlane"
+    )
+    assert _holder_cwd_matches(
+        219469, "/home/monke/Projects/code/monkeypashion/slipstream-testlane"
+    ) is True
+    assert _holder_cwd_matches(
+        219469, "/home/monke/Projects/code/monkeypashion/mcp-hub"
+    ) is False
+
+
+def test_recycled_pid_on_another_lanes_daemon_is_not_this_agents_owner(
+    monkeypatch,
+):
+    """DEFECT 2a, closed. The PID is live AND is a real heartbeat daemon — the
+    old probe stopped there and returned True. It runs from another lane's
+    directory, so it is not this claim's holder."""
+    monkeypatch.setattr(cli, "_daemon_cmdline", lambda _p: "python -m mcp_hub.cli heartbeat-daemon")
+    monkeypatch.setattr("os.readlink", lambda _p: "/home/monke/Projects/other-lane")
+
+    # Same pid, same argv, same liveness — only the recorded cwd differs.
+    assert _is_live_daemon(os.getpid(), "/home/monke/Projects/other-lane") is True
+    assert _is_live_daemon(os.getpid(), "/home/monke/Projects/my-lane") is False
+
+
+def test_daemon_alive_for_reports_false_so_self_heal_fires(tmp_path, monkeypatch):
+    """The consequence that matters: with a recycled PID holding the claim, the
+    Stop hook must see 'no daemon' and re-heal, not stay suppressed."""
+    monkeypatch.setenv("MCP_HUB_STATE_DIR", str(tmp_path))
+    _heartbeat_pidfile("alice").write_text(
+        _format_claim(4242, "alice", getcwd=lambda: "/lanes/alice"), encoding="utf-8"
+    )
+    monkeypatch.setattr(cli, "_daemon_cmdline", lambda _p: "mcp-hub heartbeat-daemon")
+
+    with patch("mcp_hub.cli._holder_cwd_matches", return_value=False):
+        assert _daemon_alive_for("alice") is False
+    with patch("mcp_hub.cli._holder_cwd_matches", return_value=True):
+        with patch("os.kill", return_value=None):
+            assert _daemon_alive_for("alice") is True
 
 
 def test_is_live_daemon_rejects_nonpositive_pid():
