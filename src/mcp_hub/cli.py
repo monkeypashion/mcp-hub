@@ -5632,6 +5632,40 @@ def _claim_singleton(agent_name: str, *, getpid=os.getpid) -> pathlib.Path | Non
     return pidfile
 
 
+def _still_owns_singleton(agent_name: str, *, getpid=os.getpid) -> bool:
+    """True if this process may keep beating for `agent_name`.
+
+    The claim is made once at startup, so without this the loop has no way to
+    notice it was displaced: a daemon whose pidfile was taken over (or that
+    never held one, via either fail-open path in `_claim_singleton`) keeps
+    beating forever, and two live daemons end up serving one agent — measured
+    2026-09-19, pids 2528703 and 219469 both beating for
+    slipstream-testlane-dev-vm-1, the older holding no pidfile.
+
+    That matters beyond tidiness: a beat refreshes a binding, and the contract
+    is that a beat must never keep a dead binding warm. An unclaimed daemon
+    beating on behalf of an agent nobody is running is exactly that.
+
+    Checked once per beat, so the cost is one small read a minute.
+
+    - pidfile names us            -> keep running
+    - pidfile missing             -> re-claim it (repairs a fail-open daemon,
+                                     so the NEXT newcomer sees a live owner
+                                     and stands down instead of doubling up)
+    - pidfile names a live daemon -> stand down, the successor owns the agent
+    - pidfile names a dead pid    -> take it over
+    """
+    pidfile = _heartbeat_pidfile(agent_name)
+    try:
+        if int(pidfile.read_text(encoding="utf-8").strip()) == getpid():
+            return True
+    except (FileNotFoundError, ValueError, OSError):
+        pass
+    # Missing, garbage, or someone else's: let the claim logic adjudicate.
+    # It stands down only for a *live* owner, and never against our own pid.
+    return _claim_singleton(agent_name, getpid=getpid) is not None
+
+
 def _release_singleton(pidfile: pathlib.Path, *, getpid=os.getpid) -> None:
     """Remove the pidfile on clean exit, but only if it still names us — so we
     never delete a successor daemon's claim."""
@@ -6225,6 +6259,16 @@ async def _heartbeat_loop(hub_url: str, agent_name: str) -> bool:
                     since_heartbeat = HEARTBEAT_INTERVAL_SECONDS
                     while True:
                         if since_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
+                            # Before the beat, never after: a beat we had no
+                            # standing to send has already refreshed the
+                            # binding by the time we notice.
+                            if not _still_owns_singleton(agent_name):
+                                print(
+                                    "[mcp-hub heartbeat] another daemon owns "
+                                    f"{agent_name}; standing down",
+                                    file=sys.stderr,
+                                )
+                                return False
                             hb_text, send_transcript = await _call_heartbeat(
                                 session, agent_name, send_transcript
                             )

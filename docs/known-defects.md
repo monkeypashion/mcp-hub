@@ -27,7 +27,7 @@ exits non-silently. It never starts a seat on a socket it did not create.
 Class: the negative path that becomes the act — the same shape as `--token ""`
 reaching the real token and parking four live lanes.
 
-## 2. The heartbeat singleton is claimed once and never re-validated
+## 2. The heartbeat singleton is claimed once and never re-validated — ✅ FIXED
 
 **Measured 2026-09-19 on dev-vm-1.** Two live heartbeat daemons served one agent:
 
@@ -37,16 +37,54 @@ pid  219469  started 21:13:21  cwd .../slipstream-testlane  holds the pidfile
 ```
 
 The newcomer took the claim two hours after the incumbent started, and the
-incumbent is still running. `_claim_singleton` is consulted once at startup; the
-loop never re-checks that it still owns its pidfile, so a daemon that loses the
-file (a lane restart removing and recreating it) never notices. *Mechanism is a
-HYPOTHESIS; the two live daemons are measured.*
+incumbent is still running.
+
+**Persistence — now VERIFIED in code, no longer a hypothesis.** `_claim_singleton`
+is called exactly once, at `cli.py` in `heartbeat_daemon_command`, before the loop
+is entered; the loop's `while True` never re-reads the pidfile, and
+`_release_singleton` runs only in the caller's `finally`. So a daemon that loses
+the file cannot notice, by construction.
+
+**Origin — still a hypothesis.** What is NOT explained is how `219469` won a claim
+while `2528703` was alive, since the claim is old-wins and stands down for a live
+owner. The likeliest path: `_claim_singleton` has two *fail-open* returns — the
+`mkdir` `OSError` branch and the retry-exhaustion branch — which return the
+pidfile PATH without ever creating or writing the file. A daemon down either
+branch runs holding no claim, which is exactly `2528703`'s observed state and
+leaves the agent free for the next newcomer. Unproven: no instrument recorded
+which branch ran. (A second, much narrower window exists — `O_EXCL` creates the
+file EMPTY and the PID is written a few instructions later, so a reader inside
+that window sees garbage and treats a live owner as stale. Microseconds wide, and
+these two daemons started two hours apart, so it is not what happened here.)
 
 Why it matters: an unclaimed daemon still beats, and the heartbeat contract is
 that a beat must never keep a dead binding warm.
 
 **Must-fire:** a daemon whose pidfile no longer names it stands down at the next
 beat, and says so.
+
+**Fixed 2026-09-19** by `_still_owns_singleton`, called once per beat **before**
+`_call_heartbeat` — after the beat would be too late, the binding is already warm.
+It resolves three ways, and the middle one is the point:
+
+| pidfile state | action |
+|---|---|
+| names us | keep beating |
+| **missing** | **re-claim it** — repairs a fail-open daemon, so the next newcomer finds a live owner and stands down instead of doubling up |
+| names a live daemon | stand down, log to stderr, return without respawning |
+| names a dead pid | take it over |
+
+Re-claiming rather than standing down on a MISSING file is deliberate: standing
+down there would kill a daemon nobody is competing for. It also closes the
+hypothesised origin without needing to prove which branch produced it.
+
+Covered by `test_loop_stands_down_when_another_daemon_owns_the_agent`
+(tests/test_daemon_reexec.py), which asserts on the recorded tool calls, not just
+the return value — standing down *after* beating would satisfy a return-value
+assertion and still be the defect. The test is bounded by `asyncio.wait_for`
+because without the fix the loop does not fail, it reconnects forever: with the
+check removed the test times out, with it the test returns in ~1s. Both states
+were run.
 
 ### 2a. `_daemon_alive_for` cannot tell WHICH agent a live daemon serves
 
@@ -63,6 +101,14 @@ nothing to read.
 
 **Must-fire:** the pidfile carries the agent name alongside the PID, and the
 liveness check compares the claim against what the holder says it is.
+
+⚠️ **Still OPEN after the §2 fix.** `_still_owns_singleton` re-reads the same
+PID-only pidfile, so it inherits this blind spot exactly: a recycled PID that
+lands on another lane's daemon reads as "a live owner" and would make the
+rightful daemon stand down. Closing it needs the pidfile FORMAT to change
+(`<pid> <agent>`), which touches `_release_singleton`, `_daemon_alive_for` and
+the tests that assert the file's exact contents — deliberately not bundled into
+the §2 fix.
 
 *Reported by `slipstream-dev-vm-1`, who measured the nameless daemon and asked
 rather than deleting the pidfile. Their lane was being served correctly — the

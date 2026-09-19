@@ -33,6 +33,7 @@ from mcp_hub.cli import (
     _sanitize_ident,
     _spawn_daemon_detached,
     _status_cache_path,
+    _still_owns_singleton,
     _write_status_cache,
     build_hook_response,
     build_parser,
@@ -1052,6 +1053,48 @@ def test_claim_singleton_is_race_safe_second_caller_stands_down(tmp_path, monkey
         second = _claim_singleton("alice", getpid=lambda: 2222)
     assert second is None
     assert first.read_text(encoding="utf-8") == "1111"
+
+
+def test_still_owns_singleton_true_for_own_pidfile(tmp_path, monkeypatch):
+    """The ordinary case: we hold the claim, so we keep beating."""
+    monkeypatch.setenv("MCP_HUB_STATE_DIR", str(tmp_path))
+    _claim_singleton("alice", getpid=lambda: 4242)
+    assert _still_owns_singleton("alice", getpid=lambda: 4242) is True
+
+
+def test_still_owns_singleton_false_when_displaced_by_live_daemon(
+    tmp_path, monkeypatch
+):
+    """The measured defect (2026-09-19): a daemon whose pidfile was taken over
+    by a live successor must stand down, not keep beating. Two live daemons
+    were serving slipstream-testlane-dev-vm-1 for two hours this way."""
+    monkeypatch.setenv("MCP_HUB_STATE_DIR", str(tmp_path))
+    _claim_singleton("alice", getpid=lambda: 1111)
+    _heartbeat_pidfile("alice").write_text("2222", encoding="utf-8")
+    with patch("mcp_hub.cli._is_live_daemon", return_value=True):
+        assert _still_owns_singleton("alice", getpid=lambda: 1111) is False
+
+
+def test_still_owns_singleton_reclaims_when_pidfile_missing(
+    tmp_path, monkeypatch
+):
+    """`_claim_singleton` has two fail-open returns that hand back the path
+    without creating the file, so a daemon can run holding no claim at all —
+    which is how a later daemon finds the agent free and doubles up. Re-check
+    repairs that: the unguarded daemon takes the claim it never had."""
+    monkeypatch.setenv("MCP_HUB_STATE_DIR", str(tmp_path))
+    assert not _heartbeat_pidfile("alice").exists()
+    assert _still_owns_singleton("alice", getpid=lambda: 4242) is True
+    assert _heartbeat_pidfile("alice").read_text(encoding="utf-8") == "4242"
+
+
+def test_still_owns_singleton_takes_over_dead_owner(tmp_path, monkeypatch):
+    """A crashed predecessor's pidfile must not strand a running daemon."""
+    monkeypatch.setenv("MCP_HUB_STATE_DIR", str(tmp_path))
+    _heartbeat_pidfile("alice").write_text("9999", encoding="utf-8")
+    with patch("mcp_hub.cli._is_live_daemon", return_value=False):
+        assert _still_owns_singleton("alice", getpid=lambda: 4242) is True
+    assert _heartbeat_pidfile("alice").read_text(encoding="utf-8") == "4242"
 
 
 def test_release_singleton_removes_pidfile_when_owner(tmp_path, monkeypatch):
