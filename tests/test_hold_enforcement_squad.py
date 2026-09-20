@@ -551,3 +551,95 @@ def test_must_fire_an_in_squad_lane_is_still_relaunched(tmp_path):
     p = call(*h, "relaunch_agent lane-a")
     assert "respawn-pane" in (tmp_path / "tmux.log").read_text()
     assert "NOT relaunched" not in p.stdout
+
+
+# --- a hand may start a held lane; heal may not ----------------------------
+#
+# His ruling 2026-09-14: "it should not prevent claude from starting — just
+# stop lanes from working." The brake was gating the PROCESS, so a cockpit
+# restart of a held lane was refused outright and the operator had no
+# terminal until the hour boundary. These pin the seam: `up_one` is the
+# hand's door (the cockpit's `attach` reaches it), `relaunch_agent` is
+# heal's, and only the first one yields.
+
+def _hand_flag(home, agent="lane-a"):
+    return home / ".mcp-hub" / f"hold-hand-started-{agent}"
+
+
+def test_a_hand_may_start_a_held_lane(tmp_path):
+    h = harness(tmp_path, held={"lane-a": held_entry()}, running=True)
+    r = call(*h, 'up_one lane-a')
+    # It must not RETURN at the held check — reaching the session check is
+    # the proof it fell through rather than refusing.
+    assert "starting it anyway" in r.stdout, r.stdout
+    assert "already up" in r.stdout, r.stdout
+    assert "not started" not in r.stdout, r.stdout
+
+
+def test_the_hand_start_says_the_hold_still_stands(tmp_path):
+    """The old line promised the lane would come back by itself. This one
+    must not read as a release — the lane is up and still held."""
+    h = harness(tmp_path, held={"lane-a": held_entry()}, running=True)
+    r = call(*h, 'up_one lane-a')
+    assert "THE HOLD STANDS" in r.stdout, r.stdout
+    assert "does no work until the boundary" in r.stdout, r.stdout
+
+
+def test_the_hand_start_records_this_holds_expiry(tmp_path):
+    h = harness(tmp_path, held={"lane-a": held_entry()}, running=True)
+    home = h[0]
+    call(*h, 'up_one lane-a')
+    flag = _hand_flag(home)
+    assert flag.exists(), "no marker written"
+    stored = flag.read_text().strip()
+    until = json.loads((home / "held.json").read_text())["held"]["lane-a"]["until"]
+    assert stored == str(until), (stored, until)
+
+
+def test_heal_still_refuses_to_relaunch_a_held_lane(tmp_path):
+    """The other door is NOT opened. A hand asking is the whole exception."""
+    h = harness(tmp_path, held={"lane-a": held_entry()}, running=False)
+    r = call(*h, 'relaunch_agent lane-a')
+    assert "heal will not relaunch it" in r.stdout, r.stdout
+    assert "starting it anyway" not in r.stdout, r.stdout
+    assert not _hand_flag(h[0]).exists(), "heal wrote a hand marker"
+
+
+def test_enforce_leaves_a_hand_started_lane_up(tmp_path):
+    """Otherwise the hand's start lasts until the next pass, which reads as a
+    lane that crashed on launch rather than one that was stopped."""
+    h = harness(tmp_path, held={"lane-a": held_entry()},
+                running=True, boundary=True)
+    home = h[0]
+    until = json.loads((home / "held.json").read_text())["held"]["lane-a"]["until"]
+    _hand_flag(home).write_text(str(until))
+    r = call(*h, 'hold_enforce_one lane-a')
+    assert "hand-started under this hold — left up" in r.stdout, r.stdout
+    assert "kill-session" not in (home / "tmux.log").read_text()
+
+
+def test_a_marker_from_an_earlier_hold_does_not_cover_this_one(tmp_path):
+    """The one that keeps a single `up` from disarming every future brake."""
+    h = harness(tmp_path, held={"lane-a": held_entry()},
+                running=True, boundary=True)
+    home = h[0]
+    _hand_flag(home).write_text("1111111111.0")      # a hold that has gone
+    r = call(*h, 'hold_enforce_one lane-a')
+    assert "stopping at its turn boundary" in r.stdout, r.stdout
+    assert "kill-session" in (home / "tmux.log").read_text()
+    assert not _hand_flag(home).exists(), "stale marker survived"
+
+
+def test_stopping_a_lane_spends_its_hand_start(tmp_path):
+    """One `up` must not cover every later stop inside the same hold."""
+    h = harness(tmp_path, held={"lane-a": held_entry()}, running=True)
+    home = h[0]
+    _hand_flag(home).write_text("whatever")
+    call(*h, 'hold_stop_lane lane-a')
+    assert not _hand_flag(home).exists(), "marker survived the stop"
+
+
+def test_an_unheld_lane_writes_no_marker(tmp_path):
+    h = harness(tmp_path, held={}, running=True)
+    call(*h, 'up_one lane-a')
+    assert not _hand_flag(h[0]).exists()

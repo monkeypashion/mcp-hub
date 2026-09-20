@@ -623,6 +623,72 @@ hub_bin() {
   else command -v mcp-hub 2>/dev/null; fi
 }
 
+# ---------------------------------------------------------------------------
+# LIFECYCLE INTENT — the operator's stop must outlive the next reconciler pass.
+#
+# `squad stop` used to kill tmux and retire the daemon, both purely local, and
+# never touch the hub's placement. The placement stayed at desired=running, so
+# edge.py plan() re-planned an `op: start` on its very next pass — 30s+jitter
+# on the timer, or instantly via the edge-watch doorbell. The operator often
+# never saw the seat go down at all: "I keep shutting you down via squad
+# cockpit context command but every time I find you are running again."
+# (Diagnosed by mindconnect-iot2050-dev-vm-1 and routed here 2026-09-17; the
+# stop path is local-only, confirmed first-hand — `placement` appears in this
+# script in comments and error strings ONLY.)
+#
+# An imperative kill wired into a declarative system can never mean "stay
+# down". The fix is to write the DESIRED STATE, which plan() already honours:
+# `desired == "stopped"` plans an `op: stop` when local is running.
+#
+# ⭐ BOTH DIRECTIONS, and that is the whole point. A stop that wrote `stopped`
+# while start left the row alone would not fix the bug, it would MIRROR it:
+# the next hand-start comes up locally against a placement still reading
+# `stopped`, and the reconciler plans `op: stop` against the seat the operator
+# just started. The Start button becomes the one that doesn't stick, with an
+# hour-old Stop as the invisible cause. Write intent at both doors or neither.
+#
+# ⚠️ THE HAND'S DOOR ONLY. `up_one` is where a hand starts a lane; heal's door
+# is `relaunch_agent` and is deliberately NOT wired here. Heal resurrecting a
+# lane is not the operator saying "I want this running", and letting it write
+# desired=running would let heal overturn a stop the operator had just made —
+# the same override this exists to remove, one layer down.
+
+# The hub's placement id for this agent, empty if it has no placement (an
+# ordinary local lane has none), the hub is unreachable, or the cli is absent.
+# REFUSES to guess when the seat name matches more than one row: picking one
+# would write lifecycle intent to an arbitrary machine's seat.
+placement_id() {
+  local hb rows n
+  hb="$(hub_bin)"; [ -n "$hb" ] || return 1
+  rows="$("$hb" placements list 2>/dev/null | awk -v a="$1" '$2 == a { print $1 }')" || return 1
+  [ -n "$rows" ] || return 1
+  n="$(printf '%s\n' "$rows" | wc -l)"
+  if [ "$n" -gt 1 ]; then
+    echo "!! $1: $n placements match that seat — not guessing which to set; use: $(hub_bin) placements list" >&2
+    return 1
+  fi
+  printf '%s' "$rows"
+}
+
+# Write want=running|stopped for this agent's placement, if it has one.
+# FAIL-SOFT AND NEVER FATAL: no placement, an unreachable hub or a missing cli
+# must not stop the local kill/launch the operator is actually watching. It
+# says so out loud when it cannot, because a stop that silently failed to
+# stick is the bug being fixed, not a quieter version of it.
+set_placement_intent() {
+  local a="$1" want="$2" pid hb
+  hb="$(hub_bin)"; [ -n "$hb" ] || return 0
+  pid="$(placement_id "$a")" || return 0
+  if "$hb" placements set "$pid" "$want" >/dev/null 2>&1; then
+    echo "   placement $pid → want=$want (the edge reconciler will hold it there)"
+  else
+    case "$want" in
+      stopped) echo "!! $a: placement $pid NOT set to stopped — the hub still wants it running, so the edge will restart it within ~30s. Set it by hand: $hb placements set $pid stopped" >&2 ;;
+      *)       echo "!! $a: placement $pid NOT set to running — if it still reads stopped the edge will stop this seat again within ~30s. Set it by hand: $hb placements set $pid running" >&2 ;;
+    esac
+  fi
+}
+
 # Epoch seconds when this agent's claude process started (empty if not found).
 # etimes = seconds alive, so start = now - etimes (integer math beats parsing
 # ps lstart date strings).
@@ -963,6 +1029,19 @@ boundary_reached() { # agent -> 0 if its Stop hook stamped a boundary
 # second kind would undo a deliberate act.
 hold_stopped_flag() { echo "$HOME/.mcp-hub/hold-stopped-$(safe_name "$1")"; }
 
+# A HAND started this lane while it was held. The brake's job is to stop a
+# lane BURNING TURNS; it was also making the tmux session unstartable, so
+# until the boundary the operator could not get a terminal on the lane at
+# all — a far wider stop than the one anybody armed, and the reason a
+# cockpit restart was refused with nothing to do but wait for the hour.
+#
+# ⚠️ THE MARKER STORES THE HOLD'S `until`, NOT A BARE FLAG. Keyed to the
+# hold it was written against, it dies with that hold: the NEXT hold has a
+# different expiry, does not match, and enforces normally. A bare flag would
+# disarm the brake for this lane permanently, and a silencer that can be
+# left on forever is the silent-drop shape this codebase has shipped before.
+hold_hand_started_flag() { echo "$HOME/.mcp-hub/hold-hand-started-$(safe_name "$1")"; }
+
 hold_stop_lane() { # the stop itself, one door for both the clean and hard path
   local a="$1"
   # His ruling: a lane outside the squad is never stopped, WHATEVER
@@ -979,15 +1058,31 @@ hold_stop_lane() { # the stop itself, one door for both the clean and hard path
   tm kill-session -t "=$a" 2>/dev/null || true
   kill_daemon "$a"
   rm -f "$HOLD_BOUNDARY_DIR/$a.json" 2>/dev/null || true
+  # The hand's start is spent once the lane is down again: leaving it would
+  # let one `up` cover every later stop inside the same hold.
+  rm -f "$(hold_hand_started_flag "$a")" 2>/dev/null || true
 }
 
 # One held lane. Prints exactly what it did and why; never silent, because a
 # lane that vanishes without a line is indistinguishable from one that died.
 hold_enforce_one() {
-  local a="$1" ha now waited
-  held_until "$a" >/dev/null || return 0           # not held — nothing to do
+  local a="$1" ha now waited hu hs
+  hu="$(held_until "$a")" || return 0              # not held — nothing to do
   tm has-session -t "=$a" 2>/dev/null || return 0  # already down; the skip
   pane_alive "$a" || return 0                      # in up_one covers restart
+
+  # Started by a hand under THIS hold: leave it up. Killing it here would
+  # make the operator's start last exactly until the next pass, which reads
+  # as a lane that crashed on launch rather than one that was stopped.
+  hs="$(cat "$(hold_hand_started_flag "$a")" 2>/dev/null || true)"
+  if [ -n "$hs" ] && [ "$hs" = "$hu" ]; then
+    echo "$a HELD and hand-started under this hold — left up ($(held_reason "$a")). The hold stands; it is expected to do no work until the boundary."
+    return 0
+  fi
+  # A marker from an EARLIER hold covers nothing here — clear it, then
+  # enforce. This is the line that keeps one `up` from disarming every
+  # future brake on the lane.
+  if [ -n "$hs" ]; then rm -f "$(hold_hand_started_flag "$a")" 2>/dev/null || true; fi
 
   if boundary_reached "$a"; then
     # The clean case, and the one his ruling asks for: the lane is between
@@ -2016,11 +2111,25 @@ hold_enforce_pass() {
 up_one() {
   local a="$1" dir hu
   # BEFORE the worktree check and before anything is launched: a held lane
-  # is not a failure, so this returns 0. `up` must not report an error for a
-  # deliberate, recorded, expiring stop.
+  # is not a failure, so this never reports an error for a deliberate,
+  # recorded, expiring stop.
+  #
+  # ⭐ A HAND MAY START A HELD LANE; HEAL MAY NOT (his ruling, 2026-09-14 —
+  # "it should not prevent claude from starting, just stop lanes from
+  # working"). This is the `up` door — the cockpit's `attach` reaches it too,
+  # which is the path a restart from the terminal list takes — while heal's
+  # door is `relaunch_agent`, and that still refuses. Guarding both was
+  # stopping the operator getting a terminal, not stopping a lane working.
+  #
+  # THE HOLD STANDS ACROSS THIS. The session comes up; the lane is expected
+  # to do no work until the boundary, which is bar 69 leg A's own shape — a
+  # notice the lane obeys under the charter. What this removes is the
+  # SECOND, wider stop nobody armed, not the brake.
   if hu="$(held_until "$a")"; then
-    echo "$a HELD until $(date -d "@$hu" '+%H:%M' 2>/dev/null || echo "$hu") — $(held_reason "$a") (not started; releases itself)"
-    return 0
+    mkdir -p "$HOME/.mcp-hub" 2>/dev/null
+    printf '%s' "$hu" > "$(hold_hand_started_flag "$a")" 2>/dev/null || true
+    echo "$a HELD until $(date -d "@$hu" '+%H:%M' 2>/dev/null || echo "$hu") — $(held_reason "$a")"
+    echo "   …starting it anyway on a hand's ask. THE HOLD STANDS: the session comes up, the lane does no work until the boundary, and heal will not restart it."
   fi
   dir="$(untilde "$(field "$a" 2)")"
   [ -d "$dir" ] || { echo "!! $a: missing worktree $dir"; return 1; }
@@ -2046,6 +2155,9 @@ up_one() {
   tm set -g set-titles on 2>/dev/null || true
   tm set -g set-titles-string '#T' 2>/dev/null || true
   if [ $# -ge 2 ]; then launch_agent_cmd "$a" "$2"; else launch_agent_cmd "$a"; fi
+  # A hand started this lane — say so to the hub, or the reconciler will stop
+  # it again on the next pass if the placement still reads `stopped`.
+  set_placement_intent "$a" running
 }
 
 org_alias() {
@@ -3793,6 +3905,8 @@ case "${1:-help}" in
             if ! tm has-session -t "=$a" 2>/dev/null; then echo "$a already down"; exit 0; fi
             tm kill-session -t "=$a"
             kill_daemon "$a"
+            # The local kill alone is what let the edge bring it straight back.
+            set_placement_intent "$a" stopped
             echo "stopped $a (conversation kept — resume with: $CMD start $a  or  $CMD restart $a --resume)" ;;
   down)     tm kill-server 2>/dev/null || true
             # The keep-alive daemons are detached (they outlive tmux), so kill
