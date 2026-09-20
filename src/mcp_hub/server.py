@@ -4691,12 +4691,12 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         """
         if card_id:
             return conn.execute(
-                "SELECT id, ask, source FROM decisions "
+                "SELECT id, ask, source, raw FROM decisions "
                 "WHERE agent=? AND id=? AND status='open'",
                 (agent, card_id),
             ).fetchone()
         return conn.execute(
-            "SELECT id, ask, source FROM decisions WHERE agent=? "
+            "SELECT id, ask, source, raw FROM decisions WHERE agent=? "
             "AND status='open' ORDER BY updated_at DESC, id DESC",
             (agent,),
         ).fetchone()
@@ -4781,6 +4781,19 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         if open_row:
             old = set((open_row["ask"] or "").lower().split())
             new = set(f["ask"].lower().split())
+            if not old or not new:
+                # An unparsed card stores ask="" BY DESIGN — parse_decision_card
+                # is tolerant so a fumbled card is kept, not dropped. But an
+                # empty set made `different` False by the bool() guards below,
+                # and False is the arm that OVERWRITES IN PLACE. So the one
+                # card whose text no parsed field records was the one the
+                # ledger destroyed, however unrelated the two asks were: an
+                # ASK-less card could never supersede, and an ASK-less open
+                # row could never BE superseded. Compare the raw bodies
+                # instead — the same question asked of both sides, and a card
+                # the parser could not read is still a card a reader can.
+                old = set((open_row["raw"] or "").lower().split())
+                new = set(card.lower().split())
             different = (
                 bool(old) and bool(new)
                 and len(old & new) / len(old | new) < 0.5
