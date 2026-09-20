@@ -7,11 +7,11 @@ would be caught by.
 
 | # | Defect | State |
 |---|---|---|
-| 1 | `tests/test_seat_hold.py` fails open onto the shared fleet socket | **OPEN** |
+| 1 | `tests/test_seat_hold.py` fails open onto the shared fleet socket | ✅ fixed 2026-09-19 |
 | 2 | Heartbeat singleton claimed once, never re-validated | ✅ fixed 2026-09-19 |
 | 2a | A PID alone cannot say whose daemon it is | ✅ fixed 2026-09-19 |
 
-## 1. `tests/test_seat_hold.py` fails OPEN onto the shared fleet socket
+## 1. `tests/test_seat_hold.py` fails OPEN onto the shared fleet socket — ✅ FIXED
 
 **Measured 2026-09-18.** On a tree that does not carry `d3c76a0` ("the hold suite
 was starting real seats on the fleet's own socket"), running
@@ -28,11 +28,93 @@ with the deselection stated on its face — it is NOT a clean full suite.
 is a live-fleet act. The fix belongs on the TEST, never on whichever branch
 happens to carry `d3c76a0`.
 
-**Must-fire:** on a tree without `d3c76a0`, the test SKIPS with a named reason and
-exits non-silently. It never starts a seat on a socket it did not create.
+⚠️ **The fix below is on `feat/hold-kind-and-owner`, not on master.** Until it
+lands, `pytest tests/test_seat_hold.py` on a master-based tree is still the
+live-fleet act described above — the ✅ in the table is the state of THIS branch.
+The verification runs quoted below were all made on a tree carrying both
+`d3c76a0` and the fix, and the socket snapshot on either side of the full suite
+is what says so.
+
+**Must-fire:** a `squad` subprocess started by this file cannot reach the fleet's
+tmux socket or a real `tmux`, and a test that forgets to contain itself FAILS
+rather than acting.
+
+⚠️ **The must-fire was reworded 2026-09-19, and the original was wrong.** It read
+"on a tree without `d3c76a0`, the test SKIPS with a named reason". No change to
+this file can satisfy that: `_stub_bin` and `_env` live IN the file, so a tree
+without `d3c76a0` has an older copy with no guard to skip on — and a tree without
+the fix below has no fix either. The clause named a tree, when the invariant is
+about a subprocess. The second sentence, "never starts a seat on a socket it did
+not create", was the real criterion all along and is what the fix is judged
+against.
 
 Class: the negative path that becomes the act — the same shape as `--token ""`
 reaching the real token and parking four live lanes.
+
+**Measured, not assumed (2026-09-19).** `squad/squad:17` reads
+`SOCK="${SQUAD_SOCKET:-squad}"`, and `_env` never set it. Logging the stub's own
+argv through a full `squad start lane-a`:
+
+```
+without SQUAD_SOCKET:  -L squad          <- the live fleet's socket
+with    SQUAD_SOCKET:  -L squad-test-<h> <- a socket this test owns
+```
+
+and the calls on that socket are `new-session -d -s lane-a` followed by
+`send-keys -t lane-a -l claude --continue`. That is the act, not a risk of it.
+
+(Field 5 of the conf — `squad` in `lane-a|<dir>||--continue|squad` — is the lane
+CLASS, read at `squad/squad:3518`, not the socket. An earlier note of mine said
+otherwise; the socket only ever came from the environment.)
+
+**Fixed 2026-09-19** with two containments and one rule that enforces them:
+
+| containment | what it stops |
+|---|---|
+| `SQUAD_SOCKET` set to a per-tmpdir private name in `_env` | a session appearing on the fleet's socket |
+| the stub `tmux` first on `PATH` (`_stub_bin`, unchanged) | a real `claude --continue` existing at all |
+| **`contain_squad_subprocesses`**, an **autouse** fixture hooking `subprocess.Popen.__init__` | a test that forgets either one |
+
+The guard is the actual fix. Both containments are properties of one helper, and
+the defect was never that the helper was wrong — it was that using the helper is a
+CONVENTION, and a test added later can build its own env and miss it in silence.
+The fixture refuses any spawn naming `squad/squad` whose env does not name a
+private socket, or whose `PATH` resolves `tmux` outside the test's own tmpdir.
+Forgetting now costs an assertion at the moment of the call, before the process
+starts.
+
+It hooks `Popen.__init__` rather than `subprocess.run`, because `run`, `call`,
+`check_call` and `check_output` all funnel through `Popen` — one hook covers
+every door, including a bare `Popen`, which is the door a `run`-shaped guard
+would have missed (`test_the_guard_catches_a_bare_Popen_too`). Patching the
+METHOD rather than rebinding the name keeps `isinstance(x, subprocess.Popen)`
+true for the rest of the process while the fixture is installed.
+
+**The residue is still on the box.** A session named `lane-a`, created
+**2026-09-06 19:10:51 UTC**, is still on the fleet socket — a real seat a green
+suite left behind fourteen days ago, in a tmpdir that no longer exists. It is
+present in the before-snapshot of the verification run below and unchanged by it.
+Left in place deliberately: killing a session this file did not create is a
+live-fleet act, and it is the clearest evidence the defect was never theoretical.
+
+**Verified on the full suite, nothing deselected.** `2841 passed in 861.95s`
+(2835 + the 6 tests added here), `ruff check src tests` clean. The tmux socket
+list was snapshotted on either side: identical, only `squad`, and no
+`squad-test-*` socket was ever created — the stub means no real tmux runs, so
+the private socket never has to exist. The fleet's own session list went 27 → 29,
+and both additions (`features-json-dev-vm-1` at 01:01:40, `reliable-ai-dev-vm-1`
+at 01:01:46) are the bar 69 brake releasing two held lanes at an hour boundary
+83 minutes AFTER the suite ended at 23:38:33 — not this suite. Attribution
+checked rather than assumed; a count alone would have read as two new seats.
+
+**Non-vacuousness was run, both ways.** Deleting `SQUAD_SOCKET` from `_env` fails
+`test_squad_refuses_to_start_a_held_lane` in 1.4s with the guard's message and no
+subprocess started; demoting the fixture off `autouse` fails
+all four guard tests, one of them on the bare-`Popen` door. The guard tests invoke
+`/nonexistent/bash` on purpose, so that if the guard ever stops firing they raise
+`FileNotFoundError` instead of running squad for real — which is what they did in
+the demoted run. `test_the_guard_lets_a_contained_run_through` is the negative
+control against a guard that simply refuses everything.
 
 ## 2. The heartbeat singleton is claimed once and never re-validated — ✅ FIXED
 

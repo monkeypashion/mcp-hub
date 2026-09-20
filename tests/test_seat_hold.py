@@ -17,7 +17,9 @@ carries its own expiry.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -126,9 +128,128 @@ def _stub_bin(tmp_path):
     return bindir
 
 
+FLEET_SOCKET = "squad"
+REAL_TMUX = shutil.which("tmux")
+
+
+def _private_socket(tmp_path) -> str:
+    """A tmux socket name this test OWNS, derived from its own tmpdir."""
+    digest = hashlib.sha1(str(tmp_path).encode("utf-8")).hexdigest()[:12]
+    return f"squad-test-{digest}"
+
+
 def _env(tmp_path, conf, heldf):
     return {"PATH": f"{_stub_bin(tmp_path)}:/usr/bin:/bin", "HOME": str(tmp_path),
-            "SQUAD_CONF": str(conf), "MCP_HUB_HELD_FILE": str(heldf)}
+            "SQUAD_CONF": str(conf), "MCP_HUB_HELD_FILE": str(heldf),
+            # squad reads SOCK="${SQUAD_SOCKET:-squad}" (squad/squad:17), so
+            # UNSET means the fleet's own socket and the stub above is the
+            # only thing between this suite and a real seat. Measured
+            # 2026-09-19 by logging the stub's argv: without this line the
+            # calls are `-L squad new-session -d -s lane-a` followed by
+            # `send-keys ... claude --continue`. Two containments now, and
+            # contain_squad_subprocesses enforces both.
+            "SQUAD_SOCKET": _private_socket(tmp_path)}
+
+
+# --- defect #1: containment that is a RULE, not a habit --------------------
+#
+# _stub_bin and the private socket above are conventions of one helper. A
+# test added to this file can build its own env, miss either, and start a
+# real `lane-a` beside the live fleet while the suite reports green — which
+# is exactly what happened for the weeks before d3c76a0. The guard below
+# fires at the moment of the call instead, so forgetting costs an assertion.
+
+
+def _names_squad(cmd) -> bool:
+    return isinstance(cmd, (list, tuple)) and str(SQUAD) in [str(c) for c in cmd]
+
+
+def _check_run_is_contained(cmd, env, tmp_path) -> None:
+    """Refuse a `squad` subprocess that could act outside this test."""
+    if not _names_squad(cmd):
+        return
+    env = env or {}
+    sock = env.get("SQUAD_SOCKET")
+    assert sock and sock != FLEET_SOCKET, (
+        f"squad subprocess with SQUAD_SOCKET={sock!r}: this run would act on "
+        f"the fleet's own tmux socket {FLEET_SOCKET!r}. Build the env with "
+        "_env(), which names a socket this test owns."
+    )
+    found = shutil.which("tmux", path=env.get("PATH", ""))
+    assert found is None or Path(found).is_relative_to(tmp_path), (
+        f"squad subprocess whose PATH resolves tmux to {found!r}, outside "
+        f"{tmp_path}: a real tmux here starts a real seat. Use _env(), which "
+        "puts the inert stub first."
+    )
+
+
+@pytest.fixture(autouse=True)
+def contain_squad_subprocesses(monkeypatch, tmp_path):
+    """Autouse on purpose — a guard you have to remember IS the defect.
+
+    Hooked on `Popen.__init__`, not on `subprocess.run`: `run`, `call`,
+    `check_call` and `check_output` all funnel through Popen, so one hook
+    covers every way a later test might spawn squad, including a bare
+    `Popen`. Patching the method rather than rebinding the NAME keeps
+    `isinstance(x, subprocess.Popen)` working for everything else in the
+    process while the fixture is installed.
+    """
+    real_init = subprocess.Popen.__init__
+
+    def guarded_init(self, args, *a, **kw):
+        _check_run_is_contained(args, kw.get("env"), tmp_path)
+        real_init(self, args, *a, **kw)
+
+    guarded_init._squad_containment_guard = True
+    monkeypatch.setattr(subprocess.Popen, "__init__", guarded_init)
+
+
+def test_the_containment_guard_is_installed():
+    """Drop the autouse fixture and this fails, rather than the fleet
+    quietly gaining a session nobody connects to this suite."""
+    assert getattr(subprocess.Popen.__init__, "_squad_containment_guard", False)
+
+
+def test_the_guard_catches_a_bare_Popen_too(tmp_path):
+    """`run` is the shape a forgetful test would copy, but it is not the
+    only door — hooking Popen is what makes that irrelevant."""
+    with pytest.raises(AssertionError, match="fleet's own tmux socket"):
+        subprocess.Popen(["/nonexistent/bash", str(SQUAD), "start", "lane-a"],
+                         env={"PATH": "/usr/bin:/bin"})
+
+
+def test_the_guard_refuses_a_run_aimed_at_the_fleet_socket(tmp_path):
+    # /nonexistent/bash on purpose: if the guard ever stops firing this
+    # raises FileNotFoundError instead of running squad for real.
+    with pytest.raises(AssertionError, match="fleet's own tmux socket"):
+        subprocess.run(["/nonexistent/bash", str(SQUAD), "start", "lane-a"],
+                       env={"PATH": "/usr/bin:/bin"})
+
+
+@pytest.mark.skipif(REAL_TMUX is None, reason="no system tmux to guard against")
+def test_the_guard_refuses_a_run_that_can_reach_the_system_tmux(tmp_path):
+    """A private socket alone is not enough — a real tmux still spawns a
+    real `claude --continue`, just somewhere harder to find."""
+    with pytest.raises(AssertionError, match="outside"):
+        subprocess.run(["/nonexistent/bash", str(SQUAD), "start", "lane-a"],
+                       env={"PATH": str(Path(REAL_TMUX).parent),
+                            "SQUAD_SOCKET": _private_socket(tmp_path)})
+
+
+def test_the_guard_lets_a_contained_run_through(tmp_path):
+    """Negative control: the guard must not simply refuse everything."""
+    _check_run_is_contained(
+        ["bash", str(SQUAD), "start", "lane-a"],
+        _env(tmp_path, tmp_path / "squad.conf", tmp_path / "held.json"),
+        tmp_path,
+    )
+
+
+def test_the_socket_and_the_tmux_are_this_tests_own(tmp_path):
+    """_env's two containments, stated as a fact rather than a habit."""
+    env = _env(tmp_path, tmp_path / "squad.conf", tmp_path / "held.json")
+    assert env["SQUAD_SOCKET"] != FLEET_SOCKET
+    assert Path(shutil.which("tmux", path=env["PATH"])).is_relative_to(tmp_path)
 
 
 def run_squad(tmp_path, held: dict | None, agent="lane-a", verb="start"):
