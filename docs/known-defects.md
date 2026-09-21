@@ -10,6 +10,8 @@ would be caught by.
 | 1 | `tests/test_seat_hold.py` fails open onto the shared fleet socket | ✅ fixed 2026-09-19 |
 | 2 | Heartbeat singleton claimed once, never re-validated | ✅ fixed 2026-09-19 |
 | 2a | A PID alone cannot say whose daemon it is | ✅ fixed 2026-09-19 |
+| 3 | `mcp-hub-seat:latest` is a stale pin; capsule export bakes it | 🔴 open |
+| 4 | `placements set` 404s on a seat with no placement row | 🔴 open |
 
 ## 1. `tests/test_seat_hold.py` fails OPEN onto the shared fleet socket — ✅ FIXED
 
@@ -222,3 +224,57 @@ everything.
 *Reported by `slipstream-dev-vm-1`, who measured the nameless daemon and asked
 rather than deleting the pidfile. Their lane was being served correctly — the
 suppressed self-heal there is right, not a defect.*
+
+## 3. `mcp-hub-seat:latest` resolves to the OLDEST image, and the capsule export bakes it — 🔴 OPEN
+
+**Reported by `slipstream-dev-vm-1` 2026-09-21, reproduced here the same day.**
+On dev-vm-1 the `latest` tag and the six-week-old `2026-08-08j` tag are the
+**same image id**, while the newest build carries a date tag and no `latest`:
+
+```
+2026-08-12   3616b0db0404   <- newest build
+2026-08-08j  7c3ac7f3e520
+latest       7c3ac7f3e520   <- same id as 2026-08-08j
+```
+
+So anything that names `latest` silently runs software six weeks behind the
+newest image, and `docker ps` reports it healthy — the failure has no symptom
+at the substrate. A date-tagged build that never moved `latest` is the cause;
+`latest` is not a floating alias here, it is a stale pin.
+
+⚠️ **Worse than the hand-run case it was found in.** `api_v1.py:2227` writes
+`"image": "mcp-hub-seat:latest"` into the **capsule compose export**, so every
+capsule bootstrapped from the hub inherits the stale pin on a machine that may
+never have held the newer image at all. The reporter hit this by hand; the
+generated path hits it unattended.
+
+**Must-fire:** a seat materialized from a spec that names no explicit tag runs
+the newest image present, or the write REFUSES and names the tag it wanted. A
+generated artifact must not name a mutable tag whose meaning is set by whoever
+last ran `docker tag` on one machine.
+
+Class: the instrument that reports normal — same family as `enabled` and
+`firing` not being `working`. A stale pin and a current one are
+indistinguishable from outside the container.
+
+## 4. `placements set <id> ran` 404s on a newly declared seat, and the help text does not say why — 🔴 OPEN
+
+**Reported by `slipstream-dev-vm-1` 2026-09-21; cost them a run.**
+`seats add` creates a seat row and **no placement row**. `placements set`
+updates an existing placement, so on a fresh seat it 404s. Creating the
+placement needs the `--seat/--machine/--substrate/--desired` form.
+
+The 404 is correct — the row genuinely is not there — but it names the symptom
+and not the missing step, and nothing in `seats add`'s output or `placements`'
+help says a second call is required. A two-step declaration that reads as one
+step is a trap that only fires on the FIRST use of each seat, i.e. exactly when
+the operator has least context to interpret it.
+
+Adjacent, same family, worth fixing together: `POST /api/v1/placements` 404s
+`no machine '<name>'` when the machine is not enrolled (`api_v1.py`, the
+`api_machines WHERE name = ? AND archived = 0` check). Same shape — a real
+missing precondition reported as a bare 404.
+
+**Must-fire:** a `placements set` against a seat with no placement row says the
+row is missing and names the form that creates one; it does not return a bare
+404 that reads as "no such seat".
