@@ -2256,8 +2256,20 @@ def hibernate_command(args: argparse.Namespace) -> int:
         print(f"  {w}park    {lane}" if rep.dry else f"  parked   {lane}")
     for lane in rep.re_held:
         print(f"  {w}re-hold {lane}" if rep.dry else f"  re-held  {lane}")
+    # 🔴 THE ARM, ON EVERY RELEASE LINE. Three different events print here
+    # — the stated condition, a check nobody could read, and the clock — and
+    # exactly one of them is bar 59's clause. A line that says only
+    # "released" is the reading that let three releases be quoted as three
+    # assignments. Never partition these on how FAST they arrived.
     for lane in rep.released:
-        print(f"  would release {lane}" if rep.dry else f"  released {lane}")
+        arm = rep.arms.get(lane, "?")
+        print(f"  would release {lane} [{arm}]" if rep.dry
+              else f"  released {lane} [{arm}]")
+    # ⭐ The holds this pass deliberately LEFT STANDING: the console looked
+    # and the lane owns no open bar. A lane that merely took a turn is here,
+    # and before 2026-09-21 it would have been in the released list above.
+    for lane in rep.standing:
+        print(f"  still held {lane} — no open bar yet (the hold stands)")
     for lane in rep.refused:
         print(f"  REFUSED  {lane}")
     # 🔴 THE ANSWER ITSELF, in the report-only pass. Every count above reads
@@ -8433,11 +8445,15 @@ def build_parser() -> argparse.ArgumentParser:
             "console never holds anyone), place a `kind=hibernation` hold "
             "owned by `hibernation-scanner` on each candidate, RE-hold the "
             "ones still listed as a fresh entry after a fresh query (never "
-            "an expiry bump), and release the ones that have dropped off — "
-            "which is what 'release on bar assignment' looks like from "
-            "here. An unreadable candidate list does NOTHING, not even "
-            "releases: with no list every held lane looks like a "
-            "non-candidate, and a blip would unpark the fleet."
+            "an expiry bump), and release a held lane on ONE of three arms: "
+            "the console says it owns an open bar (condition-met), the check "
+            "could not be made at all (condition-unreadable), or the hold "
+            "reached its TTL. A NOMINATION LIST IS NOT A RELEASE SIGNAL — a "
+            "lane that merely dropped off the list, or merely took a turn, "
+            "STAYS HELD; that was the defect ruled on 2026-09-21. An "
+            "unreadable candidate list does NOTHING, not even releases: with "
+            "no list every held lane looks like a non-candidate, and a blip "
+            "would unpark the fleet."
         ),
     )
     hib.add_argument(

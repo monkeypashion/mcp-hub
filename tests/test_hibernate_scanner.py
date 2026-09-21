@@ -12,10 +12,15 @@ import pytest
 
 from mcp_hub import hibernate
 from mcp_hub.hibernate import (
+    ARM_CONDITION,
+    ARM_TTL,
+    ARM_UNREADABLE,
     CAUSE_FROM_CONSOLE,
+    CAUSE_FROM_SCANNER,
     CAUSE_UNRECORDED,
     KIND,
     OWNER,
+    TTL_MARGIN_SECONDS,
     TTL_SECONDS,
     ConsoleAPI,
     HubHolds,
@@ -81,9 +86,11 @@ class FakeHub:
             "release_condition": release_condition,
             "kind": KIND, "owner": OWNER})
 
-    def release(self, seat, *, cause="", cause_source=CAUSE_UNRECORDED):
+    def release(self, seat, *, cause="", cause_source=CAUSE_UNRECORDED,
+                arm=ARM_UNREADABLE):
         self._append(seat, "release", {
-            "owner": OWNER, "cause": cause, "cause_source": cause_source})
+            "owner": OWNER, "cause": cause, "cause_source": cause_source,
+            "release_arm": arm})
 
     # -- what the tests read --------------------------------------------
     def holds(self, seat):
@@ -97,7 +104,7 @@ class FakeHub:
                 if a["kind"] == "release"]
 
 
-def held_by_scanner(until=NOW + 600):
+def held_by_scanner(until=NOW + TTL_SECONDS):
     return {"until": until, "kind": KIND, "owner": OWNER,
             "reason": "nothing open", "release_condition": "a bar lands"}
 
@@ -157,23 +164,109 @@ def test_every_pass_asks_the_console_again():
     assert console.asked == 2, "a pass re-held without re-asking"
 
 
-# --- release ----------------------------------------------------------------
+# --- release: THE RULED PREDICATE -------------------------------------------
+#
+# 🔴 The deputy's ruling, 2026-09-21, his word under #465: A NOMINATION LIST
+# IS NOT A RELEASE SIGNAL. The hold states a release condition; releasing
+# because the lane fell off somebody else's candidate list answers a
+# different question, so the hold would not mean what it said.
+#
+# THE MUST-FIRE GATE, verbatim from the ruling and the whole reason this
+# section was rewritten: "a held lane that merely TAKES A TURN (writes its
+# transcript, reads its notice, answers) must NOT be released by the next
+# pass; a held lane that is ASSIGNED AN OPEN BAR must be." Before today
+# those two produced the same outcome, which is why the clause was never
+# observed in 3 holds and 3 automatic releases.
+#
+# ⚠️ AND THE CONFOUND IS IN THE TESTS, NOT THE FOOTNOTES. squad-proxy's
+# cache fix makes releases FASTER while the predicate stays wrong, so every
+# test below discriminates on the recorded ARM and never on latency or on
+# which pass a thing happened in. `NOW` is frozen and identical across the
+# two halves of the gate on purpose.
 
-def test_a_lane_that_stopped_being_a_candidate_is_RELEASED():
-    """'Release on bar assignment', as it actually happens: the bar lands,
-    the console stops listing the lane, the next pass lets it go."""
+# What the console says about a held lane that woke up and took a turn: it
+# is off the candidate list (its quiet clock reset), it is in `left_out`,
+# and it owns NOTHING. Copied from the shape the live console emitted on
+# 2026-09-20 for all three lanes it parked.
+TOOK_A_TURN = {"lane": "lane-a", "bars_open": 0,
+               "why": ("ACTIVE BUT UNOWNED — a main-session response 176s "
+                       "ago (quiet < 60 min) — never mid-turn (bar 59)")}
+GOT_A_BAR = {"lane": "lane-a", "bars_open": 3, "why": "owns an open bar here"}
+
+
+def test_a_held_lane_that_merely_TOOK_A_TURN_is_NOT_released():
+    """MUST-FIRE, half one — and the defect this whole change exists for.
+
+    The hold GUARANTEES the lane a turn: `held_notice` is rebuilt at every
+    Stop boundary and a held lane is the one path that bypasses the loop
+    backstop, so it costs a turn each time. That turn writes the transcript,
+    the write resets the quiet clock that nominated the lane, and the old
+    predicate read the resulting absence as "the bar landed". The hold
+    manufactured the evidence that disqualified it — 3 times out of 3 on
+    2026-09-20, which is a mechanism working as built, not a rare event.
+    """
     hub = FakeHub(["lane-a"], existing={"lane-a": held_by_scanner()})
-    rep = run(FakeConsole([]), hub)
-    assert rep.released == ["lane-a"]
-    assert hub.writes("lane-a")[-1] == "release"
+    rep = run(FakeConsole([], left_out=[TOOK_A_TURN]), hub)
+
+    assert rep.released == [], "a lane was unparked for taking a turn"
+    assert rep.standing == ["lane-a"], "the standing hold is not reported"
+    assert hub.releases("lane-a") == [], "a release reached the hub"
+    assert hub.writes("lane-a") == ["hold"], "only the pre-existing hold"
+
+
+def test_a_held_lane_ASSIGNED_AN_OPEN_BAR_is_released_on_the_stated_condition():
+    """MUST-FIRE, half two — bar 59's actual clause, and the arm is the
+    evidence. `bars_open >= 1` is the console STATING the condition, not the
+    scanner inferring it from an absence."""
+    hub = FakeHub(["lane-a"], existing={"lane-a": held_by_scanner()})
+    rep = run(FakeConsole([], left_out=[GOT_A_BAR]), hub)
+
+    assert rep.released == ["lane-a"] and rep.standing == []
+    assert rep.arms["lane-a"] == ARM_CONDITION
+    args = hub.releases("lane-a")[-1]["args"]
+    assert args["release_arm"] == ARM_CONDITION
+    assert args["cause"] == "owns an open bar here"
+    assert args["cause_source"] == CAUSE_FROM_CONSOLE
+
+
+def test_the_two_MUST_FIRE_halves_are_told_apart_by_the_ARM_not_by_TIMING():
+    """⚠️ The confound, written into the test. Both lanes are held, both are
+    off the candidate list, both are judged in the SAME pass at the SAME
+    `NOW` — so nothing about when or how fast can separate them. Only the
+    recorded arm can, which is exactly why a shortened release gap is not
+    evidence of anything here and nobody may quote it as progress."""
+    hub = FakeHub(["lane-a", "lane-b"],
+                  existing={"lane-a": held_by_scanner(),
+                            "lane-b": held_by_scanner()})
+    rep = run(FakeConsole([], left_out=[
+        dict(TOOK_A_TURN, lane="lane-a"),
+        dict(GOT_A_BAR, lane="lane-b")]), hub)
+
+    assert rep.standing == ["lane-a"] and rep.released == ["lane-b"]
+    assert rep.arms == {"lane-b": ARM_CONDITION}
+
+
+def test_dropping_off_the_candidate_list_is_NOT_ITSELF_a_release():
+    """The ruling in one assertion, and the replacement for the test that
+    used to assert the opposite under the name
+    `test_a_lane_that_stopped_being_a_candidate_is_RELEASED`. The lane is
+    absent from `candidates[]` in both of these; what decides is what the
+    console SAYS about it, never the absence."""
+    def outcome(row):
+        hub = FakeHub(["lane-a"], existing={"lane-a": held_by_scanner()})
+        rep = run(FakeConsole([], left_out=[row]), hub)
+        return rep.released, rep.standing
+
+    assert outcome(TOOK_A_TURN) == ([], ["lane-a"])
+    assert outcome(GOT_A_BAR) == (["lane-a"], [])
 
 
 def test_the_release_records_the_CONSOLES_OWN_WORDS_for_why():
-    """Bar 59's clause is "released ... WHEN IT IS ASSIGNED AN OPEN BAR", and
-    a release row carrying only `owner` cannot say whether that is what
-    happened. The console already states the reason; the release copies it
-    VERBATIM, so a later reader partitions on the console's sentence and not
-    on this scanner's opinion of itself."""
+    """The `cause` field (2026-09-07) is the only reason any of this was
+    distinguishable: a release row carrying only `owner` cannot say whether
+    the clause fired. The console states the reason; the release copies it
+    VERBATIM, so a later reader partitions on the console's sentence and the
+    arm rather than on this scanner's opinion of itself."""
     hub = FakeHub(["lane-a"], existing={"lane-a": held_by_scanner()})
     console = FakeConsole([], left_out=[
         {"lane": "lane-a", "why": "owns an open bar here", "bars_open": 3}])
@@ -183,26 +276,62 @@ def test_the_release_records_the_CONSOLES_OWN_WORDS_for_why():
     assert args["owner"] == OWNER
     assert args["cause"] == "owns an open bar here", "the words were not copied"
     assert args["cause_source"] == CAUSE_FROM_CONSOLE
+    assert args["release_arm"] == ARM_CONDITION
 
 
 def test_a_release_the_console_DID_NOT_EXPLAIN_says_so_and_does_not_guess():
-    """The negative control, and the whole point of the field: a lane that
-    vanished from BOTH lists is still released — releasing stays the safe
-    direction — but the row must not read as an assignment. Empty and never
-    are the same bytes unless something says which."""
+    """A lane that vanished from BOTH lists is still released — ambiguity
+    releases, because a lane stranded on a reason nobody can read is the
+    failure the ruling refused to trade the old defect for. But the row must
+    not read as an assignment. Empty and never are the same bytes unless
+    something says which, and here two things do."""
     hub = FakeHub(["lane-a"], existing={"lane-a": held_by_scanner()})
     rep = run(FakeConsole([]), hub)          # left_out empty: nobody said why
     assert rep.released == ["lane-a"], "an unexplained lane was left parked"
+    assert rep.arms["lane-a"] == ARM_UNREADABLE
     args = hub.releases("lane-a")[-1]["args"]
     assert args["cause"] == ""
     assert args["cause_source"] == CAUSE_UNRECORDED
+    assert args["release_arm"] == ARM_UNREADABLE
+
+
+def test_a_row_with_NO_bars_open_is_UNREADABLE_and_never_read_as_zero():
+    """🔴 ABSENT IS NOT ZERO. Zero keeps a hold standing; absent frees the
+    lane. The live console emits rows of exactly this shape — "owns a bar
+    blocked until a date/bar — still work" carries no count at all — and
+    reading that prose instead of the field would be a check written against
+    the wrong surface of the same answer."""
+    hub = FakeHub(["lane-a"], existing={"lane-a": held_by_scanner()})
+    rep = run(FakeConsole([], left_out=[
+        {"lane": "lane-a",
+         "why": "owns a bar blocked until a date/bar — still work"}]), hub)
+
+    assert rep.released == ["lane-a"] and rep.standing == []
+    args = hub.releases("lane-a")[-1]["args"]
+    assert args["release_arm"] == ARM_UNREADABLE
+    # The words still travel, and they still come from the console.
+    assert args["cause"].startswith("owns a bar blocked")
+    assert args["cause_source"] == CAUSE_FROM_CONSOLE
+
+
+@pytest.mark.parametrize("value", ["3", None, 3.0, True, False, [3]])
+def test_a_bars_open_THAT_IS_NOT_AN_INTEGER_is_unreadable(value):
+    """Including the booleans, which are `int` in Python: `True` would read
+    as one bar and `False` as none — an answer, from a field that gave none.
+    A string "3" is not coerced either; a count this mechanism had to parse
+    twice is a count it could parse wrongly once."""
+    hub = FakeHub(["lane-a"], existing={"lane-a": held_by_scanner()})
+    rep = run(FakeConsole([], left_out=[
+        {"lane": "lane-a", "why": "who knows", "bars_open": value}]), hub)
+
+    assert rep.released == ["lane-a"], "an unreadable count kept a lane parked"
+    assert rep.arms["lane-a"] == ARM_UNREADABLE
 
 
 def test_a_cause_that_is_NOT_an_assignment_is_carried_unchanged():
-    """The scanner releases whoever stopped being a candidate for ANY cause.
-    An exemption change is not a bar landing, and the row has to keep them
-    apart — otherwise six releases read as six assignments, which is exactly
-    the reading this field exists to refuse."""
+    """An exemption change is not a bar landing, and the row has to keep
+    them apart — otherwise six releases read as six assignments, which is
+    the reading the cause field exists to refuse and the arm now settles."""
     hub = FakeHub(["lane-a"], existing={"lane-a": held_by_scanner()})
     console = FakeConsole([], left_out=[
         {"lane": "lane-a", "why": "exempt seat"}])
@@ -210,6 +339,68 @@ def test_a_cause_that_is_NOT_an_assignment_is_carried_unchanged():
     args = hub.releases("lane-a")[-1]["args"]
     assert args["cause"] == "exempt seat"
     assert args["cause_source"] == CAUSE_FROM_CONSOLE
+    assert args["release_arm"] != ARM_CONDITION
+
+
+# --- release: the clock -----------------------------------------------------
+
+def test_a_hold_whose_condition_stays_unmet_is_ENDED_BY_THE_TTL():
+    """The third arm, and the ruling's own consequence: with "fell off the
+    list" gone as a release signal, the TTL is the only thing that frees a
+    lane the console readably says owns no bar. A hold must never be harder
+    to leave than to enter."""
+    hub = FakeHub(["lane-a"], existing={
+        "lane-a": held_by_scanner(until=NOW + TTL_MARGIN_SECONDS - 1)})
+    rep = run(FakeConsole([], left_out=[TOOK_A_TURN]), hub)
+
+    assert rep.standing == [] and rep.released == ["lane-a"]
+    args = hub.releases("lane-a")[-1]["args"]
+    assert args["release_arm"] == ARM_TTL
+
+
+def test_the_TTL_release_is_SPOKEN_BY_A_PASS_and_not_left_to_silence():
+    """🔴 An elapsed hold releases itself INSIDE the hub and writes no row
+    at all (`edge._hold_state` reports it as no hold), so a TTL left to
+    expire on its own would free a lane with NO recorded cause — the one
+    thing the ruling forbids, since every release must say which arm fired.
+    The last pass that can still speak ends it explicitly, and the row says
+    the words are the scanner's own clock, not the console's."""
+    hub = FakeHub(["lane-a"], existing={
+        "lane-a": held_by_scanner(until=NOW + TTL_MARGIN_SECONDS - 1)})
+    run(FakeConsole([], left_out=[TOOK_A_TURN]), hub)
+
+    args = hub.releases("lane-a")[-1]["args"]
+    assert args["cause_source"] == CAUSE_FROM_SCANNER
+    assert "TTL" in args["cause"]
+    # and the console's last word travels with it, so a reader can see WHY
+    # it kept failing the check rather than only that it did.
+    assert "ACTIVE BUT UNOWNED" in args["cause"]
+
+
+def test_the_STATED_CONDITION_outranks_the_clock():
+    """A lane whose bar landed in the same pass its TTL ran out records the
+    ASSIGNMENT. The arms are ordered, and getting this backwards would file
+    the clause's one positive instance under the clock."""
+    hub = FakeHub(["lane-a"], existing={
+        "lane-a": held_by_scanner(until=NOW + 1)})
+    run(FakeConsole([], left_out=[GOT_A_BAR]), hub)
+    assert hub.releases("lane-a")[-1]["args"]["release_arm"] == ARM_CONDITION
+
+
+def test_the_TTL_IS_A_DECISION_and_it_is_not_the_inherited_twelve_hours():
+    """⭐ Pinned deliberately. The 12h came from the accepted note as a pure
+    backstop — the expiry that frees the fleet when the scanner STOPS
+    RUNNING. The ruling made it load-bearing, so the deputy required the
+    number be SET rather than inherited: two hours is twice the 60-minute
+    quiet window that nominates a lane, and eight of the 15-minute pass
+    intervals. Changing it is a decision; this assertion is where it gets
+    made again rather than drifted into."""
+    assert TTL_SECONDS == 2 * 3600.0
+    assert TTL_MARGIN_SECONDS == 15 * 60.0
+    # The margin must leave a usable hold behind it: a TTL shorter than a
+    # couple of pass intervals would release every lane at the first pass
+    # after it was parked, and the hold would never mean anything.
+    assert TTL_SECONDS > 4 * TTL_MARGIN_SECONDS
 
 
 def test_a_hold_that_is_NOT_the_scanners_is_never_released():
