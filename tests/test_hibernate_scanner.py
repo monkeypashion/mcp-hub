@@ -191,7 +191,19 @@ def test_every_pass_asks_the_console_again():
 TOOK_A_TURN = {"lane": "lane-a", "bars_open": 0,
                "why": ("ACTIVE BUT UNOWNED — a main-session response 176s "
                        "ago (quiet < 60 min) — never mid-turn (bar 59)")}
-GOT_A_BAR = {"lane": "lane-a", "bars_open": 3, "why": "owns an open bar here"}
+# What the console will say once `owns_open_bar` ships ⟨hub.msg 31020⟩: the
+# bool is the clause, stated. `bars_open` rides along as a load figure and is
+# deliberately NOT what the condition arm reads.
+GOT_A_BAR = {"lane": "lane-a", "owns_open_bar": True, "bars_open": 3,
+             "why": "owns an open bar here"}
+
+# TODAY's shape, measured: the field does not exist yet, and the count that
+# looks like an answer counts `claimed` bars too. vps-hetzner read exactly
+# this on 2026-09-21 — its 2 was bars 145 and 401, both claimed, neither open.
+CLAIMED_NOT_OPEN = {"lane": "lane-a", "bars_open": 2,
+                    "why": ("ACTIVE BUT UNOWNED — a main-session response "
+                            "1592s ago (quiet < 60 min) — never mid-turn "
+                            "(bar 59)")}
 
 
 def test_a_held_lane_that_merely_TOOK_A_TURN_is_NOT_released():
@@ -269,7 +281,8 @@ def test_the_release_records_the_CONSOLES_OWN_WORDS_for_why():
     arm rather than on this scanner's opinion of itself."""
     hub = FakeHub(["lane-a"], existing={"lane-a": held_by_scanner()})
     console = FakeConsole([], left_out=[
-        {"lane": "lane-a", "why": "owns an open bar here", "bars_open": 3}])
+        {"lane": "lane-a", "why": "owns an open bar here",
+         "owns_open_bar": True, "bars_open": 3}])
     rep = run(console, hub)
     assert rep.released == ["lane-a"]
     args = hub.releases("lane-a")[-1]["args"]
@@ -340,6 +353,82 @@ def test_a_cause_that_is_NOT_an_assignment_is_carried_unchanged():
     assert args["cause"] == "exempt seat"
     assert args["cause_source"] == CAUSE_FROM_CONSOLE
     assert args["release_arm"] != ARM_CONDITION
+
+
+def test_a_CLAIMED_bar_is_not_an_open_bar_and_never_reads_as_the_condition():
+    """🔴 The correction that cost this bar its first armed pass.
+
+    `bars_open` is `SUM(state != 'met')`, so it counts `claimed` bars —
+    done-and-awaiting-confirmation — alongside open ones
+    (squad-proxy-dev-vm-1, ⟨hub.msg 31020⟩, owning the fault). A lane whose
+    only non-met bars are claimed owns NO open bar, so releasing it and
+    stamping `condition-met` would put on the row a condition that was never
+    shown. It still RELEASES — the narrowing is not tradeable and an
+    unestablished condition frees the lane — but the arm says UNREADABLE,
+    and a later count of assignments is not inflated by this row."""
+    hub = FakeHub(["lane-a"], existing={"lane-a": held_by_scanner()})
+    rep = run(FakeConsole([], left_out=[CLAIMED_NOT_OPEN]), hub)
+
+    assert rep.released == ["lane-a"], "an unestablished condition parked it"
+    assert rep.arms["lane-a"] == ARM_UNREADABLE
+    args = hub.releases("lane-a")[-1]["args"]
+    assert args["release_arm"] != ARM_CONDITION
+    # The console's own sentence, unchanged and still theirs.
+    assert args["cause"] == CLAIMED_NOT_OPEN["why"]
+    assert args["cause_source"] == CAUSE_FROM_CONSOLE
+
+
+def test_the_CONDITION_arm_waits_for_the_FIELD_THAT_STATES_IT():
+    """No count, however large, is the clause. Until `owns_open_bar` is on
+    the row there is no reading of today's console that yields
+    `condition-met` — which is the whole reason this scanner is not armed."""
+    for count in (1, 2, 7, 99):
+        hub = FakeHub(["lane-a"], existing={"lane-a": held_by_scanner()})
+        rep = run(FakeConsole([], left_out=[
+            {"lane": "lane-a", "bars_open": count, "why": "whatever"}]), hub)
+        assert rep.arms["lane-a"] == ARM_UNREADABLE, f"count {count} read as the clause"
+
+
+def test_owns_open_bar_FALSE_keeps_the_hold_STANDING_whatever_the_count_says():
+    """The console answering "no" is an answer, and it is the one reading
+    that keeps a lane parked. A non-zero `bars_open` beside it is the live
+    contradiction resolved: claimed bars, no open one."""
+    hub = FakeHub(["lane-a"], existing={"lane-a": held_by_scanner()})
+    rep = run(FakeConsole([], left_out=[
+        {"lane": "lane-a", "owns_open_bar": False, "bars_open": 5,
+         "why": "ACTIVE BUT UNOWNED — a main-session response 30s ago"}]), hub)
+
+    assert rep.released == [] and rep.standing == ["lane-a"]
+    assert hub.releases("lane-a") == []
+
+
+@pytest.mark.parametrize("value", ["true", "True", 1, "yes", [True], None])
+def test_an_owns_open_bar_THAT_IS_NOT_A_BOOL_is_NO_ANSWER(value):
+    """A field that answered in a shape nobody agreed is not an answer. It
+    must not read as a yes — that would arm the condition arm on a string —
+    and it must not read as a no either, which would park a lane on it."""
+    hub = FakeHub(["lane-a"], existing={"lane-a": held_by_scanner()})
+    rep = run(FakeConsole([], left_out=[
+        {"lane": "lane-a", "owns_open_bar": value, "why": "who knows"}]), hub)
+
+    assert rep.arms.get("lane-a") == ARM_UNREADABLE
+    assert rep.released == ["lane-a"], "a malformed field parked a lane"
+
+
+def test_THE_SAME_ROW_changes_arm_when_the_field_ships_and_NOTHING_ELSE_does():
+    """The forward-compatibility claim, made falsifiable: one row, one added
+    bool, and the only thing that moves is the arm. Both eras release; the
+    difference is whether the row may be counted as an assignment. If this
+    ever needs an edit to the predicate, the claim was false."""
+    def arm_for(row):
+        hub = FakeHub(["lane-a"], existing={"lane-a": held_by_scanner()})
+        rep = run(FakeConsole([], left_out=[row]), hub)
+        assert rep.released == ["lane-a"]
+        return rep.arms["lane-a"]
+
+    today = {"lane": "lane-a", "bars_open": 3, "why": "owns an open bar here"}
+    assert arm_for(today) == ARM_UNREADABLE
+    assert arm_for(dict(today, owns_open_bar=True)) == ARM_CONDITION
 
 
 # --- release: the clock -----------------------------------------------------

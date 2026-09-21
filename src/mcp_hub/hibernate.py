@@ -40,19 +40,29 @@ it**, every time.
 THAN TO ENTER.** Holding is the destructive act; being named costs nothing.
 So a held lane is freed when, and only when:
 
-  · `condition-met`  — the console states the lane owns an open bar
-                       (`left_out[].bars_open >= 1`). The stated condition.
-  · `condition-unreadable` — the check could not be made at all: no row for
-                       the lane, or no readable `bars_open` on it. Ambiguity
-                       RELEASES and says so. A lane stranded on a reason
-                       nobody can read is the failure this refuses to trade
-                       today's defect for.
+  · `condition-met`  — the console STATES the lane is assigned an open bar
+                       (`left_out[].owns_open_bar is True`). The clause.
+  · `condition-unreadable` — the check could not be made: no row for the
+                       lane, or a row that does not state the clause.
+                       Ambiguity RELEASES and says so. A lane stranded on a
+                       reason nobody can read is the failure this refuses to
+                       trade today's defect for.
   · `ttl`            — the hold reached its expiry with the condition still
                        unestablished. See `TTL_SECONDS`.
 
 and it STANDS in exactly one case: the console says, readably, that the lane
-owns no open bar. That case is what the old predicate got wrong, and it is
+owns no open bar — `owns_open_bar is False`, or no such field but a readable
+`bars_open == 0`. That case is what the old predicate got wrong, and it is
 the whole of the change — a lane that merely TAKES A TURN now stays held.
+
+⚠️ `bars_open` IS NOT THE CLAUSE, and reading it as one was this scanner's
+own error, corrected the same day it was raised. It is `SUM(state != 'met')`,
+so it counts CLAIMED bars — done, awaiting confirmation — beside open ones
+⟨hub.msg 31020⟩. A count of 2 can mean two claimed bars and no open one, and
+releasing on it would stamp `condition-met` on a row where nothing of the
+kind was shown. `owns_open_bar` does not exist on today's rows, so TODAY the
+condition arm cannot fire at all and every real release is `unreadable` or
+`ttl`. That is the ruling working, not a degraded mode.
 
 📌 **EVERY RELEASE RECORDS WHICH ARM FIRED** (`args.release_arm`), beside the
 `cause` words themselves and the `cause_source` that says whose words they
@@ -350,7 +360,10 @@ def mine(hub: HubHolds, seat: str, now: float) -> bool:
 
 
 def bars_open(row: Any) -> int | None:
-    """The console's open-bar count for a lane — or None for "cannot say".
+    """The console's NON-MET bar count for a lane — or None for "cannot say".
+
+    Despite its name this counts `open` + `claimed`. It is a load figure,
+    not the release condition; `owns_open_bar()` is the condition.
 
     🔴 ABSENT IS NOT ZERO, and the distinction carries the whole ruling.
     Zero means the console looked and the lane owns nothing, which is the one
@@ -366,21 +379,26 @@ def bars_open(row: Any) -> int | None:
     answer. An unreadable row releases and says so; it does not get parsed
     harder.
 
-    🔴 OPEN, AND IT GATES THE FIRST ARMED PASS — the two fields disagree on
-    at least one live row. 2026-09-21 09:5xZ, verbatim from the console:
-    `{"lane": "vps-hetzner-dev-vm-1", "bars_open": 2, "why": "ACTIVE BUT
-    UNOWNED — a main-session response 1750s ago ..."}`. A count of 2 and a
-    sentence saying the lane owns nothing cannot both be the answer to "is
-    this lane assigned an open bar". The likeliest reading is that
-    `bars_open` counts owner-OR-EXECUTOR while the nomination test reads
-    owner only (`GET /cards?lane=` is documented as the former) — but that
-    is a guess about somebody else's field, and this scanner has already
-    been wrong once about an instrument it does not own. ASKED of
-    squad-proxy-dev-vm-1, who own the door. Until they answer, the
-    contradiction is LEGIBLE rather than hidden: the arm and the console's
-    sentence travel together on every release row, so a `condition-met`
-    carrying an "ACTIVE BUT UNOWNED" cause is visible as exactly that, and
-    must not be quoted as the clause.
+    🔴 THIS FIELD IS NOT THE RELEASE CONDITION, and that is MEASURED, not
+    inferred. squad-proxy-dev-vm-1 answered on 2026-09-21 ⟨hub.msg 31020⟩,
+    owning the fault: `bars_open` is `SUM(state != 'met')` per owner
+    (`store.bar_load_by_owner`), and the store has THREE states — `open`,
+    `met` and `claimed` (done, awaiting confirmation). So the count includes
+    claimed bars. The live contradiction that gated this scanner resolved
+    exactly there: `vps-hetzner-dev-vm-1` read `bars_open: 2` beside `why:
+    "ACTIVE BUT UNOWNED"` because both were true OF DIFFERENT QUESTIONS —
+    the 2 was bars 145 and 401, both `claimed`, neither open, while the
+    sentence comes from `open_bar_owners` (`state = 'open'` AND not
+    currently blocked). My own guess — owner-vs-executor — was WRONG; there
+    is no executor column on bars.
+
+    Hence: a count >= 1 does NOT establish "assigned an open bar", because
+    the bar it counts may be claimed. Reading it as the condition would
+    release a lane and stamp `condition-met` on a row where the condition
+    was never shown — the precise lie the cause field exists to stop. The
+    count keeps exactly ONE job here, the one it can do soundly: a readable
+    ZERO means no non-met bars at all, which entails no OPEN bar, and that
+    is what keeps a hold standing.
     """
     if not isinstance(row, dict):
         return None
@@ -392,6 +410,31 @@ def bars_open(row: Any) -> int | None:
     return v
 
 
+def owns_open_bar(row: Any) -> bool | None:
+    """Does the console STATE that this lane is assigned an open bar?
+
+    `True` / `False` when it says so; `None` for "no answer", which is what
+    today's rows give — the field does not exist yet. squad-proxy is shipping
+    it as `owns_open_bar`, a bool on every row carrying exactly the
+    `open_bar_owners` predicate (`state = 'open'` and not currently blocked)
+    ⟨hub.msg 31020⟩.
+
+    Written against the field BEFORE it ships, deliberately: absent reads as
+    unreadable, which RELEASES and says so, which is the ruled behaviour for
+    a condition that cannot be established. So this predicate is correct both
+    today and after their restart, with no edit and no flag day — the arm
+    recorded on the row simply stops saying `condition-unreadable` and starts
+    saying `condition-met`, at the moment the console can honestly support it.
+
+    ⚠️ A bool ONLY. A string "true", or a 1, is a field that answered in a
+    shape this has not agreed — it reads as no answer rather than as a yes.
+    """
+    if not isinstance(row, dict):
+        return None
+    v = row.get("owns_open_bar")
+    return v if isinstance(v, bool) else None
+
+
 def release_arm(row: Any, state: dict[str, Any] | None, now: float,
                 margin: float = TTL_MARGIN_SECONDS,
                 ) -> tuple[str, str, str] | None:
@@ -400,17 +443,40 @@ def release_arm(row: Any, state: dict[str, Any] | None, now: float,
     Returns `(arm, cause, cause_source)`. The order is the ruling's: the
     stated condition first, so a lane that genuinely got a bar records THAT
     even when its clock was also nearly out; then the unreadable check, which
-    releases on ambiguity; then the TTL. `None` is returned for exactly one
-    input — a readable row saying the lane owns no open bar.
+    releases on ambiguity; then the TTL.
+
+    THE CONDITION IS `owns_open_bar`, NOT `bars_open` — see that function.
+    Until the console ships the field, "assigned an open bar" cannot be
+    established for any lane, so the only release arms available in practice
+    are `condition-unreadable` and `ttl`. That is not a degraded mode, it is
+    the ruling working: an unestablishable condition releases and SAYS SO,
+    rather than holding a lane on a reason nobody can read.
+
+    The hold STANDS on exactly two readings, both of which mean the console
+    looked and the lane owns no open bar:
+      * `owns_open_bar` is False — it said so directly, or
+      * no such field, but a readable `bars_open == 0` — no non-met bars at
+        all, which entails no open bar. Sound before and after their fix.
     """
     have_row = isinstance(row, dict)
     why = str(row.get("why") or "") if have_row else ""
     src = CAUSE_FROM_CONSOLE if have_row else CAUSE_UNRECORDED
-    n = bars_open(row)
-    if n is not None and n >= 1:
+
+    owns = owns_open_bar(row)
+    if owns is True:
         return ARM_CONDITION, why, src
-    if n is None:
+
+    n = bars_open(row)
+    if owns is None and not (n is not None and n == 0):
+        # Nothing establishes the condition — either nobody answered, or the
+        # only answer is a count that may be made of CLAIMED bars. The cause
+        # stays the console's own sentence, unchanged and attributed to them:
+        # the discrimination the ruling asked for lives in the ARM, and
+        # prepending this scanner's commentary to a field marked
+        # `from-the-console` would buy one reader's convenience with every
+        # later reader's ability to tell whose words those are.
         return ARM_UNREADABLE, why, src
+
     until = float((state or {}).get("until") or 0.0)
     if until - now <= margin:
         # The scanner's own sentence, and it says so in `cause_source`. The
@@ -495,9 +561,10 @@ def scan(console: ConsoleAPI, hub: HubHolds, *, thread: int | str = 1,
     # answer that decided the release.
     # ⚠️ THE WHOLE ROW, not just its sentence. Until 2026-09-21 this kept
     # only `why`, because prose was all the release needed when any absence
-    # was a release. The ruled predicate turns on `bars_open`, which is on
-    # the same row and was being discarded one line before the decision that
-    # needed it — the same shape as throwing `why` away used to be.
+    # was a release. The ruled predicate turns on fields of that row —
+    # `owns_open_bar`, and `bars_open` for the readable-zero case — which
+    # were being discarded one line before the decision that needed them,
+    # the same shape as throwing `why` away used to be.
     left_out = {str(o.get("lane")): o
                 for o in (payload.get("left_out") or [])
                 if isinstance(o, dict) and o.get("lane")}
