@@ -153,6 +153,66 @@ A seat that needs to violate any of these is not a seat — it is a
 privileged tool, and it should be an explicit operator act rather than a
 placement.
 
+### Resource caps — and why UNCAPPED is the default rather than an oversight
+
+The list above bounds what a seat can REACH. It says nothing about how much
+of the machine a seat can TAKE, and until 2026-09-21 nothing did: `docker
+create` carried no `--memory`, no `--cpus` and no `--pids-limit`, and the
+memory volume is still unsized.
+
+🔴 **Why that is worse than a capacity question.** The kernel OOM killer
+scores by FOOTPRINT, so an uncapped seat that runs away is not merely a seat
+that dies — it is the process most likely to evict the largest innocent
+neighbour on the box. `vps-hetzner-dev-vm-1` used exactly this to veto seats
+on prod-1 (`postgres16` being the neighbour they named), and
+`slipstream-dev-vm-1` identified the half that is not about prod-1: **an
+uncapped seat is uncapped on every machine.** "Do not put these on prod-1"
+and "these are safe on dev-vm-1" are different claims, and the second had no
+evidence behind it — only operator restraint.
+
+Three optional spec fields, passed straight to `docker create`:
+
+| spec field | flag | example |
+|---|---|---|
+| `memory` | `--memory` | `"512m"`, `"2g"` |
+| `cpus` | `--cpus` | `"1.5"` |
+| `pids_limit` | `--pids-limit` | `256` |
+
+CLI: `seats add --memory-limit 512m --cpus 1.5 --pids-limit 256`. It is
+**`--memory-limit`, not `--memory`**, deliberately: `--memory-volume`
+already exists and means something entirely different (where memory is
+KEPT, not how much RAM may be taken), and two flags one letter apart with
+unrelated meanings is a mis-type that produces a working command.
+
+**Absent means uncapped, and that is deliberate.** Every seat predating this
+declares nothing, and a default cap would change running seats on their next
+recreate with nothing telling the operator why.
+
+⚠️ **A CAP OF ZERO IS NOT A CAP — it is the word "unlimited".** Measured
+against the live daemon 2026-09-21:
+
+```
+--memory=0      accepted, HostConfig.Memory    = 0    (unlimited)
+--cpus=0        accepted, HostConfig.NanoCpus  = 0    (unlimited)
+--pids-limit=0  accepted, HostConfig.PidsLimit = nil  (unlimited)
+--pids-limit=-1 accepted, HostConfig.PidsLimit = nil  (unlimited)
+--memory=4m     REFUSED  (daemon minimum is 6MB — fails closed, loudly)
+```
+
+The dangerous values are the ones docker takes without complaint. A spec
+carrying `memory: 0` reads as capped to everyone who reviews it and is
+bounded by nothing, which is strictly worse than declaring nothing —
+**a cap that is declared and never applied reads as a bound** (the failure
+slipstream named before the feature was built). `spec_guard.check_limits`
+therefore refuses every unlimited spelling at the door, on both create and
+PATCH.
+
+**The must-fire**, and it is a real test rather than an argument: a seat
+declaring `memory: 64m` must actually be OOM-killed, not merely start.
+`tests/test_seat_resource_caps.py` asserts exit 137 from a real daemon; it
+opts in via `MCP_HUB_DOCKER_TESTS=1` and **skips with a named reason**
+rather than being deselected, so the full suite never quietly shrinks.
+
 ### The ONE mount exception — a credential socket, and why it is not a precedent
 
 ⚠️ Read this before citing it for anything else. **Someone will eventually

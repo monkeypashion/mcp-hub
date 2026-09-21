@@ -43,6 +43,12 @@ select = ["E", "F", "I", "W"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    # A test that needs a REAL docker daemon. Registered for documentation,
+    # NOT used to deselect: see test_seat_resource_caps.py for why these
+    # opt in via an env var and skip with a reason instead.
+    "docker: needs a real docker daemon (opt in with MCP_HUB_DOCKER_TESTS=1)",
+]
 filterwarnings = [
     # Test-shutdown noise: the live_hub fixture spawns the server in a
     # daemon thread that dies abruptly when the test exits, occasionally

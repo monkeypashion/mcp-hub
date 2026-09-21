@@ -1430,6 +1430,31 @@ class DockerExecutor:
         # that decides what runs. Docker restarting a container the hub asked
         # to stop would make `observed` disagree with reality every 2 minutes.
         argv += ["--restart", "no"]
+        # RESOURCE CAPS — absent means uncapped, and that is the honest
+        # default rather than a guessed one.
+        #
+        # 🔴 Why this matters beyond capacity: the kernel OOM killer scores by
+        # FOOTPRINT, so an uncapped seat that runs away is not merely a seat
+        # that dies — it is the process most likely to evict the biggest
+        # innocent neighbour on the box. vps-hetzner-dev-vm-1 made exactly
+        # that argument to veto seats on prod-1 (`postgres16` was the victim
+        # they named), and slipstream-dev-vm-1 spotted the half that is not
+        # about prod-1: an uncapped seat is uncapped on EVERY machine,
+        # including the dev box where four of them ran last night bounded by
+        # nothing but their operator's restraint.
+        #
+        # ⚠️ The values are guarded (spec_guard.check_limits) BEFORE they get
+        # here, because docker accepts `0` for all three and means UNLIMITED
+        # by it. A cap that is declared and never applied reads as a bound to
+        # everyone who reviews the spec, which is worse than no cap at all.
+        # This function emits; the guard is what makes the emission mean
+        # something.
+        if spec.get("memory"):
+            argv += ["--memory", str(spec["memory"])]
+        if spec.get("cpus"):
+            argv += ["--cpus", str(spec["cpus"])]
+        if spec.get("pids_limit"):
+            argv += ["--pids-limit", str(spec["pids_limit"])]
         for k, v in (spec.get("env") or {}).items():
             argv += ["-e", f"{k}={v}"]
         # The container name IS the seat identity, so SEAT_IDENTITY is

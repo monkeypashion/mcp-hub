@@ -161,6 +161,15 @@ def validate_spec(spec: dict, *, keys: set[str] | None = None) -> str | None:
         if bad:
             return bad
 
+    # Checked as ONE group whenever any of the three is in play: they are a
+    # single decision ("how much of this machine may this seat take"), and a
+    # PATCH that sends only `cpus` must still be validated against the same
+    # zero-is-unlimited rule as a fresh create.
+    if keys is None or keys & {"memory", "cpus", "pids_limit"}:
+        bad = check_limits(spec)
+        if bad:
+            return bad
+
     return None
 
 
@@ -459,5 +468,103 @@ def check_credential_policy(spec: dict) -> str | None:
             return (
                 f"REFUSED: allowed_mounts marks '{src}' read-only but the "
                 "volume string does not carry ':ro'"
+            )
+    return None
+
+
+# --- resource caps: a declared bound must BE a bound -----------------------
+
+# 🔴 A CAP OF ZERO IS NOT A CAP — docker reads it as UNLIMITED, and accepts it.
+#
+# Measured against the live daemon 2026-09-21, which is the whole reason this
+# guard exists rather than "pass it through and let docker complain":
+#
+#   docker create --memory=0      -> accepted, HostConfig.Memory     = 0    (unlimited)
+#   docker create --cpus=0        -> accepted, HostConfig.NanoCpus   = 0    (unlimited)
+#   docker create --pids-limit=0  -> accepted, HostConfig.PidsLimit  = nil  (unlimited)
+#   docker create --pids-limit=-1 -> accepted, HostConfig.PidsLimit  = nil  (unlimited)
+#   docker create --memory=4m     -> REFUSED  (daemon minimum is 6MB)
+#
+# So the dangerous values are the ones docker takes WITHOUT COMPLAINT. A spec
+# carrying `memory: 0` starts a container that looks capped in the spec, reads
+# as capped to anyone reviewing it, and is bounded by nothing — which is
+# strictly worse than no cap at all, because no cap is at least honest.
+#
+# That failure mode was named by slipstream-dev-vm-1 before this was built
+# ("a cap that is declared and never applied is worse than no cap, because it
+# reads as a bound"), and it is reachable through the front door, not through
+# a typo in the daemon. Hence: refuse the unlimited spellings HERE.
+#
+# The 6MB minimum is deliberately NOT duplicated: the daemon refuses it
+# loudly and fail-closed, and hardcoding another process's constant is how
+# a guard starts disagreeing with the thing it guards.
+_UNITS = {"b": 1, "k": 1024, "m": 1024 ** 2, "g": 1024 ** 3}
+
+
+def _memory_bytes(value: object) -> int | None:
+    """`"512m"` -> bytes. None when it is not a memory size at all."""
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    unit = _UNITS.get(text[-1:], None)
+    digits = text[:-1] if unit else text
+    if unit is None:
+        unit = 1
+    try:
+        n = float(digits)
+    except ValueError:
+        return None
+    return int(n * unit)
+
+
+def check_limits(spec: dict) -> str | None:
+    """Validate `memory` / `cpus` / `pids_limit`, the caps the edge applies.
+
+    Absent stays absent: a spec that declares no cap is every seat that
+    existed before caps did, and it passes untouched. The default is
+    UNCAPPED and that is a deliberate, stated default — not an accident, and
+    not something this function quietly changes.
+    """
+    if "memory" in spec and spec["memory"] not in (None, ""):
+        n = _memory_bytes(spec["memory"])
+        if n is None:
+            return (
+                f"REFUSED: spec.memory '{spec['memory']}' is not a size — "
+                "use a docker size like '512m' or '2g'"
+            )
+        if n <= 0:
+            return (
+                "REFUSED: spec.memory of 0 means UNLIMITED to docker, not "
+                "'no memory' — a cap that reads as a bound and is not one is "
+                "worse than declaring nothing. Omit the field to run uncapped."
+            )
+
+    if "cpus" in spec and spec["cpus"] not in (None, ""):
+        try:
+            c = float(str(spec["cpus"]).strip())
+        except ValueError:
+            return (
+                f"REFUSED: spec.cpus '{spec['cpus']}' is not a number — "
+                "use a fraction of a core like '1.5'"
+            )
+        if c <= 0:
+            return (
+                "REFUSED: spec.cpus of 0 means UNLIMITED to docker. Omit the "
+                "field to run uncapped."
+            )
+
+    if "pids_limit" in spec and spec["pids_limit"] not in (None, ""):
+        try:
+            p = int(str(spec["pids_limit"]).strip())
+        except ValueError:
+            return (
+                f"REFUSED: spec.pids_limit '{spec['pids_limit']}' is not an "
+                "integer"
+            )
+        if p <= 0:
+            return (
+                "REFUSED: spec.pids_limit of 0 or -1 means UNLIMITED to "
+                "docker — both are accepted silently and store as nil. Omit "
+                "the field to run uncapped."
             )
     return None

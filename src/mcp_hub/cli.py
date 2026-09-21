@@ -2866,6 +2866,15 @@ def seats_command(args: argparse.Namespace, api: Any = None) -> int:
                     spec["volumes"] = list(args.volume)
                 if args.network:
                     spec["network"] = args.network
+                # getattr for the same reason as `--agent` below: callers
+                # build this Namespace by hand (the API tests do), and a new
+                # flag must not break one that predates it.
+                if getattr(args, "memory_limit", ""):
+                    spec["memory"] = args.memory_limit
+                if getattr(args, "cpus", ""):
+                    spec["cpus"] = args.cpus
+                if getattr(args, "pids_limit", ""):
+                    spec["pids_limit"] = args.pids_limit
                 if args.env_from_host:
                     spec["env_from_host"] = list(args.env_from_host)
                 if args.memory_volume:
@@ -8191,6 +8200,28 @@ def build_parser() -> argparse.ArgumentParser:
     seats.add_argument("--volume", action="append", default=None, metavar="S:D",
                        help="add: bind mount or volume (repeatable)")
     seats.add_argument("--network", default="", help="add: docker network")
+    # NOT `--memory`, deliberately: `--memory-volume` already exists and means
+    # something completely different (where this seat's memory is KEPT, not how
+    # much RAM it may take). Two flags one letter apart, one naming a volume
+    # and one naming a cap, is a mis-type that produces a working command with
+    # the wrong meaning — and argparse's prefix matching would make `--memory`
+    # ambiguous against `--memory-volume` for anyone abbreviating.
+    seats.add_argument(
+        "--memory-limit", default="", metavar="SIZE",
+        help="add: hard RAM cap, docker size syntax ('512m', '2g'). Omit to "
+             "run UNCAPPED. 0 is refused — docker reads it as unlimited",
+    )
+    seats.add_argument(
+        "--cpus", default="", metavar="N",
+        help="add: CPU cap as a fraction of cores ('1.5'). Omit to run "
+             "uncapped; 0 is refused (docker reads it as unlimited)",
+    )
+    seats.add_argument(
+        "--pids-limit", default="", metavar="N",
+        help="add: max processes in the container — the cheapest guard "
+             "against a fork bomb. Omit to run uncapped; 0 and -1 are "
+             "refused (docker takes both as unlimited)",
+    )
     seats.add_argument(
         "--env-from-host", action="append", default=None, metavar="NAME",
         help="add: pass this variable through from the EDGE MACHINE's own "
