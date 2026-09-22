@@ -2097,6 +2097,100 @@ hold_release_pass() {
   done
 }
 
+# --- supervision: the lane nothing else can revive comes back on its own ----
+#
+# Bar 414 (goal 84, deputy-accepted 2026-09-22 under #303, hub.msg 31377).
+# The squad-resourcing planner is roster class `faculty`, and BOTH timers are
+# structurally unable to reach it once its session ends:
+#   - `up` skips faculty on purpose (squad_agents() filters $5!="faculty").
+#     That is not a bug to fix here: his ruling relayed 20:32 2026-09-02 put
+#     faculty seats at 58% of one hour's burn, so teaching `up` to start them
+#     would revive fourteen seats to bring back one.
+#   - `heal` demands a live tmux session before it judges anything
+#     (`tm has-session … || continue`), so a seat that has STOPPED is invisible
+#     to it — and the pass then prints "all up agents healthy", which is how
+#     this stayed unnoticed.
+# Promoting the row to squad class would also fix it and is HIS call, not this
+# script's (deputy, hub.msg 31377). This is the route that does not need it.
+#
+# PER-ROW OPT-IN — one marker file per supervised lane, never a class rule.
+#
+# ⭐ IT HONOURS A HAND'S STOP, and that is the whole difficulty. An imperative
+# kill wired into a declarative system can never mean "stay down" — the exact
+# lesson the LIFECYCLE INTENT block above exists for. A supervisor that ignored
+# it would reproduce that bug verbatim ("every time I find you are running
+# again"), this time with no placement to blame it on. So `stop` writes the
+# want-down marker, a hand's start clears it, and this pass refuses while it
+# stands: intent at both doors or neither.
+#
+# NOT a second reconciler. A seat with a hub PLACEMENT already has the edge
+# holding it at desired=running; two supervisors racing one seat is worse than
+# none. Local lanes only — which is precisely the gap bar 414 names.
+#
+# NOT the hold's door either, and this is the one that bites. A lane the pace
+# gate has REFUSED to restart is not held any more and has no session — it sits
+# behind its hold-stopped flag waiting for the line to be met. Restarting it
+# here would silently overturn the console's brake, so the flag is a hard skip.
+# hold_release_pass owns every hold-stopped return; keeping the two passes
+# disjoint is what lets a hold-stopped seat and an idle-by-choice seat reach
+# DIFFERENT outcomes (his ruling, 2026-09-21) instead of this leg papering over
+# both.
+supervise_flag() { echo "$HOME/.mcp-hub/supervise-$(safe_name "$1")"; }
+want_down_flag() { echo "$HOME/.mcp-hub/want-down-$(safe_name "$1")"; }
+is_supervised()  { [ -e "$(supervise_flag "$1")" ]; }
+wants_down()     { [ -e "$(want_down_flag "$1")" ]; }
+
+supervise_pass() {
+  local a args gmin lm
+  gmin=$(( (HEAL_GRACE_SECONDS + 59) / 60 ))
+  # Driven off the ROSTER, not off a glob of marker files: safe_name() is
+  # one-way, so a filename cannot be turned back into an agent name, and a
+  # marker outliving its row must never resurrect a retired lane.
+  for a in $(agents); do
+    is_supervised "$a" || continue
+    # A hand put this down. Said out loud every pass on purpose — a lane that
+    # is down and staying down is exactly what someone reading heal's output
+    # is trying to find out, and the cure is one command.
+    if wants_down "$a"; then
+      echo "$a: supervised, but stopped by hand — not starting it (undo with: $CMD start $a)"
+      continue
+    fi
+    # Held right now: the hold legs above own it, and a hold is somebody
+    # deliberately wanting this lane down.
+    held_until "$a" >/dev/null && continue
+    # Released but NOT yet restarted — the pace gate refused it and kept the
+    # flag. Starting it here would overturn a brake this pass cannot even read.
+    [ -e "$(hold_stopped_flag "$a")" ] && continue
+    tm has-session -t "=$a" 2>/dev/null && continue
+    # The edge already holds a placed seat at its desired state.
+    if placement_id "$a" >/dev/null 2>&1; then
+      echo "$a: supervised but it has a hub placement — leaving it to the edge reconciler"
+      continue
+    fi
+    # Same refusal as hold_release_pass, for the same reason: starting it
+    # without the resume flag brings it back BLANK, which is a lost
+    # conversation reported as a successful recovery.
+    args="$(field "$a" 4)"
+    case " $args " in
+      *" $RESUME_FLAG "*) ;;
+      *) echo "!! $a: supervised and down, but its roster args lack $RESUME_FLAG — NOT starting it, because it would come back with no conversation. Fix: $CMD resume on $a && $CMD start $a" >&2
+         continue ;;
+    esac
+    # Grace, and the loop bound. If claude cannot boot, this marker is what
+    # stops a two-minute timer from respawning a broken lane forever; the
+    # restart is retried only after the grace window, not on every pass.
+    lm="$HOME/.mcp-hub/supervise-launched-$(safe_name "$a")"
+    if [ -n "$(find "$lm" -mmin -"$gmin" 2>/dev/null)" ]; then
+      echo "$a: supervised restart attempted moments ago — within grace, not trying again yet"
+      continue
+    fi
+    mkdir -p "$HOME/.mcp-hub" 2>/dev/null
+    touch "$lm" 2>/dev/null || true
+    echo "$a: supervised and its session is gone — starting it with $RESUME_FLAG (no keystroke needed)"
+    up_one "$a"
+  done
+}
+
 # Every held lane on the box. Fails open with everything else here: no
 # mirror, no jq, no held lanes = nothing to enforce and no output.
 hold_enforce_pass() {
@@ -2158,6 +2252,12 @@ up_one() {
   # A hand started this lane — say so to the hub, or the reconciler will stop
   # it again on the next pass if the placement still reads `stopped`.
   set_placement_intent "$a" running
+  # The local half of the same sentence. A placement covers seats the edge
+  # owns; an ordinary local lane has none (placement_id returns empty), and
+  # supervise_pass reads this marker instead. Both intent writes live at this
+  # one door on purpose — a start that cleared only one of them would leave
+  # the other still saying "stay down".
+  rm -f "$(want_down_flag "$a")" 2>/dev/null || true
 }
 
 org_alias() {
@@ -3907,11 +4007,60 @@ case "${1:-help}" in
             kill_daemon "$a"
             # The local kill alone is what let the edge bring it straight back.
             set_placement_intent "$a" stopped
+            # And the local half, for lanes with no placement to carry it: a
+            # supervised lane must read this as "stay down" until a hand says
+            # otherwise, or supervise_pass would have it back within ~2 min —
+            # the bug at the top of the LIFECYCLE INTENT block, rebuilt.
+            mkdir -p "$HOME/.mcp-hub" 2>/dev/null
+            touch "$(want_down_flag "$a")" 2>/dev/null || true
             echo "stopped $a (conversation kept — resume with: $CMD start $a  or  $CMD restart $a --resume)" ;;
+  supervise) # squad supervise [agent] [--off] — opt ONE roster row into being
+            # restarted by the heal timer when its session is gone. Per row,
+            # never per class: `up` skipping faculty is deliberate (58% of an
+            # hour's burn, his ruling 2026-09-02) and stays skipped.
+            # With no agent: list what is supervised, because a supervisor
+            # nobody can enumerate is one nobody can switch off.
+            if [ -z "${2:-}" ]; then
+              found=0
+              for a in $(agents); do
+                is_supervised "$a" || continue
+                found=1
+                if wants_down "$a"; then
+                  echo "$a — supervised, HELD DOWN by hand (start it with: $CMD start $a)"
+                elif tm has-session -t "=$a" 2>/dev/null; then echo "$a — supervised, up"
+                else echo "$a — supervised, DOWN (next heal pass will start it)"; fi
+              done
+              [ "$found" = 0 ] && echo "nothing is supervised (opt one in: $CMD supervise <agent>)"
+              exit 0
+            fi
+            a="$(need_agent "$2")" || exit 1
+            mkdir -p "$HOME/.mcp-hub" 2>/dev/null
+            if [ "${3:-}" = "--off" ]; then
+              rm -f "$(supervise_flag "$a")" 2>/dev/null || true
+              echo "$a: no longer supervised — nothing will restart it automatically"
+            else
+              case " $(field "$a" 4) " in
+                *" $RESUME_FLAG "*) ;;
+                # Refused at the DOOR, not at 03:00 in a journal nobody reads:
+                # supervising a row without the resume flag promises a recovery
+                # the pass will always decline to perform.
+                *) echo "!! $a: roster args lack $RESUME_FLAG, so a supervised restart would bring it back with NO conversation and the pass would refuse it every time. Fix first: $CMD resume on $a" >&2; exit 1 ;;
+              esac
+              touch "$(supervise_flag "$a")" 2>/dev/null || true
+              echo "$a: supervised — the heal timer will start it with $RESUME_FLAG whenever its session is gone, unless a hand stopped it."
+            fi ;;
   down)     tm kill-server 2>/dev/null || true
             # The keep-alive daemons are detached (they outlive tmux), so kill
             # them explicitly via their pidfiles and clear the stale claim.
-            for a in $(agents); do kill_daemon "$a"; done ;;
+            # `down` is a hand saying EVERYTHING off, so it carries the same
+            # want-down intent `stop` does — written only for supervised lanes,
+            # since nothing else ever reads it. Without this the supervisor
+            # would quietly undo a fleet-wide stop on its next pass.
+            mkdir -p "$HOME/.mcp-hub" 2>/dev/null
+            for a in $(agents); do
+              kill_daemon "$a"
+              is_supervised "$a" && { touch "$(want_down_flag "$a")" 2>/dev/null || true; }
+            done ;;
   compaction) # goal 81 bars 50-52: detect at the token cap, ASK the lane,
             # and act ONLY on the lane's own answer.
             # `--dry-run` reports what it would do and writes no rows and no
@@ -4024,6 +4173,12 @@ case "${1:-help}" in
             # it naturally: it no longer has a session.
             hold_enforce_pass
             hold_release_pass
+            # AFTER the hold legs, never before: a lane the hold just stopped
+            # must still be down when this runs, and a lane the pace gate
+            # refused must keep its flag. Both are hard skips inside the pass,
+            # and running it here means it can only ever see what the hold
+            # legs have finished with.
+            supervise_pass
             # Detect, ask, and — only on the lane's own answer, and only when
             # COMPACT_EXEC is armed — execute. Runs after the hold legs so a
             # lane being stopped is not asked to compact on its way down.
@@ -5811,6 +5966,7 @@ run
   $CMD start [agent]            start ONE agent (how on-demand faculty agents come up)
   $CMD stop  [agent]            stop ONE agent (session killed, conversation kept)
   $CMD down                     stop everything (tmux server + keep-alive daemons)
+  $CMD supervise [agent] [--off] restart this row when its session is gone (no agent: list)
   $CMD restart [agent] [--fresh|--resume]
                                 relaunch claude in place (attached viewers keep watching)
                                   no flag:   launch with the agent's roster args as-is
