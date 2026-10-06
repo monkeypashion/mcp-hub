@@ -5762,6 +5762,35 @@ _CLI_SUBCOMMANDS = {
 }
 
 
+# How long a stopping hub waits for open connections before cutting them.
+# uvicorn's default is to wait for ever, and a GET /mcp stream never closes on
+# its own, so a redeploy sat out Docker's whole 30s stop timeout before the
+# SIGKILL. Measured on prod 2026-10-06 (vps-hetzner, Coolify deploy row 3030):
+# 32.3s of refused connections, just past Claude Code's ~31s reconnect budget,
+# so every open session marked the hub failed and lost its tools until a
+# manual /mcp reconnect. Every client reconnects anyway, so waiting buys
+# nothing. One second leaves in-flight tool calls time to answer.
+GRACEFUL_SHUTDOWN_SECONDS = 1
+
+
+async def _serve_streamable_http(server: FastMCP) -> None:
+    """FastMCP.run_streamable_http_async, with a bounded graceful shutdown.
+
+    FastMCP builds its uvicorn.Config internally and exposes no shutdown
+    timeout, so this builds the same config with the one setting added.
+    """
+    import uvicorn
+
+    config = uvicorn.Config(
+        server.streamable_http_app(),
+        host=server.settings.host,
+        port=server.settings.port,
+        log_level=server.settings.log_level.lower(),
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,
+    )
+    await uvicorn.Server(config).serve()
+
+
 def main():
     # Subcommand dispatch — `mcp-hub stop-hook ...` etc. delegate to the
     # client CLI module. Bare `mcp-hub [--transport ... etc.]` runs the
@@ -5837,7 +5866,7 @@ def main():
                 tg.start_soon(server._hub_url_rebind_sweep)  # type: ignore[attr-defined]
                 tg.start_soon(server._hub_hold_sweep)  # type: ignore[attr-defined]
                 try:
-                    await server.run_streamable_http_async()
+                    await _serve_streamable_http(server)
                 finally:
                     tg.cancel_scope.cancel()
 
