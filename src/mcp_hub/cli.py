@@ -5284,8 +5284,33 @@ def stop_hook_command(args: argparse.Namespace) -> int:
     if response is None:
         return 0  # No block — Stop proceeds normally
 
-    print(json.dumps(response))
+    print(json.dumps(_stop_output_shape(name, response)))
     return 0
+
+
+def _stop_output_shape(agent_name: str, response: dict[str, Any]) -> dict[str, Any]:
+    """The block as Claude Code should receive it — an EXPERIMENT, opt-in.
+
+    `{"decision": "block", "reason": R}` puts R into the model's context
+    twice: once as "Stop hook feedback: R" and again as "Stop hook blocking
+    error from command …: R" (measured in every lane's transcript; the docs
+    are silent on why). The docs describe a second shape for Stop,
+    `hookSpecificOutput.additionalContext`, as reaching the model once —
+    but not whether it continues the session the way a block does.
+
+    So it ships DARK: only lanes named one per line in
+    `<state dir>/stop-output-context` get the new shape, everyone else is
+    byte-identical to before. Measured on one lane before it goes wider.
+    """
+    try:
+        listed = (_state_dir() / "stop-output-context").read_text(
+            encoding="utf-8").split()
+    except OSError:
+        return response
+    if agent_name not in listed:
+        return response
+    return {"hookSpecificOutput": {"hookEventName": "Stop",
+                                   "additionalContext": response["reason"]}}
 
 
 # ---------------------------------------------------------------------------

@@ -76,3 +76,17 @@ def test_no_card_notice_rides_along_with_real_mail(tmp_path, monkeypatch, capsys
     out = capsys.readouterr().out
     assert "bob" in out
     assert "card #1200" not in out and "DECISION" not in out
+
+
+def test_once_shape_is_opt_in_per_lane(tmp_path, monkeypatch):
+    from mcp_hub import cli
+
+    monkeypatch.setenv("MCP_HUB_STATE_DIR", str(tmp_path))
+    block = {"decision": "block", "reason": "📬 hello"}
+    # Not listed (no file): byte-identical to the old shape.
+    assert cli._stop_output_shape("lane-a", block) == block
+    (tmp_path / "stop-output-context").write_text("lane-b\nlane-a\n")
+    assert cli._stop_output_shape("lane-a", block) == {
+        "hookSpecificOutput": {"hookEventName": "Stop",
+                               "additionalContext": "📬 hello"}}
+    assert cli._stop_output_shape("lane-c", block) == block
