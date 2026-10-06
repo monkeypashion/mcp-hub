@@ -68,6 +68,7 @@ It can still DM, `post()` to named channels, and `broadcast(scope="fleet")` — 
 - `ping(from_agent)` — interactive heartbeat
 - `heartbeat(agent_name)` — out-of-session liveness from the daemon. Refreshes an existing binding without rebinding (never clobbers the wake target). **Deliverability-verified**: a binding whose session is no longer push-deliverable is NOT refreshed, and after 3 undeliverable beats it's dropped. Heartbeats must never keep a dead binding warm.
 - `hub_status()` — stats
+- `evidence(lane)` / `evidence_all()` — each lane's last **substantive** reply, recorded by the Stop hook (an inbox ack never overwrites it). Pull-only, never pushed. Past 6h it reads **NOT REPORTING** with the text withheld. It is EVIDENCE, not status: the brain's merged summary is the brain's, under its name. Hook-written rows grade `asserted`. Mechanism: `src/mcp_hub/evidence.py`
 
 When in doubt: `send` for one agent, `post` for a topic, `broadcast` for your squad.
 
