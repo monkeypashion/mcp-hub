@@ -29,6 +29,7 @@ from mcp.server.streamable_http import GET_STREAM_KEY
 from pydantic import BaseModel
 
 from mcp_hub import (
+    evidence,
     lineage,
     ra_feature,  # registers the ra.feature/1 scheme on import
     refs,
@@ -904,6 +905,8 @@ def init_db(db_path: Path = DB_PATH) -> None:
     # attested) status-target table.
     ra_feature.ensure_schema(conn)
     status_resolution.ensure_schema(conn)
+    # F14: per-lane evidence of the last substantive turn (evidence.py).
+    evidence.ensure_schema(conn)
 
 
 
@@ -5123,6 +5126,93 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             return json.dumps(status_resolution.resolve_status(conn, ref))
         except refs.RefError as e:
             return f"REFUSED: {e}"
+
+    # -- Lane evidence (F14) --
+
+    @mcp.tool()
+    def evidence_put(
+        agent_name: str,
+        text: str = "",
+        substantive: bool = False,
+        trigger: str = "",
+        tool_calls: int = 0,
+        commit: str = "",
+        project: str = "",
+        ctx: Context | None = None,
+    ) -> str:
+        """Record the turn that just ended — called by the Stop hook, not by
+        agents. Every call refreshes the lane's last-seen time; only a
+        substantive turn (operator-started, or one that called a tool)
+        replaces the stored text. See evidence.py.
+
+        Args:
+            agent_name: The lane whose turn ended.
+            text: The turn's final reply text.
+            substantive: The hook's verdict on the turn.
+            trigger: What started the turn (operator, stop-hook, hub-wake…).
+            tool_calls: How many tools the turn called.
+            commit: The lane's checkout HEAD at the time.
+            project: The lane's project.
+        """
+        # The hook's ephemeral client is unbound, so this grades 'asserted'
+        # — which is the truth about who wrote it, and readers see it.
+        grade, attr_err = _attribution(ctx, agent_name)
+        if attr_err:
+            return attr_err
+        return evidence.record(
+            _get_db(db_path), agent_name, text=text, substantive=substantive,
+            trigger=trigger, tool_calls=tool_calls, commit_sha=commit,
+            project=project, attribution=grade,
+        )
+
+    # Registered as `evidence` (the name agreed in #fleet-v2); the Python
+    # name differs only because `evidence` is the module in this scope.
+    @mcp.tool(name="evidence")
+    def evidence_tool(lane: str, format: str = "text") -> str:
+        """What one lane last SAID it was doing — pull-only, never pushed.
+
+        This is EVIDENCE (the lane's last substantive reply, as the hub saw
+        it), not a status: a summary of it is the brain's, served under the
+        brain's name. Past the stale cutoff the text is withheld and the lane
+        reads NOT REPORTING — an old reply is never shown as the current
+        state. The grade is the WRITER's: hook-written evidence is
+        `asserted`, because an unbound hook named the lane.
+
+        Args:
+            lane: Agent name.
+            format: "text" (default) or "json".
+        """
+        row = _get_db(db_path).execute(
+            "SELECT * FROM lane_evidence WHERE agent = ?", (lane,)
+        ).fetchone()
+        v = evidence.view(row, lane)
+        if format == "json":
+            return json.dumps(v)
+        return evidence.render(v, _grade_tag_str(v.get("grade", "")))
+
+    @mcp.tool()
+    def evidence_all(format: str = "text", include_stale: bool = True) -> str:
+        """Every lane's evidence, freshest first. Same rules as evidence(lane):
+        stale lanes read NOT REPORTING with their text withheld.
+
+        Args:
+            format: "text" (default) or "json".
+            include_stale: False drops NOT REPORTING lanes from the list.
+        """
+        rows = _get_db(db_path).execute(
+            "SELECT * FROM lane_evidence WHERE captured_at > 0 "
+            "ORDER BY captured_at DESC"
+        ).fetchall()
+        views = [evidence.view(r, r["agent"]) for r in rows]
+        if not include_stale:
+            views = [v for v in views if v["state"] == "current"]
+        if format == "json":
+            return json.dumps(views)
+        if not views:
+            return "No lane evidence recorded."
+        return "\n\n".join(
+            evidence.render(v, _grade_tag_str(v.get("grade", ""))) for v in views
+        )
 
     # -- Focus --
 

@@ -282,9 +282,38 @@ def _extract_decision_card(turn_text: str) -> str:
     return card[:4096]
 
 
+def _turn_evidence(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """The evidence_put arguments for the turn that just ended, or None when
+    it left no reply text. Commit is the lane checkout's HEAD — what the lane
+    was standing on when it said this — and '' when that can't be read."""
+    from mcp_hub import evidence
+
+    turn = evidence.read_turn(payload.get("transcript_path"))
+    if turn is None:
+        return None
+    commit = ""
+    cwd = payload.get("cwd") or os.getcwd()
+    try:
+        commit = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=2, check=False,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return {
+        # One char past the cap, so the hub can tell "clipped" from "fits".
+        "text": turn["text"][: evidence.EVIDENCE_MAX_CHARS + 1],
+        "substantive": turn["substantive"],
+        "trigger": turn["trigger"],
+        "tool_calls": turn["tool_calls"],
+        "commit": commit,
+    }
+
+
 async def _query_hub(
     hub_url: str, agent_name: str, project: str = "", card: str = "",
     decided: str = "", rendered_refs: str = "",
+    turn_evidence: dict[str, Any] | None = None,
 ) -> tuple[str, str, bool]:
     """Connect to the hub, return (dm_text, broadcast_text, is_online).
 
@@ -404,6 +433,18 @@ async def _query_hub(
                     card_notice = _extract_text(clear_result)
             except Exception:  # noqa: BLE001
                 pass
+
+            # F14 evidence leg: what this turn said, for evidence(lane).
+            # Fail-soft for the same version-skew reason as the card leg.
+            if turn_evidence:
+                try:
+                    await session.call_tool(
+                        "evidence_put",
+                        {"agent_name": agent_name, "project": project or "",
+                         **turn_evidence},
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
 
             agents_result = await session.call_tool("list_agents", {})
 
@@ -4791,10 +4832,18 @@ def stop_hook_command(args: argparse.Namespace) -> int:
     except Exception:  # noqa: BLE001
         rendered_report = "none"
 
+    # F14 evidence (evidence.py): the turn that just ended, classified from
+    # the transcript. The hub keeps only substantive turns' text, so an
+    # inbox acknowledgement never overwrites a lane's real blocker.
+    try:
+        turn_evidence = _turn_evidence(payload)
+    except Exception:  # noqa: BLE001
+        turn_evidence = None
+
     try:
         messages_text, broadcasts_text, is_online, card_notice = asyncio.run(
             _query_hub(args.hub_url, name, project or "", card, decided,
-                       rendered_report)
+                       rendered_report, turn_evidence=turn_evidence)
         )
     except Exception as exc:  # noqa: BLE001
         # Fail open — never block the agent on hub flakiness.
