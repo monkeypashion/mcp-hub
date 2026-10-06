@@ -401,38 +401,7 @@ async def _query_hub(
                     broadcasts_result = await session.call_tool(
                         "get_broadcasts_for_agent", bc_args
                     )
-            # DECISION card leg. Precedence: a DECIDED marker (the agent
-            # recording the in-pane verdict it just received) closes the
-            # open card WITH the verdict; else a card in the last turn ->
-            # put (upserts); else -> clear (idempotent, verdict-less
-            # withdrawal). Fail-soft: an older hub without these tools must
-            # not break message surfacing (version skew during deploys).
-            card_notice = ""
-            try:
-                if decided:
-                    await session.call_tool(
-                        "decision_resolve",
-                        {"from_agent": agent_name, "verdict": decided},
-                    )
-                elif card:
-                    await session.call_tool(
-                        "decision_put",
-                        {"from_agent": agent_name, "card": card,
-                         "project": project or ""},
-                    )
-                else:
-                    # The clear response is the owner-notice channel: a
-                    # cardless turn against an open card comes back as
-                    # "card #N kept open (n/3)" / "marked STALE" — surfaced
-                    # to the agent instead of counting silent strikes
-                    # (2026-07-27: dt only discovered a lost ask by
-                    # defensively polling the board).
-                    clear_result = await session.call_tool(
-                        "decision_clear", {"from_agent": agent_name},
-                    )
-                    card_notice = _extract_text(clear_result)
-            except Exception:  # noqa: BLE001
-                pass
+            card_notice = ""  # card leg retired; the slot stays for callers
 
             # F14 evidence leg: what this turn said, for evidence(lane).
             # Fail-soft for the same version-skew reason as the card leg.
@@ -4882,27 +4851,11 @@ def stop_hook_command(args: argparse.Namespace) -> int:
     except Exception:  # noqa: BLE001 — a hold must never break a turn end
         held_notice = ""
 
-    # DECISION card leg: harvest the card (or its absence) from the turn
-    # that just ended, ship it with the same hub round-trip below. Waiting
-    # language without a card earns the one-shot authoring nag.
-    last_turn = _read_last_assistant_text(payload.get("transcript_path"))
-    card = _extract_decision_card(last_turn)
-    decided = "" if card else _extract_decided(last_turn)
-    genuine, reason, phrase = (
-        _waiting_analysis(last_turn) if last_turn else (False, "no_match", "")
-    )
-    card_nag = not card and not decided and genuine
-    # Grace bookkeeping runs on every natural Stop — a nag-free Stop must
-    # CLEAR the flag, not just a nagging one set it. Backstop Stops
-    # (stop_hook_active) are skipped: they are the same natural turn, and
-    # skipping them also keeps the telemetry at one record per turn.
-    if not stop_hook_active:
-        card_nag = _card_nag_grace(name, card_nag)
-        if reason != "no_match":
-            outcome = ("card_filed" if card else "decided" if decided else
-                       reason if not genuine else
-                       "nagged" if card_nag else "suppressed_grace")
-            _log_nag_event(name, outcome, phrase)
+    # The DECISION card leg is gone (2026-10-06, the operator's word: cards
+    # are retired for Fleet V2). The hook no longer harvests, files, clears
+    # or nags about cards, and no longer adds "card still open" notices: each
+    # cost context in every lane, on every turn that sounded like waiting.
+    # Asks go in the reply itself; lane state is the F14 evidence record.
 
     # Delivery-receipt report (card #56): what this agent's own transcript
     # proves rendered. Defensive like everything else on this path — a scan
@@ -4925,9 +4878,10 @@ def stop_hook_command(args: argparse.Namespace) -> int:
         turn_evidence = None
 
     try:
-        messages_text, broadcasts_text, is_online, card_notice = asyncio.run(
-            _query_hub(args.hub_url, name, project or "", card, decided,
-                       rendered_report, turn_evidence=turn_evidence)
+        messages_text, broadcasts_text, is_online, _card_notice = asyncio.run(
+            _query_hub(args.hub_url, name, project or "",
+                       rendered_refs=rendered_report,
+                       turn_evidence=turn_evidence)
         )
     except Exception as exc:  # noqa: BLE001
         # Fail open — never block the agent on hub flakiness.
@@ -4949,8 +4903,6 @@ def stop_hook_command(args: argparse.Namespace) -> int:
         broadcasts_text=broadcasts_text,
         is_online=is_online,
         stop_hook_active=stop_hook_active,
-        card_nag=card_nag,
-        card_notice=card_notice,
         held_notice=held_notice,
         # Opt-IN, and off by default: this is the one path that can decide
         # not to show an agent something the hub has already marked read, so
