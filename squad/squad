@@ -303,6 +303,82 @@ capture_for() {
 
 type_line() { local t="$1"; shift; tmt send-keys -t "$t" -l "$*" || return 1; sleep 0.2; tmt send-keys -t "$t" Enter; }
 
+# ⛔ NEVER TYPE INTO THE OPERATOR'S HALF-WRITTEN LINE. His typed word, 22 Sep
+# 20:0xZ: "really fed up with the random tmux commands /clear /compact into my
+# text whilst I am typing". Measured over 21 days on the cockpit pane: 13 of his
+# lines arrived SPLICED — "t/compacthe", "/clearchangin", "whichg gaols aYour
+# context is at 147645 tokens…" — and his 20:01:34 line matches the journal's
+# "typed /compact" to the second. "Idle" was never the right test: it means
+# the MODEL is not working, which is exactly when he types.
+#
+# Two limbs, both required before any keystroke lands in a live claude pane:
+#  1. the INPUT BOX IS EMPTY, read off the screen. This is the limb that
+#     carries it: 6 of the 13 splices came 19-109 min after his previous
+#     submitted line, so no quiet window short of hours would have caught them.
+#  2. QUIET for TYPE_QUIET_SECS since the last client input on the session.
+#     `#{session_activity}` moves on a client's keys (and attach/resize), and
+#     NOT on send-keys — measured on a private socket — so our own typing can
+#     never reset it. Attach/resize only ever make it read busier, which fails
+#     toward not typing.
+# An unreadable box is not an empty one: no box, no keystroke.
+TYPE_QUIET_SECS="${MCP_HUB_TYPE_QUIET_SECS:-900}"
+
+# Characters sitting in claude's input box, off captured pane text: the `❯`
+# line directly under a rule, through to the next rule (a multi-line draft
+# wraps inside the box). Prints the count; prints NOTHING and fails when no
+# box can be found. Literal box-drawing runs, not `{n,}`: heal can run in the
+# C locale, where a quantifier binds to the last BYTE of a multibyte char.
+pane_input_chars() {
+  printf '%s\n' "$1" | awk '
+    function rule(s) { return s ~ /^[[:space:]]*────/ }
+    { l[NR] = $0 }
+    END {
+      p = 0
+      for (i = NR; i > 1; i--) if (l[i] ~ /^[[:space:]]*❯/ && rule(l[i-1])) { p = i; break }
+      if (!p) exit 1
+      q = 0
+      for (i = p + 1; i <= NR; i++) if (rule(l[i])) { q = i; break }
+      if (!q) exit 1
+      t = ""
+      for (i = p; i < q; i++) t = t l[i]
+      sub(/^[[:space:]]*❯/, "", t)
+      gsub(/[[:space:]]|\302\240/, "", t)
+      print length(t)
+    }'
+}
+
+# Seconds since the last client input on the agent's session; nothing when
+# tmux will not say.
+pane_quiet_secs() {
+  local t
+  t="$(tm display-message -p -t "$1" '#{session_activity}' 2>/dev/null)"
+  [ "$t" -gt 0 ] 2>/dev/null || return 1
+  echo $(( $(date +%s) - t ))
+}
+
+# 0 = nobody is typing here. Otherwise prints WHY and fails. `quiet` 0 skips
+# limb 2, for verbs a person pressed on purpose (`model`, `cmd`) — they still
+# must never land inside a line he is writing.
+operator_not_typing() {
+  local a="$1" cap="${2:-}" quiet="${3:-$TYPE_QUIET_SECS}" n q
+  [ -n "$cap" ] || cap="$(tm capture-pane -p -t "$a" 2>/dev/null)"
+  n="$(pane_input_chars "$cap")" || { echo "no input box on screen (unreadable is not empty)"; return 1; }
+  [ "$n" -eq 0 ] 2>/dev/null || { echo "the input line holds ${n} chars — someone is writing"; return 1; }
+  [ "$quiet" -gt 0 ] 2>/dev/null || return 0
+  q="$(pane_quiet_secs "$a")" || { echo "session activity unreadable"; return 1; }
+  [ "$q" -ge "$quiet" ] 2>/dev/null || { echo "last keystroke ${q}s ago, quiet window is ${quiet}s"; return 1; }
+  return 0
+}
+
+# type_line for a LIVE claude pane: refuses (and says why, on stderr) rather
+# than splice. Every automatic caller goes through here, never type_line.
+type_into_claude() {
+  local a="$1" text="$2" quiet="${3:-$TYPE_QUIET_SECS}" why
+  why="$(operator_not_typing "$a" "" "$quiet")" \
+    || { echo "!! $a: NOT typing — $why" >&2; return 1; }
+  type_line "$a" "$text"
+}
+
 # What is this agent's claude doing RIGHT NOW? Reads the pane's visible text —
 # the permission dialog / input prompt is on screen when claude is blocked, so
 # the screen is the source of truth no notification channel can lie about.
@@ -1453,7 +1529,7 @@ compaction_row() {
 # the slash commands are written in lowercase here ON PURPOSE: `/compact`
 # in the ask can never be mistaken for the lane's own COMPACT. Keep it that
 # way — capitalising them would make the ask its own answer.
-COMPACT_ASK_TEXT="Your context is at %s tokens, over the %s-token cap. DO IT YOURSELF, in this order, and nothing will be typed into your pane: (1) finish the step you are on — do not abandon work mid-edit; (2) flush anything worth keeping to memory; (3) park — take no new work, and write down where you got to; (4) run /compact or /clear yourself. Then reply with ONE line naming EXACTLY ONE of the two words COMPACT or CLEAR, and why. Naming both is unresolved and stops everything. If you would rather not run it yourself, reply anyway and the command you name is typed for you at your next quiet moment. Nothing is done to this session until you answer."
+COMPACT_ASK_TEXT="Your context is at %s tokens, over the %s-token cap. DO IT YOURSELF, in this order, and nothing will be typed into your pane: (1) finish the step you are on — do not abandon work mid-edit; (2) flush anything worth keeping to memory; (3) park — take no new work, and write down where you got to; (4) run /compact or /clear yourself. Then reply with ONE line naming EXACTLY ONE of the two words COMPACT or CLEAR, and why. Naming both is unresolved and stops everything. If you would rather not run it yourself, reply anyway and /compact is typed for you at your next quiet moment — whichever word you name, /clear is never typed for you. Nothing is done to this session until you answer."
 
 # Type a literal then Enter, as two sends. `send-keys "<text>" Enter` in one
 # call makes tmux read the literal as a KEY NAME wherever it matches one —
@@ -1487,8 +1563,15 @@ compaction_safe_to_type() {
 }
 
 compaction_type() {
+  local why t0
   compaction_safe_to_type "$1" \
     || { echo "!! $1: pane is not claude's idle chrome (dialog or unreadable) — NOT typing" >&2; return 1; }
+  # The operator's line, after the chrome: a dialog is the worse keystroke, so
+  # it keeps its own refusal. Both leave the flags as they were — the crossing
+  # does not expire, and the next quiet pass tries again.
+  why="$(operator_not_typing "$1")" \
+    || { echo "!! $1: NOT typing — $why" >&2; return 1; }
+  t0="$(tm display-message -p -t "$1" '#{session_activity}' 2>/dev/null)"
   tm send-keys -l -t "$1" "$2" 2>/dev/null || return 1
   sleep 1
   # RE-CHECK before the Enter. The gap between the two sends is exactly where
@@ -1497,6 +1580,11 @@ compaction_type() {
   # harmless, a pressed default is neither.
   compaction_safe_to_type "$1" \
     || { echo "!! $1: a dialog appeared after the literal — Enter NOT sent" >&2; return 1; }
+  # …and a keystroke of his in that gap would ride our Enter as one mixed
+  # line. The box now holds OUR literal, so it cannot be re-read for emptiness;
+  # the activity clock can, because send-keys never moves it.
+  [ "$(tm display-message -p -t "$1" '#{session_activity}' 2>/dev/null)" = "$t0" ] \
+    || { echo "!! $1: a key was pressed after the literal — Enter NOT sent" >&2; return 1; }
   tm send-keys -t "$1" Enter 2>/dev/null || return 1
 }
 
@@ -1962,7 +2050,7 @@ compaction_answer_leg() {
   fi
 
   # 🔴 THE SAME IDLE GUARD AS THE ASK, and for a stronger reason: this
-  # keystroke is `/clear`. A lane mid-turn is left alone and retried — the
+  # keystroke is a slash command, not a message. A lane mid-turn is left alone and retried — the
   # verdict is already banked, so waiting costs nothing.
   st="$(classify_agent "$a" || true)"
   if [ "$st" != "idle" ]; then
@@ -1985,10 +2073,14 @@ compaction_answer_leg() {
     echo "$a: answered ${ans} ${waited}s ago, still $st — deadline reached, typing"
   fi
 
-  local cmd
+  # ⛔ /compact ONLY — "/clear" is never typed. His word, 22 Sep 20:2xZ: "can
+  # we run compact … instead of the forced clear?" A lane may still /clear
+  # ITSELF on the ask; what heal types keeps the context. The verdict is still
+  # recorded as written, so the Ledger keeps what each lane chose.
+  local cmd how
   case "$ans" in
-    CLEAR)   cmd="/clear" ;;
-    COMPACT) cmd="/compact" ;;
+    CLEAR)   cmd="/compact"; how="answered CLEAR, executed COMPACT, his 22 Sep word" ;;
+    COMPACT) cmd="/compact"; how="on the lane's own COMPACT" ;;
     # Anything else was never a verdict. Unreachable by construction, and
     # still refused here rather than defaulted: a default in this position
     # is a slash command chosen by the code instead of the lane.
@@ -2000,7 +2092,7 @@ compaction_answer_leg() {
   # Row BEFORE the keystroke: if the send goes wrong, the record still says
   # what was about to happen and at what reading.
   compaction_row "$a" exec "$pct" "$tok" \
-    "typing ${cmd} at ${tok} tokens on the lane's own ${ans}"
+    "typing ${cmd} at ${tok} tokens: ${how}"
   compaction_type "$a" "$cmd" || { echo "!! $a: ${cmd} send-keys failed" >&2; return 0; }
   printf '%s\n' "$tok" > "$flag.exec"
   echo "$a: typed ${cmd} at ${tok} tokens (lane answered ${ans})"
@@ -4425,6 +4517,14 @@ case "${1:-help}" in
                 # A wedged pane must cost this ONE nudge, not the whole pass
                 # (2026-07-23: an unbounded send-keys here hung heal 2h28m and
                 # blocked all post-deploy recovery behind it).
+                # Someone writing in the pane defers the nudge WHOLE: no strike,
+                # no budget spent, so the next quiet pass nudges instead of
+                # escalating a lane that was never told. 5 of this leg's 18
+                # nudges in the week to 22 Sep landed in the operator's pane.
+                if ! why="$(operator_not_typing "$a")"; then
+                  echo "$a: $state — nudge deferred, $why"
+                  continue
+                fi
                 type_line "$a" "$nudge" \
                   || echo "!! $a: nudge send-keys failed/timed out (pane wedged?) — skipping" >&2
                 touch "$flag"
@@ -4480,7 +4580,8 @@ case "${1:-help}" in
               claude-*) ;;
               *) echo "usage: $CMD model [agent] default|opus|fable|sonnet|haiku|<alias>[1m]|claude-<full-id>" >&2; exit 1 ;;
             esac
-            type_line "$a" "/model $m"
+            # a person pressed this — no quiet window, but never into his line
+            type_into_claude "$a" "/model $m" 0 || exit 1
             for i in 1 2 3 4 5 6 7 8 9 10; do
               sleep 1
               # only the LIVE bottom of the screen — an older "Kept model as"
@@ -4497,11 +4598,11 @@ case "${1:-help}" in
                 echo "$a: model already $m (no switch needed)"; break
               fi
             done ;;
-  cmd)      if [ "${2:-}" = all ]; then shift 2; for a in $(squad_agents); do type_line "$a" "$@"; done
-            elif [ -n "${2:-}" ] && agents | grep -qxF -- "${2:-}"; then a="$2"; shift 2; type_line "$a" "$@"
+  cmd)      if [ "${2:-}" = all ]; then shift 2; for a in $(squad_agents); do type_into_claude "$a" "$*" 0 || true; done
+            elif [ -n "${2:-}" ] && agents | grep -qxF -- "${2:-}"; then a="$2"; shift 2; type_into_claude "$a" "$*" 0 || exit 1
             else a="$(need_agent "")" || exit 1; shift
                  [ -n "${1:-}" ] || { echo "usage: $CMD cmd [agent|all] \"text\"" >&2; exit 1; }
-                 type_line "$a" "$@"; fi ;;
+                 type_into_claude "$a" "$*" 0 || exit 1; fi ;;
   key)      if [ -n "${2:-}" ] && agents | grep -qxF -- "${2:-}"; then t="$2"; shift 2; tm send-keys -t "$t" "$@"
             else t="$(need_agent "")" || exit 1; shift
                  [ -n "${1:-}" ] || { echo "usage: $CMD key [agent] <keys>" >&2; exit 1; }

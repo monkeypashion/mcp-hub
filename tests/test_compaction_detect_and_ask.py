@@ -38,6 +38,10 @@ SQUAD = Path(__file__).resolve().parents[1] / "squad" / "squad"
 CAP = 138_111
 UNDER, OVER = 40_000, 169_255
 
+RULE = "─" * 48 + "\n"
+# claude's input box as the client draws it: `❯` + a no-break space.
+INPUT_BOX = RULE + "❯\u00a0\n" + RULE
+
 
 def assistant(ts, text, tokens):
     """One assistant record. Usage is SPLIT across the three fields the
@@ -87,7 +91,8 @@ def transcript(home: Path, worktree: Path, *, tokens=None, replies=(),
 
 def run(tmp_path, snippet, *, tokens=OVER, state_lines=None, agent="lane-a",
         replies=(), env=None, ctx="16", jitter=False, klass="squad",
-        compacted=None, pane=None, pane_after=None, members=None):
+        compacted=None, pane=None, pane_after=None, members=None,
+        activity=None, activity_after=None):
     home = tmp_path
     (home / ".mcp-hub").mkdir(parents=True, exist_ok=True)
     conf = home / "squad.conf"
@@ -100,15 +105,25 @@ def run(tmp_path, snippet, *, tokens=OVER, state_lines=None, agent="lane-a",
 
     # The pane: a statusline carrying ctx (decoration now, not the trigger),
     # plus whatever state chrome the test wants classify_text to read.
+    # The input box is part of every idle claude screen, and it is now read:
+    # an absent box fails closed, so the default pane carries an EMPTY one.
     if pane is None:
-        pane = (f"⚡ 8/11 · Opus high · ctx [||||] {ctx}%\n" if ctx
-                else "no statusline\n")
+        pane = INPUT_BOX
+        pane += (f"⚡ 8/11 · Opus high · ctx [||||] {ctx}%\n" if ctx
+                 else "no statusline\n")
         pane += (state_lines or "")
     (bin_ / "tmux").write_text(
         "#!/bin/bash\n"
         f'echo "$@" >> {home}/tmux.log\n'
         # the literal landing is what "a dialog appeared afterwards" means
         f'case "$*" in *"send-keys -l"*) touch {home}/literal_sent ;; esac\n'
+        # `activity` is SECONDS AGO of the last client keystroke; unset reads
+        # as long quiet. `activity_after` is a key pressed between the literal
+        # and the Enter — the second read sees it.
+        'case "$*" in *session_activity*)\n'
+        f'  if [ -f {home}/activity2 ] && [ -f {home}/literal_sent ]; then cat {home}/activity2;\n'
+        f'  elif [ -f {home}/activity ]; then cat {home}/activity; else echo 12345; fi; exit 0 ;;\n'
+        'esac\n'
         'for a in "$@"; do\n'
         '  case "$a" in\n'
         f'    has-session) exit 0 ;;\n'
@@ -123,6 +138,11 @@ def run(tmp_path, snippet, *, tokens=OVER, state_lines=None, agent="lane-a",
     (home / "pane.txt").write_text(pane)
     if pane_after is not None:
         (home / "pane2.txt").write_text(pane_after)
+    now = int(time.time())
+    if activity is not None:
+        (home / "activity").write_text(f"{now - activity}\n")
+    if activity_after is not None:
+        (home / "activity2").write_text(f"{now - activity_after}\n")
 
     # pgrep/ps make agent_started answer, so the once-per-session flag has a key
     (bin_ / "pgrep").write_text("#!/bin/bash\necho 999\n")
@@ -475,17 +495,16 @@ def test_a_verdict_types_nothing_while_the_leg_is_disarmed(tmp_path):
     assert commands_typed(tmp_path) == []
 
 
-@pytest.mark.parametrize("verdict,cmd,other", [
-    ("COMPACT", "/compact", "/clear"),
-    ("CLEAR", "/clear", "/compact"),
-])
-def test_an_armed_leg_types_the_command_the_lane_chose(tmp_path, verdict, cmd, other):
+@pytest.mark.parametrize("verdict", ["COMPACT", "CLEAR"])
+def test_an_armed_leg_types_compact_whichever_word_the_lane_chose(tmp_path, verdict):
+    """His word, 22 Sep: compact instead of the forced clear. The VERDICT is
+    still recorded as written; only the keystroke is fixed."""
     p = run(tmp_path, "compaction_one lane-a\n" * 2, env=ARMED,
             replies=answered(f"{verdict} — flushed to memory first."))
-    assert f"typed {cmd}" in p.stdout, p.stdout + p.stderr
-    assert commands_typed(tmp_path) == [cmd], f"other={other} leaked"
+    assert "typed /compact" in p.stdout, p.stdout + p.stderr
+    assert commands_typed(tmp_path) == ["/compact"]
     assert f"lane answered {verdict}" in rows(tmp_path)
-    assert f"typing {cmd}" in rows(tmp_path)
+    assert "typing /compact" in rows(tmp_path)
 
 
 def test_the_slash_command_is_typed_as_two_sends(tmp_path):
@@ -1241,7 +1260,9 @@ def test_a_boundary_from_BEFORE_the_ask_is_not_the_lane_obeying(tmp_path):
     p = run(tmp_path, "compaction_one lane-a", env=ARMED,
             replies=answered("CLEAR"), compacted=(OVER, SHRUNK, -3_600))
     assert "compacted itself on the ask" not in p.stdout, p.stdout
-    assert "typed /clear" in p.stdout, p.stdout
+    # CLEAR executes as /compact since his 22 Sep word; the point here is
+    # that the exec leg ran at all.
+    assert "typed /compact" in p.stdout, p.stdout
 
 
 # --- card #440: the ask is confined to one squad -------------------------
@@ -1288,3 +1309,148 @@ def test_the_scope_defaults_to_dreamteam_in_the_shipped_script(tmp_path):
     script rather than duplicated as a literal, the same way the cap is."""
     assert 'MCP_HUB_COMPACT_ASK_SQUAD:-dreamteam' in SQUAD.read_text(
         encoding="utf-8")
+
+
+# --- never into his half-written line (his typed word, 22 Sep 20:0xZ) -------
+#
+# "really fed up with the random tmux commands /clear /compact into my text
+# whilst I am typing". Measured on the cockpit pane over 21 days: 13 of his
+# lines arrived spliced, and 6 of those 13 came 19-109 min after his previous
+# submitted line — so the EMPTY-BOX limb carries it and the quiet window is
+# the second limb, not the first. Every property below is asserted in BOTH
+# polarities: a guard that refused everything would pass every negative.
+
+DRAFT_BOX = RULE + "❯ can you check whether the bra\n" + RULE
+DRAFT_TWO_LINES = RULE + "❯ \n  and then the second line\n" + RULE
+
+
+def _pane(box, ctx="16"):
+    return box + f"  ⚡ 8/11 · Opus high · ctx [||||] {ctx}%\n" \
+                 "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
+
+
+@pytest.mark.parametrize("box", [DRAFT_BOX, DRAFT_TWO_LINES])
+def test_text_on_his_line_means_NO_ask(tmp_path, box):
+    p = run(tmp_path, "compaction_one lane-a", pane=_pane(box))
+    assert "send-keys" not in keys(tmp_path)
+    assert "someone is writing" in p.stderr
+    assert "compaction ask sent at" not in p.stdout
+
+
+def test_an_empty_line_still_gets_the_ask(tmp_path):
+    """The other polarity, on the same pane with only the box changed."""
+    p = run(tmp_path, "compaction_one lane-a", pane=_pane(INPUT_BOX))
+    assert "send-keys -l" in keys(tmp_path)
+    assert "compaction ask sent at" in p.stdout
+
+
+def test_a_screen_with_no_input_box_is_not_an_empty_line(tmp_path):
+    """Chrome with no `❯` box under a rule: unreadable, so no keystroke."""
+    pane = ("  ⚡ 8/11 · Opus high · ctx [||||] 16%\n"
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n")
+    p = run(tmp_path, "compaction_one lane-a", pane=pane)
+    assert "send-keys" not in keys(tmp_path)
+    assert "unreadable is not empty" in p.stderr
+
+
+@pytest.mark.parametrize("ago,asked", [(120, False), (1800, True)])
+def test_the_quiet_window_after_his_last_keystroke(tmp_path, ago, asked):
+    """The deputy's must-fire: his last keystroke 2 min ago gets NO order,
+    30 min ago gets one — same seat, same reading, only the clock moved."""
+    p = run(tmp_path, "compaction_one lane-a", activity=ago)
+    assert ("compaction ask sent at" in p.stdout) is asked, p.stdout + p.stderr
+    if not asked:
+        assert "send-keys" not in keys(tmp_path)
+        assert "quiet window is 900s" in p.stderr
+
+
+def test_a_deferred_ask_still_records_the_fire_and_asks_later(tmp_path):
+    """Detection is a separate fact from delivery: the crossing is recorded
+    once, and the order waits for the quiet moment instead of expiring."""
+    run(tmp_path, "compaction_one lane-a", activity=60)
+    assert rows(tmp_path).count(" fire ") == 1
+    assert " ask " not in rows(tmp_path)
+    (tmp_path / "activity").write_text(f"{int(time.time()) - 3600}\n")
+    p = run(tmp_path, "compaction_one lane-a")
+    assert "compaction ask sent at" in p.stdout
+    assert rows(tmp_path).count(" fire ") == 1
+
+
+def test_a_key_pressed_after_the_literal_withholds_the_Enter(tmp_path):
+    """The box holds OUR text by then, so it cannot be re-read for emptiness;
+    the activity clock can, because send-keys never moves it. His keystroke
+    would otherwise ride our Enter as one mixed line."""
+    p = run(tmp_path, "compaction_one lane-a", activity=3600, activity_after=0)
+    log = keys(tmp_path)
+    assert "send-keys -l" in log
+    assert not any(ln.strip().endswith("Enter") for ln in log.splitlines())
+    assert "a key was pressed after the literal" in p.stderr
+
+
+def test_the_exec_leg_refuses_his_line_too(tmp_path):
+    """/compact typed into a draft is the "t/compacthe" splice itself."""
+    run(tmp_path, "compaction_one lane-a\n" * 2, env=ARMED,
+        replies=answered("COMPACT"), pane=_pane(DRAFT_BOX))
+    assert commands_typed(tmp_path) == []
+
+
+def test_clear_NEVER_reaches_send_keys(tmp_path):
+    """His word, 22 Sep 20:2xZ. The row says what happened in his terms."""
+    run(tmp_path, "compaction_one lane-a\n" * 2, env=ARMED,
+        replies=answered("CLEAR — nothing here worth keeping."))
+    assert "/clear" not in [ln.rsplit(" ", 1)[-1].strip()
+                            for ln in keys(tmp_path).splitlines()
+                            if "send-keys" in ln]
+    assert commands_typed(tmp_path) == ["/compact"]
+    assert "answered CLEAR, executed COMPACT, his 22 Sep word" in rows(tmp_path)
+
+
+def test_the_ask_no_longer_promises_to_type_the_word_named(tmp_path):
+    ask = (run(tmp_path, "compaction_one lane-a"), _ask_text(tmp_path))[1]
+    assert "the command you name is typed" not in ask
+    assert "/clear is never typed for you" in ask
+
+
+# the other callers: nudge (automatic), `model` and `cmd` (a person pressed them)
+
+@pytest.mark.parametrize("box,ago,typed", [
+    (INPUT_BOX, 3600, True),
+    (DRAFT_BOX, 3600, False),
+    (INPUT_BOX, 60, False),
+])
+def test_type_into_claude_guards_the_automatic_callers(tmp_path, box, ago, typed):
+    p = run(tmp_path, 'type_into_claude lane-a "hub: your session shows offline."',
+            pane=_pane(box), activity=ago)
+    assert ("send-keys -t lane-a -l" in keys(tmp_path)) is typed, p.stderr
+
+
+@pytest.mark.parametrize("box,typed", [(INPUT_BOX, True), (DRAFT_BOX, False)])
+def test_a_verb_a_person_pressed_skips_only_the_quiet_window(tmp_path, box, typed):
+    """`model`/`cmd` pass quiet=0: a keystroke 5s ago does not hold them, a
+    draft on the line still does."""
+    run(tmp_path, 'type_into_claude lane-a "/model opus" 0',
+        pane=_pane(box), activity=5)
+    assert ("send-keys -t lane-a -l" in keys(tmp_path)) is typed
+
+
+def test_the_nudge_is_guarded_and_a_deferral_costs_no_strike_or_budget():
+    """No harness reaches heal's nudge arm end to end, so its WIRING is read:
+    the guard precedes the keystroke, and the deferral leaves the arm before
+    the strike flag and the nudge budget are touched."""
+    src = SQUAD.read_text(encoding="utf-8")
+    arm = src[src.index("              nudge)\n"):src.index("              spent)\n")]
+    guard = arm.index('operator_not_typing "$a"')
+    assert guard < arm.index('type_line "$a" "$nudge"')
+    assert arm.index("continue", guard) < arm.index('touch "$flag"')
+    assert arm.index("continue", guard) < arm.index('> "$ncnt"')
+
+
+def test_every_type_line_into_a_live_claude_pane_is_guarded():
+    """Raw type_line survives only inside the guard, the guarded nudge, and
+    the relaunch lines, which type into a bare SHELL before claude exists."""
+    src = SQUAD.read_text(encoding="utf-8").splitlines()
+    raw = [ln.strip() for ln in src
+           if 'type_line "' in ln and not ln.lstrip().startswith("#")]
+    allowed = ('type_line "$a" "$text"', 'type_line "$a" "$nudge"',
+               'launch_line', 'GH_CONFIG_DIR')
+    assert raw and all(any(k in ln for k in allowed) for ln in raw), raw
