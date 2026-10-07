@@ -321,7 +321,7 @@ class TestZeroBehaviourChange:
         off = self._run(capsys, tmp_path / "a", shadow_on=False)
         on = self._run(capsys, tmp_path / "b", shadow_on=True)
         assert on == off
-        assert json.loads(on)["decision"] == "block"  # control: it DID render
+        assert "additionalContext" in json.loads(on)["hookSpecificOutput"]  # control: it DID render
 
     def test_a_RAISING_shadow_cannot_break_the_hook(self, capsys, tmp_path):
         """🔴 Fail-open, provoked rather than assumed. The corrupt-transcript
@@ -350,8 +350,8 @@ class TestZeroBehaviourChange:
 
         # the messages still reached the agent — the diagnostic died alone
         out = capsys.readouterr().out
-        assert json.loads(out)["decision"] == "block"
-        assert BODY[:20] in json.loads(out)["reason"]
+        assert "additionalContext" in json.loads(out)["hookSpecificOutput"]
+        assert BODY[:20] in json.loads(out)["hookSpecificOutput"]["additionalContext"]
 
     def test_a_corrupt_transcript_is_survivable(self, capsys, tmp_path):
         """Robustness of the reader itself (binary junk, truncated records).
@@ -373,7 +373,7 @@ class TestZeroBehaviourChange:
                           return_value=tmp_path / "shadow.jsonl"):
             assert stop_hook_command(args) == 0
 
-        assert json.loads(capsys.readouterr().out)["decision"] == "block"
+        assert "additionalContext" in json.loads(capsys.readouterr().out)["hookSpecificOutput"]
 
     def test_a_missing_transcript_path_is_survivable(self, tmp_path):
         """The hook payload does not always carry `transcript_path`."""

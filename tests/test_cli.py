@@ -382,8 +382,11 @@ def test_messages_present_outputs_valid_hook_json(capsys):
     assert rc == 0
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
-    assert payload["decision"] == "block"
-    assert "hello" in payload["reason"]
+    # The printed shape is the single-delivery one (2026-10-07): Stop hook
+    # output reaches the model once, as additionalContext.
+    ctx = payload["hookSpecificOutput"]
+    assert ctx["hookEventName"] == "Stop"
+    assert "hello" in ctx["additionalContext"]
 
 
 # ---------------------------------------------------------------------------

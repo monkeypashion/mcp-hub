@@ -5373,25 +5373,25 @@ def stop_hook_command(args: argparse.Namespace) -> int:
 
 
 def _stop_output_shape(agent_name: str, response: dict[str, Any]) -> dict[str, Any]:
-    """The block as Claude Code should receive it — an EXPERIMENT, opt-in.
+    """The block as Claude Code should receive it: ONCE, not twice.
 
-    `{"decision": "block", "reason": R}` puts R into the model's context
-    twice: once as "Stop hook feedback: R" and again as "Stop hook blocking
-    error from command …: R" (measured in every lane's transcript; the docs
-    are silent on why). The docs describe a second shape for Stop,
-    `hookSpecificOutput.additionalContext`, as reaching the model once —
-    but not whether it continues the session the way a block does.
+    `{"decision": "block", "reason": R}` put R into the model's context
+    twice, once as "Stop hook feedback: R" and again as "Stop hook blocking
+    error from command …: R", in every lane's transcript.
+    `hookSpecificOutput.additionalContext` delivers R once and still
+    continues the session. Measured on mcp-hub-dev-vm-1 from 2026-10-06
+    21:2xZ through the night (every drain landed once and continued), then
+    made the default for every lane on the operator's word, 2026-10-07.
 
-    So it ships DARK: only lanes named one per line in
-    `<state dir>/stop-output-context` get the new shape, everyone else is
-    byte-identical to before. Measured on one lane before it goes wider.
+    Escape hatch: a lane named, one per line, in
+    `<state dir>/stop-output-block` keeps the old double-delivering shape.
     """
     try:
-        listed = (_state_dir() / "stop-output-context").read_text(
+        legacy = (_state_dir() / "stop-output-block").read_text(
             encoding="utf-8").split()
     except OSError:
-        return response
-    if agent_name not in listed:
+        legacy = []
+    if agent_name in legacy:
         return response
     return {"hookSpecificOutput": {"hookEventName": "Stop",
                                    "additionalContext": response["reason"]}}
