@@ -30,6 +30,7 @@ from pydantic import BaseModel
 
 from mcp_hub import (
     evidence,
+    identity,
     lineage,
     ra_feature,  # registers the ra.feature/1 scheme on import
     refs,
@@ -5183,6 +5184,56 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             return json.dumps(status_resolution.resolve_status(conn, ref))
         except refs.RefError as e:
             return f"REFUSED: {e}"
+
+    # -- Identity assertions (identity.py) --
+
+    @mcp.tool()
+    def identity_assertion(
+        agent_name: str, audience: str, ctx: Context | None = None
+    ) -> str:
+        """A short-lived token, signed by the hub, stating who you are.
+
+        Give it to a service (e.g. Brain) that needs a caller name it can
+        trust. Issued ONLY when this session is bound to `agent_name`
+        (register first): the token says what the hub verified, never what
+        a caller claimed. Valid 5 minutes, for one audience.
+
+        Args:
+            agent_name: Your agent name.
+            audience: The service the token is for, e.g. "brain".
+        """
+        audience = (audience or "").strip()
+        if not audience or len(audience) > 64:
+            return "REFUSED: audience must be a service name, 1-64 chars."
+        grade, attr_err = _attribution(ctx, agent_name)
+        if attr_err:
+            return attr_err
+        if grade not in identity.VERIFIED_GRADES:
+            return (
+                f"REFUSED: this session is not bound to '{agent_name}' "
+                f"(grade {grade}), so the hub cannot vouch for the name. "
+                "Call register() from your own session first. A token for "
+                "an unverified name would turn a claim into an identity."
+            )
+        return identity.issue(db_path, agent_name, grade, audience)
+
+    @mcp.tool()
+    def identity_public_key() -> str:
+        """The hub's PUBLIC signing key, for verifying identity_assertion
+        tokens. The private half never leaves the hub.
+
+        Verify with PyJWT:
+            jwt.decode(token, PEM, algorithms=["EdDSA"],
+                       audience="<you>", issuer="mcp-hub")
+        Then check `grade`, and keep a replay cache of `jti` until `exp`.
+        """
+        return json.dumps({
+            "issuer": identity.ISSUER,
+            "alg": "EdDSA",
+            "kid": identity.key_id(db_path),
+            "ttl_seconds": identity.ASSERTION_TTL_SECONDS,
+            "public_key_pem": identity.public_pem(db_path),
+        })
 
     # -- Lane evidence (F14) --
 
