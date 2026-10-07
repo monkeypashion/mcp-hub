@@ -389,6 +389,23 @@ async def test_list_agents_stays_silent_for_a_lane_that_never_reported(server):
     assert "✍" not in out
 
 
+async def test_an_old_daemons_beat_is_not_a_blind_reading(server):
+    """An older daemon beats with agent_name alone. That is NO reading, and
+    it must render as nothing. Before the fix it was stored as count 0 and
+    every such lane read "✍ no transcripts", a claim that a daemon looked
+    and saw nothing (prod, 2026-10-07 03:06Z, every lane). The control
+    above never beats, so it could not see this."""
+    await _call_tool(server, "register", {"name": "alice", "project": "p"})
+    await _call_tool(server, "heartbeat", {"agent_name": "alice"})
+    out = await _call_tool(server, "list_agents", {})
+    assert "✍" not in out
+    # A real blind scan (the daemon sent count 0) still says so.
+    await _call_tool(server, "heartbeat",
+                     {"agent_name": "alice", "transcript_mtime": 0.0,
+                      "transcript_count": 0})
+    assert "✍ no transcripts" in await _call_tool(server, "list_agents", {})
+
+
 # ---------------------------------------------------------------------------
 # The daemon — and the rule that it must keep beating no matter what
 # ---------------------------------------------------------------------------

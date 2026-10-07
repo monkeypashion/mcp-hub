@@ -5358,7 +5358,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     def heartbeat(
         agent_name: str,
         transcript_mtime: float = 0.0,
-        transcript_count: int = 0,
+        transcript_count: int = -1,
     ) -> str:
         """Out-of-session liveness signal from the agent's heartbeat daemon.
 
@@ -5430,22 +5430,34 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         #
         # UPDATE ... WHERE name = ? is a no-op for an unknown agent, so a
         # heartbeat never conjures a row.
+        #
+        # transcript_count = -1 (the default) means the daemon SENT NOTHING:
+        # one older than this feature, which calls heartbeat(agent_name)
+        # alone. Writing its absent reading as count 0 rendered every such
+        # lane "✍ no transcripts", a claim that a daemon looked and saw
+        # nothing, when none had looked at all (measured on prod 2026-10-07
+        # 03:06Z, every lane, minutes after this shipped). A reading nobody
+        # sent stays unwritten, so the lane renders blank: no measurement.
         now = time.time()
         conn = _get_db(db_path)
-        cols = ("transcript_mtime = ?, transcript_count = ?, "
-                "transcript_reported_at = ?")
-        params: tuple = (
-            max(0.0, float(transcript_mtime or 0.0)),
-            max(0, int(transcript_count or 0)),
-            now,
-        )
+        cols, params = "", ()
+        if transcript_count is not None and int(transcript_count) >= 0:
+            cols = ("transcript_mtime = ?, transcript_count = ?, "
+                    "transcript_reported_at = ?")
+            params = (
+                max(0.0, float(transcript_mtime or 0.0)),
+                int(transcript_count),
+                now,
+            )
         if outcome == "refreshed":
-            cols += ", last_seen = ?"
+            cols += (", " if cols else "") + "last_seen = ?"
             params += (now,)
-        conn.execute(
-            f"UPDATE agents SET {cols} WHERE name = ?", params + (agent_name,)
-        )
-        conn.commit()
+        if cols:
+            conn.execute(
+                f"UPDATE agents SET {cols} WHERE name = ?",
+                params + (agent_name,),
+            )
+            conn.commit()
 
         if outcome == "unbound":
             return f"heartbeat ignored — '{agent_name}' has no binding{boot_tag}"
