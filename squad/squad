@@ -985,6 +985,13 @@ PACE_TIMEOUT="${MCP_HUB_PACE_TIMEOUT:-5}"
 
 pace_verdict() { # prints over | under | unknown — never fails its caller
   local body mode
+  # The console that publishes the pace was retired with the proxy on the
+  # operator's word (2026-10-07: "go ahead its wasting resources"), and the
+  # share brake it served has been off since his 2026-09-23 word. With
+  # MCP_HUB_PACE_GATE=off there is no line to be over, so a held lane's
+  # release restarts it instead of waiting on a reader that no longer runs.
+  # Unset, the gate is unchanged and still fails closed.
+  [ "${MCP_HUB_PACE_GATE:-on}" = off ] && { echo under; return 0; }
   command -v jq   >/dev/null 2>&1 || { echo unknown; return 0; }
   command -v curl >/dev/null 2>&1 || { echo unknown; return 0; }
   body="$(curl -fsS --max-time "$PACE_TIMEOUT" "$PACE_URL" 2>/dev/null)" \
