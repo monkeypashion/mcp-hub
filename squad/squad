@@ -502,6 +502,25 @@ sys.stdout.write("".join("%s\x1f%d\x1f%d\n" % r for r in out))
 # wakeability snapshot; heartbeat-*.pid is its singleton claim.
 safe_name()    { printf '%s' "$1" | sed 's/[^A-Za-z0-9_-]/_/g'; }
 status_file()  { printf '%s\n' "$HOME/.mcp-hub/status-$(safe_name "$1").json"; }
+# True when the lane's daemon has reported, within the last 3 min and after
+# <since>, that the hub can push to it right now (list_agents' ⚡). A stale,
+# missing or unreadable file is NOT proof of anything and answers false.
+wake_verified_since() {  # <agent> <since-epoch>
+  local f now
+  f="$(status_file "$1")"
+  [ -r "$f" ] || return 1
+  now="$(date +%s)"
+  python3 - "$f" "$2" "$now" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    ts, since, now = float(d.get("ts") or 0), float(sys.argv[2]), float(sys.argv[3])
+    ok = d.get("wakeable") is True and ts > since and now - ts <= 180
+except Exception:
+    ok = False
+sys.exit(0 if ok else 1)
+PY
+}
 pidfile()      { printf '%s\n' "$HOME/.mcp-hub/heartbeat-$(safe_name "$1").pid"; }
 
 # Compact hub-presence glyph from the daemon's status cache (same source as
@@ -4222,6 +4241,18 @@ case "${1:-help}" in
                 started="$(agent_started "$a")" || continue
                 [ -n "$started" ] || continue
                 [ "$started" -lt "$disrupt" ] || continue      # postdates it — stream is fine
+                # PREDATING A DISRUPTION IS A GUESS; ⚡ IS A MEASUREMENT. In July a
+                # hub restart killed every receive stream, so "older than the
+                # restart" meant deaf. Since 10c6f99 (2026-10-07) a restart is
+                # ~3s and Claude Code reattaches by itself: the day after, heal
+                # was still relaunching lanes the hub showed ⚡, ping-verified,
+                # including 27h after the last restart. The lane's own daemon
+                # writes the hub's verdict every minute; if that reading is
+                # fresh, postdates the disruption and says wakeable, the stream
+                # survived and a relaunch would only cost a session.
+                if wake_verified_since "$a" "$disrupt"; then
+                  continue
+                fi
                 args="$(field "$a" 4)"
                 # A CONTAINER seat reaches here — comms_agents includes it,
                 # since has_comms answers ON for containers — and its field 4 is
