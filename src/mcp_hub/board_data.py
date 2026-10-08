@@ -67,6 +67,39 @@ def _age_h(age: float) -> str:
     return f"{age // 86400}d"
 
 
+# One scan serves every open board. `squad board --json` captures a pane per
+# agent and costs ~9 CPU-seconds on dev-vm-1 (2026-10-08); two boards open on
+# the same box ran the identical scan twice. A board that finds a scan younger
+# than this uses it instead of running its own.
+SCAN_SHARE_SECONDS = 10.0
+SCAN_SHARE_FILE = "board-scan.json"
+
+
+def _shared_scan(cache: Path, now: float) -> str | None:
+    """The raw JSON of another board's recent scan, or None to scan anew."""
+    data = _read_json(cache / SCAN_SHARE_FILE)
+    ts, out = data.get("ts"), data.get("stdout")
+    if not isinstance(ts, (int, float)) or not isinstance(out, str):
+        return None
+    # A future ts is a clock step, not a fresh scan.
+    return out if 0 <= now - ts < SCAN_SHARE_SECONDS else None
+
+
+def _share_scan(cache: Path, stdout: str, now: float) -> None:
+    """Publish a successful scan for the other boards. Best effort: a write
+    that fails only costs them a scan of their own."""
+    path = cache / SCAN_SHARE_FILE
+    tmp = path.with_name(f".{path.name}.{os.getpid()}")
+    try:
+        tmp.write_text(json.dumps({"ts": now, "stdout": stdout}), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def collect(squad_bin: str, home: Path | None = None,
             now: float | None = None) -> dict[str, Any]:
     """One snapshot of everything the board shows, merged per agent.
@@ -84,10 +117,16 @@ def collect(squad_bin: str, home: Path | None = None,
     scan: list[dict[str, Any]] = []
     unmanaged: list[dict[str, Any]] = []
     try:
-        proc = subprocess.run(
-            [squad_bin, "board", "--json"],
-            capture_output=True, text=True, timeout=20,
-        )
+        shared = _shared_scan(cache, now)
+        if shared is None:
+            proc = subprocess.run(
+                [squad_bin, "board", "--json"],
+                capture_output=True, text=True, timeout=20,
+            )
+            if proc.returncode == 0:
+                _share_scan(cache, proc.stdout, now)
+        else:
+            proc = subprocess.CompletedProcess([], 0, shared, "")
         if proc.returncode == 0:
             doc = json.loads(proc.stdout)
             scan = doc.get("agents", [])

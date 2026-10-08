@@ -1095,10 +1095,17 @@ class SettingsApp(App):
 
     # ---- polling: a tick that outlasts its interval must not stack ----
 
-    # Backpressure ceiling. A run that took longer than its interval buys a
-    # gap of its own length before the next one starts, so a slow poll spends
-    # at most half its time scanning — capped, because a pathological run must
-    # not freeze the board for minutes.
+    # Backpressure. Every run buys a rest of POLL_REST_FACTOR times its own
+    # length before the next one starts, so a poll spends at most a quarter of
+    # its time scanning — capped, because a pathological run must not freeze
+    # the board for minutes. A fast run's rest falls inside its tick and costs
+    # nothing; only a slow one is spaced out.
+    #
+    # The factor was 1 (a gap of the run's own length) until 2026-10-08, when
+    # homelab measured two idle boards on dev-vm-1 at 0.4-2 cores each: a 7.7s
+    # `squad board --json` costing ~9 CPU-seconds, run half the time, for a
+    # screen nobody was reading. Half the time is still a busy loop.
+    POLL_REST_FACTOR = 3.0
     POLL_MAX_GAP = 30.0
 
     def _poll_guarded(self, group: str, work, *, force: bool = False) -> None:
@@ -1128,11 +1135,11 @@ class SettingsApp(App):
             try:
                 work()
             finally:
-                # The gap is the OVERRUN's cost, not a new refresh policy: a
-                # run inside its interval sets no gap at all, so a healthy box
-                # polls exactly as it always did.
+                # The gap is priced by the run's own cost: a run well inside
+                # its interval rests inside it too, so a healthy box polls
+                # exactly as it always did.
                 took = self._now() - started
-                gap = min(took, self.POLL_MAX_GAP)
+                gap = min(took * self.POLL_REST_FACTOR, self.POLL_MAX_GAP)
                 self._poll_gap_until[group] = self._now() + gap
                 self._poll_running.discard(group)
 

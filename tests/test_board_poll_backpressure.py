@@ -101,9 +101,10 @@ async def test_the_guard_releases_when_the_scan_finishes():
 
 @pytest.mark.asyncio
 async def test_an_overrunning_scan_buys_a_gap_before_the_next_one():
-    """Backpressure: a scan that outlasts its interval spends at most half the
-    time scanning. The gap is measured from the last run, because the script's
-    runtime grows with the fleet and a hand-chosen interval goes stale."""
+    """Backpressure: a slow scan spends at most a quarter of the time
+    scanning (a rest of 3x its length, capped at 30s). The gap is measured
+    from the last run, because the script's runtime grows with the fleet and
+    a hand-chosen interval goes stale."""
     clock = {"t": 1000.0}
     runs = []
 
@@ -116,14 +117,14 @@ async def test_an_overrunning_scan_buys_a_gap_before_the_next_one():
     async with app.run_test(size=(120, 34)) as pilot:
         await _settle(pilot)
         assert len(runs) == 1
-        app._poll_board()           # t=1012, gap runs to t=1024
+        app._poll_board()           # t=1012, 36s rest capped: gap runs to t=1042
         await _settle(pilot)
         assert len(runs) == 1, "the next tick ran inside the gap"
-        clock["t"] = 1023.9
+        clock["t"] = 1041.9
         app._poll_board()
         await _settle(pilot)
         assert len(runs) == 1, "the gap ended early"
-        clock["t"] = 1024.1
+        clock["t"] = 1042.1
         app._poll_board()
         await _settle(pilot)
         assert len(runs) == 2, "the gap never ended"

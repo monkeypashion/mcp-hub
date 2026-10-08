@@ -5147,7 +5147,10 @@ except Exception:
                 if self_stale; then exec "$SELF" who --watch; fi
                 printf '\033[2J\033[H'
                 printf 'squad who — %s   (🔴 dialog needs you · 🙋 asked, awaiting your word · 🟢 working · 💤 idle · ⚡ wakeable)\n\n' "$(date +%H:%M:%S)"
-                who_board; who_unmanaged; who_paint; who_badge; sleep 2
+                # 10s, not 2s: a pass scans every pane, and at 2s the watcher
+                # alone held ~0.9 of a core on dev-vm-1 (2026-10-08) to move a
+                # badge a few seconds sooner. SQUAD_WHO_INTERVAL overrides.
+                who_board; who_unmanaged; who_paint; who_badge; sleep "${SQUAD_WHO_INTERVAL:-10}"
               done
             else who_board; who_unmanaged; who_paint; who_badge; fi ;;
   board)    # OPERATOR DASHBOARD. `who` answers "what state is each agent in";
