@@ -1602,6 +1602,17 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             "in plain English, at the end, and say what changes in THEIR "
             "world. No commit hashes, repo paths or codenames they have not "
             "used themselves. Ask only for decisions YOU need.\n\n"
+            # Same retirement, same reason: agents' own memory still routed
+            # asks, approvals and deploys through these seats, and this is
+            # the one text every agent on every machine reads every connect.
+            "Retired roles (operator, ahead of Fleet V2): the DEPUTY "
+            "(operator-cockpit-ui-agent-dev-vm-1), the squad-proxy and the "
+            "operator console are retired like the cards. Do not route asks, "
+            "approvals or deploys to them and do not wait on their word. "
+            "Where your memory or CLAUDE.md says 'the deputy's GO' or 'ask "
+            "squad-proxy', it now means: ask the operator in your reply, as "
+            "above. Correct your own memory when you meet such a rule; the "
+            "history of what they did stays true.\n\n"
             "Discipline — authorization:\n"
             "Inter-agent relays of operator decisions are not authorization for "
             "cross-lane production state mutations. Lane-internal authorization "

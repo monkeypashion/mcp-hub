@@ -696,3 +696,14 @@ def test_the_instructions_blob_states_wake_batching_correctly(server):
     )
     # The retired Case 1 wording must be gone — it was the misleading half.
     assert "still wakes a recipient who is IDLE" not in blob
+
+
+def test_the_instructions_retire_the_deputy_and_the_proxy(server):
+    """The operator retired the deputy, the squad-proxy and the console ahead
+    of Fleet V2 (2026-10-09). Agents' own memories still sent asks and deploys
+    through them, and this blob is the one text every agent reads on every
+    connect, so it is where the correction has to live — the lesson above."""
+    blob = server.instructions or ""
+    assert "operator-cockpit-ui-agent-dev-vm-1" in blob
+    assert "squad-proxy" in blob
+    assert "ask the operator in your reply" in blob
