@@ -198,3 +198,18 @@ def test_only_UP_rows_count_and_the_header_is_not_an_agent():
 
 def test_empty_output_yields_no_agents_rather_than_throwing():
     assert _parse("") == set()
+
+
+def test_windows_share_one_liveness_read(tmp_path):
+    """Three VSCode windows each ran their own `squad ls` every 8s on
+    dev-vm-1 (2026-10-09), ~3.3 cores in all. A read younger than one poll is
+    reused; an older one, or one stamped in the future, is not."""
+    (tmp_path / ".mcp-hub").mkdir()
+    env = dict(os.environ, HOME=str(tmp_path), HARNESS_NOW="100000",
+               HARNESS_PROBES=json.dumps([100000, 107999, 108000, 99000]))
+    out = subprocess.run([_NODE, str(HARNESS), "sharedls"],
+                         capture_output=True, text=True, timeout=60, env=env)
+    assert out.returncode == 0, out.stderr or out.stdout
+    doc = json.loads(out.stdout)
+    assert doc["file"].startswith(str(tmp_path)), "the test must not touch the real ~/.mcp-hub"
+    assert doc["reads"] == ["alpha up\n", "alpha up\n", None, None]

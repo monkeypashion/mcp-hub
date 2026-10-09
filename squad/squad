@@ -58,9 +58,40 @@ self_stale() {
 }
 
 # ---- config (agent|worktree|gh_config_dir|claude_args ; gh_config_dir may be empty) ----
-rows()   { grep -vE '^[[:space:]]*(#|$)' "$CONF" 2>/dev/null || true; }
+# A read-only pass (ls, board, one `who` pass) primes the roster ONCE and
+# every lookup after that is answered in-process. Unprimed, each `field` was a
+# grep + awk pair, and `ls` made ~6 per agent: with 46 agents one `squad ls`
+# took ~9s, mostly sys time spent forking this large script (dev-vm-1,
+# 2026-10-09). Writers unprime, so nothing reads a roster it just changed.
+rows()   {
+  if [ -n "${_ROWS_PRIMED:-}" ]; then [ -z "$_ROWS" ] || printf '%s\n' "$_ROWS"; return 0; fi
+  grep -vE '^[[:space:]]*(#|$)' "$CONF" 2>/dev/null || true
+}
 agents() { rows | cut -d'|' -f1; }
-field()  { rows | awk -F'|' -v a="$1" -v n="$2" '$1==a {print $n; exit}'; }
+field()  {
+  if [ -n "${_ROWS_PRIMED:-}" ]; then
+    # Same answer as the awk form: the FIRST row whose first field is exactly
+    # $1, field $2 printed verbatim (empty when absent).
+    local line="${_ROW[$1]-}" f
+    [ -n "$line" ] || return 0
+    IFS='|' read -r -a f <<< "$line"
+    printf '%s\n' "${f[$(( $2 - 1 ))]-}"
+    return 0
+  fi
+  rows | awk -F'|' -v a="$1" -v n="$2" '$1==a {print $n; exit}'
+}
+rows_prime() {
+  local line k
+  _ROWS_PRIMED=; _ROWS="$(rows)"
+  declare -gA _ROW=()
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    k="${line%%|*}"
+    [ -n "${_ROW[$k]+x}" ] || _ROW[$k]="$line"
+  done <<< "$_ROWS"
+  _ROWS_PRIMED=1
+}
+rows_unprime() { _ROWS_PRIMED=; }
 
 # ---- box-wide session inventory (who / board --json) ------------------------
 # Enumerate EVERY tmux session on this box — all sockets under /tmp/tmux-$UID,
@@ -233,6 +264,7 @@ args_pair_value() {
 
 # Single writer for roster field 4 so args/comms/resume/arm_comms can't drift.
 roster_set_args() {
+  rows_unprime
   local tmp; tmp="$(mktemp)"
   awk -F'|' -v a="$1" -v n="$2" 'BEGIN{OFS="|"} $1==a{$4=n} {print}' "$CONF" > "$tmp" \
     && mv "$tmp" "$CONF"
@@ -2575,6 +2607,7 @@ launch_line() {
 }
 
 arm_comms() {
+  rows_unprime
   local a="$1" cur new
   # NEVER touch a container row: field 4 is the marker, and appending the
   # channels flag to it would name a container that does not exist. The
@@ -2592,6 +2625,7 @@ arm_comms() {
 # Migrate a legacy roster line: same worktree enrolled under a different
 # (pre-derived-identity) name -> rename the line and any live tmux session.
 migrate_roster_name() {
+  rows_unprime
   local dest="$1" derived="$2" old
   old="$(rows | awk -F'|' -v d="$dest" '$2==d && $1!="" {print $1; exit}')"
   [ -n "$old" ] && [ "$old" != "$derived" ] || return 0
@@ -2605,6 +2639,7 @@ migrate_roster_name() {
 }
 
 add_folder() {  # squad add-folder <dir> — enrol an EXISTING folder as an agent
+  rows_unprime
   # The pull to `transport`'s push: nothing is cloned, copied or re-keyed. A
   # folder that already exists becomes a roster agent so the cockpit can open a
   # tab for it and `start` can run claude there.
@@ -2745,6 +2780,7 @@ add_folder() {  # squad add-folder <dir> — enrol an EXISTING folder as an agen
 }
 
 add_agent() {  # squad add <org>/<repo> — clone/pull, opt in, enroll/migrate under the DERIVED name
+  rows_unprime
   local spec="$1" out dest name
   [[ "$spec" == ?*/?* ]] || { echo "usage: $CMD add <org>/<repo>"; return 1; }
   [ -z "${2:-}" ] || echo "note: identity is derived (<repo>-<hostname>); extra args ignored"
@@ -2770,6 +2806,7 @@ add_agent() {  # squad add <org>/<repo> — clone/pull, opt in, enroll/migrate u
 }
 
 rm_agent() {   # squad rm [agent] — exact inverse of add: session, roster, opt-in, daemon state
+  rows_unprime
   local a="$1" dir proj safe optnote="" rm_survived=""
   dir="$(untilde "$(field "$a" 2)")"
   tm kill-session -t "=$a" 2>/dev/null || true
@@ -4631,24 +4668,46 @@ case "${1:-help}" in
                 *) printf '✖ offline' ;;
               esac
             }
+            # ONE tmux listing and ONE docker listing per run, not three tmux
+            # calls and a docker call per agent: those were ~4s of a ~9s `ls`
+            # with 46 agents, and the cockpit runs `ls` every few seconds in
+            # every window (dev-vm-1, 2026-10-09). The active pane of the
+            # active window is what `display-message -t <session>` reported,
+            # and a session listed here is a session `has-session` would find.
+            rows_prime
+            declare -A ls_cmd=() ls_dk=()
+            while IFS=$'\t' read -r _s _act _cmd; do
+              [ "$_act" = 11 ] && ls_cmd[$_s]="$_cmd"
+            done < <(tm list-panes -a -F '#{session_name}	#{window_active}#{pane_active}	#{pane_current_command}' 2>/dev/null)
+            if command -v docker >/dev/null 2>&1; then
+              while IFS= read -r _s; do [ -n "$_s" ] && ls_dk[$_s]=1; done \
+                < <(docker ps --format '{{.Names}}' 2>/dev/null)
+            fi
             printf '%-26s %-10s %-11s %s\n' 'AGENT' 'TMUX' 'HUB' ''
             for a in $(agents); do
-              hs="$(hub_state "$a")"; has_comms "$a" || hs="·"   # no comms flag: no hub state to show
+              # `--up`: liveness only. The cockpit's auto-attach reads nothing
+              # but the TMUX column, and the hub column is the costliest part
+              # left (a docker exec per container seat).
+              if [ "${2:-}" = --up ]; then hs="-"
+              else hs="$(hub_state "$a")"; has_comms "$a" || hs="·"; fi   # no comms flag: no hub state to show
               # A container seat has no HOST tmux session by construction, and
               # this gate ran before pane_alive ever did — so a running,
               # ⚡-on-the-hub seat printed `down`. Ask docker instead, and say
               # which substrate the answer came from rather than implying tmux.
               if cseat="$(container_of "$a")"; then
-                if container_alive "$cseat"; then
+                if [ -n "${ls_dk[$cseat]-}" ]; then
                   printf '%-26s %-10s %-11s (container %s)\n' "$a" up "$hs" "$cseat"
                 else
                   printf '%-26s %-10s %-11s container not running — the EDGE starts it\n' "$a" down "$hs"
                 fi
                 continue
               fi
-              if tm has-session -t "=$a" 2>/dev/null; then
-                if pane_alive "$a"; then printf '%-26s %-10s %-11s (%s)\n' "$a" up "$hs" "$(pane_cmd "$a")"
-                else printf '%-26s %-10s %-11s session up, claude not running — try: %s restart %s\n' "$a" DEGRADED "$hs" "$CMD" "$a"; fi
+              if [ -n "${ls_cmd[$a]+x}" ]; then
+                _c="${ls_cmd[$a]}"
+                case "$_c" in
+                  ''|bash|sh|zsh) printf '%-26s %-10s %-11s session up, claude not running — try: %s restart %s\n' "$a" DEGRADED "$hs" "$CMD" "$a" ;;
+                  *) printf '%-26s %-10s %-11s (%s)\n' "$a" up "$hs" "$_c" ;;
+                esac
               else printf '%-26s %-10s %-11s\n' "$a" down "$hs"; fi
             done ;;
   args)     if [ -n "${2:-}" ] && agents | grep -qxF -- "${2:-}"; then a="$2"; shift 2
@@ -6048,6 +6107,7 @@ watch + repair
                                 (reads each agent's screen). -w: refresh every 2s and paint
                                 dash tile borders to match — red border = agent is blocked on you
   $CMD ls                       status: tmux liveness + hub presence per agent
+  $CMD ls --up                  liveness only, no hub column (what the cockpit polls)
   $CMD heal                     fix agents that are up in tmux but broken on the hub:
                                 a dead heartbeat daemon (stale status) is respawned quietly;
                                 offline/unwakeable agents get nudged to re-register; if still
