@@ -698,12 +698,18 @@ def test_the_instructions_blob_states_wake_batching_correctly(server):
     assert "still wakes a recipient who is IDLE" not in blob
 
 
-def test_the_instructions_retire_the_deputy_and_the_proxy(server):
-    """The operator retired the deputy, the squad-proxy and the console ahead
-    of Fleet V2 (2026-10-09). Agents' own memories still sent asks and deploys
-    through them, and this blob is the one text every agent reads on every
-    connect, so it is where the correction has to live — the lesson above."""
+
+def test_the_instructions_do_not_name_what_they_retired(server):
+    """Naming a retired seat or convention in the text every agent reads
+    on every connect keeps it alive (operator, 2026-10-09): agents were
+    still routing approvals through the deputy weeks after it went. The
+    blob states the standing rule and names none of what it replaced."""
     blob = server.instructions or ""
-    assert "operator-cockpit-ui-agent-dev-vm-1" in blob
-    assert "squad-proxy" in blob
-    assert "ask the operator in your reply" in blob
+    for gone in ("deputy", "squad-proxy", "operator-cockpit-ui-agent",
+                 "retired"):
+        assert gone not in blob.lower(), gone
+    # The card markers, not the ordinary word "decisions".
+    for marker in ("DECISION", "DECIDED"):
+        assert marker not in blob, marker
+    assert "ask in your reply" in blob
+    assert "No other agent decides or approves" in blob
