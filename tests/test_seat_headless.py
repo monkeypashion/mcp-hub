@@ -20,6 +20,7 @@ was written).
 from __future__ import annotations
 
 import json
+import shutil
 import time
 
 import pytest
@@ -214,6 +215,36 @@ class TestSeatHeadless:
         doc = json.loads((base / "result.json").read_text())
         assert doc["timed_out"] is True
         assert doc["exit_code"] == EXIT_TIMEOUT
+
+    # The timeout must BOUND THE RUN, not just kill a pid. A real turn has
+    # descendants (a tool's shell, a server it spawned) that inherit the
+    # stdout pipe; killing only the direct child left the read loop waiting
+    # for EOF until the last of them exited, so the 1s test above took 30s
+    # and a hung errand held its container until its grandchildren chose to
+    # die (vortex stack-health pass 2, 2026-10-11; measured 30.01s).
+
+    def test_timeout_bounds_the_run_when_a_child_holds_the_pipe(
+            self, monkeypatch, tmp_path, capfd):
+        started = time.monotonic()
+        rc, base = _run_headless(
+            monkeypatch, tmp_path, "echo partial; sleep 30", timeout=1)
+        assert rc == EXIT_TIMEOUT
+        assert time.monotonic() - started < 10
+        assert (base / "output.log").read_text() == "partial\n"
+
+    @pytest.mark.skipif(not shutil.which("setsid"), reason="needs setsid")
+    def test_timeout_bounds_the_run_when_a_descendant_left_the_group(
+            self, monkeypatch, tmp_path, capfd):
+        # A descendant that called setsid is outside the process group, so
+        # killpg cannot reach it and it still holds the pipe. The reader has
+        # to stop on the timeout itself rather than wait for an EOF that
+        # such a process decides.
+        started = time.monotonic()
+        rc, base = _run_headless(
+            monkeypatch, tmp_path, "echo partial; setsid sleep 30", timeout=1)
+        assert rc == EXIT_TIMEOUT
+        assert time.monotonic() - started < 10
+        assert (base / "output.log").read_text() == "partial\n"
 
     def test_tee_is_incremental_mid_run(self, monkeypatch, tmp_path, capfd):
         # ⭐ The ONLY decidable probe for streaming reads the artifact WHILE

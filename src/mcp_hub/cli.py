@@ -6084,6 +6084,8 @@ def _seat_headless(contract: Any, workdir: pathlib.Path, prefix: str = "",
       (headless default 1800s) kills it and records 124, timeout(1)'s own
       word for it; the partial output.log is still written.
     """
+    import selectors
+    import signal
     import threading
 
     from mcp_hub.seat import (
@@ -6103,16 +6105,23 @@ def _seat_headless(contract: Any, workdir: pathlib.Path, prefix: str = "",
 
     # stderr stays inherited (straight to docker logs): merging it into
     # stdout would corrupt the JSON record result.json is parsed from.
+    #
+    # Its own session, so the timeout can kill the whole tree: a turn's
+    # descendants inherit the stdout pipe, and killing only `claude` left
+    # the read below waiting for EOF until the last of them exited.
     proc = subprocess.Popen(
         launch_argv(contract, str(workdir)), cwd=str(workdir),
-        stdout=subprocess.PIPE,
+        stdout=subprocess.PIPE, start_new_session=True,
     )
     timed_out = False
 
     def _expire() -> None:
         nonlocal timed_out
         timed_out = True
-        proc.kill()
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (AttributeError, OSError):
+            proc.kill()
 
     timer = (threading.Timer(contract.timeout, _expire)
              if contract.timeout else None)
@@ -6122,8 +6131,19 @@ def _seat_headless(contract: Any, workdir: pathlib.Path, prefix: str = "",
     try:
         with open(paths["output"], "wb") as log:
             assert proc.stdout is not None
-            while True:
-                # read1, NOT read: on a BufferedReader, read(n) blocks until
+            # A descendant that called setsid is out of killpg's reach and
+            # still holds the pipe, so EOF is not ours to wait for once the
+            # clock has run out: wait for readiness in short slices and stop
+            # on the timeout itself. Raw os.read, never the buffered reader:
+            # bytes already buffered there are invisible to select.
+            fd = proc.stdout.fileno()
+            sel = selectors.DefaultSelector()
+            sel.register(fd, selectors.EVENT_READ)
+            while not timed_out:
+                if not sel.select(timeout=0.25):
+                    continue
+                # One raw read (formerly read1), NOT read(n): on a
+                # BufferedReader, read(n) blocks until
                 # n bytes OR EOF, so the tee would buffer a long errand's
                 # output until 4096 bytes piled up or the turn ended — both
                 # live properties gone while every terminating test stays
@@ -6133,13 +6153,14 @@ def _seat_headless(contract: Any, workdir: pathlib.Path, prefix: str = "",
                 # echo SECOND` and returned both lines together; read1
                 # returned FIRST at 0.00s. Caught by mcp-hub-fireblade-wsl
                 # in review.
-                chunk = proc.stdout.read1(4096)
+                chunk = os.read(fd, 4096)
                 if not chunk:
                     break
                 chunks.append(chunk)
                 log.write(chunk)
                 log.flush()
                 _emit(chunk, prefix, lock, pending)
+            sel.close()
             _emit(b"", prefix, lock, pending, final=True)
         rc = proc.wait()
     finally:
