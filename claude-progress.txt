@@ -1,0 +1,111 @@
+v2-fleet r2 (F1 then F2), built on slipstream/v2-fleet-rev2-20261012-172154
+base v2-fleet-r2-base 399e8d89 on hooks-pin c587989.
+
+DONE
+----
+F1  j6-load-meter-daily — src/mcp_hub/load_meter.py (new), src/mcp_hub/cli.py
+    (two added blocks only), tests/test_load_meter.py (36 tests).
+    The meter is reached ONLY as `python -m mcp_hub.cli load-meter` / the
+    console script's `load-meter` verb: no __main__ block, no package
+    __main__.py, and nothing imports it at module scope.
+    open_hub_ro() opens `file:<abs>?mode=ro&immutable=1`, which is the r1 L2
+    fix: a backup-API copy of the WAL-mode hub keeps a WAL header, and mode=ro
+    alone grows -wal/-shm beside the snapshot on first read.
+    Measures and their sources (baseline window, plus a before/after window of
+    the same length per change):
+      typed_turns.pane        transcripts, origin.kind="human" (upper bound:
+                              `squad send-keys` lands in the same shape)
+      typed_turns.voice_relay hub db, DMs from hub-voice-bridge to a lane
+      reaching_tim.pane       the first assistant turn after each typed turn
+      reaching_tim.voice_relay hub db, DMs addressed to hub-voice-bridge
+      wait_total/median       each wait from a lane's last assistant turn to
+                              Tim's next typed turn in the same session
+      operator_wakes          wake snapshot, reason="operator", counts summed
+      hub_wakes               transcripts, origin.kind="channel"
+      no_origin               transcripts, no origin.kind (not counted)
+    An unreadable source is null + `missing`, never 0; a readable-but-empty
+    window is 0, and an empty median is null (no waits is not a wait of zero).
+    Refusals (exit 2, nothing written): baseline under 7 days; baseline ending
+    after the first change (names it).
+
+F2  j6-squad-who-quiet-poll — squad/squad, the `who)` arm only (the --watch
+    loop plus three functions nested in the arm), tests/test_squad_who_poll.py
+    (15 tests).
+    Journal (stdout not a terminal): first pass one line per lane with a state
+    (`who: alpha idle`), later passes one line per changed lane
+    (`who: beta idle -> down`), nothing on a quiet pass, stderr empty. A lane
+    whose state goes empty (a faculty lane going down) reads
+    `who: <lane> idle -> gone`. The unmanaged banner is one line, and only
+    when that set changes; empty from the start stays silent.
+    Terminal (`[ -t 1 ]`): unchanged — cleared screen, header, whole board.
+    Backoff: `${SQUAD_WHO_INTERVAL:-10}`, doubled by awk after every pass with
+    no lane-state change, capped at `${SQUAD_WHO_MAX_INTERVAL:-45}`; any state
+    change resets to the base; the first wait is always the base; exactly one
+    external `sleep <seconds>` per pass. ctx% and model churn are NOT state
+    changes (who_board's verdict is). who_paint and who_badge still run every
+    pass, so tab badges keep updating at the backed-off cadence.
+    The backoff applies in BOTH modes — a terminal pass costs the same scan,
+    and the output rule the criteria fix is about what is printed, not when.
+
+    Known edge: FIXED. who_badge's `tm list-clients | sort | paste` exits 1
+    with no server on the squad socket, and pipefail + set -e took the watcher
+    down with its own fleet. One `|| true` on that substitution; covered by
+    test_a_fleet_with_no_tmux_server_at_all_is_reported_not_fatal.
+
+CHECKS RUN HERE (python 3.12, tmux present)
+-------------------------------------------
+F1: MCP_HUB_STATE_DIR=$(mktemp -d) python -m pytest -o pythonpath=src \
+      tests/test_load_meter.py tests/test_v2fleet_r2_falsifiers.py \
+      -k "not test_f2_" -q
+    -> 54 passed, 1 failed (the pre-existing failure below)
+F2: MCP_HUB_STATE_DIR=$(mktemp -d) python -m pytest -o pythonpath=src \
+      tests/test_squad_who_poll.py tests/test_v2fleet_r2_falsifiers.py -q
+    -> 40 passed, 1 failed (the same one)
+Also green: test_cli.py, test_cli_settings.py, test_cli_discoverability.py,
+test_cli_subcommands_reachable.py, test_squad_ls_cost.py, test_board_panel.py
+(60/60), test_board_placements.py, test_board_poll_backpressure.py,
+test_seat_hold.py (green here, including the lane-hold test listed as known
+red), and `ruff check` on every file I touched.
+The rest of the suite: 1598 + 1172 passed over two runs. The only other
+failures on this box are 5 tests that shell out to rsync, which is not
+installed in this container (nothing to do with these files):
+  tests/test_preflight_bootstrap.py::test_bootstrap_makes_it_ready
+  tests/test_transport_gate.py (4 tests; each prints "✗ rsync — apt install
+  rsync" and exits 1)
+
+REPORTED, NOT FIXED — a contradiction between two frozen files
+--------------------------------------------------------------
+tests/test_v2fleet_r2_falsifiers.py::test_guard_server_never_imports_the_meter
+FAILS ON THE BASE and still fails, and no file I may touch can change that:
+
+    def test_guard_server_never_imports_the_meter():
+        src = (ROOT / "src" / "mcp_hub" / "server.py").read_text()
+        assert "load_meter" not in src and "load-meter" not in src
+
+Base commit cda0b6b ("server: forward the load-meter verb to the client CLI")
+adds `"load-meter",` to server._CLI_SUBCOMMANDS, with a comment naming
+load_meter.py. Both files are frozen (.claude/frozen-paths.json lists
+server.py and the falsifiers), so the guard cannot pass on this base.
+
+Verified it is the base, not my build: this guard was run on the untouched
+checkout before any file was edited, and failed there with the same assertion.
+
+The build note anticipated the OPPOSITE case (the verb missing from
+_CLI_SUBCOMMANDS, which would redden test_cli_subcommands_reachable.py and
+test_cli_settings.py). The verb IS present, so those two files are green —
+the cost landed on the frozen guard instead. The guard's intent (the hub
+server never IMPORTS the meter) does hold: server.py has no import of
+load_meter, nothing at module scope pulls it in, and the two cli.py imports
+are inside build_parser() and main(). My own
+test_a_the_hub_server_does_not_import_the_meter asserts exactly that.
+Resolving it needs one line removed from a frozen file — mcp-hub's call, not
+this build's.
+
+NOT TOUCHED
+-----------
+Known red before this build and still red / flaky, unrelated to these files:
+  tests/test_seat_hold.py::test_squad_refuses_to_start_a_held_lane
+  tests/test_board_panel.py (timing-flaky on the base, 1-2 of 60 on some runs)
+No frozen file changed; no hub DB schema change; no push; master untouched.
+Nothing in either test file reaches the live tmux socket, a real ~/.mcp-hub,
+the hub or a prod database.
