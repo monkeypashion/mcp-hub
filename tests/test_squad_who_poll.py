@@ -735,6 +735,36 @@ def test_the_glyph_still_follows_the_file_and_the_clock(fleet, tmp_path):
                       "focused": "⚡🔕", "elapsed": "⚡", "nofile": "?"}, proc.stdout
 
 
+def test_the_glyph_reads_each_key_not_any_later_true(fleet, tmp_path):
+    """`*'"online"'*true*` matched ANY `true` after the key, so a lane the
+    daemon reported offline-but-wakeable read ⚡, and so did one whose body
+    carried "true" in some other field. The glyph and `ls` read each key."""
+    lanes = ("offwake", "onnowake", "fresh")
+    f = fleet(lanes=lanes, up=lanes,
+              roster_args={a: f"{COMMS} --continue" for a in lanes})
+    (f.hub / "status-offwake.json").write_text('{"online": false, "wakeable": true}')
+    (f.hub / "status-onnowake.json").write_text(
+        '{"online": true, "wakeable": false, "agent": "trueblue"}')
+    (f.hub / "status-fresh.json").write_text(FRESH_STATUS)
+    proc = subprocess.run(["bash", str(SQUAD), "who"], capture_output=True, text=True,
+                          env=f.env, stdin=subprocess.DEVNULL, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    glyphs = {}
+    for row in proc.stdout.splitlines():
+        parts = row.split()
+        if len(parts) > 2 and parts[1] in lanes:
+            glyphs[parts[1]] = parts[2]
+    assert glyphs == {"offwake": "✖", "onnowake": "⚠", "fresh": "⚡"}, proc.stdout
+    ls = subprocess.run(["bash", str(SQUAD), "ls"], capture_output=True, text=True,
+                        env=f.env, stdin=subprocess.DEVNULL, timeout=60)
+    assert ls.returncode == 0, ls.stderr
+    rows = {r.split()[0]: r for r in ls.stdout.splitlines()
+            if r.split()[:1] and r.split()[0] in lanes}
+    assert "✖ offline" in rows["offwake"], ls.stdout
+    assert "online" in rows["onnowake"] and "⚡" not in rows["onnowake"], ls.stdout
+    assert "⚡ online" in rows["fresh"], ls.stdout
+
+
 def test_one_docker_ps_a_pass_however_many_container_seats(fleet, tmp_path):
     """Liveness was `docker ps --filter name=^<c>$` per seat, and a docker
     client start is ~50 ms of CPU: one listing answers for all of them, and

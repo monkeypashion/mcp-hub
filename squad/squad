@@ -728,16 +728,25 @@ status_json() {
   printf '%s' "$STATUS_BODY"
 }
 
+# <body> <key>: true iff the status JSON sets THAT key to true. The old test,
+# `*'"online"'*true*`, matched any `true` anywhere after the key, so
+# {"online": false, "wakeable": true} read as ⚡ — and so would an agent
+# whose name contains "true". Anchored on the key, with bash's own matcher
+# (no fork: this runs once per comms lane per `who` pass).
+status_true() {
+  local re="\"$2\"[[:space:]]*:[[:space:]]*true"
+  [[ "$1" =~ $re ]]
+}
 hub_glyph() {
   local body
   status_body "$1" || { printf '?'; return; }
   body="$STATUS_BODY"
   [ -n "$body" ] || { printf '?'; return; }
-  case "$body" in
-    *'"online"'*true*)
-      case "$body" in *'"wakeable"'*true*) printf '⚡' ;; *) printf '⚠' ;; esac ;;
-    *) printf '✖' ;;
-  esac
+  if status_true "$body" online; then
+    if status_true "$body" wakeable; then printf '⚡'; else printf '⚠'; fi
+  else
+    printf '✖'
+  fi
   # 🔕 rides BESIDE the wake glyph, never instead of it: ⚡ answers "bound and
   # push-deliverable", 🔕 answers "wakes suppressed", and urgent pierces focus
   # so a focused agent really is still wakeable. Replacing ⚡ would make a
@@ -4769,14 +4778,11 @@ case "${1:-help}" in
             hub_state() {
               local body; body="$(status_json "$1")" || { printf -- '-'; return; }
               [ -n "$body" ] || { printf -- '-'; return; }
-              case "$body" in
-                *'"online"'*true*)
-                  case "$body" in
-                    *'"wakeable"'*true*) printf '⚡ online' ;;
-                    *) printf 'online' ;;
-                  esac ;;
-                *) printf '✖ offline' ;;
-              esac
+              if status_true "$body" online; then
+                if status_true "$body" wakeable; then printf '⚡ online'; else printf 'online'; fi
+              else
+                printf '✖ offline'
+              fi
             }
             # ONE tmux listing and ONE docker listing per run, not three tmux
             # calls and a docker call per agent: those were ~4s of a ~9s `ls`
