@@ -5840,6 +5840,10 @@ _CLI_SUBCOMMANDS = {
     "voice-client",
     # Host-side /voice, same reachability requirement.
     "voice-host",
+    # v2-fleet F1, the daily load meter (lives in load_meter.py). Listed
+    # ahead of its parser so the build can add the verb without touching
+    # this file, which is frozen for that build.
+    "load-meter",
 }
 
 
