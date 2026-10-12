@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# load-meter-daily — one day's load reading, taken the way the timer takes it.
+#
+# A thin, read-only wrapper around `mcp-hub load-meter` (src/mcp_hub/load_meter.py):
+# it decides WHICH files today's reading is taken from, and nothing else. The
+# measuring, the coverage rules and the contract all live in the meter.
+#
+# 🔴 $MCP_HUB_DB IS REQUIRED AND HAS NO DEFAULT. The full hub database never
+# leaves prod-1; what this box gets is a LOCAL copy — usually the body-less
+# projection mcp-hub builds there (messages(ts, from_agent, to_agent, channel)
+# plus wake_log). A default would quietly point the meter at whatever hub-ish
+# file happened to be on the box (~/.mcp-hub/hub.db, the state dir's copy, a
+# live server's file) and the reading would name a source nobody chose. So a
+# missing variable REFUSES, by name, and writes nothing at all.
+#
+# Read-only all the way down: the hub copy is opened `mode=ro&immutable=1` by
+# the meter, so not even a -wal appears beside it, and the ONLY path this
+# script writes is $MCP_HUB_STATE_DIR/v2-fleet/readings/<UTC day>.json.
+#
+# Everything else is environment, so the unit file carries no policy:
+#   MCP_HUB_DB                  the local hub copy to read          (required)
+#   MCP_HUB_STATE_DIR           where changes.json and readings/ live
+#   LOAD_METER_SNAPSHOT         the wake-ledger snapshot to read
+#   LOAD_METER_TRANSCRIPTS      root of this host's transcript logs
+#   LOAD_METER_BASELINE_START   first day of the baseline (YYYY-MM-DD)
+#   LOAD_METER_BASELINE_END     day the baseline ends, exclusive
+#   LOAD_METER_NOW              the instant of the reading (default: now)
+#   LOAD_METER_HUB_DB_TAKEN_AT  when the copy was taken (default: its mtime)
+#   LOAD_METER_PYTHON           the interpreter to run the meter with
+set -euo pipefail
+
+say() { printf 'load-meter-daily: %s\n' "$1" >&2; }
+
+# ⭐ REFUSE BEFORE ANYTHING IS WRITTEN — including the readings directory. A
+# refusal that had already created a file would leave the fleet's evidence
+# tree carrying the shape of a reading that was never taken.
+if [ -z "${MCP_HUB_DB:-}" ]; then
+  say "MCP_HUB_DB is not set, and it has NO default: the full hub database"
+  say "never leaves prod-1, so this job reads the LOCAL copy named by"
+  say "MCP_HUB_DB (mcp-hub's drop-in sets it). Nothing was read or written."
+  exit 2
+fi
+if [ ! -f "$MCP_HUB_DB" ]; then
+  say "MCP_HUB_DB=$MCP_HUB_DB is not a file — nothing read or written."
+  exit 2
+fi
+
+STATE_DIR="${MCP_HUB_STATE_DIR:-$HOME/.mcp-hub}"
+FLEET_DIR="$STATE_DIR/v2-fleet"
+SNAPSHOT="${LOAD_METER_SNAPSHOT:-$FLEET_DIR/wake-snapshot.json}"
+TRANSCRIPTS="${LOAD_METER_TRANSCRIPTS:-$HOME/.claude/projects}"
+BASE_START="${LOAD_METER_BASELINE_START:-}"
+BASE_END="${LOAD_METER_BASELINE_END:-}"
+PY="${LOAD_METER_PYTHON:-python3}"
+NOW="${LOAD_METER_NOW:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+
+if [ -z "$BASE_START" ] || [ -z "$BASE_END" ]; then
+  say "LOAD_METER_BASELINE_START / LOAD_METER_BASELINE_END are not set."
+  say "The baseline is a declared fact about the fleet, not a guess this job"
+  say "may make: a reading with an invented baseline is the number that gets"
+  say "quoted as the 'before'. Nothing read or written."
+  exit 2
+fi
+
+# The reading is named for the UTC DAY of its `now`, so one run a day lands on
+# one file and a re-run the same day replaces it rather than accumulating.
+DAY="${NOW%%T*}"
+case "$DAY" in
+  [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+  *) say "LOAD_METER_NOW=$NOW is not an ISO-8601 instant, so the reading has"
+     say "no day to be named for. Nothing read or written."
+     exit 2 ;;
+esac
+READINGS="$FLEET_DIR/readings"
+OUT="$READINGS/$DAY.json"
+# The partial lives INSIDE the readings directory, never beside a source: a
+# half-written reading must not be mistaken for the day's reading, and the
+# only directory this job may write is this one.
+PARTIAL="$READINGS/.$DAY.json.partial"
+
+mkdir -p "$READINGS"
+trap 'rm -f "$PARTIAL"' EXIT
+
+ARGS=(--hub-db "$MCP_HUB_DB"
+      --snapshot "$SNAPSHOT"
+      --transcripts "$TRANSCRIPTS"
+      --out "$PARTIAL"
+      --baseline-start "$BASE_START"
+      --baseline-end "$BASE_END"
+      --now "$NOW")
+# Only when the fleet has declared its changes: the meter's before/after and
+# the source-stop flags come from this file, and its absence is simply a
+# reading with no change rows — never a reason to skip the day.
+if [ -f "$FLEET_DIR/changes.json" ]; then
+  ARGS+=(--changes "$FLEET_DIR/changes.json")
+fi
+# Absent, the meter falls back to the copy's own mtime, which is the right
+# answer for a copy that was just taken. Named, it is the right answer for one
+# that was shipped here hours later.
+if [ -n "${LOAD_METER_HUB_DB_TAKEN_AT:-}" ]; then
+  ARGS+=(--hub-db-taken-at "$LOAD_METER_HUB_DB_TAKEN_AT")
+fi
+
+"$PY" -m mcp_hub.cli load-meter "${ARGS[@]}"
+mv -f "$PARTIAL" "$OUT"
+printf 'load-meter-daily: %s\n' "$OUT"

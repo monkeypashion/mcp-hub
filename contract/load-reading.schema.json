@@ -79,7 +79,9 @@
           "code": {
             "enum": [
               "missing_before",
-              "missing_after"
+              "missing_after",
+              "source_stopped",
+              "daily_truncated"
             ]
           },
           "change_id": {
@@ -132,6 +134,27 @@
           "required": [
             "missing"
           ]
+        }
+      }
+    },
+    "daily": {
+      "type": "array",
+      "maxItems": 60,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "day",
+          "measures"
+        ],
+        "properties": {
+          "day": {
+            "type": "string",
+            "format": "date"
+          },
+          "measures": {
+            "$ref": "#/$defs/measure_set"
+          }
         }
       }
     }

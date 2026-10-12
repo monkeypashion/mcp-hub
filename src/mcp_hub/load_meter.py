@@ -2,12 +2,12 @@
 
 A read-only job OUTSIDE the hub. It reads three sources — the hub database, a
 snapshot of the hub's wake ledger, and the lanes' transcript logs — and writes
-one reading: the three load measures over the baseline, plus a before/after
-reading per delivered v2 change. Every number in the reading names the source
-it came from, and a number that could not be read is `null` with a `missing`
-line saying why. **Never zero**: a zero is a measurement, and reporting an
-unreadable source as "no load" is how a meter starts lying in the one direction
-nobody checks.
+one reading: the three load measures over the baseline, one measure set per
+closed UTC day since the baseline, plus a before/after reading per delivered
+v2 change. Every number in the reading names the source it came from, and a
+number that could not be read is `null` with a `missing` line saying why.
+**Never zero**: a zero is a measurement, and reporting an unreadable source as
+"no load" is how a meter starts lying in the one direction nobody checks.
 
 It lives in mcp-hub's code because the measures come from mcp-hub's own files,
 but the hub SERVER never imports it: the meter is reached only as
@@ -18,12 +18,23 @@ Read-only means read-only. The hub snapshot is opened `mode=ro&immutable=1`
 WAL header, and `mode=ro` ALONE makes sqlite create `-wal`/`-shm` beside it on
 first read — writing two files next to the evidence it was told not to touch
 (features-json's r1 finding L2).
+
+⭐ COVERAGE IS PART OF THE NUMBER (r4). None of the three sources covers all
+time: a wake snapshot covers `since .. taken_at`, a copy of the hub database
+covers everything up to the moment it was taken, and the hub's `wake_log` is
+pruned, so a copy answers for the 14 days before that and no further. A window
+that is not wholly inside a source's coverage is NOT a quiet window — it is an
+unread one, and it reads `null` with a `missing` line naming the gap. The
+difference matters most where it is least visible: a before/after pair whose
+"after" fell past the snapshot read 0 wakes on r3 and would have been reported
+as the saving the change was built to produce.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import socket
 import sqlite3
 import statistics
 import sys
@@ -33,8 +44,9 @@ from urllib.parse import quote
 
 DESCRIPTION = (
     "Record one reading of Tim's load: the three measures over the baseline, "
-    "and a before/after reading per delivered v2 change. Read-only — it opens "
-    "the hub snapshot immutable and writes nothing but --out."
+    "one set per closed UTC day since it, and a before/after reading per "
+    "delivered v2 change. Read-only — it opens the hub snapshot immutable and "
+    "writes nothing but --out."
 )
 
 # The baseline has to be long enough to average over a week's rhythm (a
@@ -52,6 +64,17 @@ VOICE_RELAY_AGENT = "hub-voice-bridge"
 # would quietly inflate whichever measure the guess favours.
 HUMAN_ORIGIN = "human"
 CHANNEL_ORIGIN = "channel"
+
+# How far back a copy of the hub database can answer for wakes. The hub prunes
+# `wake_log`, so rows older than this are absent from a healthy copy exactly
+# as they are absent from a broken one — and a count over a window the table
+# no longer covers is a measurement of the retention policy.
+WAKE_LOG_DAYS = 14
+
+# The daily array is a rolling record, not an archive: 60 closed days is two
+# months of rhythm, and the days that fall off say so in a flag rather than
+# vanishing quietly.
+MAX_DAILY_DAYS = 60
 
 
 # ----------------------------------------------------------------------------
@@ -97,6 +120,57 @@ def stamp(dt: datetime) -> str:
 def _in(window, when: datetime) -> bool:
     start, end = window
     return start <= when < end
+
+
+def _maybe_instant(text):
+    """An instant, or None when there is nothing parseable to read."""
+    if text in (None, ""):
+        return None
+    try:
+        return parse_instant(text)
+    except (ValueError, TypeError):
+        return None
+
+
+# ----------------------------------------------------------------------------
+# coverage — what interval a source can answer for
+# ----------------------------------------------------------------------------
+
+class Coverage:
+    """The interval one source answers for, and the gap when it does not.
+
+    `start`/`end` are instants or None for unbounded. `covers(window)` is the
+    whole test a measure needs; `gap(window)` is the sentence that goes in
+    `missing` when it fails — it names the boundary VERBATIM as the source
+    spells it, so the reading can be checked against the file it came from.
+    """
+
+    def __init__(self, label: str, start=None, end=None,
+                 start_text: str = "", end_text: str = ""):
+        self.label = label
+        self.start = start
+        self.end = end
+        self.start_text = start_text or (stamp(start) if start else "")
+        self.end_text = end_text or (stamp(end) if end else "")
+
+    def covers(self, window) -> bool:
+        w0, w1 = window
+        if self.start is not None and w0 < self.start:
+            return False
+        if self.end is not None and w1 > self.end:
+            return False
+        return True
+
+    def gap(self, window) -> str:
+        w0, w1 = window
+        reasons = []
+        if self.start is not None and w0 < self.start:
+            reasons.append(f"it begins before that source starts ({self.start_text})")
+        if self.end is not None and w1 > self.end:
+            reasons.append(f"it ends after that source stops ({self.end_text})")
+        return (f"{self.label} covers {self.start_text or 'the beginning'} .. "
+                f"{self.end_text or 'now'}; the window {stamp(w0)} .. {stamp(w1)} "
+                f"is not inside it ({'; '.join(reasons)}) — not read, and not 0")
 
 
 # ----------------------------------------------------------------------------
@@ -241,15 +315,27 @@ def _is_tool_result(rec: dict) -> bool:
 
 
 class HubMessages:
-    """The hub's message rows, read through `open_hub_ro`."""
+    """The hub's message rows, read through `open_hub_ro`.
+
+    The copy that reaches this machine may be the BODY-LESS projection
+    mcp-hub builds on prod-1 — `messages(ts, from_agent, to_agent, channel)`
+    plus `wake_log` — so only those columns are ever selected, and a copy
+    without `wake_log` at all reads as "no wake rows here", never as none.
+    """
 
     def __init__(self, path):
         self.rows: list[tuple[float, str, str, str]] = []
+        self.wake_rows: list[tuple[float, str]] | None = None
         conn = open_hub_ro(path)
         try:
             cur = conn.execute(
                 "SELECT ts, from_agent, to_agent, channel FROM messages")
             self.rows = [(r[0], r[1] or "", r[2] or "", r[3] or "") for r in cur]
+            try:
+                cur = conn.execute("SELECT ts, reason FROM wake_log")
+                self.wake_rows = [(r[0], r[1] or "") for r in cur]
+            except sqlite3.Error:
+                self.wake_rows = None   # the table is absent from this copy
         finally:
             conn.close()
 
@@ -266,12 +352,24 @@ class HubMessages:
                 inbound += 1
         return out, inbound
 
+    def wakes(self, window, reason: str) -> int:
+        start, end = (w.timestamp() for w in window)
+        total = 0
+        for ts, row_reason in self.wake_rows or []:
+            if ts is None or not (start <= ts < end):
+                continue
+            if row_reason == reason:
+                total += 1
+        return total
+
 
 class WakeSnapshot:
     """A snapshot of the hub's wake ledger, taken outside the meter.
 
     Column-driven: the reading names the snapshot's own `source`/`taken_at`, so
-    a number can be traced back to the file it was read from.
+    a number can be traced back to the file it was read from. `since` and
+    `taken_at` are also its COVERAGE — the snapshot says nothing at all about
+    an hour outside them.
     """
 
     def __init__(self, path):
@@ -279,7 +377,14 @@ class WakeSnapshot:
         columns = doc.get("columns") or []
         self.source = str(doc.get("source") or "unnamed")
         self.taken_at = str(doc.get("taken_at") or "unknown")
+        self.since = str(doc.get("since") or "")
         self.rows = [dict(zip(columns, row)) for row in doc.get("rows") or []]
+
+    def coverage(self) -> Coverage:
+        return Coverage(
+            f"the wake snapshot ({self.source}, taken {self.taken_at})",
+            start=_maybe_instant(self.since), end=_maybe_instant(self.taken_at),
+            start_text=self.since or "", end_text=self.taken_at)
 
     def wakes(self, window, reason: str) -> int:
         total = 0
@@ -296,51 +401,126 @@ class WakeSnapshot:
         return total
 
 
-def measure_set(window, transcripts, hub, snapshot, voice: str) -> dict:
+class Sources:
+    """The three sources, their coverage, and where they were read.
+
+    One object so every measure set — the baseline's, each day's and each
+    change's two — is built from the same facts, and so a coverage rule can
+    never be applied in one place and forgotten in another.
+    """
+
+    def __init__(self, hub, snapshot, transcripts, *, voice, transcripts_path,
+                 hub_taken_at, host=None):
+        self.hub = hub
+        self.snapshot = snapshot
+        self.transcripts = transcripts
+        self.voice = voice
+        self.transcripts_path = str(transcripts_path)
+        self.host = host or socket.gethostname()
+        self.hub_taken_at = hub_taken_at
+        taken = stamp(hub_taken_at) if hub_taken_at else ""
+        self.hub_cov = Coverage(f"the hub copy at {hub['path']} (taken {taken})",
+                                end=hub_taken_at, end_text=taken)
+        wake_start = (hub_taken_at - timedelta(days=WAKE_LOG_DAYS)) if hub_taken_at else None
+        self.wake_cov = Coverage(
+            f"the hub copy's wake_log at {hub['path']} (the {WAKE_LOG_DAYS} days "
+            f"before {taken})", start=wake_start, end=hub_taken_at, end_text=taken)
+        self.snap_cov = (snapshot["data"].coverage() if snapshot["read"]
+                         else Coverage(f"the wake snapshot at {snapshot['path']}"))
+
+    # -- the pane (transcripts) --------------------------------------------
+    @property
+    def pane_label(self) -> str:
+        """Term 3: a transcript count is this HOST's, read from this dir.
+
+        A count read on one machine is not the fleet's count — dev-vm-1 holds
+        dev-vm-1's lanes. Naming the host and the directory in the source is
+        what stops a per-box number being quoted as a fleet-wide one.
+        """
+        return f"transcripts on {self.host} at {self.transcripts_path}"
+
+    def pane(self, window):
+        return self.transcripts["data"].read(window) if self.transcripts["read"] else None
+
+    # -- the hub copy ------------------------------------------------------
+    def relay(self, window):
+        """(out, in, missing) — the relay counts, or why they were not read."""
+        if not self.hub["read"]:
+            return None, None, self.hub["missing"]
+        if not self.hub_cov.covers(window):
+            return None, None, self.hub_cov.gap(window)
+        out, inbound = self.hub["data"].relay(window, self.voice)
+        return out, inbound, ""
+
+    # -- operator wakes: the snapshot, else the copy's wake_log ------------
+    def operator_wakes(self, window) -> tuple[object, str, str]:
+        """(value, source, missing) for the window's operator wakes.
+
+        The snapshot is preferred where it covers the window (it is the
+        operator plane's own summary); past its `taken_at` the copy's
+        `wake_log` answers for the rows it still holds. Neither covering is
+        NOT zero: the reason names both boundaries, so the next reading can
+        be taken with a source that reaches.
+        """
+        label = f"{stamp(window[0])} .. {stamp(window[1])}"
+        snap_source = (f"wake snapshot ({self.snapshot['label']}): rows with "
+                       f"reason=\"operator\" in {label}, counts summed")
+        log_source = (f"hub copy wake_log ({self.hub['path']}): rows with "
+                      f"reason=\"operator\" in {label}, counted")
+        why = []
+        if self.snapshot["read"]:
+            if self.snap_cov.covers(window):
+                return self.snapshot["data"].wakes(window, "operator"), snap_source, ""
+            why.append(self.snap_cov.gap(window))
+        else:
+            why.append(self.snapshot["missing"])
+        if not self.hub["read"]:
+            why.append(self.hub["missing"])
+        elif self.hub["data"].wake_rows is None:
+            why.append(f"the hub copy at {self.hub['path']} carries no wake_log table")
+        elif not self.wake_cov.covers(window):
+            why.append(self.wake_cov.gap(window))
+        else:
+            return self.hub["data"].wakes(window, "operator"), log_source, ""
+        return None, snap_source, "; and ".join(w for w in why if w)
+
+
+def measure_set(window, src: Sources) -> dict:
     """The seven measures over one window, each naming its source."""
     label = f"{stamp(window[0])} .. {stamp(window[1])}"
-    pane = transcripts["data"].read(window) if transcripts["read"] else None
-    gone = transcripts["missing"]
-    hub_gone = hub["missing"]
-    snap_gone = snapshot["missing"]
-
-    if hub["read"]:
-        relay_out, relay_in = hub["data"].relay(window, voice)
-    else:
-        relay_out = relay_in = None
+    pane = src.pane(window)
+    gone = src.transcripts["missing"]
+    relay_out, relay_in, relay_gone = src.relay(window)
+    wake_value, wake_source, wake_gone = src.operator_wakes(window)
 
     typed_source = (
-        f'transcripts: user turns with origin.kind="{HUMAN_ORIGIN}" in {label} '
+        f'{src.pane_label}: user turns with origin.kind="{HUMAN_ORIGIN}" in {label} '
         "(sidechain, meta, compact-summary and tool-result lines are not turns) "
         "— an UPPER BOUND on what Tim typed, since a `squad send-keys` injection "
         "lands in a lane's transcript in exactly the same shape"
     )
     relay_source = (
-        f"hub db messages: DMs from {voice} to a lane in {label} — Tim speaking "
+        f"hub db messages: DMs from {src.voice} to a lane in {label} — Tim speaking "
         "through the voice relay"
     )
     answer_source = (
-        "transcripts: the lane's first assistant turn after each typed turn in "
+        f"{src.pane_label}: the lane's first assistant turn after each typed turn in "
         f"{label} — the answer that reaches Tim in the pane"
     )
     inbound_source = (
-        f"hub db messages: DMs addressed to {voice} in {label} — a lane's answer "
+        f"hub db messages: DMs addressed to {src.voice} in {label} — a lane's answer "
         "reaching Tim through the voice relay"
     )
     wait_source = (
-        "transcripts: each wait from a lane's last assistant turn to Tim's next "
+        f"{src.pane_label}: each wait from a lane's last assistant turn to Tim's next "
         f"typed turn in the same session, ending in {label}"
     )
-    operator_source = (
-        f"wake snapshot ({snapshot['label']}): rows with reason=\"operator\" in "
-        f"{label}, counts summed"
-    )
     hub_wake_source = (
-        f'transcripts: user turns with origin.kind="{CHANNEL_ORIGIN}" in {label} '
+        f'{src.pane_label}: user turns with origin.kind="{CHANNEL_ORIGIN}" in {label} '
         "— a hub DM or broadcast that woke the lane rather than Tim"
     )
     no_origin_source = (
-        f"transcripts: user turns in {label} with no origin (not counted) as "
+        f"{src.pane_label}: user turns in {label} with no origin (not counted) as "
         "typed turns or as hub wakes — the harness recorded no origin.kind, so "
         "the cause of the turn is unknown and is reported rather than guessed"
     )
@@ -351,13 +531,13 @@ def measure_set(window, transcripts, hub, snapshot, voice: str) -> dict:
             "pane": measure(
                 sum(pane["typed"].values()) if pane else None, typed_source,
                 gone, pane["typed"] if pane else None),
-            "voice_relay": measure(relay_out, relay_source, hub_gone),
+            "voice_relay": measure(relay_out, relay_source, relay_gone),
         },
         "reaching_tim": {
             "pane": measure(
                 sum(pane["answers"].values()) if pane else None, answer_source,
                 gone, pane["answers"] if pane else None),
-            "voice_relay": measure(relay_in, inbound_source, hub_gone),
+            "voice_relay": measure(relay_in, inbound_source, relay_gone),
         },
         "wait_total_seconds": {
             "pane": measure(
@@ -372,9 +552,7 @@ def measure_set(window, transcripts, hub, snapshot, voice: str) -> dict:
                 wait_source.replace("each wait", "the median wait"),
                 gone if waits is None else f"no wait ended in {label}"),
         },
-        "operator_wakes": measure(
-            snapshot["data"].wakes(window, "operator") if snapshot["read"] else None,
-            operator_source, snap_gone),
+        "operator_wakes": measure(wake_value, wake_source, wake_gone),
         "hub_wakes": measure(
             sum(pane["hub_wakes"].values()) if pane else None, hub_wake_source,
             gone, pane["hub_wakes"] if pane else None),
@@ -421,9 +599,31 @@ def _load_transcripts(path) -> Transcripts:
     return Transcripts(root)
 
 
-def load_changes(path) -> list[dict]:
+def hub_db_taken_at(args) -> datetime | None:
+    """When the hub copy stopped being able to answer for anything.
+
+    `--hub-db-taken-at` when given, else the file's own mtime — a copy taken
+    by `sqlite3 .backup` or by the projection job carries the moment it was
+    written, and that moment IS its coverage end. None only when there is no
+    file to ask (an unreadable hub names its own reason instead).
+    """
+    if getattr(args, "hub_db_taken_at", None):
+        return parse_instant(args.hub_db_taken_at)
+    try:
+        return datetime.fromtimestamp(os.stat(args.hub_db).st_mtime, timezone.utc)
+    except OSError:
+        return None
+
+
+def load_changes(path) -> dict:
+    """{changes: [...], source_stops: [...]} from the changes file.
+
+    Both shapes are accepted: a bare list of changes (r1's) and the document
+    `{"changes": [...], "source_stops": [{"measure", "stopped_at"}]}` the
+    fleet's own `v2-fleet/changes.json` now carries.
+    """
     if not path:
-        return []
+        return {"changes": [], "source_stops": []}
     doc = json.loads(Path(path).read_text())
     rows = doc.get("changes") if isinstance(doc, dict) else doc
     out = []
@@ -434,6 +634,32 @@ def load_changes(path) -> list[dict]:
             "delivered": bool(row.get("delivered", False)),
         })
     out.sort(key=lambda c: c["at"])
+    stops = []
+    for row in (doc.get("source_stops") if isinstance(doc, dict) else None) or []:
+        stops.append({
+            "measure": str(row["measure"]),
+            "stopped_at": parse_instant(row["stopped_at"]),
+        })
+    stops.sort(key=lambda s: s["stopped_at"])
+    return {"changes": out, "source_stops": stops}
+
+
+# ----------------------------------------------------------------------------
+# the day-by-day record
+# ----------------------------------------------------------------------------
+
+def closed_days(start: datetime, now: datetime) -> list[datetime]:
+    """Every UTC day from `start` whose 24 hours have fully elapsed at `now`.
+
+    The OPEN day is left out on purpose: half a day beside sixty whole ones
+    reads as a quiet day, and a dip on the newest point is exactly what a
+    load meter is looked at for.
+    """
+    day = start.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    out = []
+    while day + timedelta(days=1) <= now:
+        out.append(day)
+        day += timedelta(days=1)
     return out
 
 
@@ -457,9 +683,14 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                         help="Day the baseline ends (exclusive)")
     parser.add_argument("--changes", default=None,
                         help="JSON list of v2 changes [{change_id, at, delivered}] "
-                             "to read a before/after for")
+                             "to read a before/after for, or a document with "
+                             "`changes` and `source_stops`")
     parser.add_argument("--now", default=None, metavar="ISO8601",
                         help="The instant of this reading (default: now, UTC)")
+    parser.add_argument("--hub-db-taken-at", default=None, metavar="ISO8601",
+                        help="When the hub copy was taken — its coverage ends there "
+                             "(default: the file's mtime). A window past it reads "
+                             "null with a reason, never 0")
     parser.add_argument("--voice-agent", default=VOICE_RELAY_AGENT,
                         help=f"Hub name of the voice relay (default: {VOICE_RELAY_AGENT})")
     return parser
@@ -484,10 +715,11 @@ def run(args) -> int:
         return 2
 
     try:
-        changes = load_changes(args.changes)
+        doc = load_changes(args.changes)
     except (OSError, ValueError, TypeError, KeyError) as exc:
         print(f"!! --changes unreadable: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
+    changes, stops = doc["changes"], doc["source_stops"]
 
     if changes and end > changes[0]["at"]:
         first = changes[0]
@@ -497,16 +729,43 @@ def run(args) -> int:
               f"fleet already changed — nothing written", file=sys.stderr)
         return 2
 
+    try:
+        taken = hub_db_taken_at(args)
+    except (ValueError, TypeError) as exc:
+        print(f"!! --hub-db-taken-at must be an ISO-8601 instant: {exc}", file=sys.stderr)
+        return 2
+
     hub, snapshot, transcripts = read_inputs(args)
+    src = Sources(hub, snapshot, transcripts, voice=args.voice_agent,
+                  transcripts_path=args.transcripts, hub_taken_at=taken)
     baseline = (start, end)
     reading = {
         "generated_at": stamp(now),
         "baseline": {"start": args.baseline_start, "end": args.baseline_end, "days": days},
-        "measures": measure_set(baseline, transcripts, hub, snapshot, args.voice_agent),
+        "measures": measure_set(baseline, src),
+        "daily": [],
         "changes": [],
         "flags": [],
         "inputs": [],
     }
+
+    # --- one measure set per closed day since the baseline ----------------
+    wanted = closed_days(end, now)
+    dropped = wanted[:-MAX_DAILY_DAYS] if len(wanted) > MAX_DAILY_DAYS else []
+    for day in wanted[len(dropped):]:
+        reading["daily"].append({
+            "day": day.date().isoformat(),
+            "measures": measure_set((day, day + timedelta(days=1)), src),
+        })
+    if dropped:
+        reading["flags"].append({
+            "code": "daily_truncated",
+            "detail": (f"{len(dropped)} day(s) older than the newest {MAX_DAILY_DAYS} "
+                       f"({dropped[0].date().isoformat()} .. "
+                       f"{dropped[-1].date().isoformat()}) are not in `daily`: it holds "
+                       f"the last {MAX_DAILY_DAYS} closed days, and the days it dropped "
+                       "are said out loud rather than quietly missing"),
+        })
 
     span = timedelta(days=days)
     for change in changes:
@@ -518,7 +777,7 @@ def run(args) -> int:
             # An incomplete window is NOT a reading. Half an "after" window
             # compared against a full baseline is a measurement of the calendar.
             if window[1] <= now:
-                row[side] = measure_set(window, transcripts, hub, snapshot, args.voice_agent)
+                row[side] = measure_set(window, src)
             elif change["delivered"]:
                 reading["flags"].append({
                     "code": f"missing_{side}",
@@ -528,6 +787,26 @@ def run(args) -> int:
                                f"at {stamp(now)}: no {side} reading yet, read again once it has"),
                 })
         reading["changes"].append(row)
+
+        # ⭐ A SOURCE THAT STOPPED IS NOT A CHANGE THAT WORKED (Term 2).
+        # operator-console stopped on 8 Oct; every "after" window straddling
+        # that date reads fewer operator wakes, and the drop belongs to the
+        # console going away, not to the change. The pair is flagged NOT
+        # COMPARABLE and no saving is read off it.
+        if row["before"] is not None and row["after"] is not None:
+            lo, hi = windows["before"][0], windows["after"][1]
+            for stop in stops:
+                if lo <= stop["stopped_at"] < hi:
+                    reading["flags"].append({
+                        "code": "source_stopped",
+                        "change_id": change["change_id"],
+                        "detail": (f"not comparable: source stopped — {stop['measure']} "
+                                   f"stopped at {stamp(stop['stopped_at'])}, inside "
+                                   f"{change['change_id']}'s before/after span "
+                                   f"({stamp(lo)} .. {stamp(hi)}). The two readings "
+                                   "measure different fleets, so the difference is "
+                                   "not a measure of this change"),
+                    })
 
     for rec in (hub, snapshot, transcripts):
         row = {"name": rec["name"], "path": rec["path"], "read": rec["read"]}
@@ -540,6 +819,7 @@ def run(args) -> int:
     unread = [r["name"] for r in reading["inputs"] if not r["read"]]
     print(f"load reading written: {out}")
     print(f"baseline {args.baseline_start} .. {args.baseline_end} ({days} days), "
-          f"{len(reading['changes'])} change(s), {len(reading['flags'])} flag(s)"
+          f"{len(reading['daily'])} day(s), {len(reading['changes'])} change(s), "
+          f"{len(reading['flags'])} flag(s)"
           + (f", UNREAD: {', '.join(unread)}" if unread else ""))
     return 0

@@ -2471,26 +2471,132 @@ def edge_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _hub_url_scope(cwd: str) -> tuple[pathlib.Path | None, Any, list[str]]:
+    """The per-seat scope that carries this seat's hub URL, in precedence order.
+
+    (file, its parsed contents, the key path to the hub entry), or
+    (None, None, []) when no per-seat scope names a URL at all. The shared
+    user-global `mcpServers.hub` is not among the candidates and must never
+    become one — see `_hub_config_candidates`.
+    """
+    for candidate, path in _hub_config_candidates(cwd):
+        try:
+            candidate_data = json.loads(candidate.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            continue
+        hub_entry = _dig(candidate_data, path)
+        if isinstance(hub_entry, dict) and hub_entry.get("url"):
+            return candidate, candidate_data, path
+    return None, None, []
+
+
+def _url_agent_param(url: str) -> str | None:
+    """The `agent` the URL announces itself as, or None when it carries none."""
+    from urllib.parse import parse_qsl, urlsplit
+
+    try:
+        for key, value in parse_qsl(urlsplit(url).query):
+            if key == "agent" and value:
+                return value
+    except ValueError:
+        return None
+    return None
+
+
+def rebind_url_fleet_check(args: argparse.Namespace) -> int:
+    """`rebind-url --fleet` — does every comms lane's hub URL name itself?
+
+    After a hub restart a lane whose URL carries `?agent=<name>` is rebound
+    at transport connect, within seconds; a lane without it stays UNBOUND
+    until its next turn, and an unbound idle lane cannot be woken to take
+    one. On 2026-10-07 slipstream-dev-vm-1 sat off the hub from 05:51Z to
+    17:00Z that way and Vortex's r23 build waited 11 hours for it. The lanes
+    that carried the parameter came back within seconds (#fleet-v2 34269).
+
+    Stamping the parameter into a lane's config is still that lane owner's
+    act — this is the FLEET CHECK that says which lanes are missing it, so
+    the gap is a list rather than a surprise eleven hours later.
+
+    🔴 READ-ONLY, and deliberately so even without --dry-run: a check that
+    quietly rewrote six lanes' configs the first time an operator ran it is
+    the `seats add --dry-run` mistake (2026-08-09) in a new costume. Nothing
+    here opens a file for writing.
+
+    One line per lane, and the exit code is 0 only when every CHECKABLE lane
+    is ok — a container lane is reported `not checkable from host` and is
+    neither, because the config that matters lives inside the container and
+    guessing from out here is how "delivered live" got written about an agent
+    with no channels flag at all.
+    """
+    rows = _roster_all()
+    if not rows:
+        print(f"rebind-url --fleet: no roster rows to check ({SQUAD_CONF})")
+        return 0
+    checkable = ok = unchecked = 0
+    for row in rows:
+        agent, worktree, launch_args = row["agent"], row["worktree"], row["args"]
+        if launch_args.startswith("@docker:"):
+            unchecked += 1
+            print(f"  {agent:30s} container: not checkable from host")
+            continue
+        # A lane with no comms flag has no wake path to rebind, so it is not
+        # listed at all: a "problem" it cannot have would train eyes past the
+        # lanes that do have one.
+        if not _launch_flags(launch_args)["comms"]:
+            continue
+        checkable += 1
+        derived, _project = _derive_agent_identity(worktree)
+        # EITHER name counts as naming itself: the roster name is what the hub
+        # knows the lane as, and the derived identity is what the lane itself
+        # would register under. Where they differ the lane is still ok — the
+        # split is reported for information, because it is a different fault
+        # (two readouts of one agent) and fixing it is not this check's job.
+        wanted = list(dict.fromkeys(n for n in (agent, derived) if n))
+        split = f"  name-split (roster {agent}, derived {derived})" if (
+            derived and derived != agent) else ""
+        scope, data, path = _hub_url_scope(worktree)
+        url_text = str(_dig(data, path)["url"]) if scope is not None else None
+        where = f"  [{scope}]" if scope is not None else ""
+        if url_text is None:
+            print(f"  {agent:30s} no-url{where}{split}")
+            continue
+        found = _url_agent_param(url_text)
+        if not found:
+            print(f"  {agent:30s} missing-agent{where}{split}")
+        elif found in wanted:
+            ok += 1
+            print(f"  {agent:30s} ok{where}{split}")
+        else:
+            print(f"  {agent:30s} mismatch {found} != "
+                  f"{' or '.join(wanted) or '(no derived identity)'}{where}{split}")
+    print(f"rebind-url --fleet: {ok}/{checkable} comms lane(s) name themselves"
+          + (f", {unchecked} container lane(s) not checkable from here" if unchecked else ""))
+    if ok < checkable:
+        print("  a lane without ?agent= is rebound only by its next turn: "
+              "run `mcp-hub rebind-url` in that lane's worktree (its owner's act)")
+    return 0 if ok == checkable else 1
+
+
 def rebind_url_command(args: argparse.Namespace) -> int:
     """Stamp ?agent=<derived name> into this seat's hub URL — the per-seat
-    rollout leg of transport-level auto-rebind."""
+    rollout leg of transport-level auto-rebind.
+
+    `--fleet` turns the same knowledge into a read-only FLEET CHECK
+    (`rebind_url_fleet_check`). A flag and not a new verb: server.py's
+    _CLI_SUBCOMMANDS is frozen, and a verb it does not list is a verb the
+    hub cannot tell an agent about.
+    """
+    # getattr, not args.fleet: rebind_url_command is called directly with a
+    # hand-built Namespace (tests, and the settings app), and a missing
+    # attribute must not be an AttributeError in the write path.
+    if getattr(args, "fleet", False):
+        return rebind_url_fleet_check(args)
     cwd = args.cwd or os.getcwd()
     name, _project = _derive_agent_identity(cwd)
     if not name:
         print(f"no derived identity for {cwd} (not opted in?) — nothing written")
         return 1
-    mcp_json = None
-    data: Any = None
-    hub_path: list[str] = []
-    for candidate, path in _hub_config_candidates(cwd):
-        try:
-            candidate_data = json.loads(candidate.read_text(encoding="utf-8"))
-        except (FileNotFoundError, json.JSONDecodeError):
-            continue
-        hub_entry = _dig(candidate_data, path)
-        if isinstance(hub_entry, dict) and hub_entry.get("url"):
-            mcp_json, data, hub_path = candidate, candidate_data, path
-            break
+    mcp_json, data, hub_path = _hub_url_scope(cwd)
     if mcp_json is None:
         looked = ", ".join(str(c) for c, _ in _hub_config_candidates(cwd))
         print(f"no hub server URL found (looked in: {looked}) — nothing written")
@@ -7947,6 +8053,15 @@ def build_parser() -> argparse.ArgumentParser:
     rebind.add_argument("--cwd", default=None, help="Worktree (default: current directory)")
     rebind.add_argument(
         "--dry-run", action="store_true", help="Print the rewritten URL; write nothing"
+    )
+    rebind.add_argument(
+        "--fleet",
+        action="store_true",
+        help=(
+            "Check EVERY comms lane on this box instead of stamping one: "
+            "ok / missing-agent / mismatch / no-url per lane, read-only. "
+            "Exit 0 only when every checkable lane names itself"
+        ),
     )
 
     focus_p = sub.add_parser(

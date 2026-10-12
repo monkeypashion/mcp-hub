@@ -1,0 +1,12 @@
+[Unit]
+Description=v2-fleet load meter — one day's reading of Tim's load (read-only)
+Documentation=https://github.com/monkeypashion/mcp-hub/blob/master/src/mcp_hub/load_meter.py
+
+[Service]
+Type=oneshot
+# The script decides nothing but WHICH files today's reading is taken from,
+# and reads them all read-only. $MCP_HUB_DB names the local hub copy and is
+# deliberately NOT set here: it is a per-machine fact (which copy, taken when)
+# and belongs in mcp-hub's drop-in, where changing it does not mean editing a
+# file that ships in the repo for every machine.
+ExecStart=%h/Projects/code/monkeypashion/mcp-hub/squad/load-meter-daily

@@ -46,12 +46,14 @@ class Fleet:
     """A throwaway squad: a roster, a private socket, and wrapped tools."""
 
     def __init__(self, tmp, up=("alpha", "beta"), pane=IDLE_PANE, lanes=LANES,
-                 roster_args=None, docker=DOCKER_STUB, trace=False):
+                 roster_args=None, docker=DOCKER_STUB, trace=False, tools=()):
         self.tmp = Path(tmp)
         self.lanes = tuple(lanes)
         home = self.tmp / "home"
         (home / ".config" / "squad").mkdir(parents=True)
         (home / ".mcp-hub").mkdir()
+        self.home = home
+        self.hub = home / ".mcp-hub"
         # `who` reads the recap cache with a bare redirect: on a fresh HOME a
         # missing file is a stderr line every pass, which no live box has.
         (home / ".mcp-hub" / "board-recap.cache").write_text("")
@@ -78,7 +80,20 @@ class Fleet:
             'case "$1" in -S) exit 1 ;; esac\n'      # never the live fleet's sockets
             f'{log_tmux}'
             f'exec {self.real_tmux} "$@"\n')
-        (bindir / "docker").write_text(docker)
+        # A `{trace}` in the docker stub is the trace file: a test that counts
+        # docker calls writes them where the passes are already separated.
+        (bindir / "docker").write_text(docker.replace("{trace}", str(self.trace)))
+        # Logging wrappers for the tools a pass must NOT fork per lane. They
+        # exec the real tool, so behaviour is unchanged and only the count is
+        # observable — the same way the waits are read from `sleep`.
+        for tool in tools:
+            real = shutil.which(tool)
+            assert real, tool
+            (bindir / tool).write_text(
+                "#!/bin/sh\n"
+                f'printf "TOOL {tool} %s\\n" "$*" >> {self.trace}\n'
+                f'exec {real} "$@"\n')
+            (bindir / tool).chmod(0o755)
         (bindir / "sleep").write_text(
             "#!/bin/sh\n"
             f'printf "%s %s\\n" "$(date +%s.%N)" "$*" >> {self.sleeps}\n'
@@ -615,3 +630,176 @@ def test_a_container_seat_still_answers_from_its_own_substrate(fleet, tmp_path):
     assert lines(out.read_bytes()) == ["who: alpha idle", "who: seat working"], \
         lines(out.read_bytes())
     assert err.read_bytes() == b""
+
+
+# ----------------------------------------------------------------------------
+# r4: a quiet pass must not fork PER LANE
+#
+# r3 made the pass bulk — one list-panes, one capture, one list-clients — but
+# left one question asked per COMMS lane: "is this lane's hub cache fresh, and
+# what does it say?". That answer cost five forks each (`find`, `cat`, two
+# `grep`s and a `date`), and at the live fleet's 31 comms lanes it was 0.67 s
+# of CPU a pass — two thirds of the whole pass (measured 2026-10-12). Bash can
+# read a 1 KB file and match a pattern itself; only the mtimes needed a
+# process, and ONE `stat` answers for the whole directory.
+#
+# What is asserted here is the SHAPE that makes it cheap, read from outside in
+# tool invocations. The CPU itself is measured at the live fleet's shape by the
+# r4 falsifiers.
+# ----------------------------------------------------------------------------
+
+COMMS = "--dangerously-load-development-channels server:hub"
+FRESH_STATUS = '{"online": true, "wakeable": true, "focus_until": 0}'
+
+
+def tool_calls(trace, name):
+    """[[args, ...] per pass] for one logged tool, passes split by the waits."""
+    done, cur = [], []
+    for row in trace.splitlines():
+        if row.startswith("SLEEP "):
+            done.append(cur)
+            cur = []
+        elif row.startswith(f"TOOL {name} "):
+            cur.append(row[len(f"TOOL {name} "):])
+    return done
+
+
+def comms_fleet(fleet, n, **kw):
+    """n comms lanes, each with a FRESH status cache the glyph can be read from."""
+    lanes = tuple(f"lane{i:02d}" for i in range(n))
+    f = fleet(lanes=lanes, up=lanes, roster_args={a: f"{COMMS} --continue" for a in lanes},
+              trace=True, **kw)
+    for lane in lanes:
+        (f.hub / f"status-{lane}.json").write_text(FRESH_STATUS)
+    return f, lanes
+
+
+@pytest.mark.parametrize("n", (3, 12))
+def test_a_quiet_pass_reads_every_status_cache_with_one_stat_and_no_other_fork(
+        fleet, tmp_path, n):
+    """The lever, at two fleet sizes: one `stat` for the directory, and NOT a
+    `find`, a `cat` or a `date` per lane. The counts must be the same at 3
+    lanes and at 12 — a count that grows per lane is the 46-lane failure."""
+    f, lanes = comms_fleet(fleet, n, tools=("find", "cat", "stat", "date"))
+    out, err = tmp_path / f"s{n}-out", tmp_path / f"s{n}-err"
+    with open(out, "wb") as fo, open(err, "wb") as fe:
+        proc = f.watch(fo, fe)
+        assert wait_until(lambda: len(f.waits()) >= 5, timeout=60.0), err.read_bytes()
+        assert proc.poll() is None, err.read_bytes()
+    trace = f.trace.read_text()
+    # pass 0 primes the tab titles and reads the hand-flag caches; judge the
+    # quiet passes after it
+    quiet = slice(1, 5)
+    for args in tool_calls(trace, "find")[quiet]:
+        assert not [a for a in args if "status-" in a], args
+    for args in tool_calls(trace, "cat")[quiet]:
+        assert not [a for a in args if "status-" in a], args
+    stats = tool_calls(trace, "stat")[quiet]
+    for args in stats:
+        status_stats = [a for a in args if "status-" in a]
+        assert len(status_stats) <= 1, status_stats
+    assert any(args for args in stats), "the status caches were never stat'ed at all"
+    # the only `date` in a pass is the harness's own clock in the sleep wrapper
+    for args in tool_calls(trace, "date")[quiet]:
+        assert [a for a in args if a != "+%s.%N"] == [], args
+    assert lines(out.read_bytes()) == [f"who: {a} idle" for a in lanes]
+    assert err.read_bytes() == b""
+
+
+def test_the_glyph_still_follows_the_file_and_the_clock(fleet, tmp_path):
+    """Cheap must not mean stale, and the glyph is NOT cached on an mtime: a
+    file rewritten to offline reads ✖ on the next pass, a cache nobody rewrote
+    ages into `?`, and a focus that has elapsed stops showing."""
+    lanes = ("fresh", "stale", "offline", "focused", "elapsed", "nofile")
+    f = fleet(lanes=lanes, up=lanes,
+              roster_args={a: f"{COMMS} --continue" for a in lanes})
+    now = int(time.time())
+    (f.hub / "status-fresh.json").write_text(FRESH_STATUS)
+    stale = f.hub / "status-stale.json"
+    stale.write_text(FRESH_STATUS)
+    os.utime(stale, (now - 200, now - 200))        # past `find -mmin -3`
+    (f.hub / "status-offline.json").write_text('{"online": false, "wakeable": false}')
+    (f.hub / "status-focused.json").write_text(
+        '{"online": true, "wakeable": true, "focus_until": %d.5}' % (now + 1800))
+    (f.hub / "status-elapsed.json").write_text(
+        '{"online": true, "wakeable": true, "focus_until": %d.0}' % (now - 60))
+    proc = subprocess.run(["bash", str(SQUAD), "who"], capture_output=True, text=True,
+                          env=f.env, stdin=subprocess.DEVNULL, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    glyphs = {}
+    for row in proc.stdout.splitlines():
+        parts = row.split()
+        if len(parts) > 2 and parts[1] in lanes:
+            glyphs[parts[1]] = parts[2]
+    assert glyphs == {"fresh": "⚡", "stale": "?", "offline": "✖",
+                      "focused": "⚡🔕", "elapsed": "⚡", "nofile": "?"}, proc.stdout
+
+
+def test_one_docker_ps_a_pass_however_many_container_seats(fleet, tmp_path):
+    """Liveness was `docker ps --filter name=^<c>$` per seat, and a docker
+    client start is ~50 ms of CPU: one listing answers for all of them, and
+    nothing is remembered past the pass."""
+    docker = ("#!/bin/sh\n"
+              'printf "TOOL docker %s\\n" "$*" >> {trace}\n'
+              'case "$1" in\n'
+              '  ps)   printf "ctr-s0\\nctr-s1\\nctr-s2\\n" ;;\n'
+              '  exec) shift; shift; case "$1" in\n'
+              '          tmux) echo ready ;;\n'
+              '          find) echo "$2" ;;\n'
+              f'          cat) echo \'{FRESH_STATUS}\' ;;\n'
+              '        esac ;;\n'
+              'esac\nexit 0\n')
+    lanes = ("host", "s0", "s1", "s2")
+    f = fleet(lanes=lanes, up=("host",), docker=docker, trace=True,
+              roster_args={"host": f"{COMMS} --continue",
+                           **{a: f"@docker:ctr-{a}" for a in ("s0", "s1", "s2")}})
+    (f.hub / "status-host.json").write_text(FRESH_STATUS)
+    out, err = tmp_path / "ps-out", tmp_path / "ps-err"
+    with open(out, "wb") as fo, open(err, "wb") as fe:
+        proc = f.watch(fo, fe)
+        assert wait_until(lambda: len(f.waits()) >= 4, timeout=60.0), err.read_bytes()
+        assert proc.poll() is None, err.read_bytes()
+    calls = tool_calls(f.trace.read_text(), "docker")[1:4]
+    assert calls, f.trace.read_text()
+    for args in calls:
+        listings = [a for a in args if a.startswith("ps")]
+        assert len(listings) == 1, listings
+        assert "--filter" not in listings[0], listings[0]
+    # the seats are seen as UP by that one listing, not reported down
+    assert lines(out.read_bytes()) == ["who: host idle", "who: s0 idle",
+                                       "who: s1 idle", "who: s2 idle"], \
+        lines(out.read_bytes())
+    assert err.read_bytes() == b""
+
+
+def test_the_hand_flags_are_not_re_read_on_every_pass(fleet, tmp_path):
+    """🙋 comes out of caches OTHER processes write and moves on the order of
+    minutes; re-reading it cost a transcript scan and two python starts every
+    pass. 🔴 (a dialog on screen) is read from the pane every pass and is a
+    different signal — this one is slowed, that one is not."""
+    f, lanes = comms_fleet(fleet, 3, tools=("python3",))
+    out, err = tmp_path / "hand-out", tmp_path / "hand-err"
+    env_extra = {"SQUAD_BOARD_USAGE_TTL": "0"}      # charge the scan to every pass
+    f.env.update(env_extra)
+    with open(out, "wb") as fo, open(err, "wb") as fe:
+        proc = f.watch(fo, fe)
+        assert wait_until(lambda: len(f.waits()) >= 7, timeout=90.0), err.read_bytes()
+        assert proc.poll() is None, err.read_bytes()
+    per_pass = [len(args) for args in tool_calls(f.trace.read_text(), "python3")[:7]]
+    assert per_pass[0] >= 1, "the first pass must read them at all"
+    assert sum(1 for n in per_pass if n == 0) >= 3, per_pass
+    assert err.read_bytes() == b""
+
+
+def test_the_default_base_wait_leaves_a_pass_room_inside_the_bounds():
+    """r4 judges a quiet pass against the BASE wait, not the cap: every change
+    drops the poll back to the base and the live fleet changes about every
+    40 s, so that is where the watcher lives. The two bounds are
+    pass <= 0.1 * base and cap + 2 * pass <= 60 s."""
+    src = SQUAD.read_text()
+    base = float(re.findall(r"\$\{SQUAD_WHO_INTERVAL:-([0-9.]+)\}", src)[0])
+    cap = float(re.findall(r"\$\{SQUAD_WHO_MAX_INTERVAL:-([0-9.]+)\}", src)[0])
+    assert base < cap
+    budget = 0.1 * base
+    assert budget >= 1.0, f"a {base:g} s base gives a pass only {budget:g} s of CPU"
+    assert cap + 2 * budget <= 60.0, (cap, budget)

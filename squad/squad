@@ -80,6 +80,24 @@ field()  {
   fi
   rows | awk -F'|' -v a="$1" -v n="$2" '$1==a {print $n; exit}'
 }
+# The same answer in FIELD, with no fork at all when the roster is primed —
+# `field` is read through a command substitution, and a read-only pass that
+# asks for a few fields per lane pays a subshell for each one. 36 of them a
+# pass in `who --watch` alone (measured 2026-10-12), for four fields of a
+# pipe-delimited file already in memory. Unprimed it falls back to `field`,
+# so there is still ONE rule for what a field is.
+field_var() {
+  local line f
+  FIELD=''
+  if [ -n "${_ROWS_PRIMED:-}" ]; then
+    line="${_ROW[$1]-}"
+    [ -n "$line" ] || return 0
+    IFS='|' read -r -a f <<< "$line"
+    FIELD="${f[$(( $2 - 1 ))]-}"
+    return 0
+  fi
+  FIELD="$(field "$1" "$2")"
+}
 rows_prime() {
   local line k
   _ROWS_PRIMED=; _ROWS="$(rows)"
@@ -532,8 +550,18 @@ sys.stdout.write("".join("%s\x1f%d\x1f%d\n" % r for r in out))
 # Per-agent hub state files under ~/.mcp-hub, named with the same sanitisation
 # the daemon uses (non [A-Za-z0-9_-] -> _). status-*.json is the daemon's
 # wakeability snapshot; heartbeat-*.pid is its singleton claim.
-safe_name()    { printf '%s' "$1" | sed 's/[^A-Za-z0-9_-]/_/g'; }
-status_file()  { printf '%s\n' "$HOME/.mcp-hub/status-$(safe_name "$1").json"; }
+# ONE sanitisation rule, in TWO shapes: a _var form that sets a variable with
+# no fork at all, and the printing form every existing caller already uses.
+# `who --watch` asks for a status path once per comms lane per pass, and the
+# printing form costs two forks each (the substitution, plus the `sed` inside
+# it) — 0.17 s of CPU a pass at the live fleet's 31 comms lanes, measured
+# 2026-10-12. A second spelling of the rule would be worse than the forks
+# (the daemon and statusline-command.js mirror this one), so the printing
+# forms now DELEGATE and there is still exactly one rule.
+safe_name_var()   { SAFE_NAME="${1//[^A-Za-z0-9_-]/_}"; }
+safe_name()       { safe_name_var "$1"; printf '%s' "$SAFE_NAME"; }
+status_file_var() { safe_name_var "$1"; STATUS_FILE="$HOME/.mcp-hub/status-$SAFE_NAME.json"; }
+status_file()     { status_file_var "$1"; printf '%s\n' "$STATUS_FILE"; }
 # True when the lane's daemon has reported, within the last 3 min and after
 # <since>, that the hub can push to it right now (list_agents' ⚡). A stale,
 # missing or unreadable file is NOT proof of anything and answers false.
@@ -617,25 +645,93 @@ nudge_copy() {  # <state> <hub_restarted:1|0> [fleet_wakeable] [fleet_total]
   fi
 }
 
-status_json() {
-  local a="$1" c sf p
-  if c="$(container_of "$a")"; then
-    p="/home/seat/.mcp-hub/status-$(printf '%s' "$a" | sed 's/[^A-Za-z0-9_-]/_/g').json"
+# ---- the daemon's status cache, read without a fork per lane ---------------
+# A quiet `who --watch` pass asks this question once per comms lane, and the
+# answer used to cost five forks each: `find` for freshness, `cat` for the
+# body, two `grep`s and a `date` for the focus mark. At the live fleet's 31
+# comms lanes that was 0.67 s of CPU a pass — two thirds of the whole pass —
+# for ~1 KB of JSON bash can read itself (measured on this box, 2026-10-12).
+#
+# So the primitive sets a VARIABLE: no command substitution, no `cat`, no
+# `grep`, no `date`, and ONE `stat` for the whole directory when a caller has
+# announced a pass (`status_scan`). What it MEANS is unchanged — a cache older
+# than STATUS_FRESH_S reads as unknown, never as offline — and nothing is
+# remembered between passes: a glyph cached on an mtime would go on showing ⚡
+# for a file that was rewritten to offline, which is the one reading this
+# instrument exists to catch.
+STATUS_FRESH_S=180            # `find -mmin -3`: the rule every reader used
+declare -A STATUS_MTIME       # status file -> mtime, from ONE stat a pass
+STATUS_SCANNED=''             # set only while STATUS_MTIME is this pass's truth
+STATUS_BODY=''                # the body status_body last read ('' = nothing)
+STATUS_NOW=''                 # the clock that pass read, once
+
+# ONE stat for every host lane's status cache. Call it at the top of a pass;
+# every status_body after it answers from these mtimes and costs no fork.
+status_scan() {
+  local mt path
+  STATUS_MTIME=(); STATUS_SCANNED=''
+  while read -r mt path; do
+    [ -n "$path" ] || continue
+    STATUS_MTIME["$path"]="$mt"
+  done < <(stat -c '%Y %n' "$HOME/.mcp-hub"/status-*.json 2>/dev/null || true)
+  STATUS_NOW="${EPOCHSECONDS:-}"
+  [ -n "$STATUS_NOW" ] || STATUS_NOW="$(date +%s)"
+  STATUS_SCANNED=1
+}
+
+# <agent> -> STATUS_BODY, iff that lane's status cache is FRESH. Status 1 (and
+# an empty STATUS_BODY) when there is no fresh cache: unknown, not offline.
+status_body() {
+  local a="$1" c p mt now
+  STATUS_BODY=''
+  if container_of_var "$a"; then
+    c="$CONTAINER_NAME"
+    # A container seat's daemon writes its cache INSIDE the container, so
+    # every host reader saw nothing and reported `?` for a seat that was ⚡
+    # (measured 2026-08-05). Its own substrate answers, at two docker calls —
+    # the host path below costs none.
+    safe_name_var "$a"
+    p="/home/seat/.mcp-hub/status-$SAFE_NAME.json"
     # Freshness judged the same way as the host: recently modified, not
     # merely present. A stale cache must read as unknown, never as offline.
     [ -n "$(docker exec "$c" find "$p" -mmin -3 2>/dev/null)" ] || return 1
-    docker exec "$c" cat "$p" 2>/dev/null
+    STATUS_BODY="$(docker exec "$c" cat "$p" 2>/dev/null)" || true
+    [ -n "$STATUS_BODY" ] || return 1
     return 0
   fi
-  sf="$(status_file "$a")"
-  [ -f "$sf" ] || return 1
-  [ -n "$(find "$sf" -mmin -3 2>/dev/null)" ] || return 1
-  cat "$sf" 2>/dev/null
+  status_file_var "$a"
+  if [ -n "$STATUS_SCANNED" ]; then
+    mt="${STATUS_MTIME[$STATUS_FILE]:-}"
+    now="$STATUS_NOW"
+  else
+    mt="$(stat -c %Y "$STATUS_FILE" 2>/dev/null || true)"
+    now="${EPOCHSECONDS:-}"
+    [ -n "$now" ] || now="$(date +%s)"
+  fi
+  # Digits only: `$(( ))` on a non-number is a bash ERROR, and under `set -e`
+  # that would end the watcher — the one caller that must survive anything its
+  # fleet's files do.
+  mt="${mt%%.*}"
+  case "$mt" in ''|*[!0-9]*) return 1 ;; esac
+  [ $(( now - mt )) -lt "$STATUS_FRESH_S" ] || return 1
+  # The whole file into a variable with the `read` builtin: no `cat`, no
+  # subshell. It returns 1 at EOF with no delimiter, which is the normal case.
+  IFS= read -r -d '' STATUS_BODY < "$STATUS_FILE" 2>/dev/null || true
+  [ -n "$STATUS_BODY" ] || return 1
+  return 0
+}
+
+# The same fact on stdout, for the callers that read it that way (`ls`'s
+# hub_state, fleet_wake_counts). One source, two shapes — never two readers.
+status_json() {
+  status_body "$1" || return 1
+  printf '%s' "$STATUS_BODY"
 }
 
 hub_glyph() {
   local body
-  body="$(status_json "$1")" || { printf '?'; return; }
+  status_body "$1" || { printf '?'; return; }
+  body="$STATUS_BODY"
   [ -n "$body" ] || { printf '?'; return; }
   case "$body" in
     *'"online"'*true*)
@@ -658,12 +754,16 @@ hub_glyph() {
 # 🔕 if the snapshot's focus_until is still in the future, else nothing.
 focus_glyph() {
   local until now
-  until="$(printf '%s' "$1" | grep -o '"focus_until"[[:space:]]*:[[:space:]]*[0-9.]*' \
-           | grep -o '[0-9.]*$')" || return 0
+  # Bash's own matcher, not two `grep`s and a `date`: this ran once per comms
+  # lane per `who` pass and three forks there is most of what a quiet pass
+  # cost. Same field, same answer — the integer part of epoch seconds.
+  [[ "$1" =~ \"focus_until\"[[:space:]]*:[[:space:]]*([0-9]+) ]] || return 0
+  until="${BASH_REMATCH[1]}"
   [ -n "$until" ] || return 0
-  now="$(date +%s)"
+  now="${EPOCHSECONDS:-}"
+  [ -n "$now" ] || now="$(date +%s)"
   # Integer compare: the field is epoch seconds, possibly with a float tail.
-  [ "${until%%.*}" -gt "$now" ] 2>/dev/null && printf '🔕'
+  [ "$until" -gt "$now" ] 2>/dev/null && printf '🔕'
   return 0
 }
 
@@ -2554,10 +2654,20 @@ PYEOF
 # roster is a 5-field pipe format with several readers — a sixth column would
 # silently shift every field after it for all of them.
 container_of() {
-  local args x
-  args="$(field "$1" 4)"
-  case "$args" in
-    @docker:*) x="${args#@docker:}"; printf '%s\n' "${x%%:*}" ;;
+  container_of_var "$1" || return 1
+  printf '%s\n' "$CONTAINER_NAME"
+}
+# CONTAINER_NAME instead of stdout, and no fork on the way: `container_of` is
+# asked once per lane per `who` pass (status_body asks it first), and through
+# a substitution that cost 36 subshells a pass on top of the `field` one
+# inside it. One rule for where the marker lives, two shapes for reading it.
+CONTAINER_NAME=''
+container_of_var() {
+  local x
+  CONTAINER_NAME=''
+  field_var "$1" 4
+  case "$FIELD" in
+    @docker:*) x="${FIELD#@docker:}"; CONTAINER_NAME="${x%%:*}" ;;
     *) return 1 ;;
   esac
 }
@@ -5012,6 +5122,32 @@ case "${1:-help}" in
             # milliseconds apart and the change must still be seen.
             # Measured at 46 lanes: 8.2 s a quiet pass -> 0.15 s (3 ms a
             # lane), 0.003 of a core at the 45 s cap.
+            #
+            # r4: THE LIVE FLEET IS NOT 46 PLAIN LANES. It is 31 comms lanes,
+            # 5 container seats and 10 plain ones, and a comms lane asks one
+            # more question every pass — "is your hub cache fresh, and what
+            # does it say?". That answer cost five forks a lane (`find`,
+            # `cat`, two `grep`s and a `date`), which put the real pass back
+            # at ~1.3 s here and 2.8 s on dev-vm-1: 0.28 of a core at the 10 s
+            # base. Four more levers, in the same spirit — bulk, and never per
+            # lane:
+            #   * ONE `stat` for the whole status directory (`status_scan`),
+            #     and the bodies read with bash's own `read` builtin and
+            #     matched with bash's own patterns: no fork per comms lane;
+            #   * ONE subshell for the whole fleet's glyphs (`who_glyphs`),
+            #     where it was one per comms lane — and `field` /
+            #     `container_of` answer in a VARIABLE now (`field_var`,
+            #     `container_of_var`), which was another subshell a lane;
+            #   * ONE `docker ps` a pass for every container seat's liveness,
+            #     instead of a filtered `ps` each;
+            #   * the 🙋 hand flags — written by OTHER processes, moving on
+            #     the order of minutes — re-read every WHO_WAIT_EVERY-th pass
+            #     instead of every one.
+            # Measured at the live fleet's shape: 1.28 s a quiet pass -> 0.39 s
+            # (0.02 of a core at the 20 s base wait, 0.009 at the cap).
+            # Nothing is cached ACROSS a pass: a glyph held on an mtime would
+            # keep showing ⚡ for a cache rewritten to offline, which is the
+            # reading this instrument exists to catch.
             wmode=""; case "${2:-}" in -w|--watch) wmode=1 ;; esac
             declare -A WST   # agent -> state, one classify pass per refresh
             # Compact hub-presence glyph from the daemon's status cache (same
@@ -5042,6 +5178,7 @@ case "${1:-help}" in
             declare -A WDASH   # dash pane id -> the agent it shows
             declare -A WPAINT  # dash pane id -> the border colour last pushed
             WHO_LANES=()                                  # the roster, once a pass
+            WHO_CTRS=''                                   # ' name name ' from one docker ps
             WHO_FS='|'                                    # tmux -F field split; see who_scan
             WHO_NL=$'\n'
             WHO_MARK="=who=$$="   # end-of-capture marker; no '#' (a format eats it)
@@ -5091,16 +5228,38 @@ case "${1:-help}" in
                 fi
               done < <(tm list-panes -a -F "#{session_name}$WHO_FS#{window_active}#{pane_active}$WHO_FS#{pane_id}$WHO_FS#{@agent}$WHO_FS#{session_created}$WHO_FS#{pane_current_command}$WHO_FS#{pane_title}" 2>/dev/null || true)
             }
+            who_containers() {   # ONE `docker ps` a pass, for every seat at once
+              # container_alive asks `docker ps --filter name=^<c>$` per seat,
+              # and a docker client start is ~50 ms of CPU on a live box: five
+              # container lanes paid it every pass to learn what one listing
+              # already says. The listing is this pass's truth and nothing
+              # outlives the pass — a seat that dies is `down` on the next one.
+              local a any=''
+              WHO_CTRS=''
+              for a in "${WHO_LANES[@]}"; do
+                if [ -n "${WCON[$a]:-}" ]; then any=1; break; fi
+              done
+              [ -n "$any" ] || return 0
+              command -v docker >/dev/null 2>&1 || return 0
+              # Names only, space-wrapped, so a membership test is a bash
+              # pattern and not another fork. `|| true`: no docker daemon is a
+              # fleet with no container seats up, never a dead watcher.
+              WHO_CTRS=" $(docker ps --format '{{.Names}}' 2>/dev/null | tr '\n' ' ' || true) "
+            }
             who_live() {    # is this lane's agent actually running?
               # A CONTAINER seat's process lives in docker, not in a host pane,
-              # so it keeps pane_alive's substrate: asking tmux here reported a
-              # running, ⚡-on-the-hub seat as `down` (measured 2026-08-05).
+              # so it keeps its own substrate: asking tmux here reported a
+              # running, ⚡-on-the-hub seat as `down` (measured 2026-08-05) —
+              # answered now from the pass's one `docker ps`, exact name match
+              # as `--filter name=^<c>$` made it.
               # A host lane answers from who_scan, with pane_alive's rule — a
               # bare shell in the pane means the agent exited — applied to the
               # command that scan already read, one call a PASS instead of one
               # display-message a lane.
               local a="$1"
-              if [ -n "${WCON[$a]:-}" ]; then container_alive "${WCON[$a]}"; return $?; fi
+              if [ -n "${WCON[$a]:-}" ]; then
+                case "$WHO_CTRS" in *" ${WCON[$a]} "*) return 0 ;; *) return 1 ;; esac
+              fi
               [ -n "${WLIVE[$a]:-}" ] || return 1
               case "${WCMD[$a]:-}" in ''|bash|sh|zsh) return 1 ;; esac
               return 0
@@ -5109,6 +5268,7 @@ case "${1:-help}" in
               # Asked twice (the capture list, then the board) it would be two
               # docker calls a pass for every container seat.
               local a
+              who_containers
               WUP=()
               for a in "${WHO_LANES[@]}"; do
                 if who_live "$a"; then WUP[$a]=1; else WUP[$a]=''; fi
@@ -5171,9 +5331,39 @@ case "${1:-help}" in
               elif [ -z "${WPTITLE[$a]:-}" ]; then WMOD[$a]=""
               fi
             }
+            who_glyphs() {  # every lane's hub glyph, in ONE subshell for the FLEET
+              # hub_glyph is the single producer and prints to stdout, so the
+              # board read it as `$(hub_glyph "$a")` — one subshell PER COMMS
+              # LANE, 31 forks a pass at the live fleet's shape. Called inside
+              # one process substitution instead, the fleet costs one fork and
+              # the producer is still the only thing that computes a glyph.
+              # The same lanes as the board's loop: a faculty lane that is
+              # down has no row and is not asked about.
+              local a g
+              WGLY=()
+              while IFS="$WHO_FS" read -r a g; do
+                [ -n "$a" ] || continue
+                WGLY[$a]="$g"
+              done < <(
+                for a in "${WHO_LANES[@]}"; do
+                  if [ -z "${WUP[$a]:-}" ] && [ -n "${WFAC[$a]:-}" ]; then continue; fi
+                  printf '%s%s' "$a" "$WHO_FS"
+                  # No comms flag => no hub daemon and no wake path, so
+                  # hub_glyph's "?" (= no status data) is a real alarm for a
+                  # comms agent but pure noise here; such an agent is simply
+                  # ▶. Keyed on capability, not class: a comms-enabled faculty
+                  # agent shows its REAL hub glyph, because it now has hub
+                  # state that can genuinely break.
+                  if [ -n "${WCOM[$a]:-}" ]; then hub_glyph "$a"; else printf '▶'; fi
+                  printf '\n'
+                done)
+            }
             who_board() {
               local a st g ctx txt key
-              who_facts; who_scan; who_up; who_capture
+              # ONE stat for every lane's status cache and ONE subshell for
+              # every lane's glyph ride with the other bulk reads: the loop
+              # below then forks for nothing at all.
+              who_facts; who_scan; status_scan; who_up; who_capture; who_glyphs
               for a in "${WHO_LANES[@]}"; do
                 if [ -z "${WUP[$a]:-}" ]; then
                   # down faculty is invisible here (14 grey rows would bury
@@ -5202,13 +5392,11 @@ case "${1:-help}" in
                   fi
                 fi
                 st="${WST[$a]:-}"
-                # No comms flag => no hub daemon and no wake path, so hub_glyph's
-                # "?" (= no status data) is a real alarm for a comms agent but
-                # pure noise here; such an agent is simply ▶. Keyed on capability,
-                # not class: a comms-enabled faculty agent shows its REAL hub
-                # glyph, because it now has hub state that can genuinely break.
-                if [ -n "${WCOM[$a]:-}" ]; then g="$(hub_glyph "$a")"; else g='▶'; fi
-                WGLY[$a]="$g"      # the badge reuses it; it cannot have moved since
+                # Read, never computed: who_glyphs asked once for the whole
+                # fleet this pass, and the badge below reuses the same value —
+                # asking again doubled the status-cache reads for a character
+                # that cannot have moved in between.
+                g="${WGLY[$a]-▶}"
                 ctx="${WCTX[$a]:-}"
                 case "$st" in
                   waiting) printf '  \033[1;31m🔴 %-28s %-2s %-4s WAITING ON YOU\033[0m\n' "$a" "$g" "$ctx" ;;
@@ -5305,7 +5493,17 @@ except Exception:
               # poll backs off to 45s now) — constant alternation made tabs
               # visibly flicker every pass.
               local a tty seq ts sp='' short g cur jig='' m label ctx n ghm born
-              load_wait_flags
+              # 🙋 THE HAND FLAGS ARE NOT A PER-PASS FACT. They come out of
+              # caches OTHER processes write (the daemons' decisions-open.json,
+              # the recap harvest), they move on the order of minutes, and
+              # re-reading them costs the transcript scan plus a python start
+              # — a third of what a quiet pass costs at fleet size. So they
+              # are read on the first pass and every WHO_WAIT_EVERY-th after
+              # it, and the flags stand in between.
+              # 🔴 (a dialog actually on screen) is read from the pane EVERY
+              # pass and is untouched by this: the signal that is slowed is the
+              # inferred one, which was already minutes old by construction.
+              if [ $(( WHO_PASS % WHO_WAIT_EVERY )) = 0 ]; then load_wait_flags; fi
               who_clients
               cur="$WHO_CLIENTS"
               [ "$cur" != "$WHO_LAST" ] && jig=1; WHO_LAST="$cur"
@@ -5411,6 +5609,13 @@ except Exception:
               done <<< "$lines"
             }
             WHO_PASS=0; WHO_LAST=''
+            # Passes, not seconds: the cadence has to be the same whether the
+            # poll is at its base or its cap, and a wall-clock TTL would make
+            # a backed-off watcher re-read the caches on every single pass.
+            WHO_WAIT_EVERY="${SQUAD_WHO_WAIT_FLAGS_EVERY:-4}"
+            # A nonsense value must not make the pass divide by zero and end
+            # the watcher: every pass is the honest fallback.
+            [ "$WHO_WAIT_EVERY" -ge 1 ] 2>/dev/null || WHO_WAIT_EVERY=1
             # ---- the watcher's memory between passes --------------------
             # Under systemd this loop lives for weeks and its stdout IS the
             # journal, read by a human scrolling back. So it reports CHANGES,
@@ -5460,14 +5665,24 @@ except Exception:
               fi
             }
             if [ -n "$wmode" ]; then
-              # THE POLL BACKS OFF. 10s, not 2s: a pass scans every pane, and
+              # THE POLL BACKS OFF. 20s, not 2s: a pass scans every pane, and
               # at 2s the watcher alone held ~0.9 of a core on dev-vm-1
               # (2026-10-08) to move a badge a few seconds sooner. Quiet
               # doubles the wait up to the cap; ANY state change drops it
               # straight back to the base, so the first move after an hour of
               # quiet is still on screen within T15's minute. The cap's
               # default leaves room for a whole pass inside that minute.
-              who_base="${SQUAD_WHO_INTERVAL:-10}"
+              #
+              # THE BASE, NOT THE CAP, IS WHERE THE WATCHER LIVES (r4): every
+              # change resets the wait, and the live fleet changes about every
+              # 40 s, so it sits near the base nearly all the time. T15 is
+              # therefore judged there — a quiet pass must cost under 0.1 of a
+              # core AT THE BASE WAIT. 20 s gives a pass a 2 s budget, which
+              # the levers above come in well under, and it is the only one of
+              # the two numbers that can be raised: the cap enters the latency
+              # bound (cap + 2 passes <= 60 s) as well as the cost one, so a
+              # longer cap pays for itself twice over and buys nothing.
+              who_base="${SQUAD_WHO_INTERVAL:-20}"
               who_cap="${SQUAD_WHO_MAX_INTERVAL:-45}"
               who_wait="$who_base"
               who_quiet=''; [ -t 1 ] || who_quiet=1   # no terminal = the journal

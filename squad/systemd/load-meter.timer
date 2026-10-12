@@ -1,0 +1,17 @@
+[Unit]
+Description=Take the v2-fleet load reading once a day
+
+[Timer]
+# ONE reading a day, on the calendar and not on an interval. The reading's
+# unit IS a closed UTC day (`daily` holds one measure set per day), so a timer
+# that fired every N hours would take two or three readings of the same day
+# and none of them at a day boundary. 04:10 UTC is after midnight has closed
+# the previous day everywhere the fleet runs.
+OnCalendar=*-*-* 04:10 UTC
+# A box that was asleep at 04:10 still owes the day a reading: catch up on the
+# next boot rather than leaving a hole no later run can fill.
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target
