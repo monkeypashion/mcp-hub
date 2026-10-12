@@ -241,8 +241,20 @@ def test_guard_frozen_paths_name_existing_files():
 
 
 def test_guard_server_never_imports_the_meter():
-    src = (ROOT / "src" / "mcp_hub" / "server.py").read_text()
-    assert "load_meter" not in src and "load-meter" not in src
+    # By import, not by text: mcp-hub's base commit names the verb ("load-meter" in _CLI_SUBCOMMANDS, with a
+    # comment saying the logic lives in load_meter.py). What must never happen is server.py importing the meter.
+    import ast
+    tree = ast.parse((ROOT / "src" / "mcp_hub" / "server.py").read_text())
+    imported = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported += [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            imported += [f"{node.module or ''}.{a.name}" for a in node.names] + [node.module or ""]
+        elif isinstance(node, ast.Call) and getattr(node.func, "attr", getattr(node.func, "id", "")) in (
+                "import_module", "__import__"):
+            imported += [a.value for a in node.args if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+    assert not [m for m in imported if "load_meter" in m], imported
 
 
 # cli.py: every top-level statement except build_parser() and main() is byte-identical to the
