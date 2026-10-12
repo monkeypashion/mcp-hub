@@ -18,7 +18,7 @@ Nothing here reaches the live fleet, a real ~/.mcp-hub, or the hub.
 import os
 import pty
 import re
-import select
+import selectors
 import shutil
 import signal
 import subprocess
@@ -179,6 +179,10 @@ def run(tmp_path_factory):
         rec["first"] = out.read_bytes()
 
         time.sleep(QUIET_S)
+        # A loaded box makes each pass slower, so a fixed quiet window can
+        # hold fewer than the four waits the backoff test reads. Quiet is
+        # quiet for as long as it lasts: wait for the waits, not the clock.
+        wait_until(lambda: len(f.waits()) >= 5, timeout=30.0)
         rec["quiet"] = out.read_bytes()
         rec["quiet_err"] = err.read_bytes()
         rec["t_down"] = time.time()
@@ -187,6 +191,7 @@ def run(tmp_path_factory):
         seen = wait_until(lambda: b"beta" in out.read_bytes()[len(rec["quiet"]):])
         rec["down_seen"] = bool(seen)
         time.sleep(CAP_S * 2)
+        wait_until(lambda: len([w for w, _ in f.waits() if w > rec["t_down"]]) >= 2, timeout=30.0)
         rec["down"] = out.read_bytes()
         rec["t_up"] = time.time()
 
@@ -194,6 +199,7 @@ def run(tmp_path_factory):
         seen = wait_until(lambda: b"beta" in out.read_bytes()[len(rec["down"]):])
         rec["up_seen"] = bool(seen)
         time.sleep(CAP_S * 2)
+        wait_until(lambda: len([w for w, _ in f.waits() if w > rec["t_up"]]) >= 2, timeout=30.0)
         rec["final"] = out.read_bytes()
         rec["err"] = err.read_bytes()
         rec["alive"] = proc.poll() is None
@@ -307,7 +313,7 @@ def test_a_fleet_with_no_tmux_server_at_all_is_reported_not_fatal(fleet, tmp_pat
         time.sleep(CAP_S * 3)
         assert proc.poll() is None, f"the watcher exited: {err.read_bytes()!r}"
     assert lines(out.read_bytes()) == [f"who: {a} down" for a in LANES]
-    assert len([s for _, s in f.waits()]) >= 2, "the watcher stopped polling"
+    assert wait_until(lambda: len(f.waits()) >= 2, timeout=30.0), "the watcher stopped polling"
 
 
 # ----------------------------------------------------------------------------
@@ -324,11 +330,15 @@ def test_a_terminal_still_gets_the_cleared_screen_and_the_whole_board(fleet, tmp
             os.close(secondary)
             blob = b""
             deadline = time.time() + 25.0
+            # selectors, not select.select: under the full suite this fd can
+            # sit above FD_SETSIZE, where select() refuses it outright
+            sel = selectors.DefaultSelector()
+            sel.register(primary, selectors.EVENT_READ)
             # two whole frames: a terminal watcher REPAINTS the board, it does
             # not diff — the clock in the header is the proof it is live
             # gamma is the board's last row, so twice means two whole frames
             while time.time() < deadline and blob.count(b"gamma") < 2:
-                if not select.select([primary], [], [], 0.5)[0]:
+                if not sel.select(timeout=0.5):
                     continue
                 try:
                     chunk = os.read(primary, 65536)
@@ -337,6 +347,7 @@ def test_a_terminal_still_gets_the_cleared_screen_and_the_whole_board(fleet, tmp
                 if not chunk:
                     break
                 blob += chunk
+            sel.close()
             assert proc.poll() is None, err.read_bytes()
     finally:
         os.close(primary)
