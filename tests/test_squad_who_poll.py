@@ -1,0 +1,388 @@
+"""`squad who --watch`'s quiet poll (v2-fleet F2, j6-squad-who-quiet-poll).
+
+The watcher runs for weeks under systemd, so the two things it must get right
+are what reaches the journal (changes only) and what it costs while nothing is
+happening (one pass per backed-off wait). Both are observed from OUTSIDE: the
+journal from the process's stdout, the waits from a `sleep` wrapper on PATH.
+Timings a busy box skews are never the measurement.
+
+Hermetic, and deliberately so — this file drives the REAL squad script:
+  * a private tmux socket under a private TMUX_TMPDIR (`mkdtemp`, because a
+    socket path much past 100 bytes cannot be bound),
+  * a `tmux` wrapper that refuses `-S <socket>`, so the box-wide inventory
+    (which walks /tmp/tmux-$UID) can never reach the live fleet,
+  * HOME, SQUAD_CONF, MCP_HUB_STATE_DIR and `docker` all inside tmp_path.
+Every child runs in its own process group and is stopped by that group's id.
+Nothing here reaches the live fleet, a real ~/.mcp-hub, or the hub.
+"""
+import os
+import pty
+import re
+import select
+import shutil
+import signal
+import subprocess
+import tempfile
+import time
+import uuid
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+SQUAD = ROOT / "squad" / "squad"
+
+BASE_S, CAP_S = 0.3, 1.2        # SQUAD_WHO_INTERVAL / SQUAD_WHO_MAX_INTERVAL
+QUIET_S = 6.0                   # nothing moves for this long after the start
+LANES = ("alpha", "beta", "gamma")
+IDLE_PANE = "echo ready; exec sleep 600"   # a blank pane ends a pass under pipefail
+
+pytestmark = pytest.mark.skipif(not shutil.which("tmux"), reason="squad needs tmux")
+
+
+class Fleet:
+    """A throwaway squad: a roster, a private socket, and wrapped tools."""
+
+    def __init__(self, tmp, up=("alpha", "beta"), pane=IDLE_PANE):
+        self.tmp = Path(tmp)
+        home = self.tmp / "home"
+        (home / ".config" / "squad").mkdir(parents=True)
+        (home / ".mcp-hub").mkdir()
+        # `who` reads the recap cache with a bare redirect: on a fresh HOME a
+        # missing file is a stderr line every pass, which no live box has.
+        (home / ".mcp-hub" / "board-recap.cache").write_text("")
+        work = self.tmp / "w"
+        work.mkdir()
+        conf = home / ".config" / "squad" / "squad.conf"
+        conf.write_text("".join(f"{a}|{work}||--continue\n" for a in LANES), encoding="utf-8")
+
+        self.real_tmux = shutil.which("tmux")
+        self.sleeps = self.tmp / "sleeps"
+        bindir = self.tmp / "bin"
+        bindir.mkdir()
+        (bindir / "tmux").write_text(
+            "#!/bin/sh\n"
+            'case "$1" in -S) exit 1 ;; esac\n'      # never the live fleet's sockets
+            f'exec {self.real_tmux} "$@"\n')
+        (bindir / "docker").write_text("#!/bin/sh\nexit 0\n")
+        (bindir / "sleep").write_text(
+            "#!/bin/sh\n"
+            f'printf "%s %s\\n" "$(date +%s.%N)" "$*" >> {self.sleeps}\n'
+            f'exec {shutil.which("sleep")} "$@"\n')
+        for tool in ("tmux", "docker", "sleep"):
+            (bindir / tool).chmod(0o755)
+
+        self.tmuxdir = Path(tempfile.mkdtemp(prefix="whopoll-"))
+        self.sock = f"whopoll-{uuid.uuid4().hex[:8]}"
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith("TMUX")}
+        self.env.update(HOME=str(home), SQUAD_CONF=str(conf), SQUAD_SOCKET=self.sock,
+                        TMUX_TMPDIR=str(self.tmuxdir),
+                        PATH=f"{bindir}:{os.environ['PATH']}",
+                        MCP_HUB_STATE_DIR=str(home / ".mcp-hub"))
+        # the roster sessions are started with the REAL tmux and the real PATH:
+        # a pane that inherited the wrappers would log the watcher's sleeps
+        self.tool_env = {**self.env, "PATH": os.environ["PATH"]}
+        self.pane = pane
+        self.procs = []
+        for lane in up:
+            self.up(lane)
+
+    def tmux(self, *args, check=True):
+        return subprocess.run([self.real_tmux, "-L", self.sock, *args], check=check,
+                              capture_output=True, text=True, env=self.tool_env, timeout=30)
+
+    def up(self, lane):
+        self.tmux("new-session", "-d", "-s", lane, self.pane)
+
+    def down(self, lane):
+        self.tmux("kill-session", "-t", f"={lane}")
+
+    def watch(self, stdout, stderr, base=BASE_S, cap=CAP_S):
+        env = {**self.env, "SQUAD_WHO_INTERVAL": str(base), "SQUAD_WHO_MAX_INTERVAL": str(cap)}
+        proc = subprocess.Popen(["bash", str(SQUAD), "who", "--watch"], stdout=stdout,
+                                stderr=stderr, stdin=subprocess.DEVNULL, env=env,
+                                start_new_session=True)
+        self.procs.append(proc)
+        return proc
+
+    def waits(self):
+        """Every one-argument `sleep` the watcher ran, as (when, seconds)."""
+        out = []
+        for row in (self.sleeps.read_text().splitlines() if self.sleeps.exists() else []):
+            parts = row.split()
+            if len(parts) == 2:
+                try:
+                    out.append((float(parts[0]), float(parts[1])))
+                except ValueError:
+                    pass
+        return out
+
+    def close(self):
+        for proc in self.procs:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+        self.tmux("kill-server", check=False)
+        shutil.rmtree(self.tmuxdir, ignore_errors=True)
+
+
+@pytest.fixture
+def fleet(tmp_path):
+    made = []
+
+    def build(**kw):
+        made.append(Fleet(tmp_path, **kw))
+        return made[-1]
+
+    yield build
+    for one in made:
+        one.close()
+
+
+def lines(blob):
+    text = blob.decode(errors="replace") if isinstance(blob, bytes) else blob
+    return [ln for ln in text.splitlines() if ln.strip()]
+
+
+def wait_until(predicate, timeout=25.0, tick=0.05):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        got = predicate()
+        if got:
+            return got
+        time.sleep(tick)
+    return None
+
+
+# ----------------------------------------------------------------------------
+# one long run, read many ways (a watcher start is the expensive part)
+# ----------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def run(tmp_path_factory):
+    if not shutil.which("tmux"):
+        pytest.skip("squad needs tmux")
+    tmp = tmp_path_factory.mktemp("run")
+    f = Fleet(tmp)
+    rec = {}
+    out, err = tmp / "out", tmp / "err"
+    try:
+        with open(out, "wb") as fo, open(err, "wb") as fe:
+            proc = f.watch(fo, fe)
+        assert wait_until(lambda: out.read_bytes()), "the watcher journaled nothing"
+        time.sleep(0.4)
+        rec["first"] = out.read_bytes()
+
+        time.sleep(QUIET_S)
+        rec["quiet"] = out.read_bytes()
+        rec["quiet_err"] = err.read_bytes()
+        rec["t_down"] = time.time()
+
+        f.down("beta")
+        seen = wait_until(lambda: b"beta" in out.read_bytes()[len(rec["quiet"]):])
+        rec["down_seen"] = bool(seen)
+        time.sleep(CAP_S * 2)
+        rec["down"] = out.read_bytes()
+        rec["t_up"] = time.time()
+
+        f.up("beta")
+        seen = wait_until(lambda: b"beta" in out.read_bytes()[len(rec["down"]):])
+        rec["up_seen"] = bool(seen)
+        time.sleep(CAP_S * 2)
+        rec["final"] = out.read_bytes()
+        rec["err"] = err.read_bytes()
+        rec["alive"] = proc.poll() is None
+        rec["waits"] = f.waits()
+        rec["sleeps_raw"] = f.sleeps.read_text() if f.sleeps.exists() else ""
+    finally:
+        f.close()
+    return rec
+
+
+def test_the_first_pass_names_every_lane_and_its_state(run):
+    assert run["alive"], "the watcher died"
+    first = lines(run["first"])
+    assert len(first) == len(LANES), first
+    assert first == ["who: alpha idle", "who: beta idle", "who: gamma down"], first
+
+
+def test_a_quiet_fleet_journals_nothing_at_all(run):
+    assert run["quiet"] == run["first"], lines(run["quiet"][len(run["first"]):])
+
+
+def test_stderr_stays_empty_throughout(run):
+    assert run["quiet_err"] == b"", run["quiet_err"][:400]
+    assert run["err"] == b"", run["err"][:400]
+
+
+def test_a_lane_going_down_journals_one_line_naming_both_states(run):
+    assert run["down_seen"], "beta going down never reached the journal"
+    new = lines(run["down"][len(run["quiet"]):])
+    assert new == ["who: beta idle -> down"], new
+
+
+def test_the_same_lane_coming_back_journals_the_return(run):
+    assert run["up_seen"], "beta coming back never reached the journal"
+    new = lines(run["final"][len(run["down"]):])
+    assert new == ["who: beta down -> idle"], new
+
+
+def test_no_screen_clearing_or_header_ever_reaches_the_journal(run):
+    blob = run["final"]
+    assert b"\x1b[2J" not in blob and b"\x1b[H" not in blob
+    assert b"squad who \xe2\x80\x94" not in blob, "the terminal header reached the journal"
+    for row in lines(blob):
+        assert row.startswith("who: "), row
+
+
+def test_the_wait_doubles_while_quiet_and_stops_at_the_cap(run):
+    quiet = [s for when, s in run["waits"] if when < run["t_down"]]
+    assert len(quiet) >= 4, quiet
+    assert quiet[0] == BASE_S, f"the first wait is not the base interval: {quiet}"
+    assert quiet[:4] == [BASE_S, BASE_S * 2, CAP_S, CAP_S], quiet
+    assert all(s <= CAP_S for s in [s for _, s in run["waits"]]), run["waits"]
+
+
+def test_every_change_drops_the_wait_back_to_the_base(run):
+    for label, since in (("down", run["t_down"]), ("up", run["t_up"])):
+        after = [s for when, s in run["waits"] if when > since]
+        assert len(after) >= 2, (label, after)
+        # the pass already under way when the lane moved may still sleep the
+        # backed-off wait; the pass that SAW the move waits the base again
+        assert BASE_S in after[:2], (label, after)
+
+
+def test_every_wait_is_one_sleep_with_one_argument(run):
+    """The falsifiers read the backoff from these calls, so the loop must wait
+    with a single `sleep <seconds>` — a second sleep, or a flag, and the poll's
+    cost stops being readable from outside the process."""
+    logged = [row.split() for row in lines(run["sleeps_raw"])]
+    assert logged, "no waits logged at all"
+    assert all(len(row) == 2 for row in logged), logged[:5]
+    assert len(logged) == len(run["waits"])
+
+
+# ----------------------------------------------------------------------------
+# what is NOT a state change
+# ----------------------------------------------------------------------------
+
+def test_context_and_model_churn_is_not_a_state_change(fleet, tmp_path):
+    """ctx% and the model letter move constantly and reach the TAB, not the
+    journal — counting them as state would make every pass a change again."""
+    f = fleet(up=("alpha",), pane="echo 'Opus5 high · ctx [....] 14%'; exec cat")
+    out, err = tmp_path / "ctx-out", tmp_path / "ctx-err"
+    with open(out, "wb") as fo, open(err, "wb") as fe:
+        proc = f.watch(fo, fe)
+        assert wait_until(lambda: out.read_bytes()), "nothing journaled"
+        time.sleep(0.4)
+        before = out.read_bytes()
+        assert "who: alpha idle" in lines(before), lines(before)
+        # the pane's own statusline redraws with a new ctx % and model
+        # send-keys is a pane-target command: no "=" prefix, as the script's
+        # own note says
+        f.tmux("send-keys", "-t", "alpha", "-l", "Fable5 high · ctx [......] 44%")
+        f.tmux("send-keys", "-t", "alpha", "Enter")
+        time.sleep(CAP_S * 3)
+        after = out.read_bytes()
+        assert proc.poll() is None, "the watcher died"
+    assert after == before, lines(after[len(before):])
+    assert err.read_bytes() == b""
+
+
+def test_a_fleet_with_no_tmux_server_at_all_is_reported_not_fatal(fleet, tmp_path):
+    """The known edge: with no server on the squad socket, who_badge's
+    `list-clients | sort | paste` fails under pipefail. The watcher is the one
+    caller that must outlive its whole fleet being down."""
+    f = fleet(up=())
+    out, err = tmp_path / "down-out", tmp_path / "down-err"
+    with open(out, "wb") as fo, open(err, "wb") as fe:
+        proc = f.watch(fo, fe)
+        assert wait_until(lambda: len(lines(out.read_bytes())) >= len(LANES)), \
+            f"out={out.read_bytes()!r} err={err.read_bytes()!r}"
+        time.sleep(CAP_S * 3)
+        assert proc.poll() is None, f"the watcher exited: {err.read_bytes()!r}"
+    assert lines(out.read_bytes()) == [f"who: {a} down" for a in LANES]
+    assert len([s for _, s in f.waits()]) >= 2, "the watcher stopped polling"
+
+
+# ----------------------------------------------------------------------------
+# a terminal still gets the board
+# ----------------------------------------------------------------------------
+
+def test_a_terminal_still_gets_the_cleared_screen_and_the_whole_board(fleet, tmp_path):
+    f = fleet()
+    primary, secondary = pty.openpty()
+    err = tmp_path / "tty-err"
+    try:
+        with open(err, "wb") as fe:
+            proc = f.watch(secondary, fe)
+            os.close(secondary)
+            blob = b""
+            deadline = time.time() + 25.0
+            # two whole frames: a terminal watcher REPAINTS the board, it does
+            # not diff — the clock in the header is the proof it is live
+            # gamma is the board's last row, so twice means two whole frames
+            while time.time() < deadline and blob.count(b"gamma") < 2:
+                if not select.select([primary], [], [], 0.5)[0]:
+                    continue
+                try:
+                    chunk = os.read(primary, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                blob += chunk
+            assert proc.poll() is None, err.read_bytes()
+    finally:
+        os.close(primary)
+        f.close()
+    text = blob.decode(errors="replace")
+    assert text.count("\x1b[2J") >= 2, text[:400]
+    assert len(re.findall(r"squad who — \d\d:\d\d:\d\d", text)) >= 2
+    for lane in LANES:
+        assert len(re.findall(rf"\b{lane}\b", text)) >= 2, lane
+    assert "who: alpha idle" not in text, "the journal form leaked onto a terminal"
+
+
+# ----------------------------------------------------------------------------
+# the one-shot pass, and the defaults the operator inherits
+# ----------------------------------------------------------------------------
+
+def test_one_shot_who_is_untouched(fleet):
+    f = fleet()
+    proc = subprocess.run(["bash", str(SQUAD), "who"], capture_output=True, text=True,
+                          env=f.env, stdin=subprocess.DEVNULL, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    rows = {row.split()[1]: row for row in proc.stdout.splitlines()
+            if len(row.split()) > 1 and row.split()[1] in LANES}
+    assert set(rows) == set(LANES), proc.stdout
+    assert "idle" in rows["alpha"] and "down" in rows["gamma"]
+    assert "\x1b[" in proc.stdout, "the board lost its colour"
+    assert "who: " not in proc.stdout, "one shot must print the board, not the diff"
+    assert not f.sleeps.exists(), "a single pass must not wait at all"
+
+
+def test_the_defaults_are_env_overridable_and_leave_room_inside_a_minute():
+    src = SQUAD.read_text()
+    base = re.findall(r"\$\{SQUAD_WHO_INTERVAL:-([0-9.]+)\}", src)
+    cap = re.findall(r"\$\{SQUAD_WHO_MAX_INTERVAL:-([0-9.]+)\}", src)
+    assert base and cap, (base, cap)
+    # T15 wants every lane's state within a minute: the cap plus one pass has
+    # to fit inside it, so the cap alone must leave room
+    assert all(0 < float(x) <= 50 for x in cap), cap
+    assert all(float(b) < float(c) for b in base for c in cap), (base, cap)
+
+
+def test_the_loop_waits_exactly_once_per_pass():
+    """One `sleep` in the loop, and the float doubling done by awk — bash
+    cannot double 0.4 and a fractional interval is what the tests use."""
+    src = SQUAD.read_text()
+    arm = src.split("  who)      ", 1)[1].split("\n  board)", 1)[0]
+    watch = arm.split('if [ -n "$wmode" ]; then', 1)[1]
+    assert len(re.findall(r"(?m)^\s*sleep ", watch)) == 1, "not exactly one sleep per pass"
+    assert "awk" in watch and "SQUAD_WHO_MAX_INTERVAL" in watch

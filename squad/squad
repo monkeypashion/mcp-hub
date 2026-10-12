@@ -5106,7 +5106,11 @@ except Exception:
               local a tty seq ts sp='' hostsafe short g cur jig='' m label ctx n
               load_wait_flags
               hostsafe="$(sanitize_ident "$(hostname)")"
-              cur="$(tm list-clients -F '#{client_tty}' 2>/dev/null | sort | paste -sd, -)"
+              # `|| true`: with no server on the socket (a whole squad down)
+              # list-clients exits 1, pipefail carries it out of the
+              # substitution and set -e killed the WATCHER — the one caller
+              # that must survive its fleet being down.
+              cur="$(tm list-clients -F '#{client_tty}' 2>/dev/null | sort | paste -sd, - || true)"
               [ "$cur" != "$WHO_LAST" ] && jig=1; WHO_LAST="$cur"
               WHO_PASS=$((WHO_PASS+1)); [ $(( WHO_PASS % 30 )) = 0 ] && jig=1
               [ -n "$jig" ] && sp=' '
@@ -5200,16 +5204,93 @@ except Exception:
               done <<< "$lines"
             }
             WHO_PASS=0; WHO_LAST=''
+            # ---- the watcher's memory between passes --------------------
+            # Under systemd this loop lives for weeks and its stdout IS the
+            # journal, read by a human scrolling back. So it reports CHANGES,
+            # not frames: WSEEN holds the state each lane was last reported
+            # in, WHO_UNM_SEEN the unmanaged set, and a pass that moves
+            # neither writes NOTHING. A frame per pass buried the one line
+            # that mattered under thousands of identical boards.
+            declare -A WSEEN
+            WHO_UNM_SEEN=''
+            who_line() {    # lane, state it was reported in, state now
+              # journal form: no header, no timestamp (journald stamps every
+              # line already) and no screen-clearing escape — a \033[2J in a
+              # log file makes the whole file unreadable with cat.
+              if [ -z "$3" ]; then printf 'who: %s %s -> gone\n' "$1" "$2"
+              elif [ -z "$2" ]; then printf 'who: %s %s\n' "$1" "$3"
+              else printf 'who: %s %s -> %s\n' "$1" "$2" "$3"
+              fi
+            }
+            who_moved() {
+              # Status 0 when some lane's state moved since the last pass;
+              # with $1 = journal, each move is written as it is noticed.
+              # STATE IS who_board's VERDICT — waiting / working / idle /
+              # down, empty for a faculty lane that is down — deliberately
+              # not ctx% or the model letter, which drift every few seconds
+              # and would make every pass a change, which is the whole bug.
+              local a st was moved=''
+              for a in $(agents); do
+                st="${WST[$a]:-}"; was="${WSEEN[$a]-}"
+                if [ "$st" = "$was" ]; then continue; fi
+                moved=1
+                if [ "${1:-}" = journal ]; then who_line "$a" "$was" "$st"; fi
+                WSEEN[$a]="$st"
+              done
+              [ -n "$moved" ]
+            }
+            who_unmanaged_quiet() {
+              # The inventory banner as ONE line, and only when the set
+              # changes. Empty from the start stays silent: quiet is the
+              # normal state, and a line per pass would train eyes past it
+              # exactly as the repeated board did.
+              local now
+              now="$(unmanaged_sessions | cut -f2 | sort | paste -sd, - || true)"
+              if [ "$now" = "$WHO_UNM_SEEN" ]; then return 0; fi
+              WHO_UNM_SEEN="$now"
+              if [ -n "$now" ]; then printf 'who: UNMANAGED outside the roster: %s\n' "$now"
+              else printf 'who: no unmanaged sessions outside the roster\n'
+              fi
+            }
             if [ -n "$wmode" ]; then
+              # THE POLL BACKS OFF. 10s, not 2s: a pass scans every pane, and
+              # at 2s the watcher alone held ~0.9 of a core on dev-vm-1
+              # (2026-10-08) to move a badge a few seconds sooner. Quiet
+              # doubles the wait up to the cap; ANY state change drops it
+              # straight back to the base, so the first move after an hour of
+              # quiet is still on screen within T15's minute. The cap's
+              # default leaves room for a whole pass inside that minute.
+              who_base="${SQUAD_WHO_INTERVAL:-10}"
+              who_cap="${SQUAD_WHO_MAX_INTERVAL:-45}"
+              who_wait="$who_base"
+              who_quiet=''; [ -t 1 ] || who_quiet=1   # no terminal = the journal
+              who_reset=1                             # the first wait is the base
               while true; do
                 # top of a pass = quiescent — safe to swap in new code here
                 if self_stale; then exec "$SELF" who --watch; fi
-                printf '\033[2J\033[H'
-                printf 'squad who — %s   (🔴 dialog needs you · 🙋 asked, awaiting your word · 🟢 working · 💤 idle · ⚡ wakeable)\n\n' "$(date +%H:%M:%S)"
-                # 10s, not 2s: a pass scans every pane, and at 2s the watcher
-                # alone held ~0.9 of a core on dev-vm-1 (2026-10-08) to move a
-                # badge a few seconds sooner. SQUAD_WHO_INTERVAL overrides.
-                who_board; who_unmanaged; who_paint; who_badge; sleep "${SQUAD_WHO_INTERVAL:-10}"
+                if [ -n "$who_quiet" ]; then
+                  # The board pass is what fills WST, so it still runs every
+                  # pass — the rendered board is simply thrown away and only
+                  # the diff reaches the journal.
+                  who_board >/dev/null
+                  if who_moved journal; then who_reset=1; fi
+                  who_unmanaged_quiet
+                else
+                  printf '\033[2J\033[H'
+                  printf 'squad who — %s   (🔴 dialog needs you · 🙋 asked, awaiting your word · 🟢 working · 💤 idle · ⚡ wakeable)\n\n' "$(date +%H:%M:%S)"
+                  who_board; who_unmanaged
+                  if who_moved; then who_reset=1; fi
+                fi
+                # tab badges keep updating every pass either way: the badge IS
+                # the signal for an operator who is not looking at this output
+                who_paint; who_badge
+                if [ -n "$who_reset" ]; then who_wait="$who_base"; who_reset=''
+                else who_wait="$(awk -v w="$who_wait" -v c="$who_cap" \
+                                   'BEGIN { w = w * 2; if (w > c) w = c; printf "%g", w }')"
+                fi
+                # ONE external sleep per pass, as before — the wait is the
+                # loop's only cost while a fleet is quiet.
+                sleep "$who_wait"
               done
             else who_board; who_unmanaged; who_paint; who_badge; fi ;;
   board)    # OPERATOR DASHBOARD. `who` answers "what state is each agent in";
