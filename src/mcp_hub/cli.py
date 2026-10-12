@@ -8582,6 +8582,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Validate + write files, but do not launch claude (tests/debug)",
     )
 
+    # v2-fleet F1, the daily load meter. Imported HERE, not at module scope:
+    # the meter is a read-only job that happens to live in mcp-hub's code, and
+    # nothing that boots the hub should pull it in. Its flags are declared by
+    # the module itself, so the parser cannot drift from what `run` reads.
+    from . import load_meter as _load_meter
+    _load_meter.add_arguments(sub.add_parser(
+        "load-meter",
+        help="Record one read-only reading of the fleet's load on Tim",
+        description=_load_meter.DESCRIPTION,
+    ))
+
     return parser
 
 
@@ -8659,6 +8670,9 @@ def main(argv: list[str] | None = None) -> int:
         return voice_host_command(args)
     if args.subcommand == "seat-entry":
         return seat_entry_command(args)
+    if args.subcommand == "load-meter":
+        from . import load_meter as _load_meter
+        return _load_meter.run(args)
 
     parser.print_help()
     return 0
