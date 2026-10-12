@@ -1,0 +1,277 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://v2-fleet.local/contract/load-reading.schema.json",
+  "title": "One reading of Tim's load",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "generated_at",
+    "baseline",
+    "measures",
+    "changes",
+    "flags",
+    "inputs"
+  ],
+  "properties": {
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "baseline": {
+      "$ref": "#/$defs/window"
+    },
+    "measures": {
+      "$ref": "#/$defs/measure_set"
+    },
+    "changes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "change_id",
+          "at",
+          "before",
+          "after"
+        ],
+        "properties": {
+          "change_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "before": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/measure_set"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "after": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/measure_set"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "flags": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "detail"
+        ],
+        "properties": {
+          "code": {
+            "enum": [
+              "missing_before",
+              "missing_after"
+            ]
+          },
+          "change_id": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "inputs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "path",
+          "read"
+        ],
+        "properties": {
+          "name": {
+            "enum": [
+              "hub_db",
+              "snapshot",
+              "transcripts"
+            ]
+          },
+          "path": {
+            "type": "string"
+          },
+          "read": {
+            "type": "boolean"
+          },
+          "missing": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "if": {
+          "properties": {
+            "read": {
+              "const": false
+            }
+          }
+        },
+        "then": {
+          "required": [
+            "missing"
+          ]
+        }
+      }
+    }
+  },
+  "$defs": {
+    "window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "start",
+        "end",
+        "days"
+      ],
+      "properties": {
+        "start": {
+          "type": "string",
+          "format": "date"
+        },
+        "end": {
+          "type": "string",
+          "format": "date"
+        },
+        "days": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "measure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "value",
+        "source"
+      ],
+      "properties": {
+        "value": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "missing": {
+          "type": "string",
+          "minLength": 1
+        },
+        "per_lane": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "number"
+          }
+        }
+      },
+      "if": {
+        "properties": {
+          "value": {
+            "type": "null"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "missing"
+        ]
+      },
+      "else": {
+        "not": {
+          "required": [
+            "missing"
+          ]
+        }
+      }
+    },
+    "measure_set": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "typed_turns",
+        "reaching_tim",
+        "wait_total_seconds",
+        "wait_median_seconds",
+        "operator_wakes",
+        "hub_wakes",
+        "no_origin"
+      ],
+      "properties": {
+        "typed_turns": {
+          "$ref": "#/$defs/both_channels"
+        },
+        "reaching_tim": {
+          "$ref": "#/$defs/both_channels"
+        },
+        "wait_total_seconds": {
+          "$ref": "#/$defs/pane_only"
+        },
+        "wait_median_seconds": {
+          "$ref": "#/$defs/pane_only"
+        },
+        "operator_wakes": {
+          "$ref": "#/$defs/measure"
+        },
+        "hub_wakes": {
+          "$ref": "#/$defs/measure"
+        },
+        "no_origin": {
+          "$ref": "#/$defs/measure"
+        }
+      }
+    },
+    "pane_only": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pane"
+      ],
+      "properties": {
+        "pane": {
+          "$ref": "#/$defs/measure"
+        }
+      }
+    },
+    "both_channels": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pane",
+        "voice_relay"
+      ],
+      "properties": {
+        "pane": {
+          "$ref": "#/$defs/measure"
+        },
+        "voice_relay": {
+          "$ref": "#/$defs/measure"
+        }
+      }
+    }
+  }
+}

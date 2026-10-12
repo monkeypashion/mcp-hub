@@ -1,0 +1,11 @@
+{"paths": [
+  ".claude/frozen-paths.json",
+  "contract/load-reading.schema.json",
+  "tests/test_v2fleet_r2_falsifiers.py",
+  "src/mcp_hub/server.py",
+  "src/mcp_hub/api_v1.py",
+  "src/mcp_hub/evidence.py",
+  "src/mcp_hub/lineage.py",
+  "src/mcp_hub/ra_feature.py",
+  "src/mcp_hub/status_resolution.py"
+]}
