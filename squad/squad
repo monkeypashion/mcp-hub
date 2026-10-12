@@ -4986,8 +4986,32 @@ case "${1:-help}" in
             echo "$a: answered '$intent' (option $num: $(printf '%s' "$line" | sed 's/^[[:space:]❯]*//'))" ;;
   who)      # Who needs YOU? Reads every agent's screen and reports: 🔴 waiting
             # on operator input · 🟢 working · 💤 idle. With -w/--watch, loops
-            # every 2s and also paints dash tile borders (red/green/grey) so
-            # the dash doubles as the needs-me board.
+            # on a backing-off poll and also paints dash tile borders
+            # (red/green/grey) so the dash doubles as the needs-me board.
+            #
+            # A PASS COSTS WHAT IT SCANS. r2 made the poll back off, which
+            # spread the scan without making it cheaper: the pass still forked
+            # ~10 times a LANE, so at the live fleet's 46 lanes a quiet pass
+            # cost 8-12 s of CPU (~0.18 s a lane). The watcher held 0.18 of a
+            # core doing nothing, and one lane going down took ~80 s to reach
+            # the journal (features-json, hub 35318). A longer cap cannot buy
+            # that back — the cap bounds the latency too. So the pass is BULK,
+            # and the per-lane work is gated on something having MOVED:
+            #   * rows_prime once a pass, so field / is_faculty / has_comms /
+            #     container_of answer in-process, and their answers are kept
+            #     until that lane's roster ROW changes;
+            #   * ONE list-panes -a for liveness, the current command, the pane
+            #     title and the session's birth — for every lane and every dash
+            #     tile (it was a has-session plus up to three display calls a
+            #     lane);
+            #   * ONE tmux call that captures every host lane's screen;
+            #   * ONE list-clients for the badges' ttys;
+            #   * classify_text, the ctx%/model scrape and the tab title only
+            #     for a lane whose captured TEXT (or session) actually changed.
+            # Gated on the TEXT, never on elapsed time: two passes can be
+            # milliseconds apart and the change must still be seen.
+            # Measured at 46 lanes: 8.2 s a quiet pass -> 0.15 s (3 ms a
+            # lane), 0.003 of a core at the 45 s cap.
             wmode=""; case "${2:-}" in -w|--watch) wmode=1 ;; esac
             declare -A WST   # agent -> state, one classify pass per refresh
             # Compact hub-presence glyph from the daemon's status cache (same
@@ -4999,45 +5023,193 @@ case "${1:-help}" in
             declare -A WWAIT # agent -> 1 when its newest recap says it awaits the OPERATOR
                              # (flag computed at harvest against WAIT_ON_OP_RE; see the
                              # detector note at that definition — errs noisy by design)
+            # ---- what one pass reads in bulk, and what it remembers ---------
+            declare -A WROW    # agent -> the roster row the facts below came from
+            declare -A WFAC    # agent -> 1 when its roster class is faculty
+            declare -A WCON    # agent -> its container name ('' = a host pane)
+            declare -A WCOM    # agent -> 1 when comms-capable (hub wake path)
+            declare -A WSHORT  # agent -> its tab label (hostname stripped)
+            declare -A WLIVE   # session -> 1 when it exists on this server
+            declare -A WCMD    # session -> its active pane's current command
+            declare -A WPTITLE # session -> its active pane's title
+            declare -A WBORN   # session -> session_created (a restart moves it)
+            declare -A WUP     # agent -> 1 when its agent is running, once a pass
+            declare -A WCAP    # agent -> this pass's screen text (absent = no capture)
+            declare -A WTXT    # agent -> the screen text the harvest last ran on
+            declare -A WGLY    # agent -> the glyph the board computed this pass
+            declare -A WTTY    # session -> its clients' writable xterm ttys
+            declare -A WSET    # agent -> the tab title last pushed (birth-keyed)
+            declare -A WDASH   # dash pane id -> the agent it shows
+            declare -A WPAINT  # dash pane id -> the border colour last pushed
+            WHO_LANES=()                                  # the roster, once a pass
+            WHO_FS='|'                                    # tmux -F field split; see who_scan
+            WHO_NL=$'\n'
+            WHO_MARK="=who=$$="   # end-of-capture marker; no '#' (a format eats it)
+            WHO_HOST="$(sanitize_ident "$(hostname)")"     # for the tab labels, once
+            WHO_CLIENTS=''
+            who_facts() {   # ROSTER-derived facts, recomputed only when a row moves
+              # rows_prime is what makes this cheap: unprimed, every field()
+              # was a grep + an awk, and who asked for the class, the container
+              # and the comms flag several times a lane. Primed, they answer
+              # in-process — and since none of them can change while the row
+              # that spells them out does not, the answers survive the pass.
+              local a row c
+              rows_prime
+              WHO_LANES=()
+              while IFS= read -r a; do
+                [ -n "$a" ] || continue
+                WHO_LANES+=( "$a" )
+                row="${_ROW[$a]-}"
+                if [ "${WROW[$a]-}" = "$row" ]; then continue; fi
+                WROW[$a]="$row"
+                if is_faculty "$a"; then WFAC[$a]=1; else WFAC[$a]=''; fi
+                if c="$(container_of "$a")"; then WCON[$a]="$c"; else WCON[$a]=''; fi
+                if has_comms "$a"; then WCOM[$a]=1; else WCOM[$a]=''; fi
+                WSHORT[$a]="$(short_label "$a" "$WHO_HOST")"
+              done < <(agents)
+            }
+            who_scan() {    # ONE list-panes for the whole server
+              # Liveness, the current command, the pane title and the session's
+              # birth, for every lane at once, plus the dash's tiles and which
+              # agent each shows. '|' and not a tab as the field split: tab is
+              # IFS whitespace, so `read` would collapse an EMPTY field (an
+              # untagged pane, a cleared title) and silently shift every field
+              # after it. The title comes last, so a '|' in it cannot shift
+              # anything either; a roster name cannot contain one at all.
+              local sess act pid ag born cmd title
+              WLIVE=(); WCMD=(); WPTITLE=(); WBORN=(); WDASH=()
+              while IFS="$WHO_FS" read -r sess act pid ag born cmd title; do
+                [ -n "$sess" ] || continue
+                # dash tiles carry @agent (set by `dash` per pane); who_paint
+                # needs every tile, not just the active one.
+                if [ "$sess" = dash ] && [ -n "$ag" ]; then WDASH[$pid]="$ag"; fi
+                # A lane's state is read from the pane a bare `-t <session>`
+                # target resolves to: the active pane of the active window.
+                if [ "$act" = 11 ]; then
+                  WLIVE[$sess]=1; WCMD[$sess]="$cmd"
+                  WPTITLE[$sess]="$title"; WBORN[$sess]="$born"
+                fi
+              done < <(tm list-panes -a -F "#{session_name}$WHO_FS#{window_active}#{pane_active}$WHO_FS#{pane_id}$WHO_FS#{@agent}$WHO_FS#{session_created}$WHO_FS#{pane_current_command}$WHO_FS#{pane_title}" 2>/dev/null || true)
+            }
+            who_live() {    # is this lane's agent actually running?
+              # A CONTAINER seat's process lives in docker, not in a host pane,
+              # so it keeps pane_alive's substrate: asking tmux here reported a
+              # running, ⚡-on-the-hub seat as `down` (measured 2026-08-05).
+              # A host lane answers from who_scan, with pane_alive's rule — a
+              # bare shell in the pane means the agent exited — applied to the
+              # command that scan already read, one call a PASS instead of one
+              # display-message a lane.
+              local a="$1"
+              if [ -n "${WCON[$a]:-}" ]; then container_alive "${WCON[$a]}"; return $?; fi
+              [ -n "${WLIVE[$a]:-}" ] || return 1
+              case "${WCMD[$a]:-}" in ''|bash|sh|zsh) return 1 ;; esac
+              return 0
+            }
+            who_up() {      # liveness for every lane, ONCE a pass
+              # Asked twice (the capture list, then the board) it would be two
+              # docker calls a pass for every container seat.
+              local a
+              WUP=()
+              for a in "${WHO_LANES[@]}"; do
+                if who_live "$a"; then WUP[$a]=1; else WUP[$a]=''; fi
+              done
+            }
+            who_capture() {   # ONE tmux call for EVERY host lane's screen
+              # A tmux command SEQUENCE renders them all in one client; it was
+              # one capture-pane client a lane. The marker comes AFTER each
+              # capture on purpose: a target that has vanished since the scan
+              # ABORTS the rest of the sequence, so the lanes with no marker are
+              # exactly the ones to re-read singly, and no lane can ever be
+              # credited with another lane's screen.
+              local a line i n txt
+              local -a args=() ring=()
+              WCAP=()
+              for a in "${WHO_LANES[@]}"; do
+                [ -z "${WCON[$a]:-}" ] || continue      # a seat in docker: its own substrate
+                [ -n "${WUP[$a]:-}" ] || continue
+                [ ${#args[@]} -eq 0 ] || args+=( ';' )
+                args+=( capture-pane -p -t "$a" ';' display-message -p "$WHO_MARK$a" )
+              done
+              [ ${#args[@]} -gt 0 ] || return 0
+              while IFS= read -r line; do
+                case "$line" in
+                  "$WHO_MARK"*)
+                    a="${line#$WHO_MARK}"
+                    # the harvest's own filter — blank lines out, last 20 kept —
+                    # over bytes already in hand, instead of a grep and a tail
+                    # forked per lane
+                    n=${#ring[@]}; i=0; [ "$n" -le 20 ] || i=$(( n - 20 ))
+                    txt=""
+                    while [ "$i" -lt "$n" ]; do txt+="${txt:+$WHO_NL}${ring[$i]}"; i=$(( i + 1 )); done
+                    WCAP[$a]="$txt"; ring=() ;;
+                  *) if [ -n "${line//[[:space:]]/}" ]; then ring+=( "$line" ); fi ;;
+                esac
+              done < <(tm "${args[@]}" 2>/dev/null || true)
+            }
+            who_harvest() {   # the expensive half of a lane — only on a CHANGE
+              # One capture, three harvests: waiting/working state, the ctx %
+              # AND the model — all already rendered by the agent's own
+              # statusline ("⚡ 9/9 · Fable5 high · ctx [..] 14% · …"). This is
+              # the ~0.25 s a lane that made a quiet pass expensive when it ran
+              # for every lane every pass.
+              local a="$1" tail="$2" ctx mod
+              WST[$a]="$(classify_text "$tail")"   # shared patterns — never re-implement here
+              ctx="$(printf '%s\n' "$tail" | grep -oE '[c]tx \[[^]]*\][[:space:]]*[0-9]+%' | tail -1 | grep -oE '[0-9]+%' || true)"
+              # first letter only — tab space is precious: O/F/S/H
+              mod="$(printf '%s\n' "$tail" | grep -oE '[O]pus|[F]able|[S]onnet|[H]aiku' | tail -1 | cut -c1 || true)"
+              # sticky: a capture racing the agent's redraw sometimes misses
+              # the statusline — keep the last reading rather than blinking
+              # the % out of the title (title churn = visible tab flicker).
+              # BUT an empty pane title means a just-restarted claude
+              # (restart clears it) — drop the dead session's cached %.
+              if [ -n "$ctx" ]; then WCTX[$a]="$ctx"
+              elif [ -z "${WPTITLE[$a]:-}" ]; then WCTX[$a]=""
+              fi
+              # model is sticky on the same terms (scrape misses shouldn't
+              # blink the tag out; a restart clears it like the ctx cache)
+              if [ -n "$mod" ]; then WMOD[$a]="$mod"
+              elif [ -z "${WPTITLE[$a]:-}" ]; then WMOD[$a]=""
+              fi
+            }
             who_board() {
-              local a st g tail ctx mod
-              for a in $(agents); do
-                ctx=""; mod=""
-                if ! tm has-session -t "=$a" 2>/dev/null || ! pane_alive "$a"; then
+              local a st g ctx txt key
+              who_facts; who_scan; who_up; who_capture
+              for a in "${WHO_LANES[@]}"; do
+                if [ -z "${WUP[$a]:-}" ]; then
                   # down faculty is invisible here (14 grey rows would bury
                   # the squad signal); it reappears the moment it runs
-                  if is_faculty "$a"; then WST[$a]=""; continue; fi
-                  st="down"
+                  if [ -n "${WFAC[$a]:-}" ]; then WST[$a]=""; continue; fi
+                  WST[$a]="down"; WCTX[$a]=""; WMOD[$a]=""
+                  # a lane that comes back is re-harvested even if its screen
+                  # is byte-identical to the one it went down with
+                  WTXT[$a]=''
                 else
-                  # one capture, three harvests: waiting/working state, the
-                  # ctx % AND the model — all already rendered by the agent's
-                  # own statusline ("⚡ 9/9 · Fable5 high · ctx [..] 14% · …")
-                  tail="$(capture_for "$a" | grep -v '^[[:space:]]*$' | tail -20)"
-                  st="$(classify_text "$tail")"   # shared patterns — never re-implement here
-                  ctx="$(printf '%s\n' "$tail" | grep -oE '[c]tx \[[^]]*\][[:space:]]*[0-9]+%' | tail -1 | grep -oE '[0-9]+%' || true)"
-                  # first letter only — tab space is precious: O/F/S/H
-                  mod="$(printf '%s\n' "$tail" | grep -oE '[O]pus|[F]able|[S]onnet|[H]aiku' | tail -1 | cut -c1 || true)"
+                  if [ -n "${WCAP[$a]+x}" ]; then txt="${WCAP[$a]}"
+                  else
+                    # no marker: this lane, or one ahead of it in the sequence,
+                    # vanished mid-chain. `|| true`: a pane with nothing on it
+                    # makes grep exit 1, and pipefail would carry that out of
+                    # the substitution and end the WATCHER.
+                    txt="$(capture_for "$a" | grep -v '^[[:space:]]*$' | tail -20 || true)"
+                  fi
+                  # The session's birth is in the key, so a restarted lane is
+                  # re-read even if the new pane's first screen matches the old
+                  # one's last.
+                  key="${WBORN[$a]:-}$WHO_FS$txt"
+                  if [ "${WTXT[$a]-}" != "$key" ]; then
+                    WTXT[$a]="$key"
+                    who_harvest "$a" "$txt"
+                  fi
                 fi
-                WST[$a]="$st"
-                # sticky: a capture racing the agent's redraw sometimes misses
-                # the statusline — keep the last reading rather than blinking
-                # the % out of the title (title churn = visible tab flicker).
-                # BUT an empty pane title means a just-restarted claude
-                # (restart clears it) — drop the dead session's cached %.
-                if [ -n "$ctx" ]; then WCTX[$a]="$ctx"
-                elif [ "$st" = "down" ] || [ -z "$(tm display -p -t "$a" '#{pane_title}' 2>/dev/null)" ]; then WCTX[$a]=""
-                fi
-                # model is sticky on the same terms (scrape misses shouldn't
-                # blink the tag out; a restart clears it like the ctx cache)
-                if [ -n "$mod" ]; then WMOD[$a]="$mod"
-                elif [ "$st" = "down" ] || [ -z "$(tm display -p -t "$a" '#{pane_title}' 2>/dev/null)" ]; then WMOD[$a]=""
-                fi
+                st="${WST[$a]:-}"
                 # No comms flag => no hub daemon and no wake path, so hub_glyph's
                 # "?" (= no status data) is a real alarm for a comms agent but
                 # pure noise here; such an agent is simply ▶. Keyed on capability,
                 # not class: a comms-enabled faculty agent shows its REAL hub
                 # glyph, because it now has hub state that can genuinely break.
-                if has_comms "$a"; then g="$(hub_glyph "$a")"; else g='▶'; fi
+                if [ -n "${WCOM[$a]:-}" ]; then g="$(hub_glyph "$a")"; else g='▶'; fi
+                WGLY[$a]="$g"      # the badge reuses it; it cannot have moved since
+                ctx="${WCTX[$a]:-}"
                 case "$st" in
                   waiting) printf '  \033[1;31m🔴 %-28s %-2s %-4s WAITING ON YOU\033[0m\n' "$a" "$g" "$ctx" ;;
                   working) printf '  \033[32m🟢 %-28s %-2s %-4s working\033[0m\n' "$a" "$g" "$ctx" ;;
@@ -5047,16 +5219,21 @@ case "${1:-help}" in
               done
             }
             who_paint() {   # dash borders mirror the board (no-op without a dash)
-              tm has-session -t "=dash" 2>/dev/null || return 0
-              local p ag
-              for p in $(tm list-panes -t dash -F '#{pane_id}'); do
-                ag="$(tm display -p -t "$p" '#{@agent}' 2>/dev/null)"
-                [ -n "$ag" ] || continue
-                case "${WST[$ag]:-}" in
-                  waiting) tm select-pane -t "$p" -P 'fg=red,bold' ;;
-                  working) tm select-pane -t "$p" -P 'fg=green' ;;
-                  *)       tm select-pane -t "$p" -P 'fg=colour240' ;;
+              # The tiles come out of who_scan's one list-panes — this used to
+              # be a list-panes plus a display-message PER TILE — and only a
+              # colour that actually changed is pushed.
+              local p col
+              [ ${#WDASH[@]} -gt 0 ] || return 0
+              for p in "${!WDASH[@]}"; do
+                case "${WST[${WDASH[$p]}]:-}" in
+                  waiting) col='fg=red,bold' ;;
+                  working) col='fg=green' ;;
+                  *)       col='fg=colour240' ;;
                 esac
+                if [ "${WPAINT[$p]-}" != "$col" ]; then
+                  tm select-pane -t "$p" -P "$col" 2>/dev/null || true
+                  WPAINT[$p]="$col"
+                fi
               done
             }
             load_wait_flags() {
@@ -5087,6 +5264,28 @@ except Exception:
                 done < "$HOME/.mcp-hub/board-recap.cache" 2>/dev/null || true
               fi
             }
+            who_clients() {   # ONE list-clients a pass
+              # The jiggle signal (which ttys are attached at all) and, per
+              # session, the ttys the OSC write may go to. It was one
+              # list-clients a LANE on top of this one.
+              # `|| true`: with no server on the socket (a whole squad down)
+              # list-clients exits 1, pipefail carries it out of the
+              # substitution and set -e killed the WATCHER — the one caller
+              # that must survive its fleet being down.
+              local sess tty term
+              local -a all=()
+              WTTY=(); WHO_CLIENTS=''
+              while IFS="$WHO_FS" read -r sess tty term; do
+                [ -n "$tty" ] || continue
+                all+=( "$tty" )
+                [ "$term" = xterm-256color ] || continue
+                WTTY[$sess]="${WTTY[$sess]:+${WTTY[$sess]} }$tty"
+              done < <(tm list-clients -F "#{client_session}$WHO_FS#{client_tty}$WHO_FS#{client_termname}" 2>/dev/null || true)
+              if [ ${#all[@]} -gt 0 ]; then
+                WHO_CLIENTS="$(printf '%s\n' "${all[@]}" | sort | paste -sd, - || true)"
+              fi
+              return 0
+            }
             who_badge() {   # State -> VSCode tab, two channels per agent:
               # 1. per-session set-titles-string prefix: 🔴 lands INSIDE the
               #    grey ${sequence} text (proven to render in plain terminals).
@@ -5101,35 +5300,38 @@ except Exception:
               # Re-push discipline: tmux transmits only on change; content
               # changes (#T, state, glyph) push themselves. A trailing-space
               # jiggle forces a push ONLY when a new client appears (fresh
-              # window needs a backfill) or on a slow ~60s heartbeat —
-              # constant alternation made tabs visibly flicker every pass.
-              local a tty seq ts sp='' hostsafe short g cur jig='' m label ctx n
+              # window needs a backfill) or on a slow every-30th-pass
+              # heartbeat (it read ~60s when the poll was fixed at 2s, and the
+              # poll backs off to 45s now) — constant alternation made tabs
+              # visibly flicker every pass.
+              local a tty seq ts sp='' short g cur jig='' m label ctx n ghm born
               load_wait_flags
-              hostsafe="$(sanitize_ident "$(hostname)")"
-              cur="$(tm list-clients -F '#{client_tty}' 2>/dev/null | sort | paste -sd, -)"
+              who_clients
+              cur="$WHO_CLIENTS"
               [ "$cur" != "$WHO_LAST" ] && jig=1; WHO_LAST="$cur"
               WHO_PASS=$((WHO_PASS+1)); [ $(( WHO_PASS % 30 )) = 0 ] && jig=1
               [ -n "$jig" ] && sp=' '
-              local ctx
-              for a in $(agents); do
+              for a in "${WHO_LANES[@]}"; do
                 # down faculty: no session, no clients, nothing to badge
-                if is_faculty "$a" && ! tm has-session -t "=$a" 2>/dev/null; then continue; fi
-                short="$(short_label "$a" "$hostsafe")"
+                if [ -n "${WFAC[$a]:-}" ] && [ -z "${WLIVE[$a]:-}" ]; then continue; fi
+                short="${WSHORT[$a]:-$a}"
                 # glyph FIRST (right after the tab icon) so the status column
                 # lines up; 🔴 slots in after it when waiting — the name
                 # jumping right is deliberate attention-grabbing. ctx % rides
                 # after the label: "⚡ dt 44% · ✳ <status>".
-                # Capability, not class — see the who/board glyph note above.
-                if has_comms "$a"; then g="$(hub_glyph "$a")"; else g='▶'; fi
+                # The BOARD computed it this pass (same rule, capability not
+                # class); asking hub_glyph again doubled the status-cache reads
+                # for one character that cannot have moved in between.
+                g="${WGLY[$a]-▶}"
                 # repo marker, faculty only (squad repos are ALL GitHub —
                 # implied, so the glyph only earns tab space where it
                 # varies). Cached for the painter's lifetime: repo-ness
                 # doesn't change mid-session, and a git call per agent per
-                # 2s pass would be pure waste. Trailing, like the ctx emoji
+                # pass would be pure waste. Trailing, like the ctx emoji
                 # (137374f), so the name column stays put.
                 if [ -z "${WGH[$a]+x}" ]; then
                   ghm=""
-                  if is_faculty "$a"; then
+                  if [ -n "${WFAC[$a]:-}" ]; then
                     case "$(git -C "$(untilde "$(field "$a" 2)")" remote get-url origin 2>/dev/null || true)" in
                       *github.com*|*github-*) ghm="🐙" ;;
                     esac
@@ -5169,10 +5371,19 @@ except Exception:
                         ts="$g $label${ctx:+ $ctx} · #T$sp";       seq='\033]9;4;0;0\a'
                       fi ;;
                 esac
-                # NB: show/set-option reject the "=" prefix too — bare name
-                [ "$(tm show -t "$a" -v set-titles-string 2>/dev/null)" = "$ts" ] \
-                  || tm set -t "$a" set-titles-string "$ts" 2>/dev/null || true
-                for tty in $(tm list-clients -t "=$a" -F '#{?#{==:#{client_termname},xterm-256color},#{client_tty},}' 2>/dev/null); do
+                # NB: set-option rejects the "=" prefix too — bare name
+                # TRANSMIT ONLY A CHANGE. tmux re-pushes a title on change, so
+                # a pass that computes the same string needs neither the show
+                # nor the set — two tmux clients a lane a pass, 92 of them at
+                # fleet size, for a string that moves once an hour. Keyed with
+                # the session's BIRTH, so a restarted session (new session,
+                # cleared title) is always re-set.
+                born="${WBORN[$a]:-}"
+                if [ "${WSET[$a]-}" != "$born$WHO_FS$ts" ]; then
+                  tm set -t "$a" set-titles-string "$ts" 2>/dev/null || true
+                  WSET[$a]="$born$WHO_FS$ts"
+                fi
+                for tty in ${WTTY[$a]:-}; do
                   # BOUNDED write. A client whose reader died (VSCode window
                   # closed uncleanly) stays "attached" in tmux, and a raw
                   # printf into its pty blocks FOREVER once the buffer fills —
@@ -5200,16 +5411,93 @@ except Exception:
               done <<< "$lines"
             }
             WHO_PASS=0; WHO_LAST=''
+            # ---- the watcher's memory between passes --------------------
+            # Under systemd this loop lives for weeks and its stdout IS the
+            # journal, read by a human scrolling back. So it reports CHANGES,
+            # not frames: WSEEN holds the state each lane was last reported
+            # in, WHO_UNM_SEEN the unmanaged set, and a pass that moves
+            # neither writes NOTHING. A frame per pass buried the one line
+            # that mattered under thousands of identical boards.
+            declare -A WSEEN
+            WHO_UNM_SEEN=''
+            who_line() {    # lane, state it was reported in, state now
+              # journal form: no header, no timestamp (journald stamps every
+              # line already) and no screen-clearing escape — a \033[2J in a
+              # log file makes the whole file unreadable with cat.
+              if [ -z "$3" ]; then printf 'who: %s %s -> gone\n' "$1" "$2"
+              elif [ -z "$2" ]; then printf 'who: %s %s\n' "$1" "$3"
+              else printf 'who: %s %s -> %s\n' "$1" "$2" "$3"
+              fi
+            }
+            who_moved() {
+              # Status 0 when some lane's state moved since the last pass;
+              # with $1 = journal, each move is written as it is noticed.
+              # STATE IS who_board's VERDICT — waiting / working / idle /
+              # down, empty for a faculty lane that is down — deliberately
+              # not ctx% or the model letter, which drift every few seconds
+              # and would make every pass a change, which is the whole bug.
+              local a st was moved=''
+              for a in "${WHO_LANES[@]}"; do
+                st="${WST[$a]:-}"; was="${WSEEN[$a]-}"
+                if [ "$st" = "$was" ]; then continue; fi
+                moved=1
+                if [ "${1:-}" = journal ]; then who_line "$a" "$was" "$st"; fi
+                WSEEN[$a]="$st"
+              done
+              [ -n "$moved" ]
+            }
+            who_unmanaged_quiet() {
+              # The inventory banner as ONE line, and only when the set
+              # changes. Empty from the start stays silent: quiet is the
+              # normal state, and a line per pass would train eyes past it
+              # exactly as the repeated board did.
+              local now
+              now="$(unmanaged_sessions | cut -f2 | sort | paste -sd, - || true)"
+              if [ "$now" = "$WHO_UNM_SEEN" ]; then return 0; fi
+              WHO_UNM_SEEN="$now"
+              if [ -n "$now" ]; then printf 'who: UNMANAGED outside the roster: %s\n' "$now"
+              else printf 'who: no unmanaged sessions outside the roster\n'
+              fi
+            }
             if [ -n "$wmode" ]; then
+              # THE POLL BACKS OFF. 10s, not 2s: a pass scans every pane, and
+              # at 2s the watcher alone held ~0.9 of a core on dev-vm-1
+              # (2026-10-08) to move a badge a few seconds sooner. Quiet
+              # doubles the wait up to the cap; ANY state change drops it
+              # straight back to the base, so the first move after an hour of
+              # quiet is still on screen within T15's minute. The cap's
+              # default leaves room for a whole pass inside that minute.
+              who_base="${SQUAD_WHO_INTERVAL:-10}"
+              who_cap="${SQUAD_WHO_MAX_INTERVAL:-45}"
+              who_wait="$who_base"
+              who_quiet=''; [ -t 1 ] || who_quiet=1   # no terminal = the journal
+              who_reset=1                             # the first wait is the base
               while true; do
                 # top of a pass = quiescent — safe to swap in new code here
                 if self_stale; then exec "$SELF" who --watch; fi
-                printf '\033[2J\033[H'
-                printf 'squad who — %s   (🔴 dialog needs you · 🙋 asked, awaiting your word · 🟢 working · 💤 idle · ⚡ wakeable)\n\n' "$(date +%H:%M:%S)"
-                # 10s, not 2s: a pass scans every pane, and at 2s the watcher
-                # alone held ~0.9 of a core on dev-vm-1 (2026-10-08) to move a
-                # badge a few seconds sooner. SQUAD_WHO_INTERVAL overrides.
-                who_board; who_unmanaged; who_paint; who_badge; sleep "${SQUAD_WHO_INTERVAL:-10}"
+                if [ -n "$who_quiet" ]; then
+                  # The board pass is what fills WST, so it still runs every
+                  # pass — the rendered board is simply thrown away and only
+                  # the diff reaches the journal.
+                  who_board >/dev/null
+                  if who_moved journal; then who_reset=1; fi
+                  who_unmanaged_quiet
+                else
+                  printf '\033[2J\033[H'
+                  printf 'squad who — %s   (🔴 dialog needs you · 🙋 asked, awaiting your word · 🟢 working · 💤 idle · ⚡ wakeable)\n\n' "$(date +%H:%M:%S)"
+                  who_board; who_unmanaged
+                  if who_moved; then who_reset=1; fi
+                fi
+                # tab badges keep updating every pass either way: the badge IS
+                # the signal for an operator who is not looking at this output
+                who_paint; who_badge
+                if [ -n "$who_reset" ]; then who_wait="$who_base"; who_reset=''
+                else who_wait="$(awk -v w="$who_wait" -v c="$who_cap" \
+                                   'BEGIN { w = w * 2; if (w > c) w = c; printf "%g", w }')"
+                fi
+                # ONE external sleep per pass, as before — the wait is the
+                # loop's only cost while a fleet is quiet.
+                sleep "$who_wait"
               done
             else who_board; who_unmanaged; who_paint; who_badge; fi ;;
   board)    # OPERATOR DASHBOARD. `who` answers "what state is each agent in";
