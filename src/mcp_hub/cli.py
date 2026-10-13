@@ -344,7 +344,8 @@ async def _query_hub(
     card_notice = ""
     try:
         async with streamablehttp_client(
-                _ephemeral_hub_url(hub_url), timeout=10) as (read, write, _):
+                _ephemeral_hub_url(hub_url), timeout=10,
+                **_with_agent_key(agent_name)) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
 
@@ -1302,7 +1303,9 @@ async def _memory_export(hub_url: str, name: str, project: str, cwd: str) -> int
         print(f"nothing to export — no .md files in {mem_dir}")
         return 0
 
-    async with streamablehttp_client(_ephemeral_hub_url(hub_url), timeout=15) as (read, write, _):
+    async with streamablehttp_client(
+        _ephemeral_hub_url(hub_url), timeout=15, **_with_agent_key(name)
+    ) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
 
@@ -1870,6 +1873,31 @@ def _rekey_transcript(text: str, old_cwd: str, new_cwd: str) -> tuple[str, dict[
         out.append(json.dumps(d, **_JS_JSON))
 
     return "\n".join(out) + ("\n" if out else ""), stats
+
+
+AGENT_KEY_HEADER = "x-mcp-hub-agent-key"
+
+
+def _agent_key_file(name: str) -> pathlib.Path:
+    """Where `agent-key ensure` keeps this name's hub-minted key (MH-H1)."""
+    return _state_dir() / "agent-keys" / f"{name}.key"
+
+
+def _agent_key_headers(name: str) -> dict[str, str]:
+    """The key header for an ephemeral client speaking as `name`, or {} when
+    this machine holds no key for it (an unkeyed name is legacy on the hub)."""
+    try:
+        key = _agent_key_file(name).read_text(encoding="utf-8").strip()
+    except OSError:
+        return {}
+    return {AGENT_KEY_HEADER: key} if key else {}
+
+
+def _with_agent_key(name: str) -> dict[str, Any]:
+    """kwargs for streamablehttp_client: headers only when there is a key, so
+    a keyless client is byte-for-byte the call it was before."""
+    headers = _agent_key_headers(name)
+    return {"headers": headers} if headers else {}
 
 
 def _ephemeral_hub_url(url: str) -> str:
@@ -5018,6 +5046,58 @@ def session_start_command(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _claim_agent_key(hub_url: str, name: str) -> str:
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    async with streamablehttp_client(
+        _ephemeral_hub_url(hub_url), timeout=10
+    ) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool("claim_agent_key", {"name": name})
+            return _extract_text(result)
+
+
+def agent_key_command(args: argparse.Namespace) -> int:
+    """`agent-key ensure`: hold this lane's hub-minted key (MH-H1).
+    `agent-key header`: print it as a headers JSON object (headersHelper).
+
+    The key is returned by the hub exactly once, so it is PERSISTED (0600)
+    BEFORE anything else happens to it, and it is never printed by ensure.
+    """
+    payload: dict[str, Any] = {} if args.name else _read_hook_stdin()
+    name, _project = _resolve_agent_identity(args, payload)
+    if name is None:
+        return 0  # not a hub agent here: silent, like every hook
+    path = _agent_key_file(name)
+    if args.action == "header":
+        print(json.dumps(_agent_key_headers(name)))
+        return 0
+    if path.exists() and not args.force:
+        print(f"agent key for {name}: held ({path})")
+        return 0
+    try:
+        out = asyncio.run(_claim_agent_key(args.hub_url, name))
+    except Exception as exc:  # noqa: BLE001 — a hook must never block a lane
+        print(f"[mcp-hub agent-key] hub unreachable: {exc!r}", file=sys.stderr)
+        return 0
+    m = re.search(r"AGENT-KEY: ([0-9a-f]{64})", out)
+    if not m:
+        print(f"[mcp-hub agent-key] {name}: {out}", file=sys.stderr)
+        return 1
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(m.group(1))
+    os.replace(tmp, path)   # persisted BEFORE anything is printed
+    digest = hashlib.sha256(m.group(1).encode()).hexdigest()[:12]
+    print(f"agent key for {name}: minted, written to {path} "
+          f"(mode 0600, sha256 {digest})")
+    return 0
+
+
 def session_rewake_command(args: argparse.Namespace) -> int:
     """Companion to `session-start`: writes the register instruction to
     stderr and exits with code 2 to trigger Claude Code's asyncRewake
@@ -7217,6 +7297,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Project name override (otherwise auto-discovered from marker).",
     )
 
+    agent_key = sub.add_parser(
+        "agent-key",
+        help="Hold this lane's hub-minted agent key (MH-H1)",
+        description=(
+            "ensure: claim this lane's key from the hub if this machine holds "
+            "none, and write it to ~/.mcp-hub/agent-keys/<name>.key (0600) "
+            "before anything else. header: print {\"x-mcp-hub-agent-key\": "
+            "...} for a headersHelper. The key is never placed by hand."
+        ),
+    )
+    agent_key.add_argument("action", choices=["ensure", "header"])
+    agent_key.add_argument("--name", default=None)
+    agent_key.add_argument("--project", default=None)
+    agent_key.add_argument("--force", action="store_true",
+                           help="Claim again after the operator reset the key")
+    agent_key.add_argument("--hub-url", default=DEFAULT_HUB_URL)
+
     session_rewake = sub.add_parser(
         "session-rewake",
         help="Try to trigger an unprompted first turn via asyncRewake (for SessionStart hooks)",
@@ -8100,6 +8197,8 @@ def main(argv: list[str] | None = None) -> int:
         return stop_hook_command(args)
     if args.subcommand == "session-start":
         return session_start_command(args)
+    if args.subcommand == "agent-key":
+        return agent_key_command(args)
     if args.subcommand == "session-rewake":
         return session_rewake_command(args)
     if args.subcommand == "heartbeat-daemon":

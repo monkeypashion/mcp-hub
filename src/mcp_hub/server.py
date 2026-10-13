@@ -191,18 +191,63 @@ def _operator_token_configured() -> str:
     return os.environ.get(OPERATOR_TOKEN_ENV, "")
 
 
+def _http_request(ctx: Any) -> Any:
+    """The HTTP request behind this call, or None (stdio, in-process)."""
+    try:
+        return ctx.request_context.request
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _presented_header(ctx: Any, header: str) -> str:
+    req = _http_request(ctx)
+    headers = getattr(req, "headers", None)
+    if headers is None:
+        return ""
+    try:
+        return str(headers.get(header) or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _presented_operator_token(ctx: Any) -> str:
     """The token the calling request carried, or "". Only the streamable-http
     transport has a request; stdio and the test harness have none, which reads
     as "presented nothing" — never as "verified"."""
-    try:
-        req = ctx.request_context.request
-        headers = getattr(req, "headers", None)
-        if headers is None:
-            return ""
-        return str(headers.get(OPERATOR_TOKEN_HEADER) or "")
-    except Exception:  # noqa: BLE001
-        return ""
+    return _presented_header(ctx, OPERATOR_TOKEN_HEADER)
+
+
+# Per-agent keys (MH-H1, audit 2026-10-13): the name a caller types is a
+# claim, and until this the hub had nothing else, so anyone who could reach
+# /mcp could register as, drain, or speak as any agent. NOBODY PLACES A
+# SECRET BY HAND: the hub mints a key the first time a name claims one
+# (trust on first use), stores only its sha256, and returns it exactly once
+# to the CLI (`mcp-hub agent-key ensure`), which persists it 0600 before any
+# use. Every later request presents it in the header below.
+#
+# A key is ENFORCED only once it is ARMED, i.e. once a register() has
+# presented it. A hook that claimed a key before the lane's interactive
+# transport carries the header must not lock that lane out of its own name;
+# arming is the hub seeing the whole chain work. A session already bound to
+# the name keeps its trust (it was bound through this gate, or before it).
+#
+# The rollout switch is MODE, not a secret: off | observe | enforce, read at
+# call time, default observe. Observe records every would-be refusal and
+# refuses nothing; an unreadable value reads as observe and says so in
+# hub_status, because a typo must not lock the fleet out.
+AGENT_KEY_HEADER = "x-mcp-hub-agent-key"
+AGENT_KEY_MODE_ENV = "MCP_HUB_AGENT_KEYS"
+_AGENT_KEY_MODES = ("off", "observe", "enforce")
+_AGENT_KEY_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+
+
+def _agent_key_mode() -> str:
+    raw = os.environ.get(AGENT_KEY_MODE_ENV, "").strip().lower()
+    return raw if raw in _AGENT_KEY_MODES else "observe"
+
+
+def _agent_key_hash(key: str) -> str:
+    return hashlib.sha256(key.encode("utf-8", "replace")).hexdigest()
 
 
 def _verify_operator(ctx: Any, from_agent: str) -> tuple[str, str] | None:
@@ -614,6 +659,29 @@ def init_db(db_path: Path = DB_PATH) -> None:
             decision_note TEXT NOT NULL DEFAULT '',
             clear_strikes INTEGER NOT NULL DEFAULT 0,
             stale        INTEGER NOT NULL DEFAULT 0
+        );
+
+        -- MH-H1 per-agent keys: the sha256 only, never the key.
+        CREATE TABLE IF NOT EXISTS agent_keys (
+            name         TEXT PRIMARY KEY,
+            key_hash     TEXT NOT NULL,
+            created      REAL NOT NULL,
+            armed_at     REAL,
+            name_existed INTEGER NOT NULL DEFAULT 0,
+            claim_peer   TEXT NOT NULL DEFAULT ''
+        );
+
+        -- What the key gate refused or WOULD have refused, one row per
+        -- (name, action, verdict) so a busy observe window stays bounded.
+        CREATE TABLE IF NOT EXISTS agent_key_events (
+            name      TEXT NOT NULL,
+            action    TEXT NOT NULL,
+            verdict   TEXT NOT NULL,
+            detail    TEXT NOT NULL DEFAULT '',
+            first_ts  REAL NOT NULL,
+            last_ts   REAL NOT NULL,
+            count     INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (name, action, verdict)
         );
     """)
     conn.commit()
@@ -1050,7 +1118,7 @@ def _grade_tag_str(grade: str) -> str:
     nothing after it is a surface that predates the render or a client that
     dropped it — both exactly the case that must not read as verified.
     """
-    if grade in ("session-verified", "operator-verified"):
+    if grade in ("session-verified", "operator-verified", "key-verified"):
         return " ·verified"
     if grade == "hub-authored":
         return " ·hub"
@@ -1440,6 +1508,10 @@ def is_interactive_client(session: Any) -> bool:
 
 _URL_AGENT_ATTR = "_hub_url_agent"
 _URL_SEEN_ATTR = "_hub_url_seen"
+# sha256 of the agent key the transport's requests presented ("" for none),
+# so the rebind sweep can hold a keyed ?agent= name to the same gate as a
+# tool call (MH-H1). The hash, never the key, sits on the transport.
+_URL_KEYHASH_ATTR = "_hub_url_key_hash"
 _handle_request_patched = False
 
 
@@ -1519,10 +1591,12 @@ def _ensure_url_identity_patched() -> None:
             agent = (qs.get("agent") or [""])[0]
             if agent:
                 sid = ""
+                presented_key = ""
                 for k, v in scope.get("headers") or ():
                     if k.lower() == b"mcp-session-id":
                         sid = v.decode("latin-1")
-                        break
+                    elif k.lower() == AGENT_KEY_HEADER.encode():
+                        presented_key = v.decode("latin-1")
                 # The FIRST initialize POST has no session id yet — the
                 # follow-up requests (initialized notification, GET stream)
                 # arrive within a second and do, so association lags birth
@@ -1531,6 +1605,9 @@ def _ensure_url_identity_patched() -> None:
                     transport = getattr(self, "_server_instances", {}).get(sid)
                     if transport is not None:
                         setattr(transport, _URL_AGENT_ATTR, agent)
+                        setattr(transport, _URL_KEYHASH_ATTR,
+                                _agent_key_hash(presented_key)
+                                if presented_key else "")
                         # Recency stamp: the sweep must track the CURRENT
                         # transport, not the first one it saw. Claude Code
                         # cycles sessions silently; an abandoned transport
@@ -1927,6 +2004,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                             "(cross-identity guard)", name, sorted(owners),
                         )
                         continue
+                    # MH-H1: ?agent= is typed by whoever opens the stream, so
+                    # an armed name binds only a transport that presented
+                    # its key.
+                    if name not in owners and not _url_bind_allowed(
+                        name, getattr(transport, _URL_KEYHASH_ATTR, "")
+                    ):
+                        continue
                     has_get = GET_STREAM_KEY in getattr(
                         transport, "_request_streams", {}
                     )
@@ -1964,6 +2048,103 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     # Exposed for main() to run alongside the reaper.
     mcp._hub_url_rebind_sweep = _url_rebind_sweep  # type: ignore[attr-defined]
 
+    def _note_key_event(
+        conn: sqlite3.Connection, name: str, action: str, verdict: str,
+        detail: str = "",
+    ) -> None:
+        now = time.time()
+        conn.execute(
+            "INSERT INTO agent_key_events (name, action, verdict, detail,"
+            " first_ts, last_ts) VALUES (?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(name, action, verdict) DO UPDATE SET"
+            " count = count + 1, last_ts = excluded.last_ts,"
+            " detail = excluded.detail",
+            (name, action, verdict, detail[:200], now, now),
+        )
+        conn.commit()
+        # `unarmed` is the migration's steady state (the rebind sweep meets
+        # it every pass), so it is counted, not shouted.
+        (logger.debug if verdict == "unarmed" else logger.warning)(
+            "agent-key %s: %s %s (%s)", verdict, action, name, detail)
+
+    def _key_verdict(
+        name: str, presented_hash: str, action: str, peer: str = "",
+    ) -> tuple[str, str]:
+        """(grade, refusal) for a caller asserting `name` over HTTP.
+
+        grade is 'key-verified' when the presented key matches, else "".
+        refusal is non-empty only in enforce mode, for an ARMED name, when
+        the key is absent or wrong. Every other mismatch is recorded as
+        `would-refuse` (armed) or `unarmed` and let through, so observe is
+        the same hub plus a ledger."""
+        mode = _agent_key_mode()
+        if mode == "off":
+            return "", ""
+        conn = _get_db(db_path)
+        row = conn.execute(
+            "SELECT key_hash, armed_at FROM agent_keys WHERE name = ?", (name,)
+        ).fetchone()
+        if row is None:
+            return "", ""  # unkeyed: legacy, exactly as before
+        if presented_hash and secrets.compare_digest(
+            presented_hash.encode(), row["key_hash"].encode()
+        ):
+            return "key-verified", ""
+        why = ("a wrong key" if presented_hash else "no key") + (
+            f" from {peer}" if peer else "")
+        if not row["armed_at"]:
+            _note_key_event(conn, name, action, "unarmed", why)
+            return "", ""
+        if mode != "enforce":
+            _note_key_event(conn, name, action, "would-refuse", why)
+            return "", ""
+        _note_key_event(conn, name, action, "refused", why)
+        return "asserted", (
+            f"REFUSED: '{name}' holds an agent key and this request presented "
+            f"{'a wrong one' if presented_hash else 'none'} "
+            f"({AGENT_KEY_HEADER}). Nothing was read, marked or written. On "
+            "the machine that owns the name, run `mcp-hub agent-key ensure`; "
+            "a lost key is reset by the operator (`reset_agent_key`)."
+        )
+
+    def _key_gate(
+        ctx: Context | None, name: str, action: str,
+    ) -> tuple[str, str]:
+        """The per-agent key check for one call (MH-H1). No HTTP request
+        (stdio, in-process) is local trust and passes untouched; so does a
+        session already bound to the name, which got its binding through
+        this gate or before the name was armed."""
+        if ctx is None:
+            return "", ""
+        req = _http_request(ctx)
+        if req is None:
+            return "", ""
+        presented = _presented_header(ctx, AGENT_KEY_HEADER)
+        presented_hash = _agent_key_hash(presented) if presented else ""
+        try:
+            bound = name in registry.names_for_session(ctx.session)
+        except Exception:  # noqa: BLE001
+            bound = False
+        if bound:
+            # Never refused; still graded, so a bound register that presents
+            # the key arms the name.
+            if presented_hash and _agent_key_mode() != "off":
+                row = _get_db(db_path).execute(
+                    "SELECT key_hash FROM agent_keys WHERE name = ?", (name,)
+                ).fetchone()
+                if row is not None and secrets.compare_digest(
+                    presented_hash.encode(), row["key_hash"].encode()
+                ):
+                    return "key-verified", ""
+            return "", ""
+        peer = str(getattr(getattr(req, "client", None), "host", "") or "")
+        return _key_verdict(name, presented_hash, action, peer)
+
+    def _url_bind_allowed(name: str, presented_hash: str) -> bool:
+        return not _key_verdict(name, presented_hash, "url-rebind")[1]
+
+    mcp._hub_url_bind_allowed = _url_bind_allowed  # type: ignore[attr-defined]
+
     def _attribution(ctx: Context | None, from_agent: str) -> tuple[str, str]:
         """Verify-when-bound (item 34, fo's accidental impersonation): the
         transport's own binding is the one identity signal that is not
@@ -1987,12 +2168,15 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             return verdict
         if ctx is None:
             return "asserted", ""
+        key_grade, key_refusal = _key_gate(ctx, from_agent, "speak")
+        if key_refusal:
+            return "asserted", key_refusal
         try:
             names = registry.names_for_session(ctx.session)
         except Exception:  # noqa: BLE001
-            return "asserted", ""
+            return key_grade or "asserted", ""
         if not names:
-            return "asserted", ""
+            return key_grade or "asserted", ""
         if from_agent in names:
             return "session-verified", ""
         return "asserted", (
@@ -2016,6 +2200,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         READS an inbox, and the operator token governs who SENDS as one."""
         if ctx is None:
             return ""
+        _grade, key_refusal = _key_gate(ctx, agent_name, "read")
+        if key_refusal:
+            return key_refusal
         try:
             names = registry.names_for_session(ctx.session)
         except Exception:  # noqa: BLE001
@@ -2182,6 +2369,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # the logs instead of as silent fleet-wide bind failure.
         if not is_interactive_client(ctx.session):
             _log_bind_diagnostic("touch_session-skipped", name, ctx.session)
+            return
+        if _key_gate(ctx, name, "touch")[1]:
             return
         conn = _get_db(db_path)
         row = conn.execute(
@@ -2681,6 +2870,12 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 f"'{_FLEET_SCOPE}' is reserved — it is what broadcast(scope=...) "
                 f"means by 'everyone', so it cannot also name a squad."
             )
+        # MH-H1: an ARMED name binds only a caller that presents its key (or
+        # the session already holding it). Before anything is written, so a
+        # refused register changes no row and no binding.
+        key_grade, key_refusal = _key_gate(ctx, name, "register")
+        if key_refusal:
+            return key_refusal
         now = time.time()
         conn = _get_db(db_path)
 
@@ -2816,6 +3011,14 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 conn.commit()
             _log_bind_diagnostic("register", name, ctx.session)
             registry.bind(name, ctx.session)
+            if key_grade == "key-verified":
+                # The whole chain works for this lane (key claimed, key on
+                # its transport), so from now on the key is enforced.
+                conn.execute(
+                    "UPDATE agent_keys SET armed_at = ? "
+                    "WHERE name = ? AND armed_at IS NULL", (now, name),
+                )
+                conn.commit()
 
         # Count unread messages for this agent
         row = conn.execute(
@@ -5133,13 +5336,19 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     # -- History --
 
     @mcp.tool()
-    def get_history(agent_or_channel: str, limit: int = 50) -> str:
+    def get_history(
+        agent_or_channel: str, limit: int = 50, ctx: Context | None = None,
+    ) -> str:
         """Get message history for an agent (DMs sent/received) or a channel.
 
         Args:
             agent_or_channel: Agent name or channel name (prefix with # for channels).
             limit: Max messages to return.
         """
+        if not agent_or_channel.startswith("#"):
+            _grade, key_refusal = _key_gate(ctx, agent_or_channel, "history")
+            if key_refusal:
+                return key_refusal
         conn = _get_db(db_path)
 
         if agent_or_channel.startswith("#"):
@@ -5815,6 +6024,108 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         return str(len(instances))
 
     @mcp.tool()
+    def claim_agent_key(name: str, ctx: Context | None = None) -> str:
+        """CLI ONLY (`mcp-hub agent-key ensure`); never call this from a
+        session. Mint this agent name's key, once (MH-H1).
+
+        The first claim for a name wins (trust on first use); the hub keeps
+        only the sha256 and returns the key exactly once. A second claim is
+        refused and recorded as a claim conflict, which is how a squatted
+        name surfaces before enforcement is switched on.
+        """
+        if ctx is not None and is_interactive_client(ctx.session):
+            return (
+                "REFUSED: an agent key is claimed by `mcp-hub agent-key "
+                "ensure`, never from a session — a key in a model's context "
+                "is a key in its transcript. Nothing was minted."
+            )
+        if not _AGENT_KEY_NAME_RE.fullmatch(name or ""):
+            return f"REFUSED: {name!r} is not an agent name. Nothing was minted."
+        if name in _OPERATOR_SENDERS:
+            return (
+                f"REFUSED: '{name}' is an operator name; its authority is the "
+                f"operator token ({OPERATOR_TOKEN_ENV}), not an agent key."
+            )
+        conn = _get_db(db_path)
+        req = _http_request(ctx) if ctx is not None else None
+        peer = str(getattr(getattr(req, "client", None), "host", "") or "")
+        if conn.execute(
+            "SELECT 1 FROM agent_keys WHERE name = ?", (name,)
+        ).fetchone():
+            _note_key_event(conn, name, "claim", "claim-conflict",
+                            f"second claim from {peer or 'local'}")
+            return (
+                f"REFUSED: '{name}' already holds an agent key; a key is minted "
+                "once. If this machine owns the name and lost its key file, "
+                "the operator resets it (`reset_agent_key`). If this machine "
+                "never claimed it, the name was claimed by someone else: tell "
+                "the operator."
+            )
+        existed = conn.execute(
+            "SELECT 1 FROM agents WHERE name = ?", (name,)
+        ).fetchone() is not None
+        key = secrets.token_hex(32)
+        conn.execute(
+            "INSERT INTO agent_keys (name, key_hash, created, name_existed,"
+            " claim_peer) VALUES (?, ?, ?, ?, ?)",
+            (name, _agent_key_hash(key), time.time(), int(existed), peer),
+        )
+        conn.commit()
+        logger.info("agent-key claimed: %s (existed=%s, peer=%s)",
+                    name, existed, peer or "local")
+        return (
+            f"AGENT-KEY: {key}\n"
+            f"Minted for '{name}'. Shown once and never again: persist it "
+            f"(0600) before using it, then present it as {AGENT_KEY_HEADER}."
+        )
+
+    @mcp.tool()
+    def reset_agent_key(name: str, ctx: Context | None = None) -> str:
+        """Operator only: forget a name's key so it can be claimed again
+        (lost key file, or a squatted name). Allowed from the hub host
+        itself (no HTTP request) or with the operator token."""
+        local = ctx is None or _http_request(ctx) is None
+        if not local and _verify_operator(ctx, "operator") != (
+            "operator-verified", ""
+        ):
+            return (
+                "REFUSED: resetting an agent key is the operator's act: run it "
+                "on the hub host, or present the operator token "
+                f"({OPERATOR_TOKEN_HEADER}). Nothing was changed."
+            )
+        conn = _get_db(db_path)
+        cur = conn.execute("DELETE FROM agent_keys WHERE name = ?", (name,))
+        conn.commit()
+        if not cur.rowcount:
+            return f"'{name}' holds no agent key; nothing to reset."
+        logger.warning("agent-key reset: %s", name)
+        return (
+            f"Reset '{name}': its key is forgotten and the name can be "
+            "claimed again (`mcp-hub agent-key ensure --force` on its machine)."
+        )
+
+    def _agent_key_status() -> str:
+        conn = _get_db(db_path)
+        raw = os.environ.get(AGENT_KEY_MODE_ENV, "").strip().lower()
+        mode = _agent_key_mode()
+        if raw and raw not in _AGENT_KEY_MODES:
+            mode += f" ({AGENT_KEY_MODE_ENV}={raw!r} unreadable — read as observe)"
+        names = conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0]
+        keyed, armed = conn.execute(
+            "SELECT COUNT(*), COUNT(armed_at) FROM agent_keys"
+        ).fetchone()
+        counts = dict(conn.execute(
+            "SELECT verdict, SUM(count) FROM agent_key_events GROUP BY verdict"
+        ).fetchall())
+        return (
+            f"Agent keys: mode={mode}; {keyed} keyed, {armed} armed, of "
+            f"{names} names; would-refuse {counts.get('would-refuse', 0)}, "
+            f"refused {counts.get('refused', 0)}, unarmed misses "
+            f"{counts.get('unarmed', 0)}, claim conflicts "
+            f"{counts.get('claim-conflict', 0)}"
+        )
+
+    @mcp.tool()
     def hub_status() -> str:
         """Get hub statistics — agents online, channels, message counts."""
         conn = _get_db(db_path)
@@ -5838,6 +6149,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             + ("ON (operator senders must present the token)"
                if _operator_token_configured()
                else f"OFF ({OPERATOR_TOKEN_ENV} unset — operator senders graded by binding only)")
+            + "\n" + _agent_key_status()
         )
 
     # ------------------------------------------------------------------
@@ -5887,6 +6199,7 @@ _CLI_SUBCOMMANDS = {
     "stop-hook",
     "session-start",
     "session-rewake",
+    "agent-key",
     "heartbeat-daemon",
     "onboard",
     "memory-export",
