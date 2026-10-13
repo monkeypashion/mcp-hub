@@ -21,6 +21,12 @@ Design, agreed in #fleet-v2 (2026-10-06, brain + mcp-hub; operator's word
   calling session is bound to the name it asks about (session-verified or
   operator-verified). An unbound caller is refused, loudly; a hub that
   signed `asserted` names would launder a claim into an identity.
+  ⚠️ What `session-verified` PROVES today: this session is the latest to
+  call register() for the name. register() takes no credential (per-agent
+  credentials are an open guardrail item, audit 2026-10-13 C1), so any
+  session on the tailnet can claim a name and then get a token for it. A
+  verifier may trust the token to say "the hub bound this session to this
+  name", never "this is the agent's own process".
 - SHORT-LIVED AND SINGLE-AUDIENCE. 5 minutes, one `aud`, a unique `jti` so a
   verifier can keep a replay cache within the window.
 
@@ -34,6 +40,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -65,14 +72,25 @@ def _load_or_create(path: Path) -> Ed25519PrivateKey:
             serialization.NoEncryption(),
         )
         path.parent.mkdir(parents=True, exist_ok=True)
-        # O_EXCL: two processes racing first use must not each write a key
-        # and leave verifiers holding the loser's public half.
+        # Two processes racing first use must not each write a key and leave
+        # verifiers holding the loser's public half — and the loser must not
+        # read the winner's file before it is written (audit 2026-10-13, L6:
+        # an O_EXCL create is visible EMPTY until the write lands). So write
+        # a private temp file whole, then link() it into place: the link
+        # either creates a complete file or fails because one exists.
+        # mkstemp: a name unique per call (threads share a pid) and 0600.
+        fd, tmp_name = tempfile.mkstemp(
+            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+        tmp = Path(tmp_name)
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            return _load_or_create(path)
-        with os.fdopen(fd, "wb") as f:
-            f.write(pem)
+            with os.fdopen(fd, "wb") as f:
+                f.write(pem)
+            try:
+                os.link(tmp, path)
+            except FileExistsError:
+                return _load_or_create(path)
+        finally:
+            tmp.unlink(missing_ok=True)
         return key
     key = serialization.load_pem_private_key(data, password=None)
     if not isinstance(key, Ed25519PrivateKey):

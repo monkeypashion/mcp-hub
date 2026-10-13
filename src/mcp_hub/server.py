@@ -1096,7 +1096,7 @@ def _validate_reply_ref(conn: sqlite3.Connection, in_reply_to: str) -> tuple[str
 
 
 def _apply_blocked_by(
-    conn: sqlite3.Connection, from_agent: str, blocked_by: str,
+    conn: sqlite3.Connection, from_agent: str, blocked_by: str, grade: str,
 ) -> str:
     """Parse and apply a blocked-by declaration riding a verb — the
     forward-looking half of declared lineage (docs/lineage-blocked-by.md).
@@ -1107,13 +1107,22 @@ def _apply_blocked_by(
     carrying message is stored, loudly: a silently dropped declaration
     would leave the path view lying by omission.
 
-    Authority and lifecycle live in lineage.declare_blocked/clear_blocked;
-    the ONE fact added here is who the operator is: senders in
-    _OPERATOR_SENDERS clear with operator authority (rule 2a's principal,
-    reused rather than reinvented).
+    Authority and lifecycle live in lineage.declare_blocked/clear_blocked,
+    and both compare NAMES — so the name must be one the hub verified.
+    An `asserted` caller could type anyone's name and clear anyone's edge
+    (audit 2026-10-13, H1/H2), so declaring and clearing need a verified
+    grade, and operator authority comes from the operator-verified GRADE,
+    never from the name: with the token unset, anyone can type `operator`.
     """
     if not blocked_by:
         return ""
+    if grade not in identity.VERIFIED_GRADES:
+        return (
+            f"blocked_by refused: '{from_agent}' is not verified here "
+            f"(grade {grade}). Declaring or clearing an edge compares names, "
+            "so it needs a session bound to that name (register() from your "
+            "own session) or the operator token. The message was not stored."
+        )
     body = blocked_by
     clearing = body.startswith("clear:")
     if clearing:
@@ -1129,7 +1138,7 @@ def _apply_blocked_by(
         if clearing:
             lineage.clear_blocked(
                 conn, subject, obj, from_agent,
-                is_operator=from_agent in _OPERATOR_SENDERS,
+                is_operator=grade == "operator-verified",
             )
         else:
             lineage.declare_blocked(conn, subject, obj, from_agent)
@@ -1963,6 +1972,32 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             "correct from_agent; the record was not written."
         )
 
+    def _reader_refusal(ctx: Context | None, agent_name: str) -> str:
+        """Non-empty when the calling session is bound to a DIFFERENT name
+        than the inbox it asks to drain (audit 2026-10-13, C2).
+
+        A drain marks rows read and advances cursors, so a read by the wrong
+        session is a write: the owner's next drain finds nothing, including
+        the `binding DISPLACED` notice meant to tell it. Unbound callers (the
+        Stop hook, daemons) keep their trust exactly as `_attribution` grades
+        them; only the provable case, a session that owns another name, is
+        refused. Operator names are not token-checked here: this gates who
+        READS an inbox, and the operator token governs who SENDS as one."""
+        if ctx is None:
+            return ""
+        try:
+            names = registry.names_for_session(ctx.session)
+        except Exception:  # noqa: BLE001
+            return ""
+        if not names or agent_name in names:
+            return ""
+        return (
+            f"REFUSED: this session is bound to {' / '.join(sorted(names))} "
+            f"and asked to drain '{agent_name}' — identity mismatch. Nothing "
+            "was read or marked read. Drain your own inbox by the name you "
+            "registered."
+        )
+
     def _ensure_api_squad(
         conn: sqlite3.Connection, squad: str, source: str
     ) -> bool:
@@ -2374,10 +2409,15 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         lines.extend(extra_lines or [])
         if not lines:
             return _PushOutcome(False, False)
+        # The wake inherits URGENT when the held set holds an urgent, so it
+        # pierces focus the way the original push would have (audit
+        # 2026-10-13, M5): an urgent whose live push failed must not be
+        # silenced by its own backstop. Otherwise low, as always.
         outcome = await push_channel(
             agent=to,
             content="\n".join(lines),
-            meta={"from_agent": "hub", "kind": "dm", "priority": "low",
+            meta={"from_agent": "hub", "kind": "dm",
+                  "priority": "urgent" if held_max == "urgent" else "low",
                   "drain_batch": "true" if len(lines) > 1 else "false"},
         )
         if outcome.delivered:
@@ -2416,9 +2456,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         cutoff = now - HOLD_MAX_SECONDS
         conn = _get_db(db_path)
         try:
-            conn.execute("DELETE FROM wake_log WHERE ts < ?",
-                         (now - WAKE_LOG_KEEP_SECONDS,))
-            conn.commit()
+            # A cheap SELECT first, the loan-purge rule: an unconditional
+            # DELETE takes a write lock every pass even when nothing is due.
+            if conn.execute("SELECT 1 FROM wake_log WHERE ts < ? LIMIT 1",
+                            (now - WAKE_LOG_KEEP_SECONDS,)).fetchone():
+                conn.execute("DELETE FROM wake_log WHERE ts < ?",
+                             (now - WAKE_LOG_KEEP_SECONDS,))
+                conn.commit()
         except Exception:  # noqa: BLE001 — pruning must never cost a pass
             pass
         fired = 0
@@ -3182,7 +3226,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         reply_ref, reply_err = _validate_reply_ref(conn, in_reply_to)
         if reply_err:
             return reply_err
-        blocked_err = _apply_blocked_by(conn, from_agent, blocked_by)
+        blocked_err = _apply_blocked_by(conn, from_agent, blocked_by, grade)
         if blocked_err:
             return blocked_err
 
@@ -3363,12 +3407,14 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 
         # Verify-when-bound before the touch (see send() for why the order
         # matters — a mismatched assert must not rebind the named agent).
-        reply_ref, reply_err = _validate_reply_ref(conn, in_reply_to)
-        if reply_err:
-            return reply_err
+        # Identity BEFORE the reply check, as send and post do: a refused
+        # caller must not learn which message ids exist (audit 2026-10-13, L3).
         grade, attr_err = _attribution(ctx, from_agent)
         if attr_err:
             return attr_err
+        reply_ref, reply_err = _validate_reply_ref(conn, in_reply_to)
+        if reply_err:
+            return reply_err
 
         # The audience is resolved HERE and stored on the row, so it can never
         # move later — a sender's membership changes, a sent message's audience
@@ -3735,8 +3781,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         conn.commit()
         if subscribed:
             return (
-                f"'{name}' subscribed to #{channel} — normal/urgent posts "
-                f"will wake you."
+                f"'{name}' subscribed to #{channel} — urgent posts will "
+                f"wake you; normal and low posts are not pushed, so read "
+                f"them with get_channel_messages()."
             )
         return (
             f"'{name}' unsubscribed from #{channel} — no more wakes; you can "
@@ -3845,7 +3892,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         reply_ref, reply_err = _validate_reply_ref(conn, in_reply_to)
         if reply_err:
             return reply_err
-        blocked_err = _apply_blocked_by(conn, from_agent, blocked_by)
+        blocked_err = _apply_blocked_by(conn, from_agent, blocked_by, grade)
         if blocked_err:
             return blocked_err
 
@@ -3911,16 +3958,15 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 if outcome.delivered:
                     _log_wake(conn, author, "reply")
                     woken = f"; reply-wake fired for {author}"
-            if priority == "low":
-                return (
-                    f"Posted to #{channel} (priority=low; wake-batched — "
-                    f"subscribers see it at their next natural turn; low "
-                    f"has no hold-sweep backstop{woken})."
-                ) + _verbosity_advisory(message)
+            # Say what happens, not what batching does for DMs: neither the
+            # hold sweep nor the Stop drain reads named channels, so a
+            # non-urgent post reaches a subscriber only when it reads the
+            # channel (audit 2026-10-13, H3 — this receipt promised "within
+            # 10 min" and nothing delivered it).
             return (
-                f"Posted to #{channel} (priority={priority}; wake-batched — "
-                f"subscribers see it at their next turn or within "
-                f"{HOLD_MAX_SECONDS // 60} min{woken})."
+                f"Posted to #{channel} (priority={priority}; NOT pushed — "
+                f"subscribers see it when they read the channel with "
+                f"get_channel_messages(); only urgent posts wake{woken})."
             ) + _verbosity_advisory(message)
 
         subscribers = {
@@ -4110,6 +4156,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # (receipt -> one line, no receipt -> full reprint), and the empty
         # default means "client too old to report", which keeps the legacy
         # pushed_gen inference for that caller alone.
+        refusal = _reader_refusal(ctx, agent_name)
+        if refusal:
+            return refusal
         now = time.time()
         conn = _get_db(db_path)
 
@@ -4357,6 +4406,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # landing WHOLE in every idle agent's context (operator,
         # 2026-07-26) and were the unclipped half of the Stop-hook context
         # tax. See get_messages for the bind=False rationale.
+        refusal = _reader_refusal(ctx, agent_name)
+        if refusal:
+            return refusal
         conn = _get_db(db_path)
         # READ THE RENDER EVIDENCE BEFORE ACKING. `wake_ack` below CLEARS the
         # pending expectation, so asking afterwards always answers "proven" —
@@ -4696,7 +4748,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         grade, attr_err = _attribution(ctx, from_agent)
         if attr_err:
             return attr_err
-        blocked_err = _apply_blocked_by(_get_db(db_path), from_agent, blocked_by)
+        blocked_err = _apply_blocked_by(
+            _get_db(db_path), from_agent, blocked_by, grade)
         if blocked_err:
             return blocked_err
         # Defensive size cap: the harvester takes DECISION→end-of-turn, so a
