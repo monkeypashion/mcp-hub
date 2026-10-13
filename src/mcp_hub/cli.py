@@ -480,90 +480,114 @@ async def _query_hub(
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
 
-    async with streamablehttp_client(_ephemeral_hub_url(hub_url), timeout=10) as (read, write, _):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
+    # ⭐ DRAINED TEXT IS NEVER THROWN AWAY (audit 2026-10-13, MH-H2).
+    # get_messages marks rows read on the hub BEFORE this function returns,
+    # so any failure after it (the broadcast leg, list_agents, or the client
+    # context's own exit during a hub restart) used to raise past the text
+    # and the caller printed nothing: read, and never shown. Each later leg
+    # is guarded on its own, and an exception on the way out is swallowed
+    # once there is drained text to hand back. Before the drain lands, a
+    # failure still raises, exactly as before: nothing has been consumed.
+    messages_result = broadcasts_result = agents_result = None
+    card_notice = ""
+    try:
+        async with streamablehttp_client(
+                _ephemeral_hub_url(hub_url), timeout=10) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
 
-            # bind=False on the calls below: this client is the Stop hook's
-            # ephemeral streamablehttp_client — its session_id is DELETEd
-            # when the `async with` block exits. Letting the hub auto-bind
-            # the agent's name to this short-lived session would clobber
-            # the agent's real (long-lived) wake target. The hub's
-            # touch_session honours bind=False and skips the binding.
-            #
-            # mark_idle=True: Stop hook fires at end of turn, which is the
-            # idle transition for the agent. The hub uses this flag for the
-            # Case 1 wake-on-low-prio path — a peer's low-prio DM to an
-            # idle recipient fires a wake (drain-batched) instead of just
-            # queuing.
-            # compact=True: summarise anything the agent already saw live and
-            # cap the bulk (see get_messages). Retried without the flag so a
-            # newer CLI still works against a hub that predates it — during a
-            # deploy the two versions coexist for a few minutes, and a hard
-            # failure there would silently stop surfacing messages entirely.
-            # rendered_refs is the delivery-receipt report (card #56): the
-            # message ids this agent's own transcript proves rendered, or
-            # "none" for an explicit empty report. It rides both drain calls
-            # so either alone lands the record. The version-skew fallbacks
-            # peel arguments newest-first — a deploy briefly pairs a newer
-            # CLI with an older hub, and a hard failure here would silently
-            # stop surfacing messages entirely.
-            msg_args = {
-                "agent_name": agent_name,
-                "bind": False,
-                "mark_idle": True,
-                "compact": True,
-            }
-            if rendered_refs:
-                msg_args["rendered_refs"] = rendered_refs
-            try:
-                messages_result = await session.call_tool("get_messages", msg_args)
-            except Exception:  # noqa: BLE001
+                # bind=False on the calls below: this client is the Stop hook's
+                # ephemeral streamablehttp_client — its session_id is DELETEd
+                # when the `async with` block exits. Letting the hub auto-bind
+                # the agent's name to this short-lived session would clobber
+                # the agent's real (long-lived) wake target. The hub's
+                # touch_session honours bind=False and skips the binding.
+                #
+                # mark_idle=True: Stop hook fires at end of turn, which is the
+                # idle transition for the agent. The hub uses this flag for the
+                # Case 1 wake-on-low-prio path — a peer's low-prio DM to an
+                # idle recipient fires a wake (drain-batched) instead of just
+                # queuing.
+                # compact=True: summarise anything the agent already saw live and
+                # cap the bulk (see get_messages). Retried without the flag so a
+                # newer CLI still works against a hub that predates it — during a
+                # deploy the two versions coexist for a few minutes, and a hard
+                # failure there would silently stop surfacing messages entirely.
+                # rendered_refs is the delivery-receipt report (card #56): the
+                # message ids this agent's own transcript proves rendered, or
+                # "none" for an explicit empty report. It rides both drain calls
+                # so either alone lands the record. The version-skew fallbacks
+                # peel arguments newest-first — a deploy briefly pairs a newer
+                # CLI with an older hub, and a hard failure here would silently
+                # stop surfacing messages entirely.
+                msg_args = {
+                    "agent_name": agent_name,
+                    "bind": False,
+                    "mark_idle": True,
+                    "compact": True,
+                }
+                if rendered_refs:
+                    msg_args["rendered_refs"] = rendered_refs
                 try:
-                    msg_args.pop("rendered_refs", None)
-                    messages_result = await session.call_tool(
-                        "get_messages", msg_args
-                    )
+                    messages_result = await session.call_tool("get_messages", msg_args)
                 except Exception:  # noqa: BLE001
-                    msg_args.pop("compact")
-                    messages_result = await session.call_tool(
-                        "get_messages", msg_args
-                    )
-            # compact=True mirrors the DM economy onto broadcasts (they were
-            # the unclipped half of the Stop-hook context tax).
-            bc_args = {"agent_name": agent_name, "bind": False, "compact": True}
-            if rendered_refs:
-                bc_args["rendered_refs"] = rendered_refs
-            try:
-                broadcasts_result = await session.call_tool(
-                    "get_broadcasts_for_agent", bc_args
-                )
-            except Exception:  # noqa: BLE001
+                    try:
+                        msg_args.pop("rendered_refs", None)
+                        messages_result = await session.call_tool(
+                            "get_messages", msg_args
+                        )
+                    except Exception:  # noqa: BLE001
+                        msg_args.pop("compact")
+                        messages_result = await session.call_tool(
+                            "get_messages", msg_args
+                        )
+                # compact=True mirrors the DM economy onto broadcasts (they were
+                # the unclipped half of the Stop-hook context tax).
+                bc_args = {"agent_name": agent_name, "bind": False, "compact": True}
+                if rendered_refs:
+                    bc_args["rendered_refs"] = rendered_refs
                 try:
-                    bc_args.pop("rendered_refs", None)
                     broadcasts_result = await session.call_tool(
                         "get_broadcasts_for_agent", bc_args
                     )
                 except Exception:  # noqa: BLE001
-                    bc_args.pop("compact")
-                    broadcasts_result = await session.call_tool(
-                        "get_broadcasts_for_agent", bc_args
-                    )
-            card_notice = ""  # card leg retired; the slot stays for callers
+                    try:
+                        bc_args.pop("rendered_refs", None)
+                        broadcasts_result = await session.call_tool(
+                            "get_broadcasts_for_agent", bc_args
+                        )
+                    except Exception:  # noqa: BLE001
+                        bc_args.pop("compact")
+                        try:
+                            broadcasts_result = await session.call_tool(
+                                "get_broadcasts_for_agent", bc_args
+                            )
+                        except Exception:  # noqa: BLE001
+                            # The DMs are already marked read: losing them to a
+                            # broadcast failure is the MH-H2 loss. Broadcasts
+                            # keep their cursor, so the next Stop gets them.
+                            broadcasts_result = None
+                card_notice = ""  # card leg retired; the slot stays for callers
 
-            # F14 evidence leg: what this turn said, for evidence(lane).
-            # Fail-soft for the same version-skew reason as the card leg.
-            if turn_evidence:
+                # F14 evidence leg: what this turn said, for evidence(lane).
+                # Fail-soft for the same version-skew reason as the card leg.
+                if turn_evidence:
+                    try:
+                        await session.call_tool(
+                            "evidence_put",
+                            {"agent_name": agent_name, "project": project or "",
+                             **turn_evidence},
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+
                 try:
-                    await session.call_tool(
-                        "evidence_put",
-                        {"agent_name": agent_name, "project": project or "",
-                         **turn_evidence},
-                    )
+                    agents_result = await session.call_tool("list_agents", {})
                 except Exception:  # noqa: BLE001
-                    pass
-
-            agents_result = await session.call_tool("list_agents", {})
+                    agents_result = None   # unknown, NOT offline: see below
+    except Exception:  # noqa: BLE001
+        if messages_result is None and broadcasts_result is None:
+            raise
 
     messages_text = _extract_text(messages_result)
     broadcasts_text = _extract_text(broadcasts_result)
@@ -581,7 +605,9 @@ async def _query_hub(
     # agent — a fleet-wide loop that register() couldn't clear (re-binding
     # doesn't reopen the GET stream at idle). Online (🟢) is the correct
     # "is this agent bound?" signal; ⚡ is not.
-    is_online = f"**{agent_name}**" in agents_text
+    # list_agents unanswered reads as ONLINE: an unknown must not buy the
+    # offline rebind block, which would force a turn on a hub flake.
+    is_online = agents_result is None or f"**{agent_name}**" in agents_text
 
     return messages_text, broadcasts_text, is_online, card_notice
 
