@@ -35,6 +35,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from mcp_hub import injections
 from mcp_hub.spec_guard import (
     SEAT_STATE_DIR,
     check_credential_policy,
@@ -777,6 +778,21 @@ def _seat_tmux_argv(seat: dict[str, Any], args: list[str]) -> list[str]:
     return ["tmux", "-L", "squad", sub, "-t", session, *rest]
 
 
+def _ledger_note(seat: dict[str, Any], door: str, text: str) -> None:
+    """One injections-ledger row for a keystroke the EDGE is about to send.
+
+    r5 F4. Only the length and the sha256 are stored, never the text — a
+    console prompt can carry anything the operator typed into it, and this
+    file sits in `~/.mcp-hub` where the operator token already reads
+    everything. A failed write never stops the send.
+    """
+    try:
+        injections.record(str(seat.get("session") or "seat"), door, text,
+                          by="edge")
+    except Exception:  # noqa: BLE001 — an instrument never gates the act
+        pass
+
+
 def _capture_pane(seat: dict[str, Any], runner: Any) -> tuple[bool, str]:
     rc, out = runner(_seat_tmux_argv(seat, ["capture-pane", "-p"]))
     return rc == 0, out
@@ -792,6 +808,54 @@ def _capture_pane(seat: dict[str, Any], runner: Any) -> tuple[bool, str]:
 # capture taken in the same instant as the keys shows the frame from BEFORE
 # them (fire 2 witnessed an empty box that the text had not yet reached).
 SEAT_SETTLE_SECONDS = 1.0
+
+# ⭐ r5 F5 — NOTHING AUTOMATED TYPES INTO A PANE TIM IS USING.
+#
+# The console's prompt and interrupt are the edge's two keystroke verbs, and
+# they land in a tmux session a human may be attached to RIGHT NOW. A prompt
+# typed into a pane somebody is reading appends to whatever is in their input
+# box; an Escape interrupts the turn they are watching. Neither is
+# recoverable and neither announces itself.
+#
+# "In use" is an ATTACHED CLIENT WITH RECENT ACTIVITY, read from tmux itself
+# (`list-clients`), never inferred. Attached-but-idle is not in use: a
+# cockpit terminal left open for a week would otherwise make a seat
+# permanently undrivable, which is the silencer-with-no-expiry shape.
+#
+# The refusal NAMES THE CLIENT's tty. "Refused: pane in use" sends the
+# operator looking; "refused: /dev/pts/42 was active 10s ago" tells them
+# which window of their own is holding the seat.
+SEAT_IN_USE_SECONDS = 600.0
+
+
+def _seat_client_in_use(seat: dict[str, Any], runner: Any,
+                        now: float | None = None) -> str:
+    """The tty of an attached client that is ACTIVE, or "" for none.
+
+    🔴 Fails OPEN — unreadable means not in use. The same direction as the
+    hold mirror: a guard that cannot be read must not become a second way for
+    every seat action to fail, and the pane capture below is still the
+    fail-closed gate on typing blind.
+    """
+    now = time.time() if now is None else now
+    try:
+        rc, out = runner(_seat_tmux_argv(
+            seat, ["list-clients", "-F", "#{client_activity} #{client_tty}"]))
+    except Exception:  # noqa: BLE001
+        return ""
+    if rc != 0:
+        return ""
+    for line in str(out or "").splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        try:
+            activity = float(parts[0])
+        except ValueError:
+            continue           # not a client row (a pane capture, say)
+        if 0 <= now - activity <= SEAT_IN_USE_SECONDS:
+            return parts[1].strip()
+    return ""
 
 
 def _prompt_submitted(pane: str, text: str) -> str:
@@ -869,6 +933,23 @@ def realize_seat_action(
             "pane_after": None,
         }
 
+    # r5 F5, BEFORE the capture and before any keystroke: a pane somebody is
+    # using is not the edge's to type into, whatever the pane says.
+    busy_tty = _seat_client_in_use(seat, runner)
+    if busy_tty:
+        return {
+            "status": "refused",
+            "observed": {
+                "why": f"the seat's pane is IN USE — client {busy_tty} is "
+                       f"attached and was active within "
+                       f"{int(SEAT_IN_USE_SECONDS)}s, so '{kind}' was not "
+                       f"sent. Nothing automated types into a pane Tim is "
+                       f"using; retry once that client is idle or detached",
+                "client_tty": busy_tty,
+            },
+            "pane_after": None,
+        }
+
     readable, before = _capture_pane(seat, runner)
     if not readable:
         return {
@@ -884,10 +965,16 @@ def realize_seat_action(
     if kind == "interrupt":
         # Escape ALONE. Escape-then-Enter would interrupt and then submit
         # whatever was left in the box — a different act than the one asked.
+        #
+        # r5 F4: recorded BEFORE the keystroke, like every other door. A
+        # row written afterwards is absent for exactly the window in which
+        # the send can fail, and the turn it names then counts as Tim's.
+        _ledger_note(seat, "edge_interrupt", "Escape")
         rc, out = runner(_seat_tmux_argv(seat, ["send-keys", "Escape"]))
         sent: dict[str, Any] = {"sent": "Escape"}
     else:
         text = str(action.get("args", {}).get("text") or "")
+        _ledger_note(seat, "edge_prompt", text)
         # Two sends, deliberately. `send-keys "<text>" Enter` in one call
         # makes tmux interpret the literal as a KEY NAME whenever it happens
         # to match one — a prompt whose text is "Enter" or "C-c" would be

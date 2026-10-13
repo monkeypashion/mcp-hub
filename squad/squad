@@ -353,6 +353,95 @@ capture_for() {
 
 type_line() { local t="$1"; shift; tmt send-keys -t "$t" -l "$*" || return 1; sleep 0.2; tmt send-keys -t "$t" Enter; }
 
+# ===========================================================================
+# IS SOMEBODY AT THIS PANE RIGHT NOW? (v2-fleet r5 F5)
+#
+# His complaint is the whole feature: an automated door typing into a pane he
+# is working in. A nudge appends to whatever is in his input box; a /compact
+# ask lands in the middle of a sentence he was writing; and the thing that
+# did it cannot see him, so nothing anywhere looks wrong.
+#
+# ⭐ IN USE = AN ATTACHED CLIENT WITH RECENT ACTIVITY, read from tmux
+# (`list-clients`), never inferred from anything else. Attached-and-idle is
+# NOT in use: a cockpit terminal left open for a week would otherwise make a
+# lane permanently un-nudgeable — a silencer with no expiry, which is the
+# shape this codebase has shipped bugs in before.
+#
+# ⚠️ THIS GATES THE AUTOMATED DOORS ONLY (heal's nudge, the compaction ask,
+# the edge's prompt/interrupt). The HAND verbs — cmd, key, model, answer —
+# are NEVER refused here (mcp-hub's Term 1): his cockpit buttons call them,
+# and the pane they would be refused for is the pane he is pressing the
+# button about. A guard that blocks the operator from his own seat is not a
+# guard, it is an outage with a reason attached.
+#
+# 🔴 FAILS OPEN — unreadable means NOT in use, so a broken `list-clients`
+# cannot silence heal for the whole fleet. Same direction as `held_until`.
+SQUAD_IN_USE_SECONDS="${SQUAD_IN_USE_SECONDS:-600}"
+
+pane_in_use() {   # <agent> -> 0 if somebody is attached AND active
+  local a="$1" now act rest
+  now="${EPOCHSECONDS:-}"; [ -n "$now" ] || now="$(date +%s)"
+  # ONE call, and only ever at the point of an attempted send: a heal pass
+  # that types nothing asks tmux nothing (the cost guard in r5 F5.9).
+  while read -r act rest; do
+    case "${act:-}" in ''|*[!0-9]*) continue ;; esac
+    [ $(( now - act )) -le "$SQUAD_IN_USE_SECONDS" ] && return 0
+  done < <(tmt list-clients -t "$a" -F '#{client_activity} #{client_tty}' 2>/dev/null || true)
+  return 1
+}
+
+# --- the python that ships with the hub cli --------------------------------
+# `mcp_hub` lives in the same environment as the `mcp-hub` entry point, so
+# the interpreter beside it is the one that can import it. `python3` from
+# PATH is the fallback and is right on a box where the cli is pip-installed
+# into the system environment.
+hub_python() {
+  local hb d
+  hb="$(hub_bin)" || true
+  if [ -n "${hb:-}" ]; then
+    d="$(dirname "$hb")"
+    if [ -x "$d/python" ]; then printf '%s' "$d/python"; return 0; fi
+  fi
+  command -v python3 2>/dev/null || true
+}
+
+# --- F4: the injections ledger ---------------------------------------------
+#
+# One row per line this script types into a lane, written BEFORE the first
+# keystroke, so the load meter can leave the fleet's own keystrokes out of
+# what it reports as the turns Tim typed. `typed_turns` was an upper bound
+# that silently included every nudge; this is the fact that was missing.
+#
+# 🔴 THE TEXT IS NEVER PASSED IN ARGV and never stored. It goes in on stdin
+# and only its length and sha256 are kept — a `cmd` line can carry a
+# credential, and argv is readable in `ps` by anything on the box.
+#
+# ⚠️ A FAILED WRITE NEVER STOPS THE SEND. The ledger is an instrument, not a
+# gate: a lane left un-nudged because its bookkeeping file was read-only
+# would be an outage caused by a measurement.
+ledger_note() {   # <lane> <door> <by> <text>
+  local py
+  py="$(hub_python)" || true
+  [ -n "${py:-}" ] || return 0
+  printf '%s' "$4" | "$py" -m mcp_hub.injections \
+    --lane "$1" --door "$2" --by "$3" >/dev/null 2>&1 || true
+  return 0
+}
+
+# --- F5: the lane inbox ----------------------------------------------------
+#
+# A refused door must not be a dropped message. A lane with somebody
+# attached to it is a lane reading its own Stop drains, so there IS another
+# channel: the item goes to `$MCP_HUB_STATE_DIR/lane-inbox/` and the lane's
+# next stop hook blocks with it and clears it. No keys, no strike, no charge.
+lane_inbox_put() {   # <lane> <door> <text>
+  local py
+  py="$(hub_python)" || true
+  [ -n "${py:-}" ] || return 1
+  printf '%s' "$3" | "$py" -m mcp_hub.lane_inbox put \
+    --lane "$1" --door "$2" >/dev/null 2>&1
+}
+
 # What is this agent's claude doing RIGHT NOW? Reads the pane's visible text —
 # the permission dialog / input prompt is on screen when claude is blocked, so
 # the screen is the source of truth no notification channel can lie about.
@@ -1190,6 +1279,110 @@ boundary_reached() { # agent -> 0 if its Stop hook stamped a boundary
   [ -f "$HOLD_BOUNDARY_DIR/$1.json" ]
 }
 
+boundary_at() { # agent -> the epoch its Stop hook stamped, or nothing
+  sed -n 's/.*"reached_at"[[:space:]]*:[[:space:]]*\([0-9][0-9.]*\).*/\1/p' \
+    "$HOLD_BOUNDARY_DIR/$1.json" 2>/dev/null | head -1
+}
+
+# ===========================================================================
+# THE CONVERSATION EXEMPTION (v2-fleet r5 F6)
+#
+# A hold placed by a MECHANISM must not stop a lane in the middle of a
+# conversation with Tim. He asks a question, the brake's boundary stop lands
+# on the answer, and the pane he is typing into is gone — with the thing that
+# killed it being the only party that could have told him.
+#
+# ⭐ ONLY A HOLD WITH AN `owner` IS DEFERRED, and the asymmetry is the whole
+# rule. An `owner` names the mechanism that placed the hold (a brake, the
+# hibernation scanner). A hold with NO owner was placed BY HAND — that is his
+# own act, and deferring it would be the tool overruling the person it is
+# protecting him from. By-hand holds behave exactly as they did yesterday.
+#
+# ⚠️ NO MECHANISM PLACES HOLDS TODAY (the hibernation timer is inactive and
+# the share brake has been off since his 2026-09-23 word). This is therefore
+# a guard built BEFORE it is needed, on purpose: the first mechanism to place
+# one must not be the thing that discovers the gap.
+#
+# The question of fact lives in `mcp_hub/conversation.py` — a typed,
+# NON-INJECTED turn inside the window — and is asked ONCE PER PASS for every
+# owner-held lane at once. No new `mcp-hub` verb: server.py is frozen for r5,
+# and nothing here needs the hub.
+CONVERSATION_SECONDS="${MCP_HUB_CONVERSATION_SECONDS:-1800}"
+
+declare -A CONV_IN CONV_END
+CONV_SCANNED=''
+
+# One python call for the whole pass. A call per lane would put 46 forks
+# inside a two-minute timer, which is the cost the feature was bounded on.
+conversation_scan() {   # <agent>...
+  local py lane inc end a
+  local -a specs=()
+  CONV_IN=(); CONV_END=(); CONV_SCANNED=1
+  [ "$#" -gt 0 ] || return 0
+  py="$(hub_python)" || true
+  [ -n "${py:-}" ] || return 0
+  for a in "$@"; do specs+=("$a=$(untilde "$(field "$a" 2)")"); done
+  while read -r lane inc end; do
+    [ -n "${lane:-}" ] || continue
+    CONV_IN["$lane"]="$inc"; CONV_END["$lane"]="$end"
+  done < <("$py" -m mcp_hub.conversation --window "$CONVERSATION_SECONDS" \
+             "${specs[@]}" 2>/dev/null || true)
+}
+
+# 0 = Tim is talking to this lane right now. Two ways to be true, and the
+# cheap one is asked first: a recent typed turn needs no tmux at all, so a
+# pass over lanes that are plainly in conversation makes no `list-clients`
+# call. An IN-USE PANE counts too — he is sitting in front of it, which is a
+# conversation whatever the transcript says about the last line typed.
+in_conversation() {   # <agent>
+  local a="$1"
+  [ -n "$CONV_SCANNED" ] || conversation_scan "$a"
+  [ "${CONV_IN[$a]:-0}" = 1 ] && return 0
+  pane_in_use "$a" && return 0
+  return 1
+}
+
+# When the conversation ENDED (last typed turn + the window), or 0 if this
+# lane has no typed turn to date. The hard-stop clock runs from here rather
+# than from `held_at`: a lane held while he was mid-conversation has not been
+# "ignoring the hold for ten minutes", it has been talking to him.
+conversation_end_of() {   # <agent>
+  local a="$1"
+  [ -n "$CONV_SCANNED" ] || conversation_scan "$a"
+  printf '%s' "${CONV_END[$a]:-0}"
+}
+
+held_owner() { # agent -> the mechanism that placed the hold, empty if a hand
+  command -v jq >/dev/null 2>&1 || return 0
+  jq -r --arg a "$1" '.held[$a].owner // ""' "$HELD_FILE" 2>/dev/null
+}
+
+# The deferral, recorded where the LANE'S OWN STOP HOOK can read it: a lane
+# that is not going to be stopped must not be told it is being stopped, and
+# the hook has no way to see a pane or a conversation. Written with printf
+# rather than through python — 46 forks a pass is the cost this feature is
+# bounded on, and a flat JSON object is a flat JSON object.
+#
+# It carries an EXPIRY for the usual reason: a squad that stops running must
+# not silence the notice forever. `mcp_hub/hold.py` reads the `expires` this
+# writes rather than applying a TTL of its own, so the deadline has exactly
+# one author and the reader cannot disagree with it.
+hold_defer_record() {   # <agent> <hold-until> <owner> <conversation-end>
+  local d now
+  d="${MCP_HUB_STATE_DIR:-$HOME/.mcp-hub}/hold-deferred"
+  mkdir -p "$d" 2>/dev/null || return 0
+  now="${EPOCHSECONDS:-}"; [ -n "$now" ] || now="$(date +%s)"
+  printf '{"agent":"%s","at":%s,"hold_until":%s,"owner":"%s","conversation_end":%s,"expires":%s}\n' \
+    "$1" "$now" "${2:-0}" "${3:-}" "${4:-0}" "$(( now + 900 ))" \
+    > "$d/$1.json" 2>/dev/null || true
+  return 0
+}
+
+hold_defer_clear() {   # <agent>
+  rm -f "${MCP_HUB_STATE_DIR:-$HOME/.mcp-hub}/hold-deferred/$1.json" 2>/dev/null || true
+  return 0
+}
+
 # Marks a lane as "down because it is HELD", which is the fact release needs
 # and nothing else on the box records. Without it, a released lane is
 # indistinguishable from one the operator stopped by hand, and restarting the
@@ -1233,7 +1426,7 @@ hold_stop_lane() { # the stop itself, one door for both the clean and hard path
 # One held lane. Prints exactly what it did and why; never silent, because a
 # lane that vanishes without a line is indistinguishable from one that died.
 hold_enforce_one() {
-  local a="$1" ha now waited hu hs
+  local a="$1" ha now waited hu hs owner cend bat clock
   hu="$(held_until "$a")" || return 0              # not held — nothing to do
   tm has-session -t "=$a" 2>/dev/null || return 0  # already down; the skip
   pane_alive "$a" || return 0                      # in up_one covers restart
@@ -1251,11 +1444,48 @@ hold_enforce_one() {
   # future brake on the lane.
   if [ -n "$hs" ]; then rm -f "$(hold_hand_started_flag "$a")" 2>/dev/null || true; fi
 
+  # --- THE CONVERSATION EXEMPTION (r5 F6) ----------------------------------
+  #
+  # Asked BEFORE the boundary stop and before the hard stop, because both
+  # kill the lane and the whole point is that neither may land while he is
+  # talking to it. Only a hold with an `owner` — one a MECHANISM placed —
+  # defers; a by-hand hold is his own act and runs the path below unchanged.
+  owner="$(held_owner "$a")" || owner=""
+  cend=0
+  if [ -n "${owner:-}" ]; then
+    if in_conversation "$a"; then
+      echo "$a HELD by '$owner' — deferred: in conversation with Tim (not stopped at this boundary; release: $(held_reason "$a"))"
+      # 🔴 THE STAMP IS CLEARED, and this is not housekeeping. A stamp left
+      # behind says "this lane reached a boundary while held", and the next
+      # pass after the conversation ends would read it and stop the lane at
+      # once — mid-turn, on the strength of a boundary that happened during
+      # the exemption. The deferral must not bank a stop for later.
+      rm -f "$HOLD_BOUNDARY_DIR/$a.json" 2>/dev/null || true
+      hold_defer_record "$a" "$hu" "$owner" "$(conversation_end_of "$a")"
+      return 0
+    fi
+    # Not in conversation (any more). Drop the record so the lane's own Stop
+    # hook resumes telling it that it is being stopped.
+    hold_defer_clear "$a"
+    cend="$(conversation_end_of "$a")"
+  fi
+
   if boundary_reached "$a"; then
-    # The clean case, and the one his ruling asks for: the lane is between
-    # turns, so nothing is in flight and nothing is lost.
-    echo "$a HELD — stopping at its turn boundary ($(held_reason "$a"))"
-    hold_stop_lane "$a"
+    # ⭐ ONLY A BOUNDARY AFTER THE CONVERSATION'S END STOPS IT. A stamp from
+    # DURING the talk is a boundary he was mid-conversation at, and acting on
+    # it is the same banked stop the clear above prevents — by another route,
+    # since the hook could have stamped between two passes.
+    bat="$(boundary_at "$a")"
+    if [ -z "${owner:-}" ] || [ -z "${bat:-}" ] \
+       || [ "$(awk -v b="${bat:-0}" -v c="${cend:-0}" 'BEGIN { print (b >= c) ? "after" : "before" }')" = after ]; then
+      # The clean case, and the one his ruling asks for: the lane is between
+      # turns, so nothing is in flight and nothing is lost.
+      echo "$a HELD — stopping at its turn boundary ($(held_reason "$a"))"
+      hold_stop_lane "$a"
+      return 0
+    fi
+    echo "$a HELD by '$owner' — its stamped boundary predates the end of the conversation; waiting for the next one"
+    rm -f "$HOLD_BOUNDARY_DIR/$a.json" 2>/dev/null || true
     return 0
   fi
 
@@ -1270,7 +1500,18 @@ hold_enforce_one() {
     echo "$a HELD, mid-turn — no held_at in the mirror, so the 10-minute hard stop cannot be timed; waiting for a turn boundary"
     return 0
   fi
-  now="$(date +%s)"; waited=$(( now - ${ha%.*} ))
+  now="$(date +%s)"
+  # ⭐ THE CLOCK RUNS FROM THE LATER OF `held_at` AND THE CONVERSATION'S END.
+  # A lane held at 12:00 that he then talked to until 12:20 has not spent
+  # twenty minutes ignoring the hold; it has spent them answering him. Timing
+  # the hard stop from `held_at` would hard-stop it the instant the exemption
+  # lapsed — turning the feature into a delayed version of the thing it
+  # exists to prevent.
+  clock="${ha%.*}"
+  if [ -n "${owner:-}" ]; then
+    clock="$(awk -v h="${ha%.*}" -v c="${cend:-0}" 'BEGIN { printf "%d", (c > h) ? c : h }')"
+  fi
+  waited=$(( now - clock ))
   if [ "$waited" -lt "$HOLD_HARD_STOP_AFTER" ]; then
     echo "$a HELD, mid-turn — waiting for its turn boundary (${waited}s of ${HOLD_HARD_STOP_AFTER}s before a hard stop)"
     return 0
@@ -1312,6 +1553,22 @@ hold_enforce_one() {
 # far below anything the lane needs, compacting healthy lanes for nothing.
 # This NARROWS the old 150000; it never widens it.
 COMPACT_ASK_TOKENS="${MCP_HUB_COMPACT_ASK_TOKENS:-138111}"
+
+# ⭐⭐ THE ASK IS OFF IN CODE (v2-fleet r5 F5, mcp-hub's Term 2).
+#
+# Until r5 the only thing standing between an idle lane over the cap and a
+# typed ask was a drop-in on ONE box. A guard that exists in one machine's
+# systemd unit is a guard the next machine does not have, and the complaint
+# this whole area comes from — "its keeps clearing valuable contex when I
+# don't want to lose it" — is about a lane being typed into on a box nobody
+# had remembered to configure. Default OFF makes the quiet behaviour the
+# behaviour you get by doing nothing.
+#
+# ⚠️ THE CAP KEEPS ITS 138111 DEFAULT, deliberately and separately. Arming
+# the ask must not also require re-deriving the deputy's measured number,
+# and a box that sets MCP_HUB_COMPACT_ASK=1 must not silently get a
+# different trip point than the one in the ruling.
+COMPACT_ASK="${MCP_HUB_COMPACT_ASK:-0}"
 
 # --- THE CAP ASK IS SQUAD-SCOPED (card #440, his press 14:28Z 2026-09-06) ----
 #
@@ -1654,8 +1911,25 @@ compaction_safe_to_type() {
 }
 
 compaction_type() {
+  # ⭐ r5 F5, FIRST AND BEFORE EVERY OTHER TEST: a pane Tim is using is not
+  # this door's to type into, however idle claude's chrome looks. The
+  # existing checks below ask "is the CLIENT ready for this keystroke"; this
+  # one asks "is a PERSON in the way", and no amount of idle chrome answers
+  # that. It lives here rather than at the two callers because this is the
+  # one door the ask and the exec leg both use — gating the callers would
+  # leave whichever path is added next silently unguarded, which is the
+  # four-of-five-routes mistake in a new costume.
+  if pane_in_use "$1"; then
+    if lane_inbox_put "$1" compaction_type "$2"; then
+      echo "$1: pane IN USE (attached client active within ${SQUAD_IN_USE_SECONDS}s) — the ask was left in the lane inbox for its next Stop, NOT typed"
+    else
+      echo "!! $1: pane IN USE and the lane inbox could not be written — the ask was NOT delivered by either route" >&2
+    fi
+    return 1
+  fi
   compaction_safe_to_type "$1" \
     || { echo "!! $1: pane is not claude's idle chrome (dialog or unreadable) — NOT typing" >&2; return 1; }
+  ledger_note "$1" compaction_type squad "$2"
   tm send-keys -l -t "$1" "$2" 2>/dev/null || return 1
   sleep 1
   # RE-CHECK before the Enter. The gap between the two sends is exactly where
@@ -1895,7 +2169,7 @@ compaction_recross() {
 }
 
 compaction_one() {
-  local a="$1" tok pct flag st text
+  local a="$1" tok pct flag st text fired=0
   # SQUAD SCOPE FIRST — before any transcript read, any row, any keystroke
   # (card #440). Out of scope means NOTHING happens for this lane: no ask, no
   # typed /compact, no /clear, and no flag that a later pass could act on.
@@ -1934,6 +2208,24 @@ compaction_one() {
     compaction_row "$a" fire "$pct" "$tok" \
       "detected at ${tok} tokens (cap ${COMPACT_ASK_TOKENS})"
     : > "$flag.fire"
+    fired=1
+  fi
+
+  # ⭐ TERM 2: THE ASK IS OFF UNLESS SOMEBODY ARMED IT. Detection above has
+  # already happened and the `fire` row is on the record — the lane's climb
+  # is MEASURED either way, which is what bar 50 asked for. What is off is
+  # the keystroke. Checked before `classify_agent` so a disarmed box pays no
+  # pane capture per lane per sweep.
+  #
+  # Said ONCE PER CROSSING, not once per sweep: a two-minute timer repeating
+  # the same line for every over-cap lane is the per-lane noise the scope
+  # report was collapsed to one row to avoid. `squad compaction` prints the
+  # standing per-lane state on demand, which is where a reader looks for it.
+  if [ "$COMPACT_ASK" != 1 ]; then
+    if [ "$fired" = 1 ]; then
+      echo "$a at ${tok} tokens (cap ${COMPACT_ASK_TOKENS}) — detected and recorded, NOT asked: the in-pane ask is off in code (arm it with MCP_HUB_COMPACT_ASK=1)"
+    fi
+    return 0
   fi
 
   # 🔴 IDLE ONLY, FAILING CLOSED. send-keys into a working lane appends to
@@ -2364,7 +2656,19 @@ hold_enforce_pass() {
   [ -r "$HELD_FILE" ] || return 0
   command -v jq >/dev/null 2>&1 || return 0
   local a
+  local -a held=() owned=()
   for a in $(jq -r '.held | keys[]?' "$HELD_FILE" 2>/dev/null); do
+    held+=("$a")
+    # Only an owner-held lane can be deferred, so only an owner-held lane is
+    # worth asking about. A fleet held entirely by hand costs this pass
+    # nothing at all — the exemption is bounded on what it ADDS.
+    if [ -n "$(held_owner "$a")" ]; then owned+=("$a"); fi
+  done
+  # ONE conversation call for the pass (r5 F6's cost bound), before the loop
+  # that acts. `in_conversation` then answers from this scan rather than
+  # forking python per lane.
+  if [ "${#owned[@]}" -gt 0 ]; then conversation_scan "${owned[@]}"; fi
+  for a in ${held[@]+"${held[@]}"}; do
     hold_enforce_one "$a"
   done
 }
@@ -4616,15 +4920,39 @@ case "${1:-help}" in
                 [ -n "$(find "$stamp" -mmin -5 2>/dev/null)" ] && churn=1
                 read -r fw ft <<< "$(fleet_wake_counts "$a")" || true
                 nudge="$(nudge_copy "$state" "$churn" "${fw:-}" "${ft:-}")"
-                # A wedged pane must cost this ONE nudge, not the whole pass
-                # (2026-07-23: an unbounded send-keys here hung heal 2h28m and
-                # blocked all post-deploy recovery behind it).
-                type_line "$a" "$nudge" \
-                  || echo "!! $a: nudge send-keys failed/timed out (pane wedged?) — skipping" >&2
-                touch "$flag"
-                # Counted AFTER the send, so a nudge that never landed is not
-                # charged against a budget meant to bound turns actually spent.
-                echo $((nudged + 1)) > "$ncnt"
+                # ⭐ r5 F5: NOT INTO A PANE TIM IS USING. The nudge is the
+                # one automated door that types unprompted, and an offline
+                # lane he is sitting in front of is precisely the lane he is
+                # most likely to be mid-sentence in. It goes to the lane
+                # inbox instead and reaches the lane at its next Stop —
+                # which is the channel a lane with somebody attached is
+                # demonstrably reading.
+                #
+                # 🔴 NOT CHARGED AND NO STRIKE. The lane was never asked
+                # anything, so it cannot have failed to answer: charging the
+                # nudge budget would spend a turn nobody spent, and touching
+                # the strike flag would escalate the NEXT pass to a relaunch
+                # of a lane somebody is working in — the worst outcome this
+                # feature exists to prevent. The lane is simply nudged on a
+                # later pass, once the pane is free.
+                if pane_in_use "$a"; then
+                  if lane_inbox_put "$a" nudge "$nudge"; then
+                    echo "$a: $state, but its pane is IN USE (attached client active within ${SQUAD_IN_USE_SECONDS}s) — nudge left in the lane inbox for its next Stop; nothing typed, nothing charged"
+                  else
+                    echo "!! $a: $state and its pane is IN USE, and the lane inbox could not be written — the nudge was NOT delivered by either route" >&2
+                  fi
+                else
+                  # A wedged pane must cost this ONE nudge, not the whole pass
+                  # (2026-07-23: an unbounded send-keys here hung heal 2h28m and
+                  # blocked all post-deploy recovery behind it).
+                  ledger_note "$a" nudge squad "$nudge"
+                  type_line "$a" "$nudge" \
+                    || echo "!! $a: nudge send-keys failed/timed out (pane wedged?) — skipping" >&2
+                  touch "$flag"
+                  # Counted AFTER the send, so a nudge that never landed is not
+                  # charged against a budget meant to bound turns actually spent.
+                  echo $((nudged + 1)) > "$ncnt"
+                fi
                 ;;
               spent)
                 # Budget gone. Same contract as `blocked`: keep the strike
@@ -4674,6 +5002,12 @@ case "${1:-help}" in
               claude-*) ;;
               *) echo "usage: $CMD model [agent] default|opus|fable|sonnet|haiku|<alias>[1m]|claude-<full-id>" >&2; exit 1 ;;
             esac
+            # A HAND VERB: never refused for a pane in use (Term 1 — his
+            # cockpit model menu calls this about the very pane it would be
+            # refused for). Recorded all the same: the turn it produces is
+            # squad's keystroke, not a line he typed, and the load meter has
+            # to be able to tell (F4).
+            ledger_note "$a" model hand "/model $m"
             type_line "$a" "/model $m"
             for i in 1 2 3 4 5 6 7 8 9 10; do
               sleep 1
@@ -4691,15 +5025,25 @@ case "${1:-help}" in
                 echo "$a: model already $m (no switch needed)"; break
               fi
             done ;;
-  cmd)      if [ "${2:-}" = all ]; then shift 2; for a in $(squad_agents); do type_line "$a" "$@"; done
-            elif [ -n "${2:-}" ] && agents | grep -qxF -- "${2:-}"; then a="$2"; shift 2; type_line "$a" "$@"
+            # cmd / key / model / answer are THE HAND'S DOORS, and Term 1 is
+            # that they are never refused for a pane in use: the cockpit
+            # buttons call them, so the person the refusal would protect the
+            # pane from is the person who pressed the button. There is no
+            # --by-hand flag for the same reason — a flag that must be passed
+            # to get the right behaviour is a flag somebody will forget.
+            #
+            # They still write a ledger row, with `by: hand`. Whoever asked
+            # for it, the keystroke is squad's and the turn it causes is not
+            # one Tim typed (F4).
+  cmd)      if [ "${2:-}" = all ]; then shift 2; for a in $(squad_agents); do ledger_note "$a" cmd hand "$*"; type_line "$a" "$@"; done
+            elif [ -n "${2:-}" ] && agents | grep -qxF -- "${2:-}"; then a="$2"; shift 2; ledger_note "$a" cmd hand "$*"; type_line "$a" "$@"
             else a="$(need_agent "")" || exit 1; shift
                  [ -n "${1:-}" ] || { echo "usage: $CMD cmd [agent|all] \"text\"" >&2; exit 1; }
-                 type_line "$a" "$@"; fi ;;
-  key)      if [ -n "${2:-}" ] && agents | grep -qxF -- "${2:-}"; then t="$2"; shift 2; tm send-keys -t "$t" "$@"
+                 ledger_note "$a" cmd hand "$*"; type_line "$a" "$@"; fi ;;
+  key)      if [ -n "${2:-}" ] && agents | grep -qxF -- "${2:-}"; then t="$2"; shift 2; ledger_note "$t" key hand "$*"; tm send-keys -t "$t" "$@"
             else t="$(need_agent "")" || exit 1; shift
                  [ -n "${1:-}" ] || { echo "usage: $CMD key [agent] <keys>" >&2; exit 1; }
-                 tm send-keys -t "$t" "$@"; fi ;;
+                 ledger_note "$t" key hand "$*"; tm send-keys -t "$t" "$@"; fi ;;
   attach)   # --no-start: attach ONLY if the session exists — never launch.
             # Built for the cockpit extension, whose terminals attach at
             # window-open: with auto-start, opening a workspace mass-launches
@@ -5098,6 +5442,9 @@ case "${1:-help}" in
             esac
             num="$(printf '%s\n' "$line" | grep -oE '[0-9]+' | head -1 || true)"
             [ -n "$num" ] || { echo "!! $a: no '$intent' option on screen — not waiting, or dialog has no such choice" >&2; exit 1; }
+            # Hand verb (Term 1): never refused for a pane in use — a dialog
+            # on the screen is exactly when he reaches for this button.
+            ledger_note "$a" answer hand "$num"
             tm send-keys -t "$a" "$num"
             echo "$a: answered '$intent' (option $num: $(printf '%s' "$line" | sed 's/^[[:space:]❯]*//'))" ;;
   who)      # Who needs YOU? Reads every agent's screen and reports: 🔴 waiting

@@ -166,8 +166,10 @@ def run(tmp_path, snippet, *, tokens=OVER, state_lines=None, agent="lane-a",
     assert "compaction_one()" in head, "extraction boundary moved"
     script = home / "_head.sh"
     script.write_text(head + "\n" + snippet, encoding="utf-8")
+    # v2-fleet r5 F5 (Term 2): the ask is OFF in code unless armed, so the
+    # harness arms it — every test here is about an ask that is switched on.
     e = {"PATH": f"{bin_}:/usr/bin:/bin", "HOME": str(home),
-         "SQUAD_CONF": str(conf)}
+         "SQUAD_CONF": str(conf), "MCP_HUB_COMPACT_ASK": "1"}
     e.update(env or {})
     return subprocess.run(["bash", str(script)], capture_output=True,
                           text=True, env=e)

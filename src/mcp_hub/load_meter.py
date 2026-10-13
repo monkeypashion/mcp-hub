@@ -42,6 +42,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 
+from mcp_hub import injections
+
 DESCRIPTION = (
     "Record one reading of Tim's load: the three measures over the baseline, "
     "one set per closed UTC day since it, and a before/after reading per "
@@ -75,6 +77,28 @@ WAKE_LOG_DAYS = 14
 # months of rhythm, and the days that fall off say so in a flag rather than
 # vanishing quietly.
 MAX_DAILY_DAYS = 60
+
+# ⭐ r5 F4 — THE FLEET LEAVES ITS OWN EVENTS OUT OF ITS OWN COUNTS.
+#
+# `typed_turns` has always been an UPPER BOUND and said so in its own source
+# string: a `squad send-keys` injection lands in a lane's transcript in
+# exactly the shape of a line Tim typed. The injections ledger
+# (mcp_hub/injections.py) is the missing fact — one row per typed-in line,
+# written by the door BEFORE its first keystroke, carrying the text's length
+# and sha256 and never the text.
+#
+# A declared change to the reading contract, in two parts:
+#   `injected_turns`        the turns a door caused, counted apart.
+#   `injection_unmatched`   a row that matched no turn counts NOTHING and is
+#                           flagged, because a ledger reaching the wrong
+#                           transcripts would otherwise read as a quiet fleet.
+#
+# 🔴 WITHOUT THE LEDGER, `injected_turns` IS null WITH A `missing`, NEVER 0.
+# Zero is a measurement ("no door typed into a lane today"); an absent ledger
+# is not one, and the difference is the whole reason this file reports
+# `missing` instead of defaulting. `typed_turns` then stays exactly the
+# upper bound it has always been.
+INJECTION_WINDOW_SECONDS = injections.MATCH_WINDOW_SECONDS
 
 
 # ----------------------------------------------------------------------------
@@ -203,7 +227,7 @@ class Transcripts:
     def __init__(self, root: Path):
         self.root = root
         self.lanes: list[str] = []
-        self.sessions: list[tuple[str, list[tuple[datetime, str]]]] = []
+        self.sessions: list[tuple[str, list[list]]] = []
         lanes = set()
         for path in sorted(root.rglob("*.jsonl")):
             rel = path.relative_to(root)
@@ -215,7 +239,14 @@ class Transcripts:
         self.lanes = sorted(lanes)
 
     @staticmethod
-    def _events(path: Path) -> list[tuple[datetime, str]]:
+    def _events(path: Path) -> list[list]:
+        """[when, kind, sha256-of-the-typed-text] per turn, in time order.
+
+        The sha is what lets a ledger row be matched to the turn it caused
+        (r5 F4). Computed only for a `typed` turn — a hub wake's text came
+        from the hub and no door typed it — so a lane with no injections at
+        all pays one hash per line Tim wrote and nothing else.
+        """
         out = []
         for raw in path.read_text(errors="replace").splitlines():
             raw = raw.strip()
@@ -234,15 +265,87 @@ class Transcripts:
             if not when:
                 continue
             try:
-                out.append((parse_instant(when), kind))
+                instant = parse_instant(when)
             except (ValueError, TypeError):
                 continue
+            sha = _typed_sha(rec) if kind == "typed" else ""
+            out.append([instant, kind, sha])
         out.sort(key=lambda e: e[0])
         return out
+
+    def apply_injections(self, rows: list[dict],
+                         folders: dict[str, str] | None = None) -> list[dict]:
+        """Reclassify every typed turn a door caused; return the rows left over.
+
+        ⭐ ONE ROW, ONE TURN. The ledger is consumed as it matches, so two
+        identical nudges 30 minutes apart account for two turns and a single
+        nudge cannot discount a lane's whole day. Matching is by (lane,
+        sha256) within `MATCH_WINDOW_SECONDS` AFTER the row — a row is
+        written before its keystroke, so a turn that PRECEDES it is a
+        different event however well the text agrees.
+
+        ⭐ A ROW'S `lane` IS NOT THIS CLASS'S LANE, LIVE. A lane here is its
+        transcript FOLDER (`-home-monke-Projects-...-vortex-driver`); squad's
+        doors write the roster agent name (`vortex-dev-vm-1`) and the edge's
+        write the tmux session name, which squad names for the same agent. So
+        `folders` — `{agent name: transcript folder}` from the squad roster —
+        is how a row reaches the turn it caused. Without it the two strings
+        are never equal on a live box, `injected_turns` reads 0 and every row
+        reads unmatched (features-json's T17, hub 35649).
+
+        The row's own `lane` stays a candidate alongside its mapped folder,
+        so a ledger that already names folders matches as before; both
+        candidates share ONE consumed flag, so a row still accounts for at
+        most one turn, and a mapped row can never match a same-sha turn in
+        another lane's folder.
+
+        Rows from the doors that type no line (`TEXTLESS_DOORS`) are not
+        matched at all and are not handed back: an Escape has no text a
+        transcript could carry, so it is its own kind, not a fault.
+
+        A row that matches nothing is handed back, never silently dropped: it
+        is either a send that never landed or a ledger reaching the wrong
+        transcripts, and both are facts about the instrument that the reading
+        has to say out loud.
+        """
+        folders = folders or {}
+        pending: dict[tuple[str, str], list[list]] = {}
+        entries: list[list] = []   # one per matchable row, in ledger order
+        for row in rows:
+            if str(row.get("door") or "") in injections.TEXTLESS_DOORS:
+                continue
+            try:
+                ts = float(row.get("ts"))
+            except (TypeError, ValueError):
+                continue
+            lane_name = str(row.get("lane") or "")
+            sha = str(row.get("sha256") or "")
+            entry = [ts, row, False]
+            entries.append(entry)
+            for name in (lane_name, folders.get(lane_name) or ""):
+                if name:
+                    pending.setdefault((name, sha), []).append(entry)
+        for lane, events in self.sessions:
+            for event in events:
+                if event[1] != "typed" or not event[2]:
+                    continue
+                candidates = pending.get((lane, event[2]))
+                if not candidates:
+                    continue
+                turn_ts = event[0].timestamp()
+                for cand in candidates:
+                    if cand[2]:
+                        continue
+                    if 0 <= turn_ts - cand[0] <= INJECTION_WINDOW_SECONDS:
+                        cand[2] = True
+                        event[1] = "injected"
+                        break
+        return [entry[1] for entry in entries if not entry[2]]
 
     def read(self, window) -> dict:
         """Count the window's turns and measure the waits Tim's lanes sat in."""
         typed = {lane: 0 for lane in self.lanes}
+        injected = {lane: 0 for lane in self.lanes}
         answers = {lane: 0 for lane in self.lanes}
         hub_wakes = {lane: 0 for lane in self.lanes}
         no_origin = {lane: 0 for lane in self.lanes}
@@ -251,7 +354,13 @@ class Transcripts:
         for lane, events in self.sessions:
             last_assistant = None   # end of the lane's last turn
             unanswered = False      # a typed turn is waiting for its answer
-            for when, kind in events:
+            for when, kind, _sha in events:
+                if kind == "injected":
+                    # The fleet's own keystroke. Not a turn Tim took, so it
+                    # ends no wait, asks for no answer and is counted apart.
+                    if _in(window, when):
+                        injected[lane] += 1
+                    continue
                 if kind == "typed":
                     # The wait Tim's lane just ended: from the moment it
                     # stopped talking to the moment he typed again.
@@ -276,6 +385,7 @@ class Transcripts:
                         no_origin[lane] += 1
         return {
             "typed": typed,
+            "injected": injected,
             "answers": answers,
             "hub_wakes": hub_wakes,
             "no_origin": no_origin,
@@ -303,6 +413,26 @@ def _event_kind(rec: dict):
     if origin["kind"] == CHANNEL_ORIGIN:
         return "hub_wake"
     return None  # a task notification and friends: a wake, but not the hub's
+
+
+def _typed_sha(rec: dict) -> str:
+    """sha256 of a user turn's text, as the ledger takes it (UTF-8).
+
+    The ledger's sha is over the exact line the door sent, so the hash here
+    must be over the exact line the client recorded. A list-shaped content
+    block is joined text-first-only: a turn carrying an image has no typed
+    line to match and simply never matches, which is right — no door types
+    an image into a pane.
+    """
+    content = (rec.get("message") or {}).get("content")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = "".join(b.get("text") or "" for b in content
+                       if isinstance(b, dict) and b.get("type") == "text")
+    else:
+        return ""
+    return injections.sha256(text)
 
 
 def _is_tool_result(rec: dict) -> bool:
@@ -410,10 +540,16 @@ class Sources:
     """
 
     def __init__(self, hub, snapshot, transcripts, *, voice, transcripts_path,
-                 hub_taken_at, host=None):
+                 hub_taken_at, host=None, ledger=None):
         self.hub = hub
         self.snapshot = snapshot
         self.transcripts = transcripts
+        # The injections ledger, as `load_input` records it: {read, missing,
+        # path}. NOT one of the three `inputs` rows in the reading — the
+        # contract names those three — so its readability is reported where
+        # it is used, on `injected_turns`' own `missing`.
+        self.ledger = ledger or {"read": False, "path": "", "missing":
+                                 "no injections ledger was given"}
         self.voice = voice
         self.transcripts_path = str(transcripts_path)
         self.host = host or socket.gethostname()
@@ -485,6 +621,26 @@ class Sources:
         return None, snap_source, "; and ".join(w for w in why if w)
 
 
+def _textless_note(ledger: dict) -> str:
+    """How the reading accounts for the rows that can never match a turn.
+
+    `key`, `answer` and `edge_interrupt` type a keystroke, not a line: a key
+    name, a menu digit, an Escape. The client records no user turn for them,
+    so they are counted as THEIR OWN KIND here — named in the source, never
+    added to `injected_turns`, never flagged unmatched. Said out loud rather
+    than quietly skipped: a door whose rows are dropped without a word is a
+    count nobody can reconstruct.
+    """
+    counts = ledger.get("textless") or {}
+    seen = ", ".join(f"{door} x{counts[door]}"
+                     for door in injections.TEXTLESS_DOORS if counts.get(door))
+    return ("The doors that type no line and so can never match a turn "
+            f"({', '.join(injections.TEXTLESS_DOORS)}: a key name, a menu "
+            "digit, an Escape) are counted as their own kind, neither as an "
+            "injected turn nor as an unmatched row — in this ledger: "
+            f"{seen or 'none'}.")
+
+
 def measure_set(window, src: Sources) -> dict:
     """The seven measures over one window, each naming its source."""
     label = f"{stamp(window[0])} .. {stamp(window[1])}"
@@ -524,6 +680,18 @@ def measure_set(window, src: Sources) -> dict:
         "typed turns or as hub wakes — the harness recorded no origin.kind, so "
         "the cause of the turn is unknown and is reported rather than guessed"
     )
+    injected_source = (
+        f"{src.pane_label}: user turns in {label} matched to a row in the "
+        f"injections ledger at {src.ledger['path']} — same lane, same sha256, "
+        f"within {int(INJECTION_WINDOW_SECONDS)}s after the row — so a turn a "
+        "squad or edge door typed is counted here and NOT as a turn of Tim's. "
+        "A row's `lane` is the name its door knows (squad: the roster agent, "
+        "the edge: the tmux session squad named for that agent) and is read "
+        "against a transcript folder through the squad roster at "
+        f"{src.ledger.get('roster') or '(none)'}, field 2 (the worktree) "
+        "encoded as the client names it; a row already naming a folder "
+        "matches it directly. " + _textless_note(src.ledger)
+    )
 
     waits = pane["waits"] if pane else None
     return {
@@ -559,6 +727,13 @@ def measure_set(window, src: Sources) -> dict:
         "no_origin": measure(
             sum(pane["no_origin"].values()) if pane else None, no_origin_source,
             gone, pane["no_origin"] if pane else None),
+        # null + `missing` when either side is unread, never 0: an absent
+        # ledger is not a measurement of a quiet fleet.
+        "injected_turns": measure(
+            sum(pane["injected"].values()) if (pane and src.ledger["read"]) else None,
+            injected_source,
+            gone or src.ledger["missing"],
+            pane["injected"] if (pane and src.ledger["read"]) else None),
     }
 
 
@@ -693,6 +868,12 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                              "null with a reason, never 0")
     parser.add_argument("--voice-agent", default=VOICE_RELAY_AGENT,
                         help=f"Hub name of the voice relay (default: {VOICE_RELAY_AGENT})")
+    parser.add_argument("--injections", default=None,
+                        help="Injections ledger (r5 F4) naming every line a squad "
+                             "or edge door typed into a lane; its turns are "
+                             "counted as `injected_turns`, not `typed_turns`. "
+                             "Default: $MCP_HUB_STATE_DIR/injections.jsonl. "
+                             "Unreadable reads null with a reason, never 0")
     return parser
 
 
@@ -736,8 +917,34 @@ def run(args) -> int:
         return 2
 
     hub, snapshot, transcripts = read_inputs(args)
+
+    # --- the injections ledger (r5 F4) -----------------------------------
+    # Read AFTER the transcripts and applied to them once, before any window
+    # is measured: a turn is typed-or-injected as a fact about the turn, not
+    # a fact about the window it is counted in.
+    ledger_path = (Path(args.injections) if getattr(args, "injections", None)
+                   else injections.ledger_path())
+    ledger = load_input("injections", ledger_path, injections.read_rows)
+    # The lane mapping and the textless tally, carried on the ledger record so
+    # every measure set reads them from one place. The roster is a local file
+    # ($SQUAD_CONF, default ~/.config/squad/squad.conf): no hub, no tmux.
+    roster = injections.roster_path()
+    ledger["roster"] = str(roster)
+    ledger["folders"] = injections.lane_folders(roster)
+    ledger["textless"] = {}
+    unmatched: list[dict] = []
+    if ledger["read"]:
+        for row in ledger["data"]:
+            door = str(row.get("door") or "")
+            if door in injections.TEXTLESS_DOORS:
+                ledger["textless"][door] = ledger["textless"].get(door, 0) + 1
+    if ledger["read"] and transcripts["read"]:
+        unmatched = transcripts["data"].apply_injections(
+            ledger["data"], ledger["folders"])
+
     src = Sources(hub, snapshot, transcripts, voice=args.voice_agent,
-                  transcripts_path=args.transcripts, hub_taken_at=taken)
+                  transcripts_path=args.transcripts, hub_taken_at=taken,
+                  ledger=ledger)
     baseline = (start, end)
     reading = {
         "generated_at": stamp(now),
@@ -748,6 +955,37 @@ def run(args) -> int:
         "flags": [],
         "inputs": [],
     }
+
+    # ⭐ A ROW THAT MATCHED NO TURN COUNTS NOTHING AND IS SAID OUT LOUD. It
+    # means one of two things, and both are faults in the instrument rather
+    # than in the fleet: a door typed and the keystroke never landed (the
+    # 2026-09-03 `/compact` that went to the API as ordinary text), or this
+    # ledger belongs to a different box's transcripts. Silently discarding it
+    # would leave `typed_turns` carrying injections while the reading looked
+    # clean — the exact failure this feature exists to remove.
+    if unmatched:
+        by_lane: dict[str, int] = {}
+        for row in unmatched:
+            by_lane[str(row.get("lane") or "?")] = (
+                by_lane.get(str(row.get("lane") or "?"), 0) + 1)
+        reading["flags"].append({
+            "code": "injection_unmatched",
+            "detail": (
+                f"{len(unmatched)} row(s) in the injections ledger at "
+                f"{ledger['path']} matched no transcript turn and were counted "
+                "as nothing (neither typed nor injected): "
+                + ", ".join(f"{lane} x{n}" for lane, n in sorted(by_lane.items()))
+                + f". A row matches a turn of the same lane with the same sha256 "
+                f"within {int(INJECTION_WINDOW_SECONDS)}s after it — its lane "
+                f"read through the squad roster at {ledger['roster']} "
+                f"({len(ledger['folders'])} agent(s) mapped to a transcript "
+                "folder) or taken as a folder name as it stands — so an "
+                "unmatched row is a send that did not land, a lane the roster "
+                "does not name, or a ledger read against transcripts it does "
+                f"not describe ({args.transcripts}). Rows from the doors that "
+                f"type no line ({', '.join(injections.TEXTLESS_DOORS)}) are "
+                "not counted here: they have no text a turn could carry"),
+        })
 
     # --- one measure set per closed day since the baseline ----------------
     wanted = closed_days(end, now)

@@ -81,7 +81,8 @@
               "missing_before",
               "missing_after",
               "source_stopped",
-              "daily_truncated"
+              "daily_truncated",
+              "injection_unmatched"
             ]
           },
           "change_id": {
@@ -264,6 +265,9 @@
           "$ref": "#/$defs/measure"
         },
         "no_origin": {
+          "$ref": "#/$defs/measure"
+        },
+        "injected_turns": {
           "$ref": "#/$defs/measure"
         }
       }
