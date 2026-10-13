@@ -288,7 +288,8 @@ python3 - "$HOME" "$DEST" "$NAME" "${8:-}" <<'PYMARK' || true
 import datetime, pathlib, re, sys
 
 home, dest, name, origin = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-enc = re.sub(r"-+$", "", re.sub(r"[/\\:]", "-", dest))
+# The client's rule: every non-alphanumeric character -> "-" (a dot too).
+enc = re.sub(r"[^A-Za-z0-9]", "-", dest.rstrip("/\\"))
 mem = pathlib.Path(home) / ".claude" / "projects" / enc / "memory"
 try:
     mem.mkdir(parents=True, exist_ok=True)

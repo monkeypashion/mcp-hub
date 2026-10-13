@@ -23,6 +23,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -65,12 +66,12 @@ def boundary(pre, post, *, offset=60):
 def transcript(home: Path, worktree: Path, *, tokens=None, replies=(),
                compacted=None):
     """Write the lane's Claude Code transcript the way the client encodes it:
-    ~/.claude/projects/<worktree with / -> ->/<session>.jsonl.
+    ~/.claude/projects/<worktree, every non-alphanumeric -> ->/<session>.jsonl.
 
     Every assistant turn carries the same reading, because a lane that
     answers the ask has not thereby shrunk — the reading only moves once
     something is actually executed."""
-    d = home / ".claude" / "projects" / str(worktree).replace("/", "-")
+    d = home / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(worktree))
     d.mkdir(parents=True, exist_ok=True)
     rows = [assistant("2026-09-02T18:00:00.000Z", "working", tokens)]
     rows += [assistant(ts, text, tokens) for ts, text in replies]
@@ -385,7 +386,7 @@ def test_a_new_session_re_arms_the_ask(tmp_path):
     file, and that lane has a fresh context worth asking about. This is the
     property the old start-time key bought, and it survives the change."""
     run(tmp_path, "compaction_one lane-a\n" * 3)
-    d = tmp_path / ".claude" / "projects" / str(tmp_path).replace("/", "-")
+    d = tmp_path / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(tmp_path))
     src = next(d.glob("*.jsonl"))
     later = d / "99999999-aaaa-bbbb-cccc-dddddddddddd.jsonl"
     later.write_bytes(src.read_bytes())

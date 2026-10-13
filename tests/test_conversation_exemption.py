@@ -24,6 +24,7 @@ The r5 falsifiers drive squad's real enforcement pass; this file pins the
 question of fact and the record the stop hook reads.
 """
 import json
+import re
 import subprocess
 import sys
 import time
@@ -64,7 +65,7 @@ class Rig:
         self.worktree = self.home / "w" / lane
         self.worktree.mkdir(parents=True)
         self.dir = (self.home / ".claude" / "projects"
-                    / str(self.worktree).replace("/", "-"))
+                    / re.sub(r"[^A-Za-z0-9]", "-", str(self.worktree)))
         self.dir.mkdir(parents=True)
         self.ledger = tmp / "injections.jsonl"
 

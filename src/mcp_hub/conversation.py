@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -60,13 +61,13 @@ def window_seconds() -> float:
 def project_dirname(worktree: str) -> str:
     """The lane's transcript directory name, as the client encodes it.
 
-    Same rule as `cli._claude_project_dirname`: every path separator (and a
-    Windows drive colon) becomes '-'. Stated again here rather than imported
-    because importing `cli` would pull the whole command surface into a
-    module squad forks per PASS, and this is the only part of it needed.
+    Same rule as `cli._claude_project_dirname`: every character that is not
+    [A-Za-z0-9] becomes '-', so a worktree with a dot in its path maps to
+    the folder the client actually writes. Stated again here rather than
+    imported because importing `cli` would pull the whole command surface
+    into a module squad forks per PASS, and this is the only part needed.
     """
-    return "".join("-" if c in "/\\:" else c
-                   for c in str(worktree).rstrip("/\\"))
+    return re.sub(r"[^A-Za-z0-9]", "-", str(worktree).rstrip("/\\"))
 
 
 def transcript_dir(worktree: str, home: Path | None = None) -> Path:

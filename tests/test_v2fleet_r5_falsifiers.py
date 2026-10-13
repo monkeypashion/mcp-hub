@@ -685,7 +685,7 @@ class Fleet:
         return "".join(p.read_text(errors="replace") for p in sorted(d.rglob("*")) if p.is_file())
 
     def transcript(self, a, tokens):
-        d = self.home / ".claude" / "projects" / str(self.work / a).replace("/", "-")
+        d = self.home / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(self.work / a))
         d.mkdir(parents=True, exist_ok=True)
         (d / "05a50d0c-1111-2222-3333-444455556666.jsonl").write_text(_assistant(time.time() - 120, "working", tokens) + "\n")
 
@@ -1105,7 +1105,7 @@ class Rig:
         return (self.bdir / f"{a}.json").exists()
 
     def tdir(self, a):
-        d = self.home / ".claude" / "projects" / str(self.home / "w" / a).replace("/", "-")
+        d = self.home / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(self.home / "w" / a))
         d.mkdir(parents=True, exist_ok=True)
         return d
 
