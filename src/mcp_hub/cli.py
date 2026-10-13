@@ -801,6 +801,9 @@ def build_hook_response(
     card_nag: bool = False,
     card_notice: str = "",
     held_notice: str = "",
+    held_notice_new: bool = True,
+    offline_nag_ok: bool = True,
+    inbox_text: str = "",
     defer_low: bool = False,
     trace: dict[str, object] | None = None,
 ) -> dict[str, Any] | None:
@@ -833,6 +836,35 @@ def build_hook_response(
     has no fresh content (DMs were marked read, the broadcast cursor advanced
     on the first fire), so a content-less block would re-emit forever. When
     it's set and there's nothing new to surface, we let Stop proceed.
+
+    ⭐ r5 F3 — A FORCED TURN ALWAYS CARRIES SOMETHING NEW. Two corrections
+    used to buy a block on every Stop for as long as their condition held,
+    which meant a lane could be stopped at every turn boundary to be told
+    something it had already been told:
+
+      `held_notice_new=False`  the hold notice has already reached this lane
+          for THIS hold's `until`. It still RIDES any block with real
+          content (and still comes first), but it no longer buys one of its
+          own. A new hold has a new `until`, reads new, and is announced.
+      `offline_nag_ok=False`   the rebind line has already gone out in this
+          offline episode. Offline WITH a queued DM is unaffected: the DM is
+          the content, and the warning rides it exactly as before.
+
+    Neither is a drop. Both are DERIVED — re-read from the mirror and from
+    list_agents on every Stop — so nothing is consumed by delivering them,
+    which is the same argument that let the card owner-notice stop buying a
+    block in 2026-09.
+
+    `inbox_text` is F5's other half: what an automated door left for this
+    lane rather than typing into a pane Tim was using. It is genuine new
+    content and buys a block; the caller clears it only once the block is
+    out.
+
+    `trace["cause"]` names what justified the block — one of `none`,
+    `content`, `spool`, `held_first`, `offline_first`, `mixed` — so an empty
+    forced turn is COUNTABLE rather than merely forbidden. Written on the
+    None branches too: a drain that surfaced nothing is the one case no
+    other instrument can see.
     """
     # Bar 47: a spool held from earlier low-only drains rides THIS block,
     # whatever triggered it. Taken before the has_content decision so spooled
@@ -857,19 +889,29 @@ def build_hook_response(
         trace["defer_low"] = bool(defer_low)
         trace["defer_effect"] = "none" if defer_low else "off"
         trace["defer_held_s"] = 0.0
+        # Seeded "none" so EVERY return path below carries a cause, including
+        # the ones that return None without reaching the bottom of the
+        # function. A field present on only the noisy branch would rebuild
+        # exactly the blind spot the drain record was added to close.
+        trace["cause"] = "none"
 
     has_messages = bool(messages_text.strip())
     has_broadcasts = bool(broadcasts_text.strip())
     has_content = has_messages or has_broadcasts
+    has_inbox = bool(inbox_text.strip())
 
     # Defer only a drain that is ENTIRELY low-priority, with nothing else
     # owed. A card nag, an owner notice or an offline agent are corrections,
-    # not traffic — they interrupt regardless of what else is queued.
+    # not traffic — they interrupt regardless of what else is queued. So is
+    # a lane-inbox item (r5 F5): a block is going out for it anyway, and
+    # spooling the low traffic beside it would hold back text that could
+    # have ridden along for free.
     if (
         defer_low
         and agent_name
         and has_content
         and is_online
+        and not has_inbox
         and not card_nag
         and not card_notice.strip()
         and not held_notice.strip()
@@ -954,19 +996,33 @@ def build_hook_response(
     # card nag in particular gets exactly ONE shot per natural Stop: if the
     # agent's nag-response turn still lacks a card, we let it go rather than
     # loop.
-    if stop_hook_active and not has_content and not held_notice.strip():
+    held_notice = held_notice.strip()
+    # What, on THIS Stop, is worth a turn of the agent's. `held_notice`
+    # non-empty but not new still renders (it comes first, below) — it just
+    # cannot be the reason a turn was forced.
+    held_buys = bool(held_notice) and bool(held_notice_new)
+    offline_buys = (not is_online) and bool(offline_nag_ok)
+
+    if stop_hook_active and not has_content and not has_inbox and not held_buys:
         return None
 
-    # No work needed: online + nothing queued + no correction owed.
-    # (Online — not ⚡ — is the gate: an idle agent legitimately lacks ⚡
-    # between turns.)
-    held_notice = held_notice.strip()
+    # No work needed: nothing queued + no correction owed. The old condition
+    # read `is_online` here; it now reads `offline_buys`, so an offline lane
+    # whose rebind line has already gone out this episode takes this branch
+    # too. Offline WITH content never does — `has_content` is checked first.
 
-    # A HELD LANE ALWAYS SURFACES, even on the happy path — empty inbox,
+    # A HELD LANE SURFACES ONCE, even on the happy path — empty inbox,
     # online, nothing owed. Being stopped is the one thing an agent must not
-    # learn by having its pane disappear, and this is the last turn boundary
-    # it gets. It also outranks the loop backstop below for the same reason:
-    # a re-fired Stop on a held lane is still a lane about to be stopped.
+    # learn by having its pane disappear, and the boundary it has just
+    # reached may be the last one it gets. So the notice outranks the loop
+    # backstop above: a re-fired Stop on a lane that has not yet been TOLD
+    # is still a lane about to be stopped.
+    # ⭐ ONCE, NOT EVERY STOP (r5 F3 — `held_notice_new`). Until r5 this
+    # condition read the notice itself, so a held lane blocked on every turn
+    # boundary for as long as the hold stood, which is the same cost the card
+    # owner-notice was retired for below — one turn spent per turn to repeat
+    # a sentence the lane had already read. The notice is still assembled
+    # either way, so it rides the next block with real content.
     # ⭐ THE OWNER NOTICE NO LONGER BUYS A BLOCK OF ITS OWN (2026-09-18).
     #
     # `card_notice` used to sit in this condition, so an agent with an open
@@ -998,8 +1054,8 @@ def build_hook_response(
     # notice is DERIVED, not consumed — every Stop re-reads it from the open
     # card. It is still assembled below, so it rides the next block that has
     # real content, which is the bar 47 spool's ordering without the spool.
-    if (not has_content and is_online and not card_nag
-            and not notice_answers_a_waiting_turn and not held_notice):
+    if (not has_content and not has_inbox and not offline_buys and not card_nag
+            and not notice_answers_a_waiting_turn and not held_buys):
         if card_notice and trace is not None:
             # The suppressed notices ARE the saving; bar 47's rule applies
             # here too — a branch that returns None is exactly the one no
@@ -1025,6 +1081,14 @@ def build_hook_response(
                 "of their own):**",
                 deferred,
             ])
+
+    # F5's lane inbox: what a door would have typed into a pane Tim was
+    # using. Its own section, not folded into the 📬 block, because it did
+    # not come through the hub and saying it did would misattribute it.
+    if has_inbox:
+        if parts:
+            parts.append("")
+        parts.append(inbox_text.strip())
 
     if not is_online:
         rebind_args = [f'name="{agent_name}"']
@@ -1088,6 +1152,30 @@ def build_hook_response(
     # ~230 bytes x every content-bearing Stop x every agent — ~20% of all
     # stop-hook bytes fleet-wide on 2026-07-26 — repeating guidance that
     # already lives in the hub's connect-time instructions.)
+
+    # ⭐ THE CAUSE IS READ OFF WHAT IS ACTUALLY IN THE BLOCK, never off the
+    # inputs. A drain whose every line read as already-delivered has already
+    # cleared `has_content` above, so it records `none` and returns None —
+    # which is the point: the bar is "no forced turn is content-free", and a
+    # cause derived from the ASK rather than from the block would report a
+    # justification for a turn that carried nothing.
+    if trace is not None:
+        reasons = []
+        if has_messages or has_broadcasts or has_inbox:
+            reasons.append("content")
+        if deferred:
+            reasons.append("spool")
+        if held_buys:
+            reasons.append("held_first")
+        if offline_buys:
+            reasons.append("offline_first")
+        # A block with none of the four can only be a card leg (both retired
+        # for Fleet V2 — the stop hook passes neither), and it still carries
+        # SOMETHING: `content` is the honest catch-all for "the block is not
+        # empty", and it never reads `none`, which must mean "nothing went
+        # out".
+        trace["cause"] = ("mixed" if len(reasons) > 1
+                          else reasons[0] if reasons else "content")
 
     return {"decision": "block", "reason": "\n".join(parts)}
 
@@ -5377,18 +5465,52 @@ def stop_hook_command(args: argparse.Namespace) -> int:
     from mcp_hub import hold as _hold
 
     held_notice = ""
+    held_until = 0.0
+    held_new = False
     try:
         _entry = _hold.held_entry(name)
-        if _entry:
+        if _entry and _hold.deferred(name):
+            # r5 F6: squad has DEFERRED this hold because the lane is in
+            # conversation with Tim. So it is not being stopped at this
+            # boundary — and it must not be told it is, nor leave a stamp
+            # that would stop it mid-sentence once the deferral lapses.
+            # Nothing is lost: the hold is still in the mirror, and the
+            # first pass after the conversation ends announces it.
+            _hold.clear_boundary(name)
+        elif _entry:
             _hold.stamp_boundary(name)
             held_notice = _hold.hook_notice(name, _entry)
+            try:
+                held_until = float(_entry.get("until") or 0)
+            except (TypeError, ValueError):
+                held_until = 0.0
+            # ONCE PER HOLD, keyed to its `until` (F3). The notice still
+            # rides any block with content, but a re-fired Stop whose only
+            # content is a sentence this lane has already read is not a turn
+            # worth forcing.
+            held_new = not _hold.notice_delivered(name, held_until)
         else:
             # Not held (or released, or expired): drop any stamp, or it
             # would outlive its hold and make the NEXT one look as though
-            # it had already reached a boundary.
+            # it had already reached a boundary. Same for the delivered-notice
+            # marker and any deferral: both belong to a hold that is gone.
             _hold.clear_boundary(name)
+            _hold.clear_notice_marker(name)
+            _hold.clear_deferral(name)
     except Exception:  # noqa: BLE001 — a hold must never break a turn end
         held_notice = ""
+
+    # F5: what an automated door left for this lane rather than typing into
+    # a pane Tim was using. Read BEFORE the hub round-trip and cleared only
+    # once the block is out — a read-then-clear would swallow the one copy
+    # if the drain then decided not to surface.
+    from mcp_hub import lane_inbox as _inbox
+
+    try:
+        inbox_items = _inbox.peek(name)
+    except Exception:  # noqa: BLE001 — an inbox must never break a turn end
+        inbox_items = []
+    inbox_text = "\n\n".join(text.strip() for _p, text in inbox_items if text.strip())
 
     # The DECISION card leg is gone (2026-10-06, the operator's word: cards
     # are retired for Fleet V2). The hook no longer harvests, files, clears
@@ -5431,7 +5553,11 @@ def stop_hook_command(args: argparse.Namespace) -> int:
         _log_activity_event(name, "drain", surfaced=False, error=True,
                             elapsed_ms=_elapsed_ms(t0),
                             session=str(payload.get("session_id") or ""),
-                            backstop=stop_hook_active)
+                            backstop=stop_hook_active,
+                            # Nothing surfaced, so nothing was carried — the
+                            # hub-error branch is a drain like any other and
+                            # must be countable with the rest (F3).
+                            cause="none")
         print(f"[mcp-hub stop-hook] hub query failed: {exc!r}", file=sys.stderr)
         return 0
 
@@ -5443,6 +5569,18 @@ def stop_hook_command(args: argparse.Namespace) -> int:
 
     shadow.run_shadow(name, messages_text, payload.get("transcript_path"))
 
+    # The offline rebind line, once per offline EPISODE per session (F3). The
+    # marker carries the session id: a new session is a new context that has
+    # never read it, and an episode ends the moment the lane reads online —
+    # so a lane that drops again is told again, which is the case the nag
+    # exists for.
+    session_id = str(payload.get("session_id") or "")
+    offline_nag_ok = True
+    if is_online:
+        _clear_offline_nag(name)
+    else:
+        offline_nag_ok = not _offline_nagged(name, session_id)
+
     defer_trace: dict[str, object] = {}
     response = build_hook_response(
         agent_name=name,
@@ -5452,6 +5590,9 @@ def stop_hook_command(args: argparse.Namespace) -> int:
         is_online=is_online,
         stop_hook_active=stop_hook_active,
         held_notice=held_notice,
+        held_notice_new=held_new,
+        offline_nag_ok=offline_nag_ok,
+        inbox_text=inbox_text,
         # Opt-IN, and off by default: this is the one path that can decide
         # not to show an agent something the hub has already marked read, so
         # it ships dark and is turned on per box once its spool is trusted.
@@ -5474,8 +5615,68 @@ def stop_hook_command(args: argparse.Namespace) -> int:
     if response is None:
         return 0  # No block — Stop proceeds normally
 
+    # 🔴 RECORDED ONLY NOW, on the strength of a block this process has
+    # decided to print. Marking the notice delivered (or the inbox read)
+    # before knowing whether a block went out is how a lane loses the one
+    # telling it was owed.
+    if held_notice and held_new:
+        _hold.mark_notice_delivered(name, held_until)
+    if not is_online:
+        _mark_offline_nagged(name, session_id)
+    if inbox_items:
+        _inbox.clear([path for path, _text in inbox_items])
+
     print(json.dumps(_stop_output_shape(name, response)))
     return 0
+
+
+# --- F3: the offline nag, once per offline episode -------------------------
+#
+# The rebind warning is a correction, and a correction repeated on every turn
+# boundary for as long as a binding stays lost is a lane stopped once per
+# turn to be told the same sentence. It is DERIVED (re-read from list_agents
+# every Stop), so delivering it consumes nothing and withholding it loses
+# nothing — the same argument that retired the card owner-notice's block.
+#
+# ⭐ KEYED TO THE SESSION, AND CLEARED BY READING ONLINE. Both halves matter:
+# a new session has a context that has never seen the line, and a lane that
+# recovers and drops again is in a NEW episode, which is exactly the case the
+# nag is for. A bare flag would silence it forever after one delivery.
+
+def _offline_nag_path(agent_name: str) -> pathlib.Path:
+    return _state_dir() / f"offline-nag-{_sanitize_ident(agent_name)}.json"
+
+
+def _offline_nagged(agent_name: str, session_id: str) -> bool:
+    """Has the rebind line already gone out in this episode and session?
+
+    Unreadable reads as NOT nagged: an instrument we cannot consult must
+    never be the reason a lane is left thinking it is bound when it is not.
+    """
+    try:
+        raw = json.loads(_offline_nag_path(agent_name).read_text(encoding="utf-8"))
+        return str(raw.get("session") or "") == session_id
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _mark_offline_nagged(agent_name: str, session_id: str) -> None:
+    try:
+        path = _offline_nag_path(agent_name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"session": session_id,
+                                    "at": round(time.time(), 1)}),
+                        encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _clear_offline_nag(agent_name: str) -> None:
+    """The episode is over — the lane reads online again."""
+    try:
+        _offline_nag_path(agent_name).unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _stop_output_shape(agent_name: str, response: dict[str, Any]) -> dict[str, Any]:

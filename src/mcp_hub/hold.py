@@ -190,3 +190,139 @@ def hook_notice(agent: str, entry: dict[str, Any]) -> str:
         "and release restarts this lane with --continue.\n"
         "· You do not need to do anything. Do NOT start new work."
     )
+
+
+# ---------------------------------------------------------------------------
+# r5 F3 — the notice is delivered ONCE PER HOLD, keyed to its `until`
+#
+# The notice used to outrank the loop backstop unconditionally, so a held
+# lane re-blocked on every Stop for as long as the hold stood: the lane was
+# told the same sentence again and again, and each telling cost it a turn.
+# The sentence is still owed — being stopped is the one thing an agent must
+# not learn by having its pane disappear — but it is owed ONCE.
+#
+# ⭐ KEYED TO `until`, NEVER A BARE FLAG, for the same reason
+# `hold_hand_started_flag` is: a bare flag would silence the notice for
+# every LATER hold on this lane too, and a silencer that cannot expire is
+# the silent-drop shape this codebase has shipped before. A new hold has a
+# new expiry, does not match, and is announced.
+# ---------------------------------------------------------------------------
+
+def state_dir() -> Path:
+    """Where the per-lane markers live. Same override as the rest of the cli."""
+    override = os.environ.get("MCP_HUB_STATE_DIR")
+    return Path(override) if override else Path.home() / ".mcp-hub"
+
+
+def _safe(agent: str) -> str:
+    return "".join(c if (c.isalnum() or c in "-_") else "-"
+                   for c in agent.lower()).strip("-") or "unnamed"
+
+
+def notice_marker_path(agent: str) -> Path:
+    return state_dir() / f"hold-notice-{_safe(agent)}.json"
+
+
+def notice_delivered(agent: str, until: float) -> bool:
+    """Has THIS hold's notice already reached the lane?
+
+    Unreadable or absent reads as NOT delivered, which errs towards telling
+    the lane again. The failure that matters here is the silent one.
+    """
+    try:
+        raw = json.loads(notice_marker_path(agent).read_text(encoding="utf-8"))
+        return abs(float(raw.get("until") or 0) - float(until)) < 0.5
+    except Exception:  # noqa: BLE001 — never delivered, as far as we can tell
+        return False
+
+
+def mark_notice_delivered(agent: str, until: float) -> None:
+    try:
+        p = notice_marker_path(agent)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"until": float(until),
+                                 "at": time.time()}), encoding="utf-8")
+    except Exception:  # noqa: BLE001 — a marker we cannot write just repeats
+        pass
+
+
+def clear_notice_marker(agent: str) -> None:
+    """Drop the marker once the lane is no longer held.
+
+    Not strictly needed (the marker carries its hold's `until`, so a later
+    hold never matches it), but a file that outlives every reason to exist
+    is one more thing a reader has to reason about.
+    """
+    try:
+        notice_marker_path(agent).unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# ---------------------------------------------------------------------------
+# r5 F6 — the conversation deferral, as a fact the HOOK can read
+#
+# squad decides the deferral (it is the enforcement point and the only party
+# that can see a pane), and the hook has to know about it: a lane that is
+# NOT going to be stopped must not be told it is being stopped. The record is
+# the channel, and it carries an expiry for the usual reason — a squad that
+# stops running must not silence the notice forever.
+# ---------------------------------------------------------------------------
+
+DEFERRAL_TTL_SECONDS = 900.0
+
+
+def deferral_path(agent: str) -> Path:
+    """`<state>/hold-deferred/<agent>.json` — the agent name VERBATIM.
+
+    Same convention as `boundary_dir`, and deliberately not the sanitized
+    form: squad writes this file with `$a` as it appears in the roster, and
+    two spellings of one lane's filename is a record that reads as absent.
+    """
+    return state_dir() / "hold-deferred" / f"{agent}.json"
+
+
+def record_deferral(agent: str, *, until: float, owner: str = "",
+                    conversation_end: float = 0.0,
+                    now: float | None = None) -> None:
+    """Note that this hold was deferred because the lane is in conversation.
+
+    ⚠️ IN PRODUCTION SQUAD IS THE WRITER, with `printf` — at 46 owner-held
+    lanes a python fork per lane is the cost F6 is bounded on, and the record
+    is a flat JSON object. This is the same shape stated once in the language
+    that READS it, so the field names have one definition; `deferred` below
+    honours whatever `expires` it finds in the file, so the two cannot drift
+    into disagreeing about how long a deferral lasts.
+    """
+    now = time.time() if now is None else now
+    try:
+        p = deferral_path(agent)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({
+            "agent": agent, "at": now, "hold_until": float(until),
+            "owner": owner, "conversation_end": float(conversation_end),
+            "expires": now + DEFERRAL_TTL_SECONDS,
+        }), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def clear_deferral(agent: str) -> None:
+    try:
+        deferral_path(agent).unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def deferred(agent: str, now: float | None = None) -> bool:
+    """Is this lane's hold currently deferred for a conversation?
+
+    Fails open as NOT deferred: an unreadable or lapsed record means the
+    lane hears the notice, which is the direction that loses nothing.
+    """
+    now = time.time() if now is None else now
+    try:
+        raw = json.loads(deferral_path(agent).read_text(encoding="utf-8"))
+        return float(raw.get("expires") or 0) > now
+    except Exception:  # noqa: BLE001
+        return False

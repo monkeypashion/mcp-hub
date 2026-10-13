@@ -183,10 +183,36 @@ def test_a_held_lane_blocks_even_with_an_empty_inbox():
     assert "HELD" in out["reason"]
 
 
-def test_a_held_lane_blocks_even_on_a_re_fired_stop():
+def test_a_held_lane_blocks_on_a_re_fired_stop_until_delivered_once(_isolated, monkeypatch):
     """The loop backstop exists to stop content-less re-blocks. A lane about
-    to be stopped is not content-less."""
+    to be stopped is not content-less until it has been told ONCE: v2-fleet
+    r5 F3 delivers the notice once per hold (keyed to its `until`), so the
+    next re-fired Stop with nothing new is let through."""
     assert base(held_notice="⏸️ HELD", stop_hook_active=True) is not None
+    import argparse
+    import contextlib
+    import io
+
+    from mcp_hub import cli
+
+    write_mirror(_isolated)
+
+    async def _quiet(*_a, **_k):
+        return ("", "", True, "")
+
+    monkeypatch.setattr(cli, "_query_hub", _quiet)
+    monkeypatch.setattr(cli, "_read_hook_stdin",
+                        lambda: {"session_id": "s1", "stop_hook_active": True})
+    outs = []
+    for _ in range(2):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli.stop_hook_command(argparse.Namespace(
+                name="lane-1", project="org/repo",
+                hub_url="http://hub.invalid/mcp"))
+        outs.append(buf.getvalue().strip())
+    assert "HELD" in outs[0], "an undelivered hold notice must block a re-fired Stop"
+    assert outs[1] == "", "a delivered hold notice re-blocked with nothing new"
 
 
 def test_the_hold_notice_comes_first():
