@@ -150,6 +150,23 @@ HOLD_SWEEP_INTERVAL_SECONDS = 60
 # priority field they remembered to set.
 _OPERATOR_SENDERS = frozenset({"operator-console", "operator"})
 
+# An agent name is what every rendered line puts between `**` and the grade,
+# so it must not be able to carry markup, a newline or a lookalike of another
+# name (audit 2026-10-13, MH-H3/H4: `Operator`, `a** ·verified …`). Lowercase
+# letters, digits, `-` and `_` — the rule derived identity already produces.
+_AGENT_NAME_RE = re.compile(r"^[a-z0-9_-]{1,64}$")
+
+
+def _name_refusal(name: str, field: str = "name") -> str:
+    """Non-empty when `name` is not a valid agent name."""
+    if isinstance(name, str) and _AGENT_NAME_RE.match(name):
+        return ""
+    return (
+        f"REFUSED: {field}={name!r} is not a valid agent name — use 1-64 of "
+        "a-z, 0-9, '-' and '_' (what derived identity produces). Nothing "
+        "was written."
+    )
+
 # The operator's authority is VERIFIED, not name-matched (console card #269,
 # operator-approved 2026-08-29). A name in _OPERATOR_SENDERS buys an
 # immediate wake and blocked_by-clear rights, and until this shipped the hub
@@ -350,6 +367,20 @@ def _clip(body: str, limit: int = COMPACT_FULL_BODY_CHARS) -> str:
     return cut.rstrip() + " […clipped]"
 
 
+def _render_body(body: str) -> str:
+    """A body as it appears inside a rendered message line: every line after
+    the first is indented two spaces (audit 2026-10-13, MH-H3).
+
+    A rendered line is an interface: lanes read `[hh:mm:ss] **name** ·grade
+    ⟨ref⟩: ...` as a message header, and hub-voice splits a drain into
+    records at every line that starts like one. A raw body containing a
+    newline and a header-shaped line therefore forged a whole message,
+    `**operator** ·verified` included. Every real header starts at column
+    0, so an indented line can only ever be part of the body above it.
+    Storage is untouched; the JSON formats carry the raw body."""
+    return body.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\n  ")
+
+
 _TLDR_BODY_CHARS = 1500
 _TLDR_FIRST_LINE_CHARS = 200
 
@@ -391,7 +422,7 @@ def _clip_push(body: str) -> str:
     clipped = _clip(body)
     if clipped is not body:
         clipped += " (full text: get_history)"
-    return clipped
+    return _render_body(clipped)
 
 
 # Card field lines: **VALUE:** <sentence> [7/10] — score in [n/10] at the end
@@ -1948,6 +1979,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         Operator names are graded by TOKEN when one is configured (card
         #269) and never by binding: the name is claimable via register(),
         so a bound `operator-console` proves only that someone bound it."""
+        bad = _name_refusal(from_agent, "from_agent")
+        if bad:
+            return "asserted", bad
         verdict = _verify_operator(ctx, from_agent)
         if verdict is not None:
             return verdict
@@ -2638,6 +2672,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             bio: Short description of your role so others know what you do.
             meta: Optional JSON metadata.
         """
+        bad = _name_refusal(name)
+        if bad:
+            return bad
         wanted = _parse_squads(squads)
         if _FLEET_SCOPE in wanted:
             return (
@@ -3216,6 +3253,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         grade, attr_err = _attribution(ctx, from_agent)
         if attr_err:
             return attr_err
+        bad_to = _name_refusal(to, "to")
+        if bad_to:
+            return bad_to
 
         # Declared lineage validates BEFORE the insert: a malformed or
         # nonexistent reply target refuses the send loudly, never drops the
@@ -4113,7 +4153,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             prio = r["priority"] if r["priority"] != "normal" else ""
             prio_tag = f" [{prio}]" if prio else ""
             lines.append(f"[{ts}] **{r['from_agent']}**{_grade_tag(r)} ⟨{_msg_ref(r['id'])}⟩"
-                         f"{prio_tag}: {r['body']}")
+                         f"{prio_tag}: {_render_body(r['body'])}")
         return "\n".join(lines)
 
     # -- Reading messages --
@@ -4320,7 +4360,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                     capped += 1
                     body = _summarise(body, COMPACT_SUMMARY_CHARS)
             lines.append(f"[{ts}] **{r['from_agent']}**{_grade_tag(r)} ⟨{_msg_ref(r['id'])}⟩"
-                         f"{prio_tag}: {body}")
+                         f"{prio_tag}: {_render_body(body)}")
         if compact and (seen_live or capped or clipped):
             # Point at get_history, NOT get_messages: this very call marked
             # these rows read, so a follow-up get_messages returns nothing.
@@ -4367,7 +4407,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             prio = r["priority"] if r["priority"] != "normal" else ""
             prio_tag = f" [{prio}]" if prio else ""
             lines.append(f"[{ts}] **{r['from_agent']}**{_grade_tag(r)} ⟨{_msg_ref(r['id'])}⟩"
-                         f"{prio_tag}: {r['body']}")
+                         f"{prio_tag}: {_render_body(r['body'])}")
         return "\n".join(lines)
 
     @mcp.tool()
@@ -4625,7 +4665,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                     capped += 1
                     body = _summarise(body, COMPACT_SUMMARY_CHARS)
             lines.append(f"[{ts}] **{r['from_agent']}**{_grade_tag(r)} ⟨{_msg_ref(r['id'])}⟩"
-                         f"{prio_tag}: {body}")
+                         f"{prio_tag}: {_render_body(body)}")
         if compact and (seen_live or capped or clipped):
             # Point at get_history('#general'), not get_broadcasts_for_agent:
             # this very call advanced the cursor, so a repeat returns nothing.
@@ -5079,7 +5119,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         conn.commit()
         outcome = await push_channel(
             agent=row["agent"],
-            content=f"DM from operator{_grade_tag_str(grade)}: {body}",
+            content=f"DM from operator{_grade_tag_str(grade)}: {_render_body(body)}",
             meta={"from_agent": "operator", "kind": "dm",
                   "priority": "normal", "drain_batch": "false"},
         )
@@ -5126,12 +5166,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             ref_bit = f" ⟨{_msg_ref(r['id'])}⟩"
             if "to_agent" in r.keys() and r["to_agent"]:
                 lines.append(f"[{ts}] {r['from_agent']}{_grade_tag(r)} → {r['to_agent']}"
-                             f"{ref_bit}: {r['body']}")
+                             f"{ref_bit}: {_render_body(r['body'])}")
             elif "channel" in r.keys() and r["channel"]:
                 lines.append(f"[{ts}] {r['from_agent']}{_grade_tag(r)} → #{r['channel']}"
-                             f"{ref_bit}: {r['body']}")
+                             f"{ref_bit}: {_render_body(r['body'])}")
             else:
-                lines.append(f"[{ts}] {r['from_agent']}{_grade_tag(r)}{ref_bit}: {r['body']}")
+                lines.append(f"[{ts}] {r['from_agent']}{_grade_tag(r)}{ref_bit}: "
+                             f"{_render_body(r['body'])}")
         lines.reverse()
         return "\n".join(lines)
 
