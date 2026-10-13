@@ -238,12 +238,14 @@ def _presented_operator_token(ctx: Any) -> str:
 AGENT_KEY_HEADER = "x-mcp-hub-agent-key"
 AGENT_KEY_MODE_ENV = "MCP_HUB_AGENT_KEYS"
 _AGENT_KEY_MODES = ("off", "observe", "enforce")
-_AGENT_KEY_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 
 
 def _agent_key_mode() -> str:
+    """`off` unless set: deploying this code issues no credential. Minting
+    per-agent keys is credential issuance, so it starts only when the mode
+    is switched on deliberately; an unreadable value is `off` too."""
     raw = os.environ.get(AGENT_KEY_MODE_ENV, "").strip().lower()
-    return raw if raw in _AGENT_KEY_MODES else "observe"
+    return raw if raw in _AGENT_KEY_MODES else "off"
 
 
 def _agent_key_hash(key: str) -> str:
@@ -6039,8 +6041,14 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 "ensure`, never from a session — a key in a model's context "
                 "is a key in its transcript. Nothing was minted."
             )
-        if not _AGENT_KEY_NAME_RE.fullmatch(name or ""):
-            return f"REFUSED: {name!r} is not an agent name. Nothing was minted."
+        if _agent_key_mode() == "off":
+            return (
+                f"REFUSED: agent keys are off on this hub ({AGENT_KEY_MODE_ENV} "
+                "is unset or 'off'), so no key is issued. Nothing was minted."
+            )
+        bad = _name_refusal(name)
+        if bad:
+            return bad
         if name in _OPERATOR_SENDERS:
             return (
                 f"REFUSED: '{name}' is an operator name; its authority is the "

@@ -5084,6 +5084,10 @@ def agent_key_command(args: argparse.Namespace) -> int:
         return 0
     m = re.search(r"AGENT-KEY: ([0-9a-f]{64})", out)
     if not m:
+        if "agent keys are off" in out:
+            # The hub issues no keys yet. Silent: this runs at every session
+            # start, and "off" is the normal state until it is switched on.
+            return 0
         print(f"[mcp-hub agent-key] {name}: {out}", file=sys.stderr)
         return 1
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -12,8 +12,9 @@ The scheme pinned here is `tofu-agent-key`: no secret is placed by hand.
   * A name's key is ENFORCED only once it is ARMED: the hub has seen a
     register() present it. A lane whose interactive transport does not carry
     the header yet is never locked out by its own hook having claimed a key.
-  * `MCP_HUB_AGENT_KEYS` = off | observe | enforce, default observe. Observe
-    records every would-be refusal and never refuses.
+  * `MCP_HUB_AGENT_KEYS` = off | observe | enforce, default OFF: deploying the
+    code issues no key. Observe mints and records every would-be refusal and
+    never refuses. The tests run with keys on (observe) unless they say not.
 
 RED tests fail today by assertion; GUARD tests pass today and must still
 pass after the fix (the live agent keeps working, observe never refuses).
@@ -37,8 +38,8 @@ KEY_RE = re.compile(r"AGENT-KEY: ([0-9a-f]{64})")
 
 
 @pytest.fixture(autouse=True)
-def _mode_unset(monkeypatch):
-    monkeypatch.delenv(MODE_ENV, raising=False)
+def _keys_on(monkeypatch):
+    monkeypatch.setenv(MODE_ENV, "observe")
     monkeypatch.delenv("MCP_HUB_OPERATOR_TOKEN", raising=False)
 
 
@@ -325,9 +326,11 @@ async def test_guard_the_original_agent_keeps_working_under_enforce(
 @pytest.mark.parametrize("mode", ["", "observe", "off", "bogus"])
 async def test_guard_no_mode_but_enforce_ever_refuses(server, db, monkeypatch,
                                                       mode):
+    await _keyed(server, "alice")   # claimed while keys are on (observe)
     if mode:
         monkeypatch.setenv(MODE_ENV, mode)
-    await _keyed(server, "alice")
+    else:
+        monkeypatch.delenv(MODE_ENV, raising=False)
     await _setup_dm(server, body="readable")
     stranger = _Ctx(_Sess("claude-code"))
     out = await _call(server, "get_messages",
@@ -392,3 +395,18 @@ async def test_guard_local_stdio_calls_are_trusted_under_enforce(server, enforce
     await _setup_dm(server, body="local")
     out = await _call(server, "get_messages", {"agent_name": "alice", "bind": False})
     assert "local" in out, out
+
+
+@pytest.mark.parametrize("mode", ["", "off", "bogus"])
+async def test_with_keys_off_no_key_is_minted(server, db, monkeypatch, mode):
+    """Deploying the code issues no credential: until the mode is switched on
+    deliberately, a claim is refused and agent_keys stays empty."""
+    if mode:
+        monkeypatch.setenv(MODE_ENV, mode)
+    else:
+        monkeypatch.delenv(MODE_ENV, raising=False)
+    out = await _call(server, "claim_agent_key", {"name": "alice"}, _Ctx())
+    assert out.startswith("REFUSED"), out
+    assert "AGENT-KEY" not in out
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT COUNT(*) FROM agent_keys").fetchone()[0] == 0
