@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 
@@ -360,7 +361,7 @@ def test_a_destination_without_mcp_hub_refuses_rather_than_guessing(env, tmp_pat
 # ---- the clone knows it is a clone ---------------------------------------
 
 def _marker_dir(home: str, dest: pathlib.Path) -> pathlib.Path:
-    enc = str(dest).replace("/", "-").rstrip("-")
+    enc = re.sub(r"[^A-Za-z0-9]", "-", str(dest)).rstrip("-")
     return pathlib.Path(home) / ".claude" / "projects" / enc / "memory"
 
 
@@ -465,7 +466,7 @@ def test_the_whole_remote_leg_runs_end_to_end(env, tmp_path):
     work = _pushed_repo(tmp_path, rewrite_origin=False)
     _enrol(conf, "demo-box", work, args="--continue")
     # give it memory to carry, keyed the way Claude keys it
-    enc = str(work).replace("/", "-")
+    enc = re.sub(r"[^A-Za-z0-9]", "-", str(work))
     mem = pathlib.Path(e["HOME"]) / ".claude" / "projects" / enc / "memory"
     mem.mkdir(parents=True)
     (mem / "a.md").write_text("remembered\n", encoding="utf-8")
@@ -480,7 +481,8 @@ def test_the_whole_remote_leg_runs_end_to_end(env, tmp_path):
     dest = pathlib.Path(e["HOME"]) / "Projects" / "code" / "remotes" / "demo"
     assert (dest / "README.md").exists(), f"clone did not land: {res.stdout}"
     assert (dest / ".mcp.json").exists(), "the destination generates its own .mcp.json"
-    landed = pathlib.Path(e["HOME"]) / ".claude" / "projects" / str(dest).replace("/", "-")
+    enc = re.sub(r"[^A-Za-z0-9]", "-", str(dest))
+    landed = pathlib.Path(e["HOME"]) / ".claude" / "projects" / enc
     assert (landed / "memory" / "a.md").exists(), "memory did not rsync to the far end"
     cfg = json.loads((pathlib.Path(e["HOME"]) / ".mcp-hub" / "config.json").read_text())
     assert str(dest) in (cfg.get("workspaces") or {}), "no identity suffix registered"
@@ -763,7 +765,7 @@ def test_duplicate_lands_a_real_second_seat(env, tmp_path):
     marker naming the agent it was copied from."""
     e, conf = env
     work, ws = _dup_env(env, tmp_path)
-    enc = str(work).replace("/", "-")
+    enc = re.sub(r"[^A-Za-z0-9]", "-", str(work))
     mem = pathlib.Path(e["HOME"]) / ".claude" / "projects" / enc / "memory"
     mem.mkdir(parents=True)
     (mem / "a.md").write_text("remembered\n", encoding="utf-8")
@@ -780,7 +782,7 @@ def test_duplicate_lands_a_real_second_seat(env, tmp_path):
     folders = ws.read_text(encoding="utf-8")
     assert str(work) in folders and (str(clone) in folders or clone.name in folders), folders
     marker = (pathlib.Path(e["HOME"]) / ".claude" / "projects"
-              / str(clone).replace("/", "-") / "memory"
+              / re.sub(r"[^A-Za-z0-9]", "-", str(clone)) / "memory"
               / "000_you_are_a_transported_clone.md")
     assert marker.is_file(), "a copy that doesn't know it's a copy is the whole hazard"
     assert "demo-box" in marker.read_text(encoding="utf-8"), "the marker must name the parent"

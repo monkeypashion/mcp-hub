@@ -101,7 +101,7 @@ SRC="$HOME/Projects/code/$ORG/$REPO"
 BARE="$TMP/github/$ORG/$REPO.git"
 WS="$TMP/sidecar.code-workspace"
 FARWS="$TMP/farbox.code-workspace"
-enc() { printf '%s' "$1" | sed -e 's:[/\\:]:-:g' -e 's/-*$//'; }
+enc() { local p="${1%/}"; printf '%s' "${p//[^A-Za-z0-9]/-}"; }   # the client's rule (see squad enc_project_dir)
 
 mkdir -p "$HOME/.config/squad" "$HOME/.mcp-hub" "$HOME/Projects/code/$ORG" \
          "$(dirname "$BARE")" "$TMP/bin"
@@ -145,9 +145,9 @@ printf -- '---\nname: feedback_ask_before_deleting\n---\n\nAlways ask first.\n' 
   > "$STATE/memory/feedback_ask_before_deleting.md"
 
 python3 - "$STATE" "$SRC" <<'PY'
-import json, pathlib, sys
+import json, pathlib, re, sys
 state, src = pathlib.Path(sys.argv[1]), sys.argv[2]
-enc = src.replace("/", "-").replace("\\", "-").replace(":", "-").rstrip("-")
+enc = re.sub(r"[^A-Za-z0-9]", "-", src.rstrip("/\\"))
 J = dict(separators=(",", ":"), ensure_ascii=False)
 lines = [
     {"type": "user", "cwd": src, "message": {"role": "user", "content": [

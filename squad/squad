@@ -396,7 +396,7 @@ DEC_RE = re.compile(r"\*{0,2}DECISION\*{0,2}.*?\*{0,2}SCORE:\*{0,2}[^\n]*", re.S
 out = []
 recaps = []
 for agent, wt in rows:
-    d = os.path.expanduser("~/.claude/projects/" + wt.replace("/", "-"))
+    d = os.path.expanduser("~/.claude/projects/" + re.sub(r"[^A-Za-z0-9]", "-", wt.rstrip("/")))
     tot = hr = 0
     r_ts, r_txt = 0, ""
     a_ts, d_ts, d_txt = 0, 0, ""
@@ -2361,7 +2361,17 @@ resolve_dest() {  # <rsh> <host> <home> <org/repo> <label> <minn> [claimed]
 }
 
 # Mirror of cli.py _claude_project_dirname: every / \ : becomes '-'.
-enc_project_dir() { printf '%s' "$1" | sed -e 's:[/\\:]:-:g' -e 's/-*$//'; }
+# The client names a project's state dir by replacing EVERY character that is
+# not [A-Za-z0-9] with '-' — a dot or an underscore too, not just the
+# separators (~/.claude/jobs lives in `-home-monke--claude-jobs`). Mirrored in
+# cli._claude_project_dirname; change both or neither.
+enc_project_dir() {
+  local p="$1"
+  while [ "${#p}" -gt 1 ] && { [ "${p%/}" != "$p" ] || [ "${p%\\}" != "$p" ]; }; do
+    p="${p%/}"; p="${p%\\}"
+  done
+  printf '%s' "${p//[^A-Za-z0-9]/-}"
+}
 # The DESTINATION's Claude state dir, absolute. The remote's $HOME must be
 # asked for, never assumed and never embedded as a literal "$HOME": quoting it
 # through ssh either expands on the wrong box or (single-quoted) creates a

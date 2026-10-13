@@ -250,3 +250,15 @@ def test_main_survives_streams_without_reconfigure(monkeypatch, capsys):
     monkeypatch.setattr("sys.stdout", _Plain())
     monkeypatch.setattr("sys.stderr", _Plain())
     assert cli.main([]) == 0  # bare invocation prints help, exits 0
+
+
+def test_claude_project_dirname_maps_dots_and_underscores_too():
+    """The client replaces every non-alphanumeric character, not just the
+    separators: ~/.claude/jobs lives in `-home-monke--claude-jobs` on disk.
+    A separators-only rule pointed a dotted worktree at a folder that does
+    not exist, so its memory read as absent."""
+    assert _claude_project_dirname("/home/monke/.mcp-hub/hooks-clone") == (
+        "-home-monke--mcp-hub-hooks-clone")
+    assert _claude_project_dirname("/tmp/brain-status-_0btdeij") == (
+        "-tmp-brain-status--0btdeij")
+

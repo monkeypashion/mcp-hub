@@ -1150,14 +1150,19 @@ def onboard_command(args: argparse.Namespace) -> int:
 
 def _claude_project_dirname(cwd: str) -> str:
     """Encode an absolute project path the way Claude Code names its
-    per-project state dir: every path separator (and drive colon) becomes
-    '-'. Examples:
+    per-project state dir: every character that is not [A-Za-z0-9] becomes
+    '-', so a dot or an underscore does too, not only the separators.
+    Examples:
       /home/monke/Projects/code/monkeypashion/mcp-hub
         -> -home-monke-Projects-code-monkeypashion-mcp-hub
       D:\\Projects\\code\\monkeypashion\\mcp-hub
         -> D--Projects-code-monkeypashion-mcp-hub
+      /home/monke/.mcp-hub/hooks-clone
+        -> -home-monke--mcp-hub-hooks-clone
+    A separators-only rule mapped that last path to a folder that does not
+    exist, so its memory and transcripts read as absent.
     """
-    return "".join("-" if c in "/\\:" else c for c in cwd.rstrip("/\\"))
+    return re.sub(r"[^A-Za-z0-9]", "-", cwd.rstrip("/\\"))
 
 
 def _claude_memory_dir(cwd: str) -> pathlib.Path:
