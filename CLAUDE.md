@@ -95,6 +95,8 @@ Detail: `docs/lineage-blocked-by.md`.
 
 Every delivered wake is recorded with its reason (`urgent` | `operator` | `reply` | `hold`) in `wake_log`.
 
+⚠️ **Channel posts are not batched — they are not delivered at all below urgent.** The hold sweep and the Stop drain cover DMs and squad broadcasts only, so a normal or low `post()` reaches a subscriber only when it reads the channel (`get_channel_messages`). Use `send` when one agent must see it.
+
 ### The operator is VERIFIED, not name-matched (card #269)
 
 ```

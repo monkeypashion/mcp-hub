@@ -281,3 +281,24 @@ def test_racing_first_use_agrees_on_one_complete_key(tmp_path):
     assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
     assert identity.key_path(db).stat().st_mode & 0o777 == 0o600
 
+
+
+# ---- the instructions say the same as the receipts --------------------------
+
+
+def test_the_instructions_say_channel_posts_are_not_pushed(server):
+    """H3's second half: the first text every agent reads must not teach the
+    DM batching rules as if they covered channel posts."""
+    blob = server.instructions or ""
+    assert "post() is NOT pushed" in blob, blob
+    assert "get_channel_messages" in blob
+
+
+def test_the_instructions_carry_no_history_labels(server):
+    """Card numbers, rule ids and seat names are history; the standing rule
+    is what an agent needs at connect time."""
+    blob = server.instructions or ""
+    for label in ("card #", "rule 4a", "operator-signed", "operator-console",
+                  "console"):
+        assert label not in blob, label
+    assert "guardrail gap" in blob
