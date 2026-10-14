@@ -410,3 +410,61 @@ async def test_with_keys_off_no_key_is_minted(server, db, monkeypatch, mode):
     assert "AGENT-KEY" not in out
     conn = sqlite3.connect(db)
     assert conn.execute("SELECT COUNT(*) FROM agent_keys").fetchone()[0] == 0
+
+
+# =============================================================================
+# heartbeat: a beat keeps a lane looking alive, so it is the lane's act too
+# =============================================================================
+
+
+def _mtime(db: Path, name: str):
+    return _conn(db).execute(
+        "SELECT transcript_mtime FROM agents WHERE name=?", (name,)
+    ).fetchone()[0]
+
+
+async def test_a_keyless_heartbeat_for_an_armed_name_is_refused(server, db, enforce):
+    await _keyed(server, "alice")
+    out = await _call(server, "heartbeat",
+                      {"agent_name": "alice", "transcript_mtime": 123.0,
+                       "transcript_count": 1}, _Ctx())
+    assert out.startswith("REFUSED"), out
+    assert "[hub_boot=" in out, "the daemon needs the boot tag on every reply"
+    assert _mtime(db, "alice") != 123.0, "a refused beat must write nothing"
+
+
+async def test_the_key_holders_heartbeat_still_lands(server, db, enforce):
+    key, _ctx, _sess = await _keyed(server, "alice")
+    out = await _call(server, "heartbeat",
+                      {"agent_name": "alice", "transcript_mtime": 123.0,
+                       "transcript_count": 1},
+                      _Ctx(headers={AGENT_KEY_HEADER: key}))
+    assert not out.startswith("REFUSED"), out
+    assert _mtime(db, "alice") == 123.0
+
+
+async def test_observe_records_a_keyless_heartbeat_and_lets_it_land(server, db):
+    await _keyed(server, "alice")
+    out = await _call(server, "heartbeat",
+                      {"agent_name": "alice", "transcript_mtime": 123.0,
+                       "transcript_count": 1}, _Ctx())
+    assert not out.startswith("REFUSED"), out
+    assert _mtime(db, "alice") == 123.0
+    row = _conn(db).execute(
+        "SELECT verdict FROM agent_key_events WHERE name='alice' "
+        "AND action='heartbeat'").fetchone()
+    assert row and row[0] == "would-refuse"
+
+
+async def test_an_in_process_heartbeat_is_untouched(server, db, enforce):
+    await _keyed(server, "alice")
+    out = await _call(server, "heartbeat",
+                      {"agent_name": "alice", "transcript_mtime": 123.0,
+                       "transcript_count": 1})
+    assert not out.startswith("REFUSED"), out
+
+
+async def test_an_unreadable_mode_says_it_reads_as_off(server, monkeypatch):
+    monkeypatch.setenv(MODE_ENV, "obsrve")
+    out = await _call(server, "hub_status", {})
+    assert "unreadable — read as off" in out, out

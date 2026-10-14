@@ -232,9 +232,9 @@ def _presented_operator_token(ctx: Any) -> str:
 # the name keeps its trust (it was bound through this gate, or before it).
 #
 # The rollout switch is MODE, not a secret: off | observe | enforce, read at
-# call time, default observe. Observe records every would-be refusal and
-# refuses nothing; an unreadable value reads as observe and says so in
-# hub_status, because a typo must not lock the fleet out.
+# call time, default off. Observe records every would-be refusal and refuses
+# nothing; an unreadable value reads as off and says so in hub_status,
+# because a typo must neither lock the fleet out nor start issuing keys.
 AGENT_KEY_HEADER = "x-mcp-hub-agent-key"
 AGENT_KEY_MODE_ENV = "MCP_HUB_AGENT_KEYS"
 _AGENT_KEY_MODES = ("off", "observe", "enforce")
@@ -5712,6 +5712,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         agent_name: str,
         transcript_mtime: float = 0.0,
         transcript_count: int = -1,
+        ctx: Context | None = None,
     ) -> str:
         """Out-of-session liveness signal from the agent's heartbeat daemon.
 
@@ -5750,6 +5751,15 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         # when the binding is gone. Structured `hub_boot=<id>` so the daemon
         # parses a token, not prose.
         boot_tag = f" [hub_boot={registry.boot_id}]"
+
+        # MH-H1: a beat refreshes a binding's liveness and writes the lane's
+        # ✍ reading, so a caller that is not the lane must not be able to
+        # keep it looking alive. Observe records the miss; enforce refuses
+        # it for an armed name. The boot tag rides the refusal too: the
+        # daemon needs it most when something is wrong.
+        _grade, key_refusal = _key_gate(ctx, agent_name, "heartbeat")
+        if key_refusal:
+            return key_refusal + boot_tag
 
         # heartbeat_touch first: it is in-memory registry work, and running it
         # here lets the whole beat settle into ONE write and ONE commit below
@@ -6117,7 +6127,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         raw = os.environ.get(AGENT_KEY_MODE_ENV, "").strip().lower()
         mode = _agent_key_mode()
         if raw and raw not in _AGENT_KEY_MODES:
-            mode += f" ({AGENT_KEY_MODE_ENV}={raw!r} unreadable — read as observe)"
+            mode += f" ({AGENT_KEY_MODE_ENV}={raw!r} unreadable — read as off)"
         names = conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0]
         keyed, armed = conn.execute(
             "SELECT COUNT(*), COUNT(armed_at) FROM agent_keys"
