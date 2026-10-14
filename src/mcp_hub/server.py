@@ -5810,6 +5810,7 @@ _CLI_SUBCOMMANDS = {
     "stop-hook",
     "session-start",
     "session-rewake",
+    "agent-key",
     "heartbeat-daemon",
     "onboard",
     "memory-export",

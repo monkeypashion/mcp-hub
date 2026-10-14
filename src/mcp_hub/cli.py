@@ -28,6 +28,7 @@ import asyncio
 import contextlib
 import datetime as _dt
 import hashlib
+import io
 import json
 import os
 import pathlib
@@ -492,7 +493,8 @@ async def _query_hub(
     card_notice = ""
     try:
         async with streamablehttp_client(
-                _ephemeral_hub_url(hub_url), timeout=10) as (read, write, _):
+                _ephemeral_hub_url(hub_url), timeout=10,
+                **_with_agent_key(agent_name)) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
 
@@ -1727,7 +1729,9 @@ async def _memory_export(hub_url: str, name: str, project: str, cwd: str) -> int
         print(f"nothing to export — no .md files in {mem_dir}")
         return 0
 
-    async with streamablehttp_client(_ephemeral_hub_url(hub_url), timeout=15) as (read, write, _):
+    async with streamablehttp_client(
+        _ephemeral_hub_url(hub_url), timeout=15, **_with_agent_key(name)
+    ) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
 
@@ -2297,6 +2301,70 @@ def _rekey_transcript(text: str, old_cwd: str, new_cwd: str) -> tuple[str, dict[
     return "\n".join(out) + ("\n" if out else ""), stats
 
 
+AGENT_KEY_HEADER = "x-mcp-hub-agent-key"
+
+
+def _agent_key_file(name: str) -> pathlib.Path:
+    """Where `agent-key ensure` keeps this name's hub-minted key (MH-H1)."""
+    return _state_dir() / "agent-keys" / f"{name}.key"
+
+
+def _agent_key_headers(name: str) -> dict[str, str]:
+    """The key header for an ephemeral client speaking as `name`, or {} when
+    this machine holds no key for it (an unkeyed name is legacy on the hub)."""
+    try:
+        key = _agent_key_file(name).read_text(encoding="utf-8").strip()
+    except OSError:
+        return {}
+    return {AGENT_KEY_HEADER: key} if key else {}
+
+
+def _with_agent_key(name: str) -> dict[str, Any]:
+    """kwargs for streamablehttp_client: headers only when there is a key, so
+    a keyless client is byte-for-byte the call it was before."""
+    headers = _agent_key_headers(name)
+    return {"headers": headers} if headers else {}
+
+
+_AGENT_KEY_HELPER_SH = """#!/bin/sh
+# MH-H1 headersHelper, written by `mcp-hub rebind-url`. Prints this lane's
+# agent-key header, or {} while it holds none. It never fails and imports
+# nothing: a helper that fails connects the lane WITHOUT its key, which an
+# enforcing hub refuses once the name is armed.
+case "$1" in ""|*[!a-z0-9_-]*) echo '{}'; exit 0 ;; esac
+k=$(cat "${MCP_HUB_STATE_DIR:-$HOME/.mcp-hub}/agent-keys/$1.key" 2>/dev/null)
+case "$k" in ""|*[!0-9a-f]*) echo '{}'; exit 0 ;; esac
+[ "${#k}" -eq 64 ] || { echo '{}'; exit 0; }
+printf '{"%s": "%s"}\\n' "x-mcp-hub-agent-key" "$k"
+"""
+
+
+def _install_agent_key_helper() -> pathlib.Path:
+    """Write the POSIX headersHelper once per machine (rewritten only when
+    its content changes), atomically, 0755."""
+    path = _state_dir() / "bin" / "agent-key-header"
+    if path.exists() and path.read_text(encoding="utf-8") == _AGENT_KEY_HELPER_SH:
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(_AGENT_KEY_HELPER_SH, encoding="utf-8")
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, path)
+    return path
+
+
+def _agent_key_helper_command(name: str) -> str:
+    """The lane's headersHelper: prints its agent-key header, or {} while it
+    holds no key. Claude Code runs it at every (re)connect from the
+    project folder, so it names the agent explicitly. On POSIX it is a
+    dependency-free sh script; Windows runs this interpreter, pinned like
+    the daemons."""
+    if os.name != "nt":
+        return f"{shlex.quote(str(_install_agent_key_helper()))} {shlex.quote(name)}"
+    return (f"{subprocess.list2cmdline([sys.executable])} -m mcp_hub.cli "
+            f"agent-key header --name {name}")
+
+
 def _ephemeral_hub_url(url: str) -> str:
     """Strip the ?agent= identity from a hub URL before an EPHEMERAL client
     connects with it.
@@ -2727,18 +2795,21 @@ def rebind_url_command(args: argparse.Namespace) -> int:
     query = [(k, v) for k, v in parse_qsl(parts.query) if k != "agent"]
     query.append(("agent", name))
     new_url = urlunsplit(parts._replace(query=urlencode(query)))
-    if new_url == url:
+    helper = _agent_key_helper_command(name)
+    if new_url == url and hub.get("headersHelper") == helper:
         print(f"already stamped: {url}")
         return 0
     where = f"{mcp_json}:{'.'.join(hub_path)}"
     if args.dry_run:
-        print(f"would rewrite {where}: {url} -> {new_url}")
+        print(f"would rewrite {where}: {url} -> {new_url}, "
+              f"headersHelper -> {helper}")
         return 0
     # Mutate in place — these files carry unrelated state (~/.claude.json
-    # holds every project's settings), so only the one key changes.
+    # holds every project's settings), so only these two keys change.
     hub["url"] = new_url
+    hub["headersHelper"] = helper
     mcp_json.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    print(f"stamped {where}: {new_url}")
+    print(f"stamped {where}: {new_url} (headersHelper: agent key)")
     print("(takes effect at the session's next MCP reconnect or relaunch)")
     return 0
 
@@ -5016,7 +5087,9 @@ async def _mute_squad(hub_url: str, name: str, squad: str, muted: bool) -> str:
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
 
-    async with streamablehttp_client(_ephemeral_hub_url(hub_url), timeout=15) as (read, write, _):
+    async with streamablehttp_client(
+        _ephemeral_hub_url(hub_url), timeout=15, **_with_agent_key(name)
+    ) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
             return _extract_text(await session.call_tool(
@@ -5029,7 +5102,7 @@ async def _set_focus(hub_url: str, name: str, minutes: int, reason: str) -> str:
     from mcp.client.streamable_http import streamablehttp_client
 
     async with streamablehttp_client(
-        _ephemeral_hub_url(hub_url), timeout=15
+        _ephemeral_hub_url(hub_url), timeout=15, **_with_agent_key(name)
     ) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
@@ -5045,7 +5118,7 @@ async def _send_dm(hub_url: str, frm: str, to: str, message: str,
     from mcp.client.streamable_http import streamablehttp_client
 
     async with streamablehttp_client(
-        _ephemeral_hub_url(hub_url), timeout=15
+        _ephemeral_hub_url(hub_url), timeout=15, **_with_agent_key(frm)
     ) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
@@ -5801,6 +5874,66 @@ def session_start_command(args: argparse.Namespace) -> int:
         }
     }
     print(json.dumps(output))
+    return 0
+
+
+async def _claim_agent_key(hub_url: str, name: str) -> str:
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    async with streamablehttp_client(
+        _ephemeral_hub_url(hub_url), timeout=10
+    ) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool("claim_agent_key", {"name": name})
+            return _extract_text(result)
+
+
+def agent_key_command(args: argparse.Namespace) -> int:
+    """`agent-key ensure`: hold this lane's hub-minted key (MH-H1).
+    `agent-key header`: print it as a headers JSON object (headersHelper).
+
+    The key is returned by the hub exactly once, so it is PERSISTED (0600)
+    BEFORE anything else happens to it, and it is never printed by ensure.
+    """
+    if args.action == "header":
+        # A headersHelper gets no hook stdin; Claude Code runs it from the
+        # project folder, so the one shared user-scope helper names each
+        # lane by the folder it was started in.
+        name = args.name or _derive_agent_identity(os.getcwd())[0]
+        print(json.dumps(_agent_key_headers(name) if name else {}))
+        return 0
+    payload: dict[str, Any] = {} if args.name else _read_hook_stdin()
+    name, _project = _resolve_agent_identity(args, payload)
+    if name is None:
+        return 0  # not a hub agent here: silent, like every hook
+    path = _agent_key_file(name)
+    if path.exists() and not args.force:
+        print(f"agent key for {name}: held ({path})")
+        return 0
+    try:
+        out = asyncio.run(_claim_agent_key(args.hub_url, name))
+    except Exception as exc:  # noqa: BLE001 — a hook must never block a lane
+        print(f"[mcp-hub agent-key] hub unreachable: {exc!r}", file=sys.stderr)
+        return 0
+    m = re.search(r"AGENT-KEY: ([0-9a-f]{64})", out)
+    if not m:
+        if "agent keys are off" in out:
+            # The hub issues no keys yet. Silent: this runs at every session
+            # start, and "off" is the normal state until it is switched on.
+            return 0
+        print(f"[mcp-hub agent-key] {name}: {out}", file=sys.stderr)
+        return 1
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(m.group(1))
+    os.replace(tmp, path)   # persisted BEFORE anything is printed
+    digest = hashlib.sha256(m.group(1).encode()).hexdigest()[:12]
+    print(f"agent key for {name}: minted, written to {path} "
+          f"(mode 0600, sha256 {digest})")
     return 0
 
 
@@ -6605,8 +6738,11 @@ async def _heartbeat_loop(hub_url: str, agent_name: str) -> bool:
     send_transcript = True
     while True:
         try:
+            # Re-read at every (re)connect, so a key minted after the
+            # daemon started is presented from its next connection on.
             async with streamablehttp_client(
-                _ephemeral_hub_url(hub_url), timeout=10
+                _ephemeral_hub_url(hub_url), timeout=10,
+                **_with_agent_key(agent_name),
             ) as (read, write, _):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
@@ -6717,6 +6853,15 @@ def heartbeat_daemon_command(args: argparse.Namespace) -> int:
         # A live daemon already owns this agent — stand down rather than
         # leak a second one. This is the fix for the daemon accumulation.
         return 0
+    # MH-H1: hold this lane's agent key before the first connect, so every
+    # beat presents it. Quiet and fail-open: keys off, a hub blip or a key
+    # already held all leave the daemon exactly as it was.
+    with contextlib.suppress(Exception), \
+            contextlib.redirect_stdout(io.StringIO()), \
+            contextlib.redirect_stderr(io.StringIO()):
+        agent_key_command(argparse.Namespace(
+            action="ensure", name=name, project=None, force=False,
+            hub_url=args.hub_url))
     respawn = False
     try:
         respawn = asyncio.run(_heartbeat_loop(args.hub_url, name))
@@ -8022,6 +8167,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Project name override (otherwise auto-discovered from marker).",
     )
 
+    agent_key = sub.add_parser(
+        "agent-key",
+        help="Hold this lane's hub-minted agent key (MH-H1)",
+        description=(
+            "ensure: claim this lane's key from the hub if this machine holds "
+            "none, and write it to ~/.mcp-hub/agent-keys/<name>.key (0600) "
+            "before anything else. header: print {\"x-mcp-hub-agent-key\": "
+            "...} for a headersHelper. The key is never placed by hand."
+        ),
+    )
+    agent_key.add_argument("action", choices=["ensure", "header"])
+    agent_key.add_argument("--name", default=None)
+    agent_key.add_argument("--project", default=None)
+    agent_key.add_argument("--force", action="store_true",
+                           help="Claim again after the operator reset the key")
+    agent_key.add_argument("--hub-url", default=DEFAULT_HUB_URL)
+
     session_rewake = sub.add_parser(
         "session-rewake",
         help="Try to trigger an unprompted first turn via asyncRewake (for SessionStart hooks)",
@@ -8963,6 +9125,8 @@ def main(argv: list[str] | None = None) -> int:
         return stop_hook_command(args)
     if args.subcommand == "session-start":
         return session_start_command(args)
+    if args.subcommand == "agent-key":
+        return agent_key_command(args)
     if args.subcommand == "session-rewake":
         return session_rewake_command(args)
     if args.subcommand == "heartbeat-daemon":
