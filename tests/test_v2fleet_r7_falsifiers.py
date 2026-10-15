@@ -23,14 +23,18 @@ The interface these tests drive (r6's, plus):
   Operator tasks (requester an operator name): created only at grade operator-verified; the requester's acts need
   it too. Override (cancel, reassign on anyone's task) needs the grade, never the name. Agent keys
   (MCP_HUB_AGENT_KEYS) read per act: in `enforce` owner acts (claim, done, failed, release, note) on an operator
-  task need a verified grade (session-, operator- or key-verified); in `observe` they pass and the event's reason
-  carries "would-refuse". Agent-to-agent tasks keep r6's grades (asserted allowed, recorded).
+  task need a verified grade (identity.VERIFIED_GRADES, the one verified set; no local copy); in `observe` they pass
+  and the event's reason carries "would-refuse". Agent-to-agent tasks keep r6's grades (asserted allowed, recorded).
   Lineage, written after COMMIT through lineage.write_edge (module attribute): task authored-by requester,
   addressed-to each target (history kept), assigned-to each owner (the new predicate). Each later act re-asserts
   authored-by and addressed-to, so a swallowed edge failure heals.
   get_task json grows by two derived keys, `blocked` (bool) and `blockers` (list of exactly {ref, state, cleared}:
   state is the blocker task's state, or null for a non-task object; a task blocker clears when done or accepted).
-  Nothing about blocked is stored. Declared base change: test_r6_new4_get_task_full_log_in_order's
+  Nothing about blocked is stored. A note's blocked_by is CHECKED before BEGIN (format, verified grade, the author
+  is the requester; a failed check refuses the whole note), recorded in the note event's reason inside the
+  transaction, and its blocked-by edge WRITTEN after COMMIT (lineage.declare_blocked / clear_blocked as the write).
+  A note refused inside the transaction (e.g. the task went terminal first) leaves no edge; a failed post-COMMIT
+  write leaves the note stored and the reply says "note stored; blocker NOT recorded: <why>; re-declare". Declared base change: test_r6_new4_get_task_full_log_in_order's
   TASK_JSON_FIELDS names the two keys.
   GET /api/v1/tasks?owner=&requester=&squad=&state= -> {"tasks": [rows of exactly SUMMARY_FIELDS]} and
   GET /api/v1/tasks/{id} -> exactly get_task's json; both operator_only; no write method on either path.
@@ -56,7 +60,7 @@ from pathlib import Path
 
 import pytest
 
-from mcp_hub import lineage, refs
+from mcp_hub import identity, lineage, refs
 from mcp_hub.server import (
     OPERATOR_TOKEN_ENV,
     OPERATOR_TOKEN_HEADER,
@@ -77,7 +81,6 @@ AGENTS = ("alice", "bob", "carol", "dave", "eve", "frank")
 ACTS = ("claim", "done", "release", "failed", "accept", "cancel", "reassign", "note")
 STATES = ("open", "claimed", "done", "accepted", "failed", "cancelled")
 TERMINAL = ("accepted", "failed", "cancelled")
-VERIFIED = ("session-verified", "operator-verified", "key-verified")
 BLOCKER_FIELDS = {"ref", "state", "cleared"}
 SUMMARY_FIELDS = {"ref", "state", "owner", "requester", "addressed_to", "title", "updated_ts", "blocked"}
 
@@ -563,7 +566,16 @@ async def test_r7_new7_override_needs_grade_not_name(server, monkeypatch):
 
 
 async def test_r7_new7_key_enforce_owner_act_needs_verified(server, monkeypatch):
+    # mcp-hub adds key-verified to identity.VERIFIED_GRADES on master before any enforce (the GG-7 enforce gate).
+    # Until then this patch stands in for that change; once it lands, the patch is a no-op.
+    if "key-verified" not in identity.VERIFIED_GRADES:
+        monkeypatch.setattr(identity, "VERIFIED_GRADES", (*identity.VERIFIED_GRADES, "key-verified"))
     _arm_op(monkeypatch)
+    monkeypatch.setenv("MCP_HUB_AGENT_KEYS", "observe")
+    claimed = await _call(server, "claim_agent_key", {"name": "bob"}, _Ctx(headers={}))
+    key = re.search(r"AGENT-KEY: ([0-9a-f]{64})", claimed)
+    assert key, f"no agent key minted for bob: {claimed!r}"
+    keyed = _Ctx(headers={"x-mcp-hub-agent-key": key.group(1)})  # unbound HTTP caller presenting bob's key
     ref = await _create(server, frm=OP, to="bob", ctx=_op_ctx())
     monkeypatch.setenv("MCP_HUB_AGENT_KEYS", "enforce")
     out = await _act(server, "claim", "bob", ref)
@@ -577,8 +589,10 @@ async def test_r7_new7_key_enforce_owner_act_needs_verified(server, monkeypatch)
         assert out.startswith("REFUSED"), f"an asserted owner's {act} on Tim's task passed under enforce: {out!r}"
         assert len(_events(server, ref)) == n + 1 and _events(server, ref)[-1]["grade"] == "asserted"
         assert _row(server, ref)["state"] == "claimed"
+    _ok(await _act(server, "note", "bob", ref, keyed, text="key-verified owner"))
+    assert _events(server, ref)[-1]["grade"] == "key-verified", _events(server, ref)[-1]
     _ok(await _act(server, "done", "bob", ref, bob))
-    assert _row(server, ref)["state"] == "done" and _events(server, ref)[-1]["grade"] in VERIFIED
+    assert _row(server, ref)["state"] == "done" and _events(server, ref)[-1]["grade"] in identity.VERIFIED_GRADES
 
 
 async def test_r7_new7_key_observe_records_would_refuse(server, monkeypatch):
@@ -753,6 +767,72 @@ async def test_r7_new8_evidence_never_sets_blocked(server):
     view = await _view(server, t1)
     assert "blocked" in view, "get_task has no derived blocked field"
     assert view["blocked"] is False and view["blockers"] == [], f"text set blocked: {view['blockers']}"
+
+
+def test_r7_new8_note_losing_terminal_race_leaves_no_edge(server, monkeypatch):
+    """The cancel commits in the window between the note's pre-BEGIN blocker work and its BEGIN: whichever
+    lineage call the note makes first. The note is then refused in its transaction and must leave no edge."""
+    t1 = asyncio.run(_create(server))
+    t2 = asyncio.run(_create(server, to="carol"))
+    alice = _bound(server, "alice")
+    fired: list[str] = []
+
+    def cancel_now():
+        if fired:
+            return
+        fired.append("cancel")
+        outs: list[str] = []
+        th = threading.Thread(target=lambda: outs.append(asyncio.run(_act(server, "cancel", "alice", t1))))
+        th.start()
+        th.join(30)
+        assert outs and not outs[0].startswith("REFUSED"), f"the racing cancel did not win: {outs}"
+
+    def racing(name):
+        real = getattr(lineage, name)
+
+        def wrapped(*a, **k):
+            cancel_now()
+            return real(*a, **k)
+        return wrapped
+
+    for name in ("check_declare_blocked", "declare_blocked"):
+        if hasattr(lineage, name):
+            monkeypatch.setattr(lineage, name, racing(name))
+    try:
+        out = asyncio.run(_act(server, "note", "alice", t1, alice, text="waits", blocked_by=f"{t1}|{t2}"))
+    except Exception as e:  # noqa: BLE001 — a raise is a defect here, reported as a failure
+        raise AssertionError(f"the note raised: {e!r}") from e
+    assert fired, "the note never reached lineage, so the race was not run"
+    assert _row(server, t1)["state"] == "cancelled"
+    assert out.startswith("REFUSED") and "cancelled" in out, f"the note did not lose to the cancel: {out!r}"
+    assert not [e for e in _edges(server, t1) if e[0] == "blocked-by"], (
+        "a note refused in its transaction left a blocked-by edge")
+    view = asyncio.run(_view(server, t1))
+    assert view["blocked"] is False and view["blockers"] == [], view
+
+
+async def test_r7_new8_blocker_write_failure_keeps_note_and_says_so(server, monkeypatch):
+    t1, t2 = await _create(server), await _create(server, to="carol")
+    alice = _bound(server, "alice")
+    frozen = _row(server, t1)
+    spec = f"{t1}|{t2}"
+
+    def broken(*a, **k):
+        raise RuntimeError("lineage store unavailable")
+
+    monkeypatch.setattr(lineage, "declare_blocked", broken)
+    try:
+        out = await _act(server, "note", "alice", t1, alice, text="waits on t2", blocked_by=spec)
+    except Exception as e:  # noqa: BLE001 — the note must stand, not raise
+        raise AssertionError(f"a failed blocker write raised out of the note: {e!r}") from e
+    assert not out.startswith("REFUSED"), f"a failed post-COMMIT write refused the note: {out!r}"
+    assert "note stored; blocker NOT recorded:" in out and "lineage store unavailable" in out and "re-declare" in out, (
+        f"the reply does not say loudly that the blocker was lost: {out!r}")
+    last = _events(server, t1)[-1]
+    assert last["act"] == "note" and "waits on t2" in last["reason"] and spec in last["reason"], last
+    assert _row(server, t1) == frozen, "the note moved the task's row"
+    view = await _view(server, t1)
+    assert view["blocked"] is False and view["blockers"] == [], f"blocked reads true with no edge: {view['blockers']}"
 
 
 # -- NEW-9 the cockpit reads tasks over HTTP --------------------------------------------
