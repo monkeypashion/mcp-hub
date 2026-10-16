@@ -1,8 +1,8 @@
 """v2-fleet revision 7 falsifiers (Vortex project v2-fleet, line hub-master, built in mcp-hub's repo). FROZEN.
 
 Hub tasks, stage 2: the whole lifecycle, authority, lineage and the HTTP read (roadmap item 3; O8
-"Work moves as tasks, not chat"; design drafts/v2f-tasks-r7-design.md). Base: the r6 base
-(r6 falsifiers) PROVISIONALLY; recut onto mcp-hub master once r6 has merged there.
+"Work moves as tasks, not chat"; design drafts/v2f-tasks-r7-design.md). Base: mcp-hub master
+9aa0ba3 (r6 merged, b-89); recut from the provisional r6 base (see "Recut onto" below).
 
 The interface these tests drive (r6's, plus):
   release_task(from_agent, ref, reason)        claimed -> open; owner only; owner cleared, addressed_to kept.
@@ -16,7 +16,7 @@ The interface these tests drive (r6's, plus):
       `reason`. blocked_by is lineage's "<task-ref>|<object-ref>" (or "clear:..."), declared by the requester only.
   Event acts: create, claim, done, release, failed, accept, cancel, reassign, note. Terminal: accepted, failed,
   cancelled. Every successful act except a note moves `version`. Every refusal (role or state) writes one event
-  with to_state = from_state and a reason starting "refused", and the reply starts "REFUSED".
+  with act "<act>-refused", to_state = from_state and a non-empty reason, and the reply starts "REFUSED".
   Notices (normal, hub-authored, chained by replies-to to the task's previous notice, never to oneself):
   release/failed -> requester; accept -> owner; cancel -> addressed agent (open) or owner (claimed), none for a
   squad; reassign -> old owner (if claimed), then the new target if an agent; note -> nobody.
@@ -38,6 +38,12 @@ The interface these tests drive (r6's, plus):
   TASK_JSON_FIELDS names the two keys.
   GET /api/v1/tasks?owner=&requester=&squad=&state= -> {"tasks": [rows of exactly SUMMARY_FIELDS]} and
   GET /api/v1/tasks/{id} -> exactly get_task's json; both operator_only; no write method on either path.
+
+Recut onto mcp-hub master 9aa0ba3 (r6 as built by b-89, 16 Oct): three r6-as-built conventions replace the
+provisional ones above, and nothing else moves. (1) A refusal's event act is "<act>-refused" (r6 already records
+claim-refused and done-refused on the live store), from_state = to_state, with a non-empty reason. (2) A task's
+addressed_to is stored as a ref (hub.agent/1?name=X or hub.squad/1?name=X), never a bare name. (3) requester_grade
+is read from get_task's json (r6 derives it from the create event; there is no column).
 
 Groups (one per feature's test_command):
   test_r7_new6_*  NEW-6 owners give back or fail; requesters cancel, reassign and accept
@@ -194,6 +200,16 @@ def _agent(name: str) -> str:
     return refs.canonical(refs.make_ref("hub.agent/1", name=name))
 
 
+def _to(name: str) -> str:
+    """The stored addressed_to for `name` (r6 as built): an agent's or a squad's canonical ref."""
+    return refs.canonical(refs.parse_ref(name)) if name.startswith("hub.") else _agent(name)
+
+
+def _refused(act: str) -> str:
+    """The event act a refusal of `act` records (r6 as built: claim-refused, done-refused)."""
+    return f"{act}-refused"
+
+
 async def _create(server, frm="alice", to="bob", title="ship the r7 notes", body="Please write them.", ctx=None) -> str:
     out = await _call(server, "create_task", {"from_agent": frm, "to": to, "title": title, "body": body}, ctx)
     return _ref_of(out)
@@ -309,12 +325,12 @@ async def test_r7_new6_transition_table_exhaustive(server, monkeypatch):
                 assert len(ev) == len(before_ev) + 1, f"{case}: not exactly one event recorded: {ev[len(before_ev):]}"
                 new = ev[-1]
                 assert new["actor"] == role and new["grade"], f"{case}: event {new}"
-                assert new["act"] == act, f"{case}: event act {new['act']!r}"
+                assert new["act"] == (act if want is not None else _refused(act)), f"{case}: event act {new['act']!r}"
                 if want is None:
                     assert out.startswith("REFUSED"), f"{case} was allowed: {out!r}"
                     assert row["state"] == state, f"{case}: a refused act moved the task to {row['state']}"
                     assert new["from_state"] == state and new["to_state"] == state, f"{case}: {new}"
-                    assert new["reason"].startswith("refused"), f"{case}: reason {new['reason']!r}"
+                    assert new["reason"], f"{case}: a refusal recorded no reason"
                     assert row["version"] == before_row["version"] and row["owner"] == before_row["owner"]
                     continue
                 assert not out.startswith("REFUSED"), f"{case} was refused: {out!r}"
@@ -325,9 +341,9 @@ async def test_r7_new6_transition_table_exhaustive(server, monkeypatch):
                 else:
                     assert row["version"] > before_row["version"], f"{case}: the version did not move"
                 if act == "release":
-                    assert not row["owner"] and row["addressed_to"] == "bob", f"{case}: {row}"
+                    assert not row["owner"] and row["addressed_to"] == _to("bob"), f"{case}: {row}"
                 if act == "reassign":
-                    assert not row["owner"] and row["addressed_to"] == "carol", f"{case}: {row}"
+                    assert not row["owner"] and row["addressed_to"] == _to("carol"), f"{case}: {row}"
     # A release followed by a fresh claim: the old version stays stale, a fresh claim makes a new owner.
     ref = await _create(server, to=SQUAD)
     _ok(await _act(server, "claim", "bob", ref))
@@ -353,7 +369,7 @@ async def test_r7_new6_accept_separate_from_done(server, monkeypatch):
     view = await _view(server, ref)
     assert view["state"] == "accepted" and view["owner"] == "bob"
     acts = [(e["act"], e["actor"], e["to_state"]) for e in view["events"]]
-    assert acts[-4:] == [("accept", "bob", "done"), ("accept", OP, "done"), ("accept", "carol", "done"),
+    assert acts[-4:] == [(_refused("accept"), "bob", "done"), (_refused("accept"), OP, "done"), (_refused("accept"), "carol", "done"),
                          ("accept", "alice", "accepted")], acts
     assert [e for e in view["events"] if e["act"] == "done"][0]["to_state"] == "done"
     assert _id_of(ref) not in _refs_in(await _call(server, "list_tasks", {"requester": "alice", "state": "done"}))
@@ -372,8 +388,8 @@ async def test_r7_new6_terminal_states_refuse_all_acts(server, monkeypatch):
                 assert out.startswith("REFUSED"), f"{act} by {role} on a {state} task: {out!r}"
         assert _row(server, ref) == frozen, f"an act changed a {state} task's row"
         assert _msg_count(server) == n_msgs, f"an act on a {state} task sent a notice"
-        refused = [e for e in _events(server, ref) if e["reason"].startswith("refused")]
-        assert len(refused) == len(ACTS) * 4 and all(e["to_state"] == state for e in refused)
+        refused = [e for e in _events(server, ref) if e["act"].endswith("-refused")]
+        assert len(refused) == len(ACTS) * 4 and all(e["from_state"] == e["to_state"] == state and e["reason"] for e in refused)
 
 
 async def test_r7_new6_reassign_only_by_requester_or_verified_operator(server, monkeypatch):
@@ -382,20 +398,20 @@ async def test_r7_new6_reassign_only_by_requester_or_verified_operator(server, m
         out = await _act(server, "reassign", who, ref, to="dave")
         assert out.startswith("REFUSED"), f"{who} reassigned alice's task: {out!r}"
     row = _row(server, ref)
-    assert row["state"] == "claimed" and row["owner"] == "bob" and row["addressed_to"] == "bob"
+    assert row["state"] == "claimed" and row["owner"] == "bob" and row["addressed_to"] == _to("bob")
     named = [e for e in _events(server, ref) if e["actor"] == OP]
-    assert len(named) == 1 and named[0]["grade"] == "asserted" and named[0]["act"] == "reassign"
+    assert len(named) == 1 and named[0]["grade"] == "asserted" and named[0]["act"] == _refused("reassign")
     _arm_op(monkeypatch)
     _ok(await _act(server, "reassign", OP, ref, _op_ctx(), to="dave"))
     row = _row(server, ref)
-    assert row["state"] == "open" and not row["owner"] and row["addressed_to"] == "dave"
+    assert row["state"] == "open" and not row["owner"] and row["addressed_to"] == _to("dave")
     assert _events(server, ref)[-1]["grade"] == "operator-verified"
     # The requester may reassign; the same open target is no change and is refused.
     _ok(await _act(server, "reassign", "alice", ref, to="carol"))
     out = await _act(server, "reassign", "alice", ref, to="carol")
-    assert out.startswith("REFUSED") and _row(server, ref)["addressed_to"] == "carol", out
+    assert out.startswith("REFUSED") and _row(server, ref)["addressed_to"] == _to("carol"), out
     _ok(await _act(server, "reassign", "alice", ref, to=SQUAD))
-    assert _row(server, ref)["addressed_to"] == SQUAD
+    assert _row(server, ref)["addressed_to"] == _to(SQUAD)
     _ok(await _act(server, "claim", "frank", ref))
 
 
@@ -532,7 +548,7 @@ async def test_r7_new7_operator_task_needs_operator_verified(server, monkeypatch
     _arm_op(monkeypatch)
     done = await _in_state(server, "done", frm=OP, op=_op_ctx())
     opened = await _in_state(server, "open", frm=OP, op=_op_ctx())
-    assert _row(server, done)["requester_grade"] == "operator-verified"
+    assert (await _view(server, done))["requester_grade"] == "operator-verified"
     monkeypatch.delenv(OPERATOR_TOKEN_ENV)  # the name alone, as anyone can type it
     for act, ref in (("accept", done), ("cancel", opened), ("reassign", opened), ("note", opened)):
         n = len(_events(server, ref))
@@ -540,7 +556,7 @@ async def test_r7_new7_operator_task_needs_operator_verified(server, monkeypatch
         assert out.startswith("REFUSED"), f"an asserted operator could {act} Tim's task: {out!r}"
         ev = _events(server, ref)
         assert len(ev) == n + 1 and ev[-1]["actor"] == OP and ev[-1]["grade"] == "asserted", ev[-1]
-        assert ev[-1]["reason"].startswith("refused")
+        assert ev[-1]["act"] == _refused(act) and ev[-1]["reason"]
     assert _row(server, done)["state"] == "done" and _row(server, opened)["state"] == "open"
     _arm_op(monkeypatch)
     _ok(await _act(server, "accept", OP, done, _op_ctx()))
@@ -554,11 +570,11 @@ async def test_r7_new7_override_needs_grade_not_name(server, monkeypatch):
         out = await _act(server, act, OP, ref)
         assert out.startswith("REFUSED"), f"the bare name 'operator' could {act} alice's task: {out!r}"
         assert _events(server, ref)[-1]["grade"] == "asserted"
-    assert _row(server, a)["state"] == "claimed" and _row(server, b)["addressed_to"] == "bob"
+    assert _row(server, a)["state"] == "claimed" and _row(server, b)["addressed_to"] == _to("bob")
     _arm_op(monkeypatch)
     _ok(await _act(server, "cancel", OP, a, _op_ctx()))
     _ok(await _act(server, "reassign", OP, b, _op_ctx(), to="carol"))
-    assert _row(server, a)["state"] == "cancelled" and _row(server, b)["addressed_to"] == "carol"
+    assert _row(server, a)["state"] == "cancelled" and _row(server, b)["addressed_to"] == _to("carol")
     assert _events(server, a)[-1]["grade"] == "operator-verified"
     c = await _in_state(server, "done")
     out = await _act(server, "accept", OP, c, _op_ctx())
