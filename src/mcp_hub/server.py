@@ -35,6 +35,7 @@ from mcp_hub import (
     ra_feature,  # registers the ra.feature/1 scheme on import
     refs,
     status_resolution,
+    tasks,
 )
 
 from .session_registry import SessionRegistry, live_server_sessions
@@ -1086,6 +1087,10 @@ def init_db(db_path: Path = DB_PATH) -> None:
     status_resolution.ensure_schema(conn)
     # F14: per-lane evidence of the last substantive turn (evidence.py).
     evidence.ensure_schema(conn)
+    # v2-fleet r6: hub tasks — `tasks` and `task_events`, owned by tasks.py.
+    # A task is its own record, so it brings its own schema and no existing
+    # table changes shape to make room for it.
+    tasks.ensure_schema(conn)
 
 
 
@@ -5486,6 +5491,160 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             return json.dumps(status_resolution.resolve_status(conn, ref))
         except refs.RefError as e:
             return f"REFUSED: {e}"
+
+    # -- Tasks (v2-fleet r6: hub tasks, the minimum) --
+    #
+    # Wiring only. Every rule lives in tasks.py, including the rendering: this
+    # file hands the store the four helpers it reuses (render_body, the grade
+    # tag, the msg ref, the message-lineage writer) and otherwise does what
+    # every other tool here does — grade the caller, then call the store.
+    _task_hooks = tasks.Hooks(
+        render_body=_render_body,
+        grade_tag=_grade_tag_str,
+        msg_ref=_msg_ref,
+        record_msg_lineage=_record_msg_lineage,
+    )
+
+    @mcp.tool()
+    def create_task(
+        from_agent: str, to: str, title: str, body: str,
+        deadline: str = "", lease: str = "", ctx: Context | None = None,
+    ) -> str:
+        """Make a TASK — a record of work to be done, not a message.
+
+        A message is something said; a task is something to be done, and it
+        gets its own record and its own ref (hub.task/1?id=N): one requester,
+        at most one owner at a time, a state, an end. It is never written to
+        your inbox or anyone else's, and it never appears in get_history or a
+        drain — read it with get_task / list_tasks.
+
+        State moves ONLY by a recorded act (claim_task / task_done) from a
+        named actor. The hub never reads a task's state from text: saying
+        "done" in a reply changes nothing.
+
+        Args:
+            from_agent: Your agent name — the requester.
+            to: Who is to do it: one agent name, or a squad as the ref
+                hub.squad/1?name=<squad>. A squad-addressed task notifies
+                nobody (a squad is not a party); its members find it with
+                list_tasks(squad="<squad>").
+            title: One line, shown in every list and notice.
+            body: What is to be done. Stored as DATA and rendered as data;
+                like the title and a result, it is refused if it looks like
+                it contains a credential — this store is plaintext SQLite.
+            deadline: REFUSED in r6 if non-empty. The clocks arrive in r8;
+                storing a deadline nothing sweeps records a promise nothing
+                keeps.
+            lease: REFUSED in r6 if non-empty, for the same reason.
+        """
+        grade, attr_err = _attribution(ctx, from_agent)
+        if attr_err:
+            return attr_err
+        touch_session(from_agent, ctx)
+        return tasks.create(
+            _get_db(db_path), _task_hooks, requester=from_agent, grade=grade,
+            to=to, title=title, body=body, deadline=deadline, lease=lease,
+        )
+
+    @mcp.tool()
+    def claim_task(
+        from_agent: str, ref: str, version: int,
+        ctx: Context | None = None,
+    ) -> str:
+        """Take ownership of an open task. Compare-and-set: one claim wins.
+
+        Ownership moves only by this explicit act — there is no auto-assign,
+        and nobody claims on another agent's behalf. A task addressed to a
+        squad may be claimed by any CURRENT member, muted or not: mute decides
+        what wakes you, never what you belong to.
+
+        Args:
+            from_agent: Your agent name.
+            ref: The task's ref, hub.task/1?id=N.
+            version: The version you read off the task. A claim against a
+                stale version is refused rather than applied to a task that
+                has already moved — and the refusal is recorded, as every
+                attempt is.
+        """
+        grade, attr_err = _attribution(ctx, from_agent)
+        if attr_err:
+            return attr_err
+        touch_session(from_agent, ctx)
+        conn = _get_db(db_path)
+        # THE LOCK RULE (F18), found by the trial's first claim race: squad
+        # membership is read HERE, before tasks.claim opens BEGIN IMMEDIATE,
+        # because _squads_of purges expired loans and COMMITS. A commit inside
+        # the claim's transaction drops its write lock, and two claimers then
+        # take the same event number. include_muted=True is the membership
+        # view, not the delivery one: this asks who BELONGS.
+        member_squads = _squads_of(conn, from_agent, include_muted=True)
+        return tasks.claim(
+            conn, _task_hooks, actor=from_agent, grade=grade, ref=ref,
+            version=version, member_squads=member_squads,
+        )
+
+    @mcp.tool()
+    def task_done(
+        from_agent: str, ref: str, result: str = "",
+        ctx: Context | None = None,
+    ) -> str:
+        """Record that you, the owner, consider the task finished.
+
+        This is the owner's CLAIM, stored under the owner's attribution grade
+        — not the hub's verdict, and not something the hub will ever infer
+        from what anyone says in a message. Only the owner may make it, and
+        only on a claimed task. In r6 the lifecycle ends here; the requester's
+        accept is a separate transition, in r7.
+
+        Args:
+            from_agent: Your agent name — must be the task's owner.
+            ref: The task's ref, hub.task/1?id=N.
+            result: What you did, in your own words. Stored as the done
+                event's reason, and scanned for credentials like any other
+                task text.
+        """
+        grade, attr_err = _attribution(ctx, from_agent)
+        if attr_err:
+            return attr_err
+        touch_session(from_agent, ctx)
+        return tasks.done(
+            _get_db(db_path), _task_hooks, actor=from_agent, grade=grade,
+            ref=ref, result=result,
+        )
+
+    @mcp.tool()
+    def get_task(ref: str, format: str = "text") -> str:
+        """One task: its state, its text, and its full append-only log.
+
+        Anyone may read any task without asking anyone — the record is the
+        truth, and a notice is only a pointer at it.
+
+        Args:
+            ref: The task's ref, hub.task/1?id=N.
+            format: "text" renders it, with the task's own text indented
+                under a "task text (data)" header so no line of it can read
+                as a message header. "json" returns an explicit ALLOW-LIST of
+                named fields — never the stored row, so a column added later
+                is not interface until it is named.
+        """
+        return tasks.get(_get_db(db_path), _task_hooks, ref, format)
+
+    @mcp.tool()
+    def list_tasks(
+        owner: str = "", requester: str = "", squad: str = "", state: str = "",
+    ) -> str:
+        """The tasks matching every filter you give, with their refs.
+
+        Args:
+            owner: Tasks this agent currently owns.
+            requester: Tasks this agent asked for.
+            squad: Tasks addressed to this squad (name, or its ref).
+            state: One of "open", "claimed", "done".
+        """
+        return tasks.list_tasks(
+            _get_db(db_path), _task_hooks, owner=owner, requester=requester,
+            squad=squad, state=state,
+        )
 
     # -- Identity assertions (identity.py) --
 

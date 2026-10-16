@@ -195,6 +195,11 @@ def parse_ref(text: str) -> Ref:
 # ---------------------------------------------------------------------------
 
 register_scheme(Scheme("hub.msg", 1, required=frozenset({"id"})))
+# A task is NOT a kind of message, so it is not a `hub.msg` with a flag — it
+# is its own scheme with its own store (tasks.py). `id` is required for the
+# same reason it is on hub.msg: a ref without the half that identifies WHICH
+# task is a missing identity, not a wildcard over all of them.
+register_scheme(Scheme("hub.task", 1, required=frozenset({"id"})))
 register_scheme(Scheme("hub.decision", 1, required=frozenset({"card"})))
 register_scheme(Scheme("hub.agent", 1, required=frozenset({"name"})))
 register_scheme(Scheme("hub.channel", 1, required=frozenset({"name"})))
