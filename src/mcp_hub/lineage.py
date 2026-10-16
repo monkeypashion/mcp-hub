@@ -41,8 +41,6 @@ from mcp_hub.refs import Ref, RefError, canonical, parse_ref
 
 __all__ = [
     "PREDICATES",
-    "check_clear_blocked",
-    "check_declare_blocked",
     "clear_blocked",
     "coverage",
     "declare_blocked",
@@ -62,10 +60,6 @@ PREDICATES: dict[str, str] = {
     "supersedes": "subject card replaced object card (auto)",
     "blocked-by": "subject work cannot start until object clears (declared, "
                   "lifecycle: live until explicitly cleared)",
-    # v2-fleet r7: a task's owner at a moment. Separate from addressed-to
-    # because they answer different questions — who it was PUT to, and who
-    # actually TOOK it — and a reassigned task has a history of both.
-    "assigned-to": "subject task was taken by object agent (auto)",
 }
 
 # Walks are COLD-tier queries (operator/agent asks), never hot-path — but an
@@ -156,48 +150,6 @@ def write_edge(
     return cur.rowcount > 0
 
 
-def check_declare_blocked(
-    conn: sqlite3.Connection,
-    subject: Ref | str,
-    obj: Ref | str,
-    declared_by: str,
-) -> tuple[str, str]:
-    """Every refusal `declare_blocked` can raise, and NO write. Returns the
-    canonical (subject, object) so the writer does not re-parse them.
-
-    Split out in v2-fleet r7 for the task note: a declaration's checks have to
-    run BEFORE the note's `BEGIN IMMEDIATE` (they read the store and can
-    refuse) while the write has to run AFTER its COMMIT (`declare_blocked`
-    commits, and a commit inside a transition drops its write lock). The
-    authority below is unchanged and still enforced in the writer — this is a
-    seam, not a second rule.
-    """
-    s = canonical(subject) if isinstance(subject, Ref) else canonical(parse_ref(subject))
-    o = canonical(obj) if isinstance(obj, Ref) else canonical(parse_ref(obj))
-    if s == o:
-        raise RefError(f"self-edge refused: {s} -blocked-by-> itself")
-    if not declared_by:
-        raise RefError("blocked-by needs a declarer — anonymous intent is "
-                       "not a record")
-    author = conn.execute(
-        "SELECT object FROM lineage_edges WHERE subject = ? AND "
-        "predicate = 'authored-by' LIMIT 1", (s,),
-    ).fetchone()
-    if author is not None:
-        # Exact canonical comparison, not a substring — an endswith here
-        # would let 'bob' pass for 'alice-bob', and the first draft of this
-        # check guessed the wrong param name entirely (agent= for name=),
-        # which is why it compares refs, never strings.
-        declarer_ref = canonical(parse_ref(f"hub.agent/1?name={declared_by}"))
-        if author["object"] != declarer_ref:
-            raise RefError(
-                f"blocked-by refused: {s} has a recorded author "
-                f"({author['object']}) and it is not '{declared_by}' — only "
-                f"the lane that owns the blocked work may declare it blocked"
-            )
-    return s, o
-
-
 def declare_blocked(
     conn: sqlite3.Connection,
     subject: Ref | str,
@@ -223,7 +175,29 @@ def declare_blocked(
     rendering, and keeping the original ts would date a new blockage by a
     dead one.
     """
-    s, o = check_declare_blocked(conn, subject, obj, declared_by)
+    s = canonical(subject) if isinstance(subject, Ref) else canonical(parse_ref(subject))
+    o = canonical(obj) if isinstance(obj, Ref) else canonical(parse_ref(obj))
+    if s == o:
+        raise RefError(f"self-edge refused: {s} -blocked-by-> itself")
+    if not declared_by:
+        raise RefError("blocked-by needs a declarer — anonymous intent is "
+                       "not a record")
+    author = conn.execute(
+        "SELECT object FROM lineage_edges WHERE subject = ? AND "
+        "predicate = 'authored-by' LIMIT 1", (s,),
+    ).fetchone()
+    if author is not None:
+        # Exact canonical comparison, not a substring — an endswith here
+        # would let 'bob' pass for 'alice-bob', and the first draft of this
+        # check guessed the wrong param name entirely (agent= for name=),
+        # which is why it compares refs, never strings.
+        declarer_ref = canonical(parse_ref(f"hub.agent/1?name={declared_by}"))
+        if author["object"] != declarer_ref:
+            raise RefError(
+                f"blocked-by refused: {s} has a recorded author "
+                f"({author['object']}) and it is not '{declared_by}' — only "
+                f"the lane that owns the blocked work may declare it blocked"
+            )
     row = conn.execute(
         "SELECT ts, cleared_at FROM lineage_edges WHERE subject = ? AND "
         "predicate = 'blocked-by' AND object = ?", (s, o),
@@ -248,15 +222,23 @@ def declare_blocked(
     return True
 
 
-def check_clear_blocked(
+def clear_blocked(
     conn: sqlite3.Connection,
     subject: Ref | str,
     obj: Ref | str,
     cleared_by: str,
     is_operator: bool = False,
-) -> tuple[str, str]:
-    """Every refusal `clear_blocked` can raise, and NO write (r7's seam, for
-    the same reason as `check_declare_blocked`)."""
+) -> None:
+    """Clear a live blocked-by edge — the first-class half of the lifecycle.
+
+    The edge is KEPT, marked cleared — never deleted (a vanished edge is
+    indistinguishable from one never declared). Only the declarer or the
+    operator clears: the authority that asserted the future fact is the one
+    entitled to retract it. Clearing a non-existent or already-cleared edge
+    REFUSES loudly — a clear against nothing is a typo wearing a path's
+    clothes, and swallowing it would hide exactly the misfire the loud
+    in_reply_to refusal exists to surface.
+    """
     s = canonical(subject) if isinstance(subject, Ref) else canonical(parse_ref(subject))
     o = canonical(obj) if isinstance(obj, Ref) else canonical(parse_ref(obj))
     row = conn.execute(
@@ -278,27 +260,6 @@ def check_clear_blocked(
             f"clear refused: declared by '{row['declared_by']}', and only "
             f"the declaring authority (or the operator) may clear it"
         )
-    return s, o
-
-
-def clear_blocked(
-    conn: sqlite3.Connection,
-    subject: Ref | str,
-    obj: Ref | str,
-    cleared_by: str,
-    is_operator: bool = False,
-) -> None:
-    """Clear a live blocked-by edge — the first-class half of the lifecycle.
-
-    The edge is KEPT, marked cleared — never deleted (a vanished edge is
-    indistinguishable from one never declared). Only the declarer or the
-    operator clears: the authority that asserted the future fact is the one
-    entitled to retract it. Clearing a non-existent or already-cleared edge
-    REFUSES loudly — a clear against nothing is a typo wearing a path's
-    clothes, and swallowing it would hide exactly the misfire the loud
-    in_reply_to refusal exists to surface.
-    """
-    s, o = check_clear_blocked(conn, subject, obj, cleared_by, is_operator)
     conn.execute(
         "UPDATE lineage_edges SET cleared_at = ?, cleared_by = ? WHERE "
         "subject = ? AND predicate = 'blocked-by' AND object = ?",
