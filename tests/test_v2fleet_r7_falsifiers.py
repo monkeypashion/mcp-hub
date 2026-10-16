@@ -24,7 +24,8 @@ The interface these tests drive (r6's, plus):
   it too. Override (cancel, reassign on anyone's task) needs the grade, never the name. Agent keys
   (MCP_HUB_AGENT_KEYS) read per act: in `enforce` owner acts (claim, done, failed, release, note) on an operator
   task need a verified grade (identity.VERIFIED_GRADES, the one verified set; no local copy); in `observe` they pass
-  and the event's reason carries "would-refuse". Agent-to-agent tasks keep r6's grades (asserted allowed, recorded).
+  and the event's hub-authored `key_note` carries "would-refuse" (mcp-hub 36836: never the reason, so a done's
+  result stays exactly what the owner passed; key_note is named in the events json allow-list). Agent-to-agent tasks keep r6's grades (asserted allowed, recorded).
   Lineage, written after COMMIT through lineage.write_edge (module attribute): task authored-by requester,
   addressed-to each target (history kept), assigned-to each owner (the new predicate). Each later act re-asserts
   authored-by and addressed-to, so a swallowed edge failure heals.
@@ -617,18 +618,22 @@ async def test_r7_new7_key_observe_records_would_refuse(server, monkeypatch):
     ref = await _create(server, frm=OP, to="bob", ctx=_op_ctx())
     _ok(await _act(server, "claim", "bob", ref))
     _ok(await _act(server, "note", "bob", ref, text="on it"))
-    _ok(await _act(server, "done", "bob", ref))
+    _ok(await _act(server, "done", "bob", ref, result="shipped"))
     ev = _events(server, ref)
     for e in ev[1:]:
-        assert e["grade"] == "asserted" and "would-refuse" in e["reason"], (
-            f"observe did not record what enforce would stop: {e}")
+        assert e["grade"] == "asserted" and "would-refuse" in (e["key_note"] or ""), (
+            f"observe did not record what enforce would stop in key_note: {e}")
+        assert "would-refuse" not in e["reason"], f"the observe verdict leaked into the reason: {e}"
     assert _row(server, ref)["state"] == "done"
+    view = await _view(server, ref)
+    assert view["result"] == "shipped", f"result is not exactly the owner's text: {view['result']!r}"
+    assert all("would-refuse" in (x["key_note"] or "") for x in view["events"][1:]), view["events"]
     # A verified owner, and any agent-to-agent task, leave no would-refuse.
     ref2 = await _create(server, frm=OP, to="bob", ctx=_op_ctx())
     _ok(await _act(server, "claim", "bob", ref2, _bound(server, "bob")))
     agent = await _in_state(server, "done")
     for e in _events(server, ref2)[1:] + _events(server, agent):
-        assert "would-refuse" not in e["reason"], e
+        assert "would-refuse" not in e["reason"] and "would-refuse" not in (e["key_note"] or ""), e
 
 
 async def test_r7_new7_agent_tasks_keep_r6_grades(server, monkeypatch):

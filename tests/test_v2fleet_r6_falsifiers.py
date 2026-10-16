@@ -68,7 +68,9 @@ TASK_JSON_FIELDS = {"ref", "state", "version", "title", "body", "result", "reque
                     "addressed_to", "owner", "owner_grade", "created_ts", "updated_ts", "events",
                     # v2-fleet r7 (declared base change): the two derived blocker keys, named here.
                     "blocked", "blockers"}
-EVENT_JSON_FIELDS = {"seq", "ts", "act", "from_state", "to_state", "actor", "grade", "reason", "notice"}
+EVENT_JSON_FIELDS = {"seq", "ts", "act", "from_state", "to_state", "actor", "grade", "reason", "notice",
+                     # v2-fleet r7 (declared base change, mcp-hub 36836): the hub-authored agent-keys verdict.
+                     "key_note"}
 
 
 # -- harness -------------------------------------------------------------------
