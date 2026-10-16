@@ -594,3 +594,278 @@ async def test_a_task_reaches_no_feed_and_no_channel(server):
     assert _count(server, "SELECT COUNT(*) FROM messages WHERE body LIKE ?",
                   (f"%{marker}%",)) == 0
     assert marker in await _call(server, "get_task", {"ref": ref})
+
+
+# -- r7: the acts around the headline behaviour -------------------------------
+#
+# The frozen falsifiers (tests/test_v2fleet_r7_falsifiers.py) pin the six new
+# acts, the authority model, the graph and the HTTP read. These are the edges
+# around them — the places a plausible implementation would be wrong in a way
+# no headline test would notice.
+
+
+async def _note(server, who: str, ref: str, ctx=None, **kw) -> str:
+    return await _call(server, "task_note",
+                       {"from_agent": who, "ref": ref, **kw}, ctx=ctx)
+
+
+def _verified(server, name: str):
+    """A ctx whose session is bound to `name`, so its acts grade
+    session-verified — what a blocker declaration needs."""
+    sess = _FakeSess()
+    server._hub_registry.bind(name, sess)
+    return _FakeCtx(sess)
+
+
+async def test_updated_ts_is_the_last_moving_act_not_the_last_event(server):
+    """r7's declared change. r6 took the last event, refusals included, so a
+    refused claim aged the task — an instrument that reads a non-event as a
+    change. A note is the same shape: it records something and moves nothing.
+    """
+    ref = await _create(server)
+    await _claim(server, "bob", ref)
+    moved = (await _json(server, ref))["updated_ts"]
+    await _note(server, "alice", ref, text="still going")
+    await _claim(server, "carol", ref)          # refused, recorded
+    view = await _json(server, ref)
+    assert [e["act"] for e in view["events"]][-2:] == ["note", "claim-refused"]
+    assert view["updated_ts"] == moved, (
+        "a note or a refusal moved updated_ts; only a MOVING act may")
+    await _call(server, "task_done", {"from_agent": "bob", "ref": ref})
+    assert (await _json(server, ref))["updated_ts"] > moved
+
+
+async def test_release_keeps_the_addressee_and_clears_the_owner(server):
+    """Release gives the work back to WHOEVER IT WAS ADDRESSED TO, which is
+    the whole difference from reassign: the desk does not move, only the
+    hand. A squad task released by one member is claimable by another."""
+    ref = await _create(server, to=SQUAD_REF)
+    await _claim(server, "bob", ref)
+    out = await _call(server, "release_task", {
+        "from_agent": "bob", "ref": ref, "reason": "out of my depth",
+    })
+    assert not out.startswith("REFUSED"), out
+    row = _row(server, ref)
+    assert row["state"] == "open" and row["owner"] is None
+    assert row["addressed_to"] == SQUAD_REF, "release moved the task's desk"
+    out = await _claim(server, "carol", ref)
+    assert not out.startswith("REFUSED"), out
+    assert _row(server, ref)["owner"] == "carol"
+
+
+async def test_reassign_to_a_name_nobody_answers_changes_nothing(server):
+    """The same rule create keeps: a task addressed to a name nobody answers
+    is a promise nothing keeps — and the refusal happens before the row is
+    touched, so a typo cannot park somebody's work nowhere."""
+    ref = await _create(server, to="bob")
+    before = _row(server, ref)
+    out = await _call(server, "reassign_task", {
+        "from_agent": "alice", "ref": ref, "to": "nobody", "reason": "move it",
+    })
+    assert out.startswith("REFUSED") and "nobody" in out
+    assert _row(server, ref)["addressed_to"] == before["addressed_to"]
+    assert _row(server, ref)["version"] == before["version"]
+
+
+async def test_blocked_by_is_refused_on_anything_that_is_not_a_note(server):
+    """A blocker is a declaration about the work, not a side effect of
+    finishing it, so it rides the one act that exists to record things. No
+    other tool takes the argument; the store refuses it anyway, because a
+    guard that lives only in a signature is one tool away from being gone.
+    """
+    ref = await _create(server)
+    other = await _create(server, to="carol")
+    conn = _db(server)
+    try:
+        hooks = tasks.Hooks(
+            render_body=str, grade_tag=lambda g: "", msg_ref=lambda i: "",
+            record_msg_lineage=lambda *a, **k: None,
+        )
+        out = tasks.done(
+            conn, hooks, actor="bob", grade="asserted", ref=ref,
+        )
+        assert out.startswith("REFUSED") and "not claimed" in out
+        out = tasks._transition(
+            conn, hooks, act="done", actor="bob", grade="asserted", ref=ref,
+            blocked_by=f"{ref}|{other}",
+        )
+    finally:
+        conn.close()
+    assert out.startswith("REFUSED") and "blocked_by rides a note" in out
+    assert len(_events(server, ref)) == 2, (
+        "the blocked_by guard fired before the act, so only the state "
+        "refusal is on the log")
+
+
+async def test_a_malformed_blocker_refuses_the_whole_note_and_is_recorded(server):
+    """A failed check refuses the NOTE, not just the blocker: half a note,
+    with the declaration silently dropped, is the path view lying by
+    omission. And every refusal is one recorded event, as every act is."""
+    ctx = _verified(server, "alice")
+    t1 = await _create(server)
+    t2 = await _create(server, to="carol")
+    before = len(_events(server, t1))
+    for bad, why in (
+        ("no-pipe-here", "format is"),
+        (f"{t2}|{t1}", "is not"),                # subject is another task
+        (f"hub.agent/1?name=bob|{t2}", "is not"),
+    ):
+        out = await _note(server, "alice", t1, ctx=ctx, text="n", blocked_by=bad)
+        assert out.startswith("REFUSED") and why in out, out
+    evs = _events(server, t1)
+    assert len(evs) == before + 3
+    assert [e["act"] for e in evs[before:]] == ["note-refused"] * 3
+    assert all(e["reason"] and e["from_state"] == e["to_state"] == "open"
+               for e in evs[before:])
+    view = await _json(server, t1)
+    assert view["blocked"] is False and view["blockers"] == []
+
+
+async def test_a_cleared_blocker_stops_blocking_and_stays_on_the_record(server):
+    """`clear:` is the declarer retracting their own declaration. The EDGE
+    survives, marked cleared — a vanished edge is indistinguishable from one
+    never declared — so the blocker is still listed, and no longer blocks."""
+    ctx = _verified(server, "alice")
+    t1 = await _create(server)
+    t2 = await _create(server, to="carol")
+    out = await _note(server, "alice", t1, ctx=ctx, text="waits",
+                      blocked_by=f"{t1}|{t2}")
+    assert not out.startswith("REFUSED"), out
+    assert (await _json(server, t1))["blocked"] is True
+    out = await _note(server, "alice", t1, ctx=ctx, text="not any more",
+                      blocked_by=f"clear:{t1}|{t2}")
+    assert not out.startswith("REFUSED"), out
+    view = await _json(server, t1)
+    assert view["blocked"] is False
+    assert view["blockers"] == [{"ref": t2, "state": "open", "cleared": True}]
+
+
+async def test_a_non_task_blocker_has_no_state_and_blocks(server):
+    """The hub has no lifecycle for an external work item or a message, so
+    its state is NULL — never "", which would read as a state — and it keeps
+    blocking until somebody says otherwise. Absence is not completion."""
+    ctx = _verified(server, "alice")
+    t1 = await _create(server, to="bob")
+    (notice,) = _notices(server, t1)
+    obj = f"hub.msg/1?id={notice['id']}"
+    out = await _note(server, "alice", t1, ctx=ctx, text="waits on a reply",
+                      blocked_by=f"{t1}|{obj}")
+    assert not out.startswith("REFUSED"), out
+    view = await _json(server, t1)
+    assert view["blockers"] == [{"ref": obj, "state": None, "cleared": False}]
+    assert view["blocked"] is True
+
+
+async def test_the_render_names_who_ended_it_and_what_it_waits_on(server):
+    """Every state reads as somebody's graded act, never as a fact the hub
+    established by itself — the r6 rule, carried to the three terminal
+    states — and `blocked` is visible in the text read, not only the json."""
+    ctx = _verified(server, "alice")
+    t1 = await _create(server)
+    t2 = await _create(server, to="carol")
+    await _note(server, "alice", t1, ctx=ctx, text="waits", blocked_by=f"{t1}|{t2}")
+    text = await _call(server, "get_task", {"ref": t1})
+    assert "blocked: yes" in text and t2 in text, text
+    await _claim(server, "bob", t1)
+    await _call(server, "task_failed", {
+        "from_agent": "bob", "ref": t1, "reason": "the API is gone",
+    })
+    assert "failed, reported by bob ·asserted" in await _call(
+        server, "get_task", {"ref": t1})
+    t3 = await _create(server, to="bob")
+    await _call(server, "cancel_task", {
+        "from_agent": "alice", "ref": t3, "reason": "not needed",
+    })
+    assert "cancelled by alice ·asserted" in await _call(
+        server, "get_task", {"ref": t3})
+
+
+async def test_an_agent_tasks_events_carry_no_key_note(server):
+    """key_note is the HUB's verdict about the grade an act was taken under,
+    and it is written only where there is one to record. An empty string
+    would read as "the hub looked and said nothing"; NULL says it never
+    applied — absent-vs-empty, as everywhere else in this store."""
+    ref = await _create(server)
+    await _claim(server, "bob", ref)
+    await _call(server, "task_done", {"from_agent": "bob", "ref": ref,
+                                      "result": "ok"})
+    assert [e["key_note"] for e in _events(server, ref)] == [None, None, None]
+    view = await _json(server, ref)
+    assert all(e["key_note"] is None for e in view["events"])
+    assert view["result"] == "ok", "the result is not exactly the owner's text"
+
+
+async def test_a_notice_for_the_new_acts_carries_the_ref_and_no_task_text(server):
+    """Same rule as r6's create/claim/done notices: the record is the truth
+    and the notice only points at it. A reason riding a pointer into
+    somebody's drain is a forged title in a new costume."""
+    marker = "REASON-MARKER-4412"
+    ref = await _create(server, to="bob")
+    await _claim(server, "bob", ref)
+    await _call(server, "release_task", {
+        "from_agent": "bob", "ref": ref, "reason": f"because {marker}",
+    })
+    await _call(server, "reassign_task", {
+        "from_agent": "alice", "ref": ref, "to": "carol",
+        "reason": f"carol knows {marker}",
+    })
+    ns = _notices(server, ref)
+    # create → bob, claim → alice, release → alice, reassign → carol (the
+    # open task had no owner left to tell).
+    assert [n["to_agent"] for n in ns] == ["bob", "alice", "alice", "carol"]
+    for n in ns:
+        assert ref in n["body"] and marker not in n["body"]
+        assert n["priority"] == "normal" and n["attribution"] == "hub-authored"
+    assert marker in await _call(server, "get_task", {"ref": ref})
+
+
+def test_the_http_reads_refuse_a_filter_the_tool_refuses(server, monkeypatch):
+    """One filter, two surfaces: a state the tool refuses is a 422 here, not
+    a 200 with a quietly empty list — an unapplied filter that returns
+    "nothing matched" is the worst answer of the three."""
+    from starlette.testclient import TestClient
+
+    token = "tasks-api-" + "t" * 12
+    monkeypatch.setenv("MCP_HUB_API_TOKEN", token)
+    headers = {"Authorization": f"Bearer {token}"}
+    with TestClient(server.streamable_http_app()) as client:
+        r = client.get("/api/v1/tasks", params={"state": "reopened"},
+                       headers=headers)
+        assert r.status_code == 422, r.text
+        assert "reopened" in r.json()["detail"]
+        r = client.get("/api/v1/tasks",
+                       params={"squad": "hub.agent/1?name=bob"},
+                       headers=headers)
+        assert r.status_code == 422, r.text
+        assert client.get("/api/v1/tasks/not-a-number",
+                          headers=headers).status_code == 404
+
+
+def test_the_http_summary_agrees_with_the_task_it_summarises(server, monkeypatch):
+    """The cockpit's row and the task's own json come from one place, so
+    they cannot drift into two answers about one task."""
+    import asyncio
+
+    from starlette.testclient import TestClient
+
+    async def setup() -> str:
+        ctx = _verified(server, "alice")
+        ref = await _create(server, to="bob", title="the one")
+        other = await _create(server, to="carol")
+        await _note(server, "alice", ref, ctx=ctx, text="waits",
+                    blocked_by=f"{ref}|{other}")
+        await _claim(server, "bob", ref)
+        return ref
+
+    ref = asyncio.run(setup())
+    full = asyncio.run(_json(server, ref))
+    token = "tasks-api-" + "s" * 12
+    monkeypatch.setenv("MCP_HUB_API_TOKEN", token)
+    with TestClient(server.streamable_http_app()) as client:
+        rows = client.get("/api/v1/tasks", params={"owner": "bob"},
+                          headers={"Authorization": f"Bearer {token}"}).json()
+    (row,) = rows["tasks"]
+    assert set(row) == set(tasks.SUMMARY_FIELDS)
+    for field in tasks.SUMMARY_FIELDS:
+        assert row[field] == full[field], f"{field} disagrees with get_task"
+    assert row["blocked"] is True and row["state"] == "claimed"

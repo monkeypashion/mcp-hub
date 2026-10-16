@@ -1201,17 +1201,36 @@ def _validate_reply_ref(conn: sqlite3.Connection, in_reply_to: str) -> tuple[str
     return refs.canonical(ref), ""
 
 
-def _apply_blocked_by(
-    conn: sqlite3.Connection, from_agent: str, blocked_by: str, grade: str,
-) -> str:
-    """Parse and apply a blocked-by declaration riding a verb — the
-    forward-looking half of declared lineage (docs/lineage-blocked-by.md).
+def _blocked_by_parts(blocked_by: str) -> tuple[bool, str, str, str]:
+    """(clearing, subject, object, refusal) for a blocked_by declaration.
 
     Format: `"<subject-ref>|<object-ref>"` declares;
-    `"clear:<subject-ref>|<object-ref>"` clears. Returns "" on success or a
-    refusal string — and like in_reply_to, refusal happens BEFORE the
-    carrying message is stored, loudly: a silently dropped declaration
-    would leave the path view lying by omission.
+    `"clear:<subject-ref>|<object-ref>"` clears.
+    """
+    body = blocked_by
+    clearing = body.startswith("clear:")
+    if clearing:
+        body = body[len("clear:"):]
+    if "|" not in body:
+        return clearing, "", "", (
+            "blocked_by refused: format is '<subject-ref>|<object-ref>' "
+            "(or 'clear:<subject-ref>|<object-ref>') — the subject is the "
+            "work that is blocked, the object what it waits on"
+        )
+    subject, obj = (part.strip() for part in body.split("|", 1))
+    return clearing, subject, obj, ""
+
+
+def _check_blocked_by(
+    conn: sqlite3.Connection, from_agent: str, blocked_by: str, grade: str,
+) -> str:
+    """Every refusal a blocked-by declaration can earn, and NO write.
+
+    Split from the write (v2-fleet r7) exactly as `lineage.check_declare_
+    blocked` is split from `declare_blocked`, and for one reason: a task's
+    note has to run every check BEFORE `BEGIN IMMEDIATE` and the write only
+    AFTER the COMMIT, because `declare_blocked` commits. The messages are
+    unchanged — this is a seam, not a redesign.
 
     Authority and lifecycle live in lineage.declare_blocked/clear_blocked,
     and both compare NAMES — so the name must be one the hub verified.
@@ -1229,17 +1248,33 @@ def _apply_blocked_by(
             "so it needs a session bound to that name (register() from your "
             "own session) or the operator token. The message was not stored."
         )
-    body = blocked_by
-    clearing = body.startswith("clear:")
-    if clearing:
-        body = body[len("clear:"):]
-    if "|" not in body:
-        return (
-            "blocked_by refused: format is '<subject-ref>|<object-ref>' "
-            "(or 'clear:<subject-ref>|<object-ref>') — the subject is the "
-            "work that is blocked, the object what it waits on"
-        )
-    subject, obj = (part.strip() for part in body.split("|", 1))
+    clearing, subject, obj, refusal = _blocked_by_parts(blocked_by)
+    if refusal:
+        return refusal
+    try:
+        if clearing:
+            lineage.check_clear_blocked(
+                conn, subject, obj, from_agent,
+                is_operator=grade == "operator-verified",
+            )
+        else:
+            lineage.check_declare_blocked(conn, subject, obj, from_agent)
+    except refs.RefError as e:
+        return f"blocked_by refused: {e}"
+    return ""
+
+
+def _write_blocked_by(
+    conn: sqlite3.Connection, from_agent: str, blocked_by: str, grade: str,
+) -> str:
+    """The write half: the edge, and the refusals the write itself can still
+    raise (the checks ran already, but they are re-run inside the writer —
+    one authority, checked once more where it is enforced)."""
+    if not blocked_by:
+        return ""
+    clearing, subject, obj, refusal = _blocked_by_parts(blocked_by)
+    if refusal:
+        return refusal
     try:
         if clearing:
             lineage.clear_blocked(
@@ -1251,6 +1286,22 @@ def _apply_blocked_by(
     except refs.RefError as e:
         return f"blocked_by refused: {e}"
     return ""
+
+
+def _apply_blocked_by(
+    conn: sqlite3.Connection, from_agent: str, blocked_by: str, grade: str,
+) -> str:
+    """Parse and apply a blocked-by declaration riding a verb — the
+    forward-looking half of declared lineage (docs/lineage-blocked-by.md).
+
+    Returns "" on success or a refusal string — and like in_reply_to, refusal
+    happens BEFORE the carrying message is stored, loudly: a silently dropped
+    declaration would leave the path view lying by omission.
+    """
+    refusal = _check_blocked_by(conn, from_agent, blocked_by, grade)
+    if refusal:
+        return refusal
+    return _write_blocked_by(conn, from_agent, blocked_by, grade)
 
 
 def _record_msg_lineage(
@@ -5503,7 +5554,18 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         grade_tag=_grade_tag_str,
         msg_ref=_msg_ref,
         record_msg_lineage=_record_msg_lineage,
+        check_blocked_by=_check_blocked_by,
+        write_blocked_by=_write_blocked_by,
     )
+
+    def _task_authority() -> dict:
+        """What the store needs from this file to judge authority, read ONCE
+        per act and BEFORE any transaction (THE LOCK RULE): who counts as an
+        operator name, and what the agent-key mode is right now."""
+        return {
+            "operator_senders": _OPERATOR_SENDERS,
+            "key_mode": _agent_key_mode(),
+        }
 
     @mcp.tool()
     def create_task(
@@ -5544,6 +5606,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         return tasks.create(
             _get_db(db_path), _task_hooks, requester=from_agent, grade=grade,
             to=to, title=title, body=body, deadline=deadline, lease=lease,
+            **_task_authority(),
         )
 
     @mcp.tool()
@@ -5581,6 +5644,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         return tasks.claim(
             conn, _task_hooks, actor=from_agent, grade=grade, ref=ref,
             version=version, member_squads=member_squads,
+            **_task_authority(),
         )
 
     @mcp.tool()
@@ -5609,7 +5673,178 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         touch_session(from_agent, ctx)
         return tasks.done(
             _get_db(db_path), _task_hooks, actor=from_agent, grade=grade,
-            ref=ref, result=result,
+            ref=ref, result=result, **_task_authority(),
+        )
+
+    @mcp.tool()
+    def release_task(
+        from_agent: str, ref: str, reason: str = "",
+        ctx: Context | None = None,
+    ) -> str:
+        """Hand a task you own back: claimed → open, and you stop owning it.
+
+        The task stays addressed where it was, so the next claim can be
+        anyone's who may take it. The version MOVES, so a claim somebody is
+        holding against the pre-release version is refused rather than
+        applied to a task that has changed hands. Giving work back is a
+        first-class act, recorded under your name: a task silently abandoned
+        is the thing this exists to prevent.
+
+        Args:
+            from_agent: Your agent name — must be the task's current owner.
+            ref: The task's ref, hub.task/1?id=N.
+            reason: Why, in your own words. Stored as the event's reason,
+                scanned for credentials and rendered as data like every
+                other task text.
+        """
+        grade, attr_err = _attribution(ctx, from_agent)
+        if attr_err:
+            return attr_err
+        touch_session(from_agent, ctx)
+        return tasks.release(
+            _get_db(db_path), _task_hooks, actor=from_agent, grade=grade,
+            ref=ref, reason=reason, **_task_authority(),
+        )
+
+    @mcp.tool()
+    def task_failed(
+        from_agent: str, ref: str, reason: str = "",
+        ctx: Context | None = None,
+    ) -> str:
+        """Record that the work cannot be done: claimed → failed, terminal.
+
+        This is the owner's REPORT under the owner's grade, the same kind of
+        claim `task_done` records and not the hub's verdict. It is terminal:
+        a fresh attempt is a fresh task, so what went wrong stays readable
+        instead of being overwritten by the retry.
+
+        Args:
+            from_agent: Your agent name — must be the task's current owner.
+            ref: The task's ref, hub.task/1?id=N.
+            reason: What stopped you. Stored as the event's reason.
+        """
+        grade, attr_err = _attribution(ctx, from_agent)
+        if attr_err:
+            return attr_err
+        touch_session(from_agent, ctx)
+        return tasks.task_failed(
+            _get_db(db_path), _task_hooks, actor=from_agent, grade=grade,
+            ref=ref, reason=reason, **_task_authority(),
+        )
+
+    @mcp.tool()
+    def accept_task(
+        from_agent: str, ref: str, ctx: Context | None = None,
+    ) -> str:
+        """Agree, as the requester, that a done task is finished: done →
+        accepted.
+
+        `done` is the OWNER's claim; this is yours, and the log keeps both
+        with the grade each was made under. There is NO operator override:
+        nobody signs off somebody else's work for them, because a sign-off
+        anyone can make says nothing. Nothing auto-accepts either —
+        list_tasks(requester="<you>", state="done") is your to-accept list.
+
+        Args:
+            from_agent: Your agent name — must be the task's requester.
+            ref: The task's ref, hub.task/1?id=N.
+        """
+        grade, attr_err = _attribution(ctx, from_agent)
+        if attr_err:
+            return attr_err
+        touch_session(from_agent, ctx)
+        return tasks.accept(
+            _get_db(db_path), _task_hooks, actor=from_agent, grade=grade,
+            ref=ref, **_task_authority(),
+        )
+
+    @mcp.tool()
+    def cancel_task(
+        from_agent: str, ref: str, reason: str = "",
+        ctx: Context | None = None,
+    ) -> str:
+        """Stop a task: open or claimed → cancelled, terminal.
+
+        The requester's act, or the operator's at grade operator-verified —
+        the operator NAME is not authority, because anyone can type it. The
+        agent actually holding the work is told (the owner if it was claimed,
+        the addressee if it was only offered); a squad has no inbox, so a
+        squad-addressed open task tells nobody.
+
+        Args:
+            from_agent: Your agent name — the requester, or the operator.
+            ref: The task's ref, hub.task/1?id=N.
+            reason: Why it is being stopped. Stored as the event's reason.
+        """
+        grade, attr_err = _attribution(ctx, from_agent)
+        if attr_err:
+            return attr_err
+        touch_session(from_agent, ctx)
+        return tasks.cancel(
+            _get_db(db_path), _task_hooks, actor=from_agent, grade=grade,
+            ref=ref, reason=reason, **_task_authority(),
+        )
+
+    @mcp.tool()
+    def reassign_task(
+        from_agent: str, ref: str, to: str, reason: str = "",
+        ctx: Context | None = None,
+    ) -> str:
+        """Put a task on another desk: open or claimed → open, addressed to
+        `to`, owner cleared.
+
+        The requester's act, or the operator's at grade operator-verified.
+        The version MOVES, so an old owner's in-flight done or a stale claim
+        is refused rather than landing on a task that is now somebody else's.
+        Reassigning an open task to where it already points is refused: a
+        no-op transition in the log reads as a decision somebody made.
+
+        Args:
+            from_agent: Your agent name — the requester, or the operator.
+            ref: The task's ref, hub.task/1?id=N.
+            to: The new addressee: one agent name, or a squad as
+                hub.squad/1?name=<squad>.
+            reason: Why it is moving. Stored as the event's reason.
+        """
+        grade, attr_err = _attribution(ctx, from_agent)
+        if attr_err:
+            return attr_err
+        touch_session(from_agent, ctx)
+        return tasks.reassign(
+            _get_db(db_path), _task_hooks, actor=from_agent, grade=grade,
+            ref=ref, to=to, reason=reason, **_task_authority(),
+        )
+
+    @mcp.tool()
+    def task_note(
+        from_agent: str, ref: str, text: str = "", blocked_by: str = "",
+        ctx: Context | None = None,
+    ) -> str:
+        """Write something on a task's log without moving it.
+
+        A note MOVES NOTHING — not the state, not the owner, not the version,
+        not `updated_ts` — and it tells NOBODY: it is for the record, not for
+        anyone's attention. The requester or the current owner may write one,
+        on an open, claimed or done task.
+
+        Args:
+            from_agent: Your agent name — the requester or the current owner.
+            ref: The task's ref, hub.task/1?id=N.
+            text: What to record. Stored as the event's reason, scanned for
+                credentials and rendered as data.
+            blocked_by: Optionally declare what this task waits on, as
+                "<this-task-ref>|<object-ref>" (or "clear:<...>|<...>" to
+                retract it). The REQUESTER's declaration, at a verified
+                grade; a failed check refuses the whole note. `blocked` is
+                DERIVED from these edges and stored nowhere.
+        """
+        grade, attr_err = _attribution(ctx, from_agent)
+        if attr_err:
+            return attr_err
+        touch_session(from_agent, ctx)
+        return tasks.note(
+            _get_db(db_path), _task_hooks, actor=from_agent, grade=grade,
+            ref=ref, text=text, blocked_by=blocked_by, **_task_authority(),
         )
 
     @mcp.tool()
@@ -5639,7 +5874,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             owner: Tasks this agent currently owns.
             requester: Tasks this agent asked for.
             squad: Tasks addressed to this squad (name, or its ref).
-            state: One of "open", "claimed", "done".
+            state: One of "open", "claimed", "done", "accepted", "failed",
+                "cancelled".
         """
         return tasks.list_tasks(
             _get_db(db_path), _task_hooks, owner=owner, requester=requester,

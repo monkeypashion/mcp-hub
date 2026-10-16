@@ -1698,6 +1698,64 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
         from mcp_hub import lineage as _lineage
         return JSONResponse(_lineage.coverage(db()))
 
+    # -- tasks (v2-fleet r7): the cockpit's READ, and nothing else ----------
+    #
+    # This is the back end of the one door for Tim (F12) and its read of his
+    # items (F8). It is GET-ONLY on both paths, by construction: a task's
+    # state moves only by a recorded act from a named actor, and an HTTP verb
+    # carries no actor the hub can grade. A PATCH here would be a state
+    # change with nobody's name on it — exactly the thing `tasks.py` exists
+    # to make impossible. Every row comes from tasks.py, so the cockpit and
+    # the tools cannot drift into two answers about one task.
+
+    def _task_hooks() -> Any:
+        from mcp_hub import tasks as _tasks
+        from mcp_hub.server import (
+            _grade_tag_str,
+            _msg_ref,
+            _record_msg_lineage,
+            _render_body,
+        )
+        return _tasks.Hooks(
+            render_body=_render_body,
+            grade_tag=_grade_tag_str,
+            msg_ref=_msg_ref,
+            record_msg_lineage=_record_msg_lineage,
+        )
+
+    @route("/api/v1/tasks", methods=["GET"])
+    async def tasks_list(request: Request) -> Response:
+        """The task list, filtered exactly as `list_tasks` filters it."""
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        from mcp_hub import tasks as _tasks
+        q = request.query_params
+        rows, refusal = _tasks.summaries(
+            db(),
+            owner=q.get("owner", ""), requester=q.get("requester", ""),
+            squad=q.get("squad", ""), state=q.get("state", ""),
+        )
+        if refusal:
+            return _err(422, refusal)
+        return JSONResponse({"tasks": rows})
+
+    @route("/api/v1/tasks/{task_id}", methods=["GET"])
+    async def task_one(request: Request) -> Response:
+        """One task, exactly `get_task(format="json")` — the same allow-list,
+        built by the same code."""
+        got = operator_only(request)
+        if isinstance(got, JSONResponse):
+            return got
+        from mcp_hub import tasks as _tasks
+        raw = request.path_params["task_id"]
+        view = None
+        if str(raw).isdigit():
+            view = _tasks.view_json(db(), _task_hooks(), int(raw))
+        if view is None:
+            return _err(404, f"no task hub.task/1?id={raw} on this hub")
+        return JSONResponse(view)
+
     @route("/api/v1/squads", methods=["GET", "POST"])
     async def squads(request: Request) -> Response:
         got = operator_only(request)
