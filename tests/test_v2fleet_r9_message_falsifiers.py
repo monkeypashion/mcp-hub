@@ -105,7 +105,8 @@ def test_r9_message_render_body_indents_after_every_break(sep):
 async def test_r9_message_renders_forge_no_header(server, sep):
     for where, out in (await _three_renders(server, body_with(SEPARATORS[sep]))).items():
         heads = _headers(out)
-        assert len(heads) == 1 and "**bob**" in heads[0], f"{where}: {len(heads)} header lines: {heads!r}"
+        assert len(heads) == 1 and "bob" in heads[0] and "operator" not in heads[0], (
+            f"{where}: {len(heads)} header lines: {heads!r}")
 
 
 async def test_r9_message_mixed_breaks_in_one_body(server):
