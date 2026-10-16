@@ -451,7 +451,8 @@ async def test_json_on_an_open_task_is_null_where_nothing_happened(server):
 
 
 async def test_list_tasks_refuses_a_state_that_is_not_one(server):
-    out = await _call(server, "list_tasks", {"state": "accepted"})
+    # v2-fleet r7 (declared base change): accepted is a state now; "reopened" never is.
+    out = await _call(server, "list_tasks", {"state": "reopened"})
     assert out.startswith("REFUSED") and "open" in out
 
 
