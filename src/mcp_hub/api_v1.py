@@ -1749,9 +1749,17 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             return got
         from mcp_hub import tasks as _tasks
         raw = request.path_params["task_id"]
+        # One id rule, read off tasks.py, so this path and the tool refuse the
+        # same ids (mcp-hub finding 5, r8). `str.isdigit()` was not that rule:
+        # it is true for '²', where int() then raised ValueError and this
+        # returned a 500, and for Arabic-Indic '٣', where it returned 3 and
+        # this answered with task 3 under a second spelling of its id — and an
+        # id above sqlite's ceiling raised OverflowError on the read. An id no
+        # task can have is the ordinary 404, which is what it means.
+        task_id = _tasks.task_id_from_text(raw)
         view = None
-        if str(raw).isdigit():
-            view = _tasks.view_json(db(), _task_hooks(), int(raw))
+        if task_id is not None:
+            view = _tasks.view_json(db(), _task_hooks(), task_id)
         if view is None:
             return _err(404, f"no task hub.task/1?id={raw} on this hub")
         return JSONResponse(view)
