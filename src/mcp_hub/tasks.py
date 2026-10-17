@@ -175,65 +175,6 @@ _EVENT_SELECT = ", ".join(_EVENT_COLUMNS)
 # The header that says the lines under it are DATA, not hub voice.
 DATA_HEADER = "task text (data)"
 
-# Every line of task text is rendered behind this MARK: four spaces, a bar,
-# two spaces. No hub-authored line in a task render contains a bar, and none
-# starts at the column the mark ends at, so the hub's own lines stay
-# recognisable by their start (mcp-hub finding 1, r8 — see `_data_lines`).
-DATA_MARK = "    │  "
-
-# A task id is ASCII 0-9, naming an integer sqlite can hold. Both halves
-# matter (mcp-hub finding 5, r8): `str.isdigit()` is true for '²', where
-# `int()` then raises ValueError, and for Arabic-Indic '٣', where it
-# returns 3 — so a second spelling named task 3. And an id above this ceiling
-# raised OverflowError inside sqlite: a tool error, or an HTTP 500, where the
-# honest answer is "no task with that id".
-MAX_TASK_ID = 2 ** 63 - 1
-_ASCII_DIGITS = frozenset("0123456789")
-
-
-def task_id_from_text(raw: Any) -> int | None:
-    """The task id `raw` names, or None when NO task can have it.
-
-    Public because the HTTP read uses it too: one rule decides both surfaces,
-    so an id the tool refuses is a 404 there rather than a 500.
-    """
-    text = str(raw if raw is not None else "")
-    if not text or not _ASCII_DIGITS.issuperset(text):
-        return None
-    value = int(text)
-    return value if value <= MAX_TASK_ID else None
-
-
-def _add_column(
-    conn: sqlite3.Connection, statement: str, column: str
-) -> None:
-    """Run one ADD COLUMN, passing over ONLY "the column is already there".
-
-    The migration has to be idempotent — `ensure_schema` runs at every start,
-    on a store that may already carry the column — and r7 got that by
-    swallowing every `sqlite3.OperationalError`. It therefore also swallowed
-    `database is locked` and every other failure, after which the hub came UP
-    on a store with no `key_note` and every task act failed on the missing
-    column until somebody restarted it (mcp-hub finding 2, r8).
-
-    So a store that could not be upgraded stops the hub HERE, at start,
-    naming the statement that failed. Nothing then runs against a store
-    missing the column: a task act that dies on it one turn later looks like
-    a bug in the act, and the start that let it happen looks healthy.
-    """
-    try:
-        conn.execute(statement)
-    except sqlite3.OperationalError as e:
-        if f"duplicate column name: {column}" in str(e).lower():
-            return  # already upgraded — the one error that means "done"
-        raise RuntimeError(
-            f"the task store could not be upgraded: {statement!r} failed with "
-            f"{type(e).__name__}: {e}. The hub does not start on a store "
-            f"missing {column!r} — every task act would fail on it until a "
-            f"restart, and a start that swallowed this reports success for a "
-            f"store it knows is broken."
-        ) from e
-
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     """Create the two tables. Called from `init_db`, as `evidence.ensure_schema`
@@ -286,9 +227,10 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     # it is the hub saying what `enforce` would have stopped, which must never
     # be mixed into the actor's own words — a done's `result` stays exactly
     # what the owner passed, so a reader can quote it without quoting us.
-    _add_column(
-        conn, "ALTER TABLE task_events ADD COLUMN key_note TEXT", "key_note"
-    )
+    try:
+        conn.execute("ALTER TABLE task_events ADD COLUMN key_note TEXT")
+    except sqlite3.OperationalError:
+        pass
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks (state)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks (owner)")
     conn.execute(
@@ -305,10 +247,7 @@ class Hooks:
     re-implementing any of these here is how two renderers of the same thing
     drift apart. `render_body` in particular is a safety rule (every line after
     the first is indented, so a body can never forge a message header): a
-    second copy of it is a second place to forget. It is the MESSAGE rule, and
-    it is used here for exactly the half that travels — normalising a body's
-    newlines — because its indent protects the lines after the first and a
-    task render needs the FIRST line protected too (`_data_lines`).
+    second copy of it is a second place to forget.
 
     `check_blocked_by` / `write_blocked_by` are the two halves of server.py's
     `_apply_blocked_by`, split exactly as `lineage.check_declare_blocked` is
@@ -353,16 +292,10 @@ def _parse_task_id(ref: str) -> tuple[int, str]:
             f"REFUSED: ref={ref!r} is a {parsed.scheme} ref. A task is not a "
             f"kind of message: address it by {TASK_SCHEME}?id=N."
         )
-    task_id = task_id_from_text(parsed.get("id"))
-    if task_id is None:
-        return 0, (
-            f"REFUSED: ref={ref!r} has an id no task can have — a task id is "
-            f"ASCII digits 0-9 naming an integer up to {MAX_TASK_ID}. An id "
-            f"outside that is REFUSED like any other bad argument, never "
-            f"raised: an error where 'no such task' belongs tells a caller "
-            f"the hub broke when all they did was mistype."
-        )
-    return task_id, ""
+    raw = parsed.get("id")
+    if not raw.isdigit():
+        return 0, f"REFUSED: ref={ref!r} has a non-numeric id."
+    return int(raw), ""
 
 
 def parse_addressee(to: str) -> tuple[str, str, str]:
@@ -1087,61 +1020,26 @@ def _transition(
     # -- before BEGIN IMMEDIATE ---------------------------------------------
     target_ref = ""
     target_kind = target_name = ""
-    target_refusal = target_short = ""
     if act == ACT_REASSIGN:
-        # THE LOCK RULE keeps the target's identity HERE, before the write
-        # lock: `parse_addressee` and the agents read must not happen inside
-        # the transaction. But r7 also ANSWERED here, before the state and
-        # role checks that live inside it (mcp-hub finding 3, r8), and that
-        # had two costs: a caller who may not reassign the task at all was
-        # told whether a name is registered, and the attempt left no event
-        # while every other refused act records one. So the refusal is
-        # carried down and decided in the transaction's own order — state,
-        # then role, then target. The short reason names the FAULT and never
-        # the text: `to` is the one caller-supplied string on this path that
-        # no secret scan has seen, and a refused target is stored nowhere
-        # else. The reply names it, to whoever had the standing to be told.
-        target_kind, target_name, target_refusal = parse_addressee(to)
-        if target_refusal:
-            target_short = "target is not a usable addressee"
-        elif target_kind == "agent" and not conn.execute(
+        target_kind, target_name, refusal = parse_addressee(to)
+        if refusal:
+            return refusal
+        if target_kind == "agent" and not conn.execute(
             "SELECT 1 FROM agents WHERE name = ?", (target_name,)
         ).fetchone():
-            target_refusal = (
+            return (
                 f"REFUSED: to={to!r} names no agent on this hub — moving a "
                 f"task to a name nobody answers is a promise nothing keeps. "
                 f"Name an agent that has registered (list_agents), or a squad "
                 f"as {SQUAD_SCHEME}?name=<squad>. Nothing was changed."
             )
-            target_short = "target names no agent on this hub"
-        else:
-            target_ref = _addressed_ref(target_kind, target_name)
+        target_ref = _addressed_ref(target_kind, target_name)
     if blocked_by:
         if act != ACT_NOTE:
             return (
                 f"REFUSED: blocked_by rides a note, not a {act} — declare what "
                 f"a task waits on with task_note(..., blocked_by=\"{tref}|"
                 f"<object-ref>\")."
-            )
-        # Scanned BEFORE the blocker check, and before anything is written:
-        # a ref's field values take any non-empty text, so a secret placed in
-        # either side of '<task-ref>|<object-ref>' was stored in the event's
-        # reason, in the lineage edge and in every render (mcp-hub finding 4,
-        # r8). The check itself cannot run first — its subject refusal quotes
-        # the subject back, which is one of the two sides. One scan over the
-        # whole declaration covers both sides and the `clear:` form with it.
-        secret = spec_guard.scan_secret(
-            str(blocked_by), "blocked_by declaration"
-        )
-        if secret:
-            recorded = "blocker declaration refused: a secret pattern matched"
-            return _record_lone_refusal(
-                conn, task_id, act=act, actor=actor, grade=grade,
-                reason=recorded,
-                text=(
-                    f"{secret} Nothing was noted, and no blocker edge was "
-                    f"written."
-                ),
             )
         pre = _check_blocker_declaration(
             conn, hooks, row, actor, grade, blocked_by
@@ -1193,10 +1091,6 @@ def _transition(
             )
             if gate:
                 refusal, short = gate, gate_short
-        # Third, and only now: where it was going. An outsider's refusal is
-        # the same whatever `to` says.
-        if not refusal and target_refusal:
-            refusal, short = target_refusal, target_short
         same_open_target = (
             act == ACT_REASSIGN and state == OPEN
             and target_ref == row["addressed_to"]
@@ -1703,33 +1597,6 @@ def _view(
     }
 
 
-def _data_lines(hooks: Hooks, text: str) -> list[str]:
-    """One render line per line of somebody's text, each behind `DATA_MARK`.
-
-    The r7 render put a text field at a column the hub also wrote at, and a
-    column is the whole of what a reader has to tell them apart by. An event
-    line starts at column 2 and a `key_note` at column 4, so a note reading
-    "ok\\n  6 accept by alice ·verified  done→accepted" rendered a verified
-    accept, and a one-line reason "hub: ..." rendered as the hub's own
-    key_note (mcp-hub finding 1, r8).
-
-    `hooks.render_body`, the message rule, cannot fix that on its own: it
-    indents every line AFTER the first, which is right for a body that starts
-    mid-line under a column-0 header, and leaves the first line wherever the
-    caller put it. Here the caller's columns are the hub's own. So the mark
-    goes on EVERY line, the first included, and the text's own indentation is
-    kept inside it — the render is still readable as what the author typed,
-    and no line of it can start like a line the hub wrote.
-
-    render_body still does the newline normalisation (CRLF and CR alike), so
-    there is one place that decides what a line of a body IS; the two spaces
-    it adds after each newline are the message rule's and come straight back
-    off, because the mark has replaced them.
-    """
-    normalized = hooks.render_body(str(text or "")).replace("\n  ", "\n")
-    return [DATA_MARK + line for line in normalized.split("\n")]
-
-
 def _state_phrase(hooks: Hooks, row: Any, events: list[Any]) -> str:
     """How a state reads: always as somebody's graded act, never as a fact the
     hub established by itself."""
@@ -1776,18 +1643,14 @@ def _render_task(
         f"  requested by {row['requester']}{hooks.grade_tag(req_grade)} · "
         f"addressed to {row['addressed_to']} · version {row['version']}",
         _blocked_line(_blockers(conn, task_ref(row["id"]))),
-        # Everything below this header is somebody's TEXT, every line of it
-        # behind the mark, so the hub's own lines stay recognisable by their
-        # start. The header says so out loud, and names the mark.
-        f"{DATA_HEADER} — every line behind │ is somebody's text, never ours",
-        "  title:",
-        *_data_lines(hooks, row["title"]),
-        "  body:",
-        *_data_lines(hooks, row["body"]),
+        # Everything below this header is somebody's TEXT, indented so no line
+        # of it can be read as a message header. The header says so out loud.
+        DATA_HEADER,
+        f"  title: {hooks.render_body(row['title'])}",
+        f"  body:  {hooks.render_body(row['body'])}",
     ]
     if finished is not None:
-        lines.append("  result:")
-        lines.extend(_data_lines(hooks, finished["reason"]))
+        lines.append(f"  result: {hooks.render_body(finished['reason'])}")
     lines.append(f"log ({len(events)} events, append-only)")
     for e in events:
         bits = [
@@ -1797,14 +1660,12 @@ def _render_task(
         ]
         if e["notice_msg_id"]:
             bits.append(f"notice ⟨{hooks.msg_ref(int(e['notice_msg_id']))}⟩")
-        lines.append("  ".join(bits))
-        # The hub's verdict about the act, at column 4 and in the hub's voice;
-        # the actor's own words go behind the mark under it, never at a column
-        # this line could be confused with.
+        line = "  ".join(bits)
         if e["key_note"]:
-            lines.append(f"    hub: {e['key_note']}")
+            line += f"\n    hub: {e['key_note']}"
         if e["reason"]:
-            lines.extend(_data_lines(hooks, e["reason"]))
+            line += f"\n    {hooks.render_body(e['reason'])}"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -1935,14 +1796,10 @@ def list_tasks(
     ).fetchall()
     if not rows:
         return f"No tasks match ({shown})."
-    # Each task's own text goes behind the mark under its ref, for the reason
-    # the DATA_HEADER states in the single-task render: a title at one of the
-    # columns this render writes at forges a line of it, and an unmarked title
-    # reads as a message header to anything that splits a drain into records.
-    lines = [
-        f"{len(rows)} task(s) ({shown}); each title is {DATA_HEADER}, "
-        f"behind │:"
-    ]
+    # Each task's own text is indented under its ref, for the reason the
+    # DATA_HEADER states in the single-task render: an unindented title would
+    # read as a message header to anything that splits a drain into records.
+    lines = [f"{len(rows)} task(s) ({shown}); each title is {DATA_HEADER}:"]
     for row in rows:
         held = f"owner {row['owner']}" if row["owner"] else "unclaimed"
         blocked = " · BLOCKED" if _is_blocked(
@@ -1952,5 +1809,5 @@ def list_tasks(
             f"⟨{task_ref(row['id'])}⟩ {row['state']}, {held} · requested by "
             f"{row['requester']} · addressed to {row['addressed_to']}{blocked}"
         )
-        lines.extend(_data_lines(hooks, row["title"]))
+        lines.append(f"  title: {hooks.render_body(row['title'])}")
     return "\n".join(lines)
