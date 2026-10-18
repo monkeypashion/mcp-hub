@@ -18,7 +18,6 @@ Runs on a PRIVATE tmux socket with a fake docker: never the live fleet.
 """
 from __future__ import annotations
 
-import os
 import pathlib
 import shutil
 import subprocess
@@ -68,8 +67,10 @@ def fleet(tmp_path):
     for f in ("tmux", "docker"):
         (bindir / f).chmod(0o755)
     sock = f"lscost-{uuid.uuid4().hex[:8]}"
-    env = dict(os.environ, HOME=str(home), SQUAD_CONF=str(conf),
-               SQUAD_SOCKET=sock, PATH=f"{bindir}:{os.environ['PATH']}")
+    # A clean env (declared base test edit, v2f r10 m3): it was dict(os.environ, ...), so every variable of the
+    # shell that ran pytest (MCP_HUB_*, SQUAD_*, BASH_ENV, PATH entries) reached squad.
+    env = {"HOME": str(home), "SQUAD_CONF": str(conf), "SQUAD_SOCKET": sock,
+           "PATH": f"{bindir}:/usr/bin:/bin", "LANG": "C.UTF-8"}
     t = [real_tmux, "-L", sock]
     # alpha runs a program (up); beta's pane is a bare shell (DEGRADED);
     # gamma has no session at all (down).

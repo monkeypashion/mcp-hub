@@ -30,8 +30,10 @@ from pathlib import Path
 SQUAD = Path(__file__).resolve().parents[1] / "squad" / "squad"
 
 AGENT = "planner-dev-vm-1"
-ROW_RESUME = f"{AGENT}|/tmp/planner||--continue --model fable|faculty"
-ROW_NO_RESUME = f"{AGENT}|/tmp/planner||--model fable|faculty"
+# The worktree is inside the test's own tmp_path (declared base test edit, v2f r10 m3): it was the shared
+# /tmp/planner, which every run created and left behind. `@WORK@` is filled in by run().
+ROW_RESUME = f"{AGENT}|@WORK@||--continue --model fable|faculty"
+ROW_NO_RESUME = f"{AGENT}|@WORK@||--model fable|faculty"
 
 
 def head() -> str:
@@ -44,7 +46,7 @@ def run(tmp_path, snippet, *, row=ROW_RESUME, stubs="", stub_up_one=True):
     home = tmp_path
     (home / ".mcp-hub").mkdir(parents=True, exist_ok=True)
     conf = home / "squad.conf"
-    conf.write_text(row + "\n", encoding="utf-8")
+    conf.write_text(row.replace("@WORK@", str(home / "planner")) + "\n", encoding="utf-8")
 
     default_stubs = """
 placement_id()  { return 1; }
@@ -183,7 +185,7 @@ launch_agent_cmd()     {{ :; }}
 wait_shell_ready()     {{ :; }}
 untilde()              {{ printf '%s' "$1"; }}
 tm()                   {{ [ "$1" = has-session ] && return 1; return 0; }}
-mkdir -p /tmp/planner
+mkdir -p "$HOME/planner"
 up_one {AGENT}
 ''', stub_up_one=False)
     assert not flag.exists(), "up_one is the hand's door and must clear it"

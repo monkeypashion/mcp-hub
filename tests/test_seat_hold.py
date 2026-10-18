@@ -18,6 +18,7 @@ carries its own expiry.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -27,6 +28,19 @@ import pytest
 from mcp_hub import edge
 
 SQUAD = Path(__file__).resolve().parents[1] / "squad" / "squad"
+
+
+def _squad(tmp_path) -> Path:
+    """squad, copied into tmp_path (declared base test edit, v2f r10 m3).
+
+    `hub_bin` prefers `<script dir>/../.venv/bin/mcp-hub`, so run from a checkout that has a .venv, `squad start`
+    called the REAL cli's `placements list` / `placements set`, which talk to the live hub. A copy has no .venv
+    beside it, and `_stub_bin` puts a stub `mcp-hub` on PATH that only records its arguments."""
+    dst = tmp_path / "checkout" / "squad" / "squad"
+    if not dst.exists():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(SQUAD, dst)
+    return dst
 
 
 # --- leg 3: the edge's view of "is this seat held" -------------------------
@@ -123,6 +137,9 @@ def _stub_bin(tmp_path):
         encoding="utf-8",
     )
     stub.chmod(0o755)
+    hub = bindir / "mcp-hub"
+    hub.write_text(f'#!/bin/sh\necho "$@" >> {tmp_path}/hub-calls.log\nexit 0\n', encoding="utf-8")
+    hub.chmod(0o755)
     return bindir
 
 
@@ -139,7 +156,7 @@ def run_squad(tmp_path, held: dict | None, agent="lane-a", verb="start"):
         heldf.write_text(json.dumps({"generated": time.time(), "held": held}),
                          encoding="utf-8")
     return subprocess.run(
-        ["bash", str(SQUAD), verb, agent],
+        ["bash", str(_squad(tmp_path)), verb, agent],
         capture_output=True, text=True,
         env=_env(tmp_path, conf, heldf),
     )
@@ -236,7 +253,7 @@ def test_a_corrupt_mirror_means_nothing_is_held(tmp_path):
     heldf = tmp_path / "held.json"
     heldf.write_text("{not json at all", encoding="utf-8")
     p = subprocess.run(
-        ["bash", str(SQUAD), "start", "lane-a"],
+        ["bash", str(_squad(tmp_path)), "start", "lane-a"],
         capture_output=True, text=True,
         env=_env(tmp_path, conf, heldf),
     )
@@ -396,3 +413,12 @@ def test_a_pending_release_lifts_the_hold_in_the_same_pass(tmp_path, monkeypatch
     )
     assert out["held"] == []
     assert json.loads(mirror.read_text())["held"] == {}
+
+
+def test_squad_start_reaches_only_the_stub_hub(tmp_path):
+    """Hermetic guard (declared base test edit, v2f r10 m3): `squad start` asks the hub for this seat's
+    placement. It must ask the stub on PATH, never a cli next to the script."""
+    run_squad(tmp_path, None)
+    log = tmp_path / "hub-calls.log"
+    assert log.exists() and "placements list" in log.read_text(), "squad start did not reach the stub hub"
+    assert not (_squad(tmp_path).parents[1] / ".venv").exists()
