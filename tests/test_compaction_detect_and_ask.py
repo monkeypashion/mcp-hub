@@ -1380,17 +1380,25 @@ def test_the_same_session_is_not_asked_twice_at_the_same_mark(tmp_path):
 
 DEFAULT_CONFIG = {"MCP_HUB_COMPACT_ASK": "", "MCP_HUB_COMPACTION_EXEC": ""}
 
+# Every value the exec leg must read as OFF. It is armed by exactly "1" and by
+# nothing else: squad reads `${MCP_HUB_COMPACTION_EXEC:-0}` and the gate is
+# the fail-closed `[ "$COMPACT_EXEC" != "1" ]`. `None` = the variable unset.
+EXEC_OFF_VALUES = [None, "", "0", "yes", "true", "on", "01", " 1", "1 ", "2", "-1"]
+
+
+def _exec_env(value):
+    return {} if value is None else {"MCP_HUB_COMPACTION_EXEC": value}
+
 
 @pytest.mark.parametrize("verdict", ["COMPACT", "CLEAR"])
 def test_nothing_types_a_slash_command(tmp_path, verdict):
     """master's test, kept and made exact for the exec leg (bar 52, now built).
 
-    With the DEFAULT config (neither the ask nor the exec leg armed: both
-    variables empty reads as unset, `${VAR:-0}`), nothing types a slash
-    command into any pane, however many passes run and even with a verdict
-    the lane wrote sitting in its transcript. The ask is off too, so nothing
-    names `/compact` or `/clear` in the pane at all and master's substring
-    check holds as written."""
+    With the DEFAULT config (neither the ask nor the exec leg armed), nothing
+    types a slash command into any pane, however many passes run and even
+    with a verdict the lane wrote sitting in its transcript. The ask is off
+    too, so nothing names `/compact` or `/clear` in the pane at all and
+    master's substring check holds as written."""
     p = run(tmp_path, "compaction_pass\n" + "compaction_one lane-a\n" * 4,
             env=DEFAULT_CONFIG, pane=SAFE_PANE,
             replies=answered(f"{verdict} — flushed to memory first."))
@@ -1400,12 +1408,46 @@ def test_nothing_types_a_slash_command(tmp_path, verdict):
     assert "send-keys -l" not in typed, "the ask is off by default: nothing may be typed"
 
 
+@pytest.mark.parametrize("value", EXEC_OFF_VALUES, ids=lambda v: "unset" if v is None else repr(v))
 @pytest.mark.parametrize("verdict", ["COMPACT", "CLEAR"])
-def test_an_armed_ask_with_the_default_exec_leg_types_no_slash_command(tmp_path, verdict):
-    """The ask armed, the exec leg left at its default: the lane is asked and
-    answers, and still no slash command is typed as its own send."""
+def test_an_exec_leg_not_exactly_1_types_no_slash_command(tmp_path, verdict, value):
+    """The ask armed and answered; the exec leg unset, "0", or any value other
+    than exactly "1". No slash command reaches send-keys as its own send."""
     p = run(tmp_path, "compaction_pass\n" + "compaction_one lane-a\n" * 4,
-            env={"MCP_HUB_COMPACTION_EXEC": ""}, pane=SAFE_PANE,
+            env=_exec_env(value), pane=SAFE_PANE,
             replies=answered(f"{verdict} — flushed to memory first."))
     assert commands_typed(tmp_path) == [], p.stdout + p.stderr
     assert f"lane answered {verdict}" in rows(tmp_path)
+    assert "exec leg disarmed" in rows(tmp_path)
+
+
+def test_exactly_1_arms_the_exec_leg(tmp_path):
+    """The positive control for the list above: with only the value changed to
+    "1", the command is typed. Without it a gate that never typed would pass."""
+    run(tmp_path, "compaction_one lane-a\n" * 3, env={"MCP_HUB_COMPACTION_EXEC": "1"},
+        pane=SAFE_PANE, replies=answered("COMPACT"))
+    assert commands_typed(tmp_path) == ["/compact"]
+
+
+# --- the ask tells the truth about the exec leg (declared test edit, v2f r10 m3) ---
+#
+# The ask used to promise, unconditionally, that "the command you name is
+# typed for you at your next quiet moment". With the exec leg off (the
+# shipped default) nothing is ever typed, so the promise was false on every
+# box that had not armed it. The sentence is chosen by the exec leg.
+
+PROMISE = "typed for you"
+
+
+@pytest.mark.parametrize("value", [None, "0", "yes"], ids=["unset", "'0'", "'yes'"])
+def test_with_the_exec_leg_off_the_ask_promises_no_typing(tmp_path, value):
+    run(tmp_path, "compaction_one lane-a", env=_exec_env(value), pane=SAFE_PANE)
+    ask = _ask_text(tmp_path)
+    assert PROMISE not in ask, f"the ask promises typing with the exec leg off:\n{ask}"
+    assert "run the command yourself" in ask, f"the ask does not say to run it yourself:\n{ask}"
+
+
+def test_with_the_exec_leg_armed_the_ask_promises_typing(tmp_path):
+    run(tmp_path, "compaction_one lane-a", env={"MCP_HUB_COMPACTION_EXEC": "1"}, pane=SAFE_PANE)
+    ask = _ask_text(tmp_path)
+    assert f"the command you name is {PROMISE} at your next quiet moment" in ask, ask
