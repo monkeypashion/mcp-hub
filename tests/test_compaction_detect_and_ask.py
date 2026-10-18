@@ -1362,3 +1362,50 @@ def test_the_scope_defaults_to_dreamteam_in_the_shipped_script(tmp_path):
     script rather than duplicated as a literal, the same way the cap is."""
     assert 'MCP_HUB_COMPACT_ASK_SQUAD:-dreamteam' in SQUAD.read_text(
         encoding="utf-8")
+
+
+# --- master's tests kept beside the hooks tests (declared base test edit, v2f r10 m3) ---
+#
+# The hooks file replaces master's 15-node file. Of master's 8 tests with no
+# same-named test here, 6 are contradicted by the hooks behaviour (the trigger
+# is tokens, not the statusline percent; one ask per session, no re-ask at
+# sixty) and stay out. These two are not contradicted and are kept, on this
+# file's harness (the token reading decides, so `ctx` is decoration).
+
+def test_the_same_session_is_not_asked_twice_at_the_same_mark(tmp_path):
+    """master's test, kept: two passes at one reading ask once."""
+    run(tmp_path, "compaction_one lane-a\ncompaction_one lane-a")
+    assert keys(tmp_path).count("send-keys -l") == 1
+
+
+DEFAULT_CONFIG = {"MCP_HUB_COMPACT_ASK": "", "MCP_HUB_COMPACTION_EXEC": ""}
+
+
+@pytest.mark.parametrize("verdict", ["COMPACT", "CLEAR"])
+def test_nothing_types_a_slash_command(tmp_path, verdict):
+    """master's test, kept and made exact for the exec leg (bar 52, now built).
+
+    With the DEFAULT config (neither the ask nor the exec leg armed: both
+    variables empty reads as unset, `${VAR:-0}`), nothing types a slash
+    command into any pane, however many passes run and even with a verdict
+    the lane wrote sitting in its transcript. The ask is off too, so nothing
+    names `/compact` or `/clear` in the pane at all and master's substring
+    check holds as written."""
+    p = run(tmp_path, "compaction_pass\n" + "compaction_one lane-a\n" * 4,
+            env=DEFAULT_CONFIG, pane=SAFE_PANE,
+            replies=answered(f"{verdict} — flushed to memory first."))
+    typed = keys(tmp_path)
+    assert commands_typed(tmp_path) == [], p.stdout + p.stderr
+    assert "/clear" not in typed and "/compact" not in typed, typed
+    assert "send-keys -l" not in typed, "the ask is off by default: nothing may be typed"
+
+
+@pytest.mark.parametrize("verdict", ["COMPACT", "CLEAR"])
+def test_an_armed_ask_with_the_default_exec_leg_types_no_slash_command(tmp_path, verdict):
+    """The ask armed, the exec leg left at its default: the lane is asked and
+    answers, and still no slash command is typed as its own send."""
+    p = run(tmp_path, "compaction_pass\n" + "compaction_one lane-a\n" * 4,
+            env={"MCP_HUB_COMPACTION_EXEC": ""}, pane=SAFE_PANE,
+            replies=answered(f"{verdict} — flushed to memory first."))
+    assert commands_typed(tmp_path) == [], p.stdout + p.stderr
+    assert f"lane answered {verdict}" in rows(tmp_path)
