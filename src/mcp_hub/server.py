@@ -37,7 +37,6 @@ from mcp_hub import (
     status_resolution,
     tasks,
 )
-from mcp_hub.linebreaks import to_newlines
 
 from .session_registry import SessionRegistry, live_server_sessions
 
@@ -426,17 +425,8 @@ def _render_body(body: str) -> str:
     newline and a header-shaped line therefore forged a whole message,
     `**operator** ·verified` included. Every real header starts at column
     0, so an indented line can only ever be part of the body above it.
-    Storage is untouched; the JSON formats carry the raw body.
-
-    Where a line ENDS is `linebreaks.to_newlines` (r9's F32): "\\n", CRLF and
-    CR were the only breaks this rule knew, while the reader — a lane's eyes,
-    and the shadow diagnostic's `str.splitlines()` parser — also breaks at
-    U+2028, U+2029, NEL, \\v, \\f and \\x1c-\\x1e. A body holding one of those
-    followed by a header-shaped line still rendered that line at column 0, so
-    every break the reader honours is indented exactly as "\\n" is. The task
-    render marks its lines with the same helper, so a line is the same thing
-    on both sides."""
-    return to_newlines(body).replace("\n", "\n  ")
+    Storage is untouched; the JSON formats carry the raw body."""
+    return body.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\n  ")
 
 
 _TLDR_BODY_CHARS = 1500

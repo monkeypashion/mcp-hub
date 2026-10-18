@@ -73,7 +73,6 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from mcp_hub import identity, lineage, refs, spec_guard
-from mcp_hub.linebreaks import to_newlines
 
 logger = logging.getLogger(__name__)
 
@@ -1726,18 +1725,8 @@ def _data_lines(hooks: Hooks, text: str) -> list[str]:
     there is one place that decides what a line of a body IS; the two spaces
     it adds after each newline are the message rule's and come straight back
     off, because the mark has replaced them.
-
-    Where a line ENDS is `linebreaks.to_newlines` (r9's F31): "\\n", CRLF and
-    CR were the only breaks this fence knew, while the reader — any reader
-    running `str.splitlines()` — also breaks at U+2028, U+2029, NEL, \\v, \\f
-    and \\x1c-\\x1e. One of those in a text started a new line with NO mark on
-    it, which is the one thing the fence exists to prevent, so every break
-    the reader honours is written "\\n" first and marked exactly as "\\n" is.
-    The message-body render takes the same helper, so the two never disagree
-    about where a line starts. The stored text is untouched: `get_task`'s
-    json and the HTTP routes carry it byte for byte.
     """
-    normalized = hooks.render_body(to_newlines(str(text or ""))).replace("\n  ", "\n")
+    normalized = hooks.render_body(str(text or "")).replace("\n  ", "\n")
     return [DATA_MARK + line for line in normalized.split("\n")]
 
 

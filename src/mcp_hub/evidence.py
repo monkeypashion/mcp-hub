@@ -134,9 +134,7 @@ def read_turn(transcript_path: str | None) -> dict[str, Any] | None:
     text = ""
     tool_calls = 0
     trigger = "unknown"
-    # JSONL framing is "\n" alone (r9's F33): splitting at a raw
-    # U+2028/U+2029/U+0085 inside a JSON string lost the turn.
-    for line in reversed(tail.split("\n")):
+    for line in reversed(tail.splitlines()):
         try:
             rec = json.loads(line)
         except ValueError:
