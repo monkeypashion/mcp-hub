@@ -165,3 +165,54 @@ def test_r9_receipts_guard_shadow_trim_plain(tmp_path):
     text = log.read_text(encoding="utf-8")
     assert [json.loads(ln) for ln in text.splitlines()] == entries[-5:]
     assert text.endswith("\n")
+
+
+# Added with mcp-hub's r9 review (18 Oct, T47/F33 widened): `cli._rekey_transcript`, the history re-key of a
+# transported transcript. It reads with `.splitlines()` and writes back with "\n".join, so a record carrying a raw
+# U+2028/U+2029/U+0085 is cut in two, both halves are kept as "unparseable" lines, and the separator itself is gone:
+# the transported transcript holds two broken lines where one record was.
+REKEY_OLD = "/mnt/d/Projects/code/monkeypashion/mcp-hub"
+REKEY_NEW = "/home/monke/Projects/xport/mcp-hub"
+
+
+def _js(rec: dict) -> str:
+    """Claude Code's JS writer: compact separators, non-ASCII left raw."""
+    return json.dumps(rec, separators=(",", ":"), ensure_ascii=False)
+
+
+@pytest.mark.parametrize("sep", SEP_IDS)
+def test_r9_receipts_rekey_keeps_a_raw_break_record_whole(sep):
+    from mcp_hub import cli
+
+    s = RAW_SEPARATORS[sep]
+    recs = [
+        {"type": "user", "cwd": REKEY_OLD, "message": {"content": "first"}},
+        {"type": "assistant", "cwd": REKEY_OLD, "message": {"role": "assistant",
+                                                            "content": [{"type": "text", "text": f"before{s}after"}]}},
+        {"type": "user", "cwd": REKEY_OLD, "message": {"content": "last"}},
+    ]
+    out, stats = cli._rekey_transcript("\n".join(_js(r) for r in recs) + "\n", REKEY_OLD, REKEY_NEW)
+    assert out.endswith("\n"), "the re-keyed transcript does not end with a newline"
+    lines = out[:-1].split("\n")
+    got = []
+    for ln in lines:
+        try:
+            got.append(json.loads(ln))
+        except ValueError as e:
+            raise AssertionError(f"the re-key wrote a line that is not a record ({sep}): {ln!r}") from e
+    want = [dict(r, cwd=REKEY_NEW) for r in recs]
+    assert got == want, f"the re-key did not keep each record whole apart from cwd ({sep}): {got!r}"
+    assert stats["unparseable"] == 0, f"the re-key counted {stats['unparseable']} unparseable lines ({sep})"
+
+
+def test_r9_receipts_guard_rekey_cut_line_kept_verbatim():
+    from mcp_hub import cli
+
+    cut = '{"type":"user","cwd":"' + REKEY_OLD + '","message":{"content":"cut'
+    good = {"type": "user", "cwd": REKEY_OLD, "message": {"content": "café \u2028 escaped in the input"}}
+    text = _js({"type": "user", "cwd": REKEY_OLD, "message": {"content": "one"}}) + "\n" + cut + "\n" + json.dumps(good) + "\n"
+    out, stats = cli._rekey_transcript(text, REKEY_OLD, REKEY_NEW)
+    lines = out[:-1].split("\n")
+    assert len(lines) == 3 and lines[1] == cut, f"a cut line was not kept verbatim: {lines!r}"
+    assert stats["unparseable"] == 1, stats
+    assert json.loads(lines[0])["cwd"] == REKEY_NEW and json.loads(lines[2]) == dict(good, cwd=REKEY_NEW)
