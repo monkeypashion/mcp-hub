@@ -20,7 +20,7 @@ from mcp_hub import shadow
 from mcp_hub.server import _grade_tag_str, _msg_ref, _render_body, create_server
 
 SEPARATORS = {
-    "u2028": " ", "u2029": " ", "nel": "\x85", "vt": "\x0b",
+    "u2028": "\u2028", "u2029": "\u2029", "nel": "\x85", "vt": "\x0b",
     "ff": "\x0c", "fs": "\x1c", "gs": "\x1d", "rs": "\x1e",
 }
 SEP_IDS = list(SEPARATORS)
