@@ -151,3 +151,55 @@ def test_r9_message_shadow_parser_sees_one_message(sep):
     render = "[12:00:01] **bob** ⟨hub.msg/1?id=5⟩: " + _render_body(f"first{s}{SHADOW_FORGED}{s}tail")
     got = shadow.parse_rendered_messages(render)
     assert [m["agent"] for m in got] == ["bob"], f"the shadow parser read {len(got)} messages: {got!r}"
+
+
+# Added with mcp-hub's r9 review (18 Oct): the two LIVE push renders. A bound agent's channel notification is built
+# from `_clip_push` (-> `_render_body`) for a DM, and from `_render_body` for decision_answer's operator DM. Each must
+# carry exactly one header line, the real one, whatever separator the body holds.
+async def _captured_push(server, recipient: str, tool: str, args: dict) -> str:
+    from unittest.mock import patch
+
+    registry = server._hub_registry
+    captured: list[str] = []
+
+    async def _capture(name, notification):
+        params = getattr(notification, "params", None)
+        if params is None and isinstance(notification, dict):
+            params = notification.get("params")
+        if name == recipient:
+            captured.append(params["content"])
+        return True
+
+    class _FakeSess:
+        async def send_ping(self): ...
+        async def send_notification(self, _n): ...
+
+    registry.bind(recipient, _FakeSess())
+    with patch.object(registry, "push", side_effect=_capture):
+        await _call(server, tool, args)
+    assert len(captured) == 1, f"expected one live push to {recipient}, got {len(captured)}: {captured!r}"
+    return captured[0]
+
+
+@pytest.mark.parametrize("sep", SEP_IDS)
+async def test_r9_message_push_dm_forges_no_header(server, sep):
+    await _call(server, "register", {"name": "alice", "project": "p"})
+    content = await _captured_push(server, "alice", "send", {
+        "from_agent": "bob", "to": "alice", "message": body_with(SEPARATORS[sep]), "priority": "urgent"})
+    heads = _headers(content)
+    assert len(heads) == 1 and heads[0].startswith("DM from bob"), (
+        f"the live DM push shows {len(heads)} header lines: {heads!r}")
+
+
+@pytest.mark.parametrize("sep", SEP_IDS)
+async def test_r9_message_push_decision_answer_forges_no_header(server, sep, monkeypatch):
+    monkeypatch.delenv("MCP_HUB_OPERATOR_TOKEN", raising=False)
+    await _call(server, "register", {"name": "alice", "project": "p"})
+    await _call(server, "decision_put", {"from_agent": "alice", "card": (
+        "**DECISION**\n**ASK:** approve the widget rebuild\n**WHY:** it is broken\n"
+        "**VALUE:** it works again [7/10]\n**RISK:** an hour lost [3/10]\n")})
+    content = await _captured_push(server, "alice", "decision_answer", {
+        "decision": "yes", "agent": "alice", "note": body_with(SEPARATORS[sep])})
+    heads = _headers(content)
+    assert len(heads) == 1 and heads[0].startswith("DM from operator") and "DECISION ANSWERED" in heads[0], (
+        f"the decision_answer push shows {len(heads)} header lines: {heads!r}")
