@@ -62,10 +62,28 @@ def test_a_transport_that_cannot_answer_is_left_alone():
     assert "a" in m._server_instances
 
 
-def test_the_targeted_path_touches_only_that_session():
+def test_a_NORMAL_delete_also_clears_stragglers():
+    """🔴 THE TEST THAT USED TO PIN THE BUG. It asserted that a DELETE with a
+    known sid reclaimed ONLY that session and left `b` behind — which is what
+    the code did, so the suite was green over a backstop that could not fire.
+    The sweep ran only when the sid was unreadable, i.e. almost never, while
+    the docstring promised straggler coverage.
+
+    A straggler is a transport terminated with no DELETE of its own. Nothing
+    else ever reclaims one, so if a normal DELETE does not, it is held for the
+    life of the process — the same shape as the leak this function closes.
+    """
     m = Mgr({"a": T(True), "b": T(True)})
+    assert _reclaim_terminated(m, "a") == 2
+    assert m._server_instances == {}
+
+
+def test_the_sweep_still_spares_a_live_session_on_the_targeted_path():
+    """The inverse property, restated for the sweeping version: widening what
+    is EXAMINED must not widen what is DROPPED."""
+    m = Mgr({"a": T(True), "live": T(False), "mute": Mute()})
     assert _reclaim_terminated(m, "a") == 1
-    assert set(m._server_instances) == {"b"}
+    assert set(m._server_instances) == {"live", "mute"}
 
 
 def test_the_sweep_reclaims_every_terminated_straggler():
