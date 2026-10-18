@@ -64,6 +64,72 @@ def test_suffix_tolerates_trailing_separator_and_relative_form(hub_config, tmp_p
     assert cli._workspace_suffix(str(work)) == "xport"
 
 
+def test_suffix_covers_subdirectories_of_the_worktree(hub_config, tmp_path):
+    """Card #432. The entry covers the whole worktree, not just its top folder.
+
+    Exact equality lost the suffix one level down while the repo half of the
+    derivation kept working (git walks UP from cwd), so a session in a
+    subdirectory — the normal case, not the exception — fell back to the bare
+    name.
+    """
+    work = tmp_path / "xport" / "mcp-hub"
+    (work / "src" / "deep").mkdir(parents=True)
+    hub_config.write_text(json.dumps({"workspaces": {str(work): "xport"}}))
+    assert cli._workspace_suffix(str(work)) == "xport"
+    assert cli._workspace_suffix(str(work / "src")) == "xport"
+    assert cli._workspace_suffix(str(work / "src" / "deep")) == "xport"
+
+
+def test_two_clones_do_not_collapse_below_their_top_folders(hub_config, tmp_path):
+    """The regression the card exists for: ONE name for TWO clones.
+
+    Both clones of a repo derive the same `<repo>-<host>`, so with the suffix
+    dropped in a subdirectory they became indistinguishable — the collision
+    the suffixes were added to prevent, one directory below them.
+    """
+    a = tmp_path / "one" / "templates"
+    b = tmp_path / "two" / "templates"
+    (a / "templates").mkdir(parents=True)
+    (b / "templates").mkdir(parents=True)
+    hub_config.write_text(json.dumps({"workspaces": {str(a): "one", str(b): "two"}}))
+    assert cli._workspace_suffix(str(a / "templates")) == "one"
+    assert cli._workspace_suffix(str(b / "templates")) == "two"
+
+
+def test_suffix_matches_path_components_not_string_prefixes(hub_config, tmp_path):
+    """`/a/b` must not claim `/a/bc` — a sibling is not a descendant."""
+    work = tmp_path / "xport" / "mcp-hub"
+    sibling = tmp_path / "xport" / "mcp-hub-2"
+    work.mkdir(parents=True)
+    sibling.mkdir(parents=True)
+    hub_config.write_text(json.dumps({"workspaces": {str(work): "xport"}}))
+    assert cli._workspace_suffix(str(sibling)) is None
+
+
+def test_nested_entries_resolve_to_the_most_specific(hub_config, tmp_path):
+    """A submodule with its own entry keeps ITS suffix, not its parent's."""
+    outer = tmp_path / "clone"
+    inner = outer / "vendor" / "submodule"
+    inner.mkdir(parents=True)
+    hub_config.write_text(
+        json.dumps({"workspaces": {str(outer): "outer", str(inner): "inner"}})
+    )
+    assert cli._workspace_suffix(str(outer)) == "outer"
+    assert cli._workspace_suffix(str(outer / "vendor")) == "outer"
+    assert cli._workspace_suffix(str(inner)) == "inner"
+    assert cli._workspace_suffix(str(inner / "src")) == "inner"
+
+
+def test_root_entry_does_not_rename_the_whole_machine(hub_config, tmp_path):
+    """`"/"` normalises to the empty string — a prefix of every path.
+
+    Skipped deliberately: one stray character in a hand-edited config would
+    otherwise re-suffix every lane on the box at once.
+    """
+    hub_config.write_text(json.dumps({"workspaces": {"/": "everything"}}))
+    assert cli._workspace_suffix(str(tmp_path)) is None
+
+
 def test_malformed_workspaces_table_is_ignored(hub_config, tmp_path):
     # Fail-open: a hand-edited config must never break identity derivation,
     # because that would unbind the agent from the hub entirely.

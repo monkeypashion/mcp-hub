@@ -367,6 +367,15 @@ const disposeAll = () => {
     console.log(JSON.stringify({ passes: out }));
     return;
   }
+  if (mode === "sharedls") {
+    // One window publishes a liveness read; later reads at HARNESS_PROBES
+    // (ms) say whether another window would reuse it.
+    ext.writeSharedLs("alpha up\n", Number(process.env.HARNESS_NOW));
+    const probes = JSON.parse(process.env.HARNESS_PROBES || "[]");
+    console.log(JSON.stringify({ file: ext.LS_SHARE_FILE,
+                                 reads: probes.map((t) => ext.readSharedLs(t)) }));
+    return;
+  }
   if (mode === "parseup") {
     console.log(JSON.stringify({ up: [...ext.parseUpAgents(process.env.HARNESS_LS || "")] }));
     return;

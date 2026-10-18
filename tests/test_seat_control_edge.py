@@ -687,8 +687,11 @@ class TestTmuxArgvShape:
         realize_seat_action(
             {"id": 2, "kind": "prompt", "args": {"text": "hi"}}, SEAT, r
         )
+        # v2-fleet r5 F5: the edge also asks `list-clients` (is the pane in
+        # use?) before it types; the same argv rule holds for that call.
         for c in r.calls:
-            sub = c.index("send-keys") if "send-keys" in c else c.index("capture-pane")
+            sub = next(i for i, x in enumerate(c)
+                       if x in ("send-keys", "capture-pane", "list-clients"))
             assert c[sub + 1] == "-t" and c[sub + 2] == SEAT["session"], c
 
     def test_interrupt_is_not_subject_to_the_prompt_witness(self):

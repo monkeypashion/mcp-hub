@@ -100,3 +100,18 @@ def test_hub_shutdown_is_bounded():
     src = inspect.getsource(server._serve_streamable_http)
     assert "timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS" in src
     assert "_serve_streamable_http(server)" in inspect.getsource(server.main)
+
+
+def test_once_shape_is_the_default_with_a_per_lane_escape(tmp_path, monkeypatch):
+    from mcp_hub import cli
+
+    monkeypatch.setenv("MCP_HUB_STATE_DIR", str(tmp_path))
+    block = {"decision": "block", "reason": "📬 hello"}
+    once = {"hookSpecificOutput": {"hookEventName": "Stop",
+                                   "additionalContext": "📬 hello"}}
+    # No file: every lane gets the single-delivery shape.
+    assert cli._stop_output_shape("lane-a", block) == once
+    # A lane named in the escape file keeps the old shape; others don't.
+    (tmp_path / "stop-output-block").write_text("lane-a\n")
+    assert cli._stop_output_shape("lane-a", block) == block
+    assert cli._stop_output_shape("lane-b", block) == once

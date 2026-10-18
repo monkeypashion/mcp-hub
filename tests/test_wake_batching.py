@@ -405,6 +405,49 @@ async def test_hold_sweep_notes_pending_broadcasts(server):
     )
 
 
+async def test_the_broadcast_note_does_not_promise_a_delivery(server):
+    """The note names the queued broadcasts; it must not assert that they
+    WILL surface.
+
+    The wake carries DM bodies only — broadcast bodies are the client
+    Stop-hook drain's job, and nothing on this side can observe whether that
+    drain ran. The old wording ("they surface at this turn's end") was an
+    unconditional promise about another component's future: reported live on
+    2026-09-05, the note said 3 were waiting on two consecutive turns, none
+    surfaced either time, and the missing row was a WITHDRAWAL of a fleet
+    rule. A reader told to expect a delivery has no reason to go looking for
+    it, so the note must instead say whose job it is and carry the recovery.
+
+    SCOPE: this pins the SENTENCE. It does not couple the wake to the drain
+    and does not detect a broken promise — both remain open.
+    """
+    stream = await _pair(server)
+    await _call(server, "set_squads", {"name": "alice", "squads": "team"})
+    await _call(server, "set_squads", {"name": "bob", "squads": "team"})
+    await _call(server, "broadcast",
+                {"from_agent": "alice", "message": "a withdrawal"})
+    conn = _db(server)
+    conn.execute("UPDATE messages SET ts = ts - ?", (HOLD_MAX_SECONDS + 60,))
+    conn.commit()
+    assert await server._hub_hold_sweep_pass() == 1
+    content = str(stream.sent[0])
+
+    assert "they surface at this turn's end" not in content, (
+        "the note promises a delivery this wake does not make and cannot "
+        "observe — see the comment at the extra.append() that builds it"
+    )
+    assert "get_broadcasts_for_agent" in content, (
+        "a reader whose drain silently did nothing needs the recovery in "
+        "the sentence; without it a broken promise is unactionable"
+    )
+    assert "Stop-hook drain" in content, (
+        "the note must name which component owns the surfacing"
+    )
+    assert "a withdrawal" not in content, (
+        "broadcast body rendered in the hold wake — the drain owns bodies"
+    )
+
+
 # ---- R5: wakes are measured -------------------------------------------------
 
 
