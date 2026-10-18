@@ -227,7 +227,11 @@ def _card_nag_grace(agent_name: str, would_nag: bool) -> bool:
 def _read_last_assistant_text(transcript_path: str | None) -> str:
     """Text of the LAST assistant message in the transcript, '' on any
     problem. Reads only the file tail — transcripts grow to tens of MB and
-    this runs at every Stop."""
+    this runs at every Stop.
+
+    Framed on "\\n" alone (r9's F33): a raw U+2028/U+2029/U+0085 inside a JSON
+    string is DATA, and splitting on it cut the record in two and returned
+    the wrong last reply."""
     if not transcript_path:
         return ""
     try:
@@ -238,7 +242,7 @@ def _read_last_assistant_text(transcript_path: str | None) -> str:
             tail = f.read().decode("utf-8", errors="ignore")
     except OSError:
         return ""
-    for line in reversed(tail.splitlines()):
+    for line in reversed(tail.split("\n")):
         if '"assistant"' not in line or '"text"' not in line:
             continue
         try:
@@ -1770,7 +1774,19 @@ def _rekey_transcript(text: str, old_cwd: str, new_cwd: str) -> tuple[str, dict[
              "unclassified_paths": 0}
     out: list[str] = []
 
-    for raw in text.splitlines():
+    # JSONL framing is "\n", and "\n" only (r9's F33). `splitlines()` also
+    # breaks at U+2028, U+2029 and U+0085, which JSON leaves RAW inside a
+    # string and Claude Code's JS writer emits raw: a record carrying one was
+    # read as two halves, neither parsed, both were kept verbatim as
+    # `unparseable` and the separator itself was dropped by the "\n".join — so
+    # the re-keyed transcript held two lines that are not records where one
+    # record had been. The file's final "\n" terminates the last record rather
+    # than opening an empty one; the join below puts it back.
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+
+    for raw in lines:
         stats["lines"] += 1
         if not raw.strip():
             out.append(raw)

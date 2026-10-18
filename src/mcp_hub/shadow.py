@@ -126,7 +126,9 @@ def observed_renders(
         return []
 
     renders: list[dict] = []
-    for line in tail.splitlines():
+    # JSONL framing is "\n" alone (r9's F33): a raw U+2028/U+2029/U+0085 in a
+    # JSON string is data, and splitting on it undercounted a render.
+    for line in tail.split("\n"):
         # Prefilter on the channel tag ONLY, then decide on the parsed record.
         # Measured shapes carrying a `<channel …>` tag: `queue-operation`
         # (enqueue/remove), `attachment` (queued_command), and `user` (the
@@ -200,7 +202,10 @@ def record(entries: list[dict], path: Path, cap: int = LOG_CAP) -> None:
     # Trim after writing rather than before: the cap is a disk bound, not a
     # transaction, and a rewrite that fails must not cost the new records.
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        # On "\n" alone (r9's F33). This log is written ensure_ascii=False, so
+        # it HOLDS raw U+2028/U+2029/U+0085 inside records; a trim that split
+        # on them rewrote one record as two broken lines, for good.
+        lines = path.read_text(encoding="utf-8").rstrip("\n").split("\n")
         if len(lines) > cap:
             path.write_text("\n".join(lines[-cap:]) + "\n", encoding="utf-8")
     except OSError:

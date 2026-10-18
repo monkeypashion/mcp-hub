@@ -123,9 +123,15 @@ def rendered_message_ids(
     client, not that the agent ever saw it (shadow.py's founding
     distinction). Never raises: any unreadable or unparseable state returns
     fewer receipts, and fewer receipts means fuller reprints, never loss.
+
+    JSONL framing is "\\n", and "\\n" only (r9's F33). `splitlines()` also
+    breaks at U+2028, U+2029 and U+0085, which JSON leaves RAW inside a
+    string and a JS writer emits raw, so a record carrying one was cut in
+    two, neither half parsed, and the receipt was never minted — the message
+    reprinted in full at the next drain.
     """
     ids: set[int] = set()
-    for line in _tail(transcript_path, window).splitlines():
+    for line in _tail(transcript_path, window).split("\n"):
         if "<channel" not in line:
             continue
         try:
