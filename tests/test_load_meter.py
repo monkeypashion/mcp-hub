@@ -972,3 +972,31 @@ def test_the_units_carry_no_policy_of_their_own():
     assert not [ln for ln in timer.splitlines()
                 if ln.startswith(("OnUnitActiveSec", "OnBootSec", "OnActiveSec"))]
     assert DAILY.is_file() and os.access(DAILY, os.X_OK), "the unit's ExecStart must be runnable"
+
+
+# ----------------------------------------------------------------------------
+# a day is half-open: an event exactly at midnight belongs to ONE day
+# (declared base test edit, v2f r10: the inclusive-end mutant of `_in`
+# survived every falsifier above, because no fixture put an event on the line)
+# ----------------------------------------------------------------------------
+
+def test_an_event_exactly_at_midnight_is_counted_in_one_day_only(tmp_path):
+    """Two adjacent days share the instant 00:00. If both claimed it, a
+    daily series would count a midnight turn twice and the sum of the days
+    would exceed the whole; if neither did, it would vanish. The day that
+    STARTS at midnight owns it."""
+    root = write_transcripts(tmp_path / "transcripts", {"lane-a/s1.jsonl": [
+        asst("2026-09-28T23:59:00.000Z"),
+        typed("2026-09-29T00:00:00.000Z"),
+        asst("2026-09-29T00:00:05.000Z"),
+    ]})
+    tr = m._load_transcripts(root)
+    day1 = (m.parse_day("2026-09-28"), m.parse_day("2026-09-29"))
+    day2 = (m.parse_day("2026-09-29"), m.parse_day("2026-09-30"))
+    whole = (m.parse_day("2026-09-28"), m.parse_day("2026-09-30"))
+    first, second, both = tr.read(day1), tr.read(day2), tr.read(whole)
+    assert first["typed"]["lane-a"] == 0, "the day that ENDS at midnight claimed it"
+    assert second["typed"]["lane-a"] == 1, "the day that STARTS at midnight lost it"
+    assert first["waits"] == [] and second["waits"] == [60.0]
+    assert (first["typed"]["lane-a"] + second["typed"]["lane-a"]
+            == both["typed"]["lane-a"] == 1), "the days do not sum to the whole"

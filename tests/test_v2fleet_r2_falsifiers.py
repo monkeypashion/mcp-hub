@@ -175,7 +175,9 @@ def env(tmp_path):
     make_wal_snapshot(wal, scratch)
     make_snapshot(snap)
     make_transcripts(tr)
-    return {"db": db, "wal": wal, "snap": snap, "tr": tr, "tmp": tmp_path, "work": work}
+    home = tmp_path / "home"   # the child's pinned HOME; see run(). Made here, before any snapshot.
+    home.mkdir()
+    return {"db": db, "wal": wal, "snap": snap, "tr": tr, "tmp": tmp_path, "work": work, "home": home}
 
 
 def run(env, *, db=None, snap=None, tr=None, start=BASE_START, end=BASE_END, changes=None, now=NOW):
@@ -190,7 +192,13 @@ def run(env, *, db=None, snap=None, tr=None, start=BASE_START, end=BASE_END, cha
         cf = env["work"] / "changes.json"
         cf.write_text(json.dumps(changes))
         cmd += ["--changes", str(cf)]
-    p = subprocess.run(cmd, capture_output=True, text=True, cwd=env["work"], env=CHILD_ENV, timeout=120)
+    # HOME is PINNED to this test's tmp dir (declared base test edit, v2f r10). The meter
+    # reads the injections ledger from $MCP_HUB_STATE_DIR, else ~/.mcp-hub, so an inherited
+    # HOME let this run read the LIVE box's ledger: 58 real rows turned into an
+    # injection_unmatched flag and the assertion on `flags` failed by whose machine it ran on.
+    child = {k: v for k, v in CHILD_ENV.items() if k != "MCP_HUB_STATE_DIR"}
+    child["HOME"] = str(env["home"])
+    p = subprocess.run(cmd, capture_output=True, text=True, cwd=env["work"], env=child, timeout=120)
     data = json.loads(out.read_text()) if out.exists() else None
     return p, data
 
