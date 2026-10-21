@@ -158,10 +158,20 @@ process.stdin.on('end', () => {
           try { return fs.realpathSync(path.resolve(p)).replace(/[/\\]+$/, ''); }
           catch { return path.resolve(p).replace(/[/\\]+$/, ''); }
         };
+        // An entry covers its worktree AND every folder below it, matched on
+        // path components (/a/b never claims /a/bc); the longest root wins
+        // and a '/' root is skipped — same rule as cli.py (card #432).
         const target = norm(cwd);
+        let best = null;
         for (const [p, s] of Object.entries(table)) {
-          if (typeof s === 'string' && s.trim() && norm(p) === target) return s.trim();
+          if (typeof s !== 'string' || !s.trim() || typeof p !== 'string') continue;
+          const root = norm(p);
+          if (!root.replace(/[/\\]+/g, '')) continue;
+          const under = target === root
+            || target.startsWith(root + path.sep) || target.startsWith(root + '/');
+          if (under && (!best || root.length > best[0])) best = [root.length, s.trim()];
         }
+        if (best) return best[1];
       } catch { /* no config / unreadable → no suffix */ }
       return null;
     };

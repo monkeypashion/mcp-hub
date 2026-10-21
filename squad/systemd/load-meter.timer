@@ -1,0 +1,11 @@
+[Unit]
+# Once a day, after the UTC day has closed: the reading's daily array holds
+# closed days only, so an earlier run would just wait a day for its newest.
+Description=Take the daily load-meter reading
+
+[Timer]
+OnCalendar=*-*-* 00:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

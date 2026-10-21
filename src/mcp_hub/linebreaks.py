@@ -35,8 +35,8 @@ LINE_BREAKS: tuple[str, ...] = (
     "\x1d",      # group separator
     "\x1e",      # record separator
     "\x85",      # NEXT LINE (C1)
-    " ",    # LINE SEPARATOR
-    " ",    # PARAGRAPH SEPARATOR
+    "\u2028",    # LINE SEPARATOR
+    "\u2029",    # PARAGRAPH SEPARATOR
 )
 
 _BREAK_RE = re.compile("|".join(re.escape(b) for b in LINE_BREAKS))

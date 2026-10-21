@@ -443,6 +443,17 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             return _err(403, "operator token required")
         return got
 
+    def actor_of(got: tuple[str, str]) -> str:
+        """The authenticated principal, for a trail's `actor` column.
+
+        Observed from the credential that opened the door, never a literal:
+        a constant here asserts who acted instead of recording it. The
+        operator token carries no finer identity than its GRADE, so that is
+        what is written; a machine is named.
+        """
+        principal, name = got
+        return f"machine:{name}" if principal == "machine" else principal
+
     async def body_of(request: Request) -> dict:
         try:
             return await request.json()
@@ -1150,7 +1161,7 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
                 "DELETE FROM api_seats WHERE identity = ?", (identity,)
             )
             # The death-fact outlives the row it describes.
-            seat_event(identity, "purged", "operator-api")
+            seat_event(identity, "purged", actor_of(got))
             db().commit()
             return JSONResponse({"identity": identity, "purged": True})
         if active_placements("seat = ?", (identity,)):
@@ -1158,7 +1169,7 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
         db().execute(
             "UPDATE api_seats SET archived = 1 WHERE identity = ?", (identity,)
         )
-        seat_event(identity, "archived", "operator-api")
+        seat_event(identity, "archived", actor_of(got))
         db().commit()
         # After the commit: a doorbell that can break a write is worse than
         # no doorbell. The edge reconciles the disappearance promptly instead
@@ -1196,6 +1207,21 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
     # laptop is not a viewer.
     _WATCH_WINDOW_SECONDS = 180.0
     _PANE_RING = 20
+    # A hold's KIND is a closed set (bar 59). Every reader downstream treats
+    # a kind it does not know as "not hibernation", so an unknown word is
+    # refused here rather than carried: a typo would otherwise make a parked
+    # lane silently hard-stoppable. NO KIND stays legal — an older writer
+    # keeps the brake's hard-stoppable behaviour, the fail-closed direction.
+    _HOLD_KINDS = ("brake", "hibernation")
+    # Seats that may never be PARKED. Resolved once, at app construction: a
+    # list re-read per request could change under a hold already validated
+    # against the old one. Names are checked against seats at the write,
+    # because seats are declared after the hub starts.
+    _hibernation_exempt = tuple(
+        n.strip()
+        for n in os.environ.get("MCP_HUB_HIBERNATION_EXEMPT", "").split(",")
+        if n.strip()
+    )
 
     def _seat_row(identity: str):
         return db().execute(
@@ -1266,6 +1292,32 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
                 f"'{machine}' — a machine may only act on its own seats",
             )
         return got
+
+    def _live_hold(identity: str) -> dict | None:
+        """The seat's live hold as the hub recorded it — or None.
+
+        The same reading as the edge's mirror (`edge._hold_state`): newest
+        first, only an action the edge carried out (`done`) counts, a later
+        release ends it, and a hold past its `until` released itself. A
+        pending hold is an ASK and scopes nothing.
+        """
+        rows = db().execute(
+            "SELECT kind, args FROM api_seat_actions WHERE seat = ? AND "
+            "status = 'done' AND kind IN ('hold', 'release') "
+            "ORDER BY id DESC LIMIT 1", (identity,),
+        ).fetchall()
+        for r in rows:
+            if r["kind"] == "release":
+                return None
+            args = json.loads(r["args"] or "{}")
+            try:
+                until = float(args.get("until") or 0)
+            except (TypeError, ValueError):
+                return None
+            if until <= _now():
+                return None
+            return args
+        return None
 
     @route("/api/v1/seats/{identity}/actions", methods=["GET", "POST"])
     async def seat_actions(request: Request) -> Response:
@@ -1344,6 +1396,63 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
                         "the held lane and the operator are both told. A "
                         "stop whose end nobody can state reads as an "
                         "ignoring lane, not a held one.",
+                    )
+                hold_kind = str(args.get("kind") or "")
+                if hold_kind and hold_kind not in _HOLD_KINDS:
+                    return _err(
+                        400,
+                        f"unknown hold kind '{hold_kind}' — the set is "
+                        f"closed: {', '.join(_HOLD_KINDS)} (or none, which "
+                        f"keeps the brake's hard-stoppable behaviour)",
+                    )
+                if hold_kind and not str(args.get("owner") or "").strip():
+                    return _err(
+                        400,
+                        f"a '{hold_kind}' hold needs `args.owner` — the "
+                        f"mechanism that placed it, and the only one that "
+                        f"may lift it. A scanner that could lift a brake "
+                        f"would hand a lane its share back mid-window.",
+                    )
+                if hold_kind == "hibernation" and _hibernation_exempt:
+                    # 🔴 Fail closed: a typo'd entry protects nothing, and
+                    # nothing reveals that until its lane is parked. While
+                    # any name resolves to no seat, no seat can be said to
+                    # be safe to hibernate. Brakes are unaffected — a broken
+                    # list must not become an unstoppable fleet.
+                    unresolved = [
+                        n for n in _hibernation_exempt
+                        if _seat_row(n) is None
+                    ]
+                    if unresolved:
+                        return _err(
+                            500,
+                            "MCP_HUB_HIBERNATION_EXEMPT names "
+                            f"{', '.join(unresolved)}, which match(es) no "
+                            "seat — refusing every hibernation until the "
+                            "list resolves",
+                        )
+                    if identity in _hibernation_exempt:
+                        return _err(
+                            409,
+                            f"seat '{identity}' is hibernation-exempt "
+                            "(MCP_HUB_HIBERNATION_EXEMPT) — it may be "
+                            "braked, never parked",
+                        )
+            if kind == "release":
+                # Owner releases own. No owner is the by-hand override: a
+                # rule that could strand a lane held by a mechanism nobody
+                # can run any more would make the hold unsafe in exactly the
+                # way its expiry exists to prevent.
+                owner = str(args.get("owner") or "")
+                live = _live_hold(identity)
+                held_by = str((live or {}).get("owner") or "")
+                if owner and held_by and owner != held_by:
+                    return _err(
+                        409,
+                        f"seat '{identity}' is held by '{held_by}' "
+                        f"({(live or {}).get('kind') or 'unkinded'}) — "
+                        f"'{owner}' may only release its own holds. Omit "
+                        f"the owner to release by hand.",
                     )
             # UPSERT, never queue: mashing the button re-states the ask.
             # Superseded intent is recorded as such rather than deleted, so
@@ -1551,7 +1660,7 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
         db().execute(
             "UPDATE api_seats SET archived = 0 WHERE identity = ?", (identity,)
         )
-        seat_event(identity, "restored", "operator-api")
+        seat_event(identity, "restored", actor_of(got))
         db().commit()
         # Symmetric with archive: an asymmetric doorbell is how observers
         # drift out of sync with the record.

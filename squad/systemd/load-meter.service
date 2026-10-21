@@ -1,0 +1,14 @@
+[Unit]
+# The daily load meter (v2-fleet F1): one reading of Tim's load, written to
+# $MCP_HUB_STATE_DIR/v2-fleet/readings/<day>.json. Read-only against every
+# source it names.
+#
+# Ships UNINSTALLED. Which hub copy it reads, and when that copy was taken,
+# is a per-machine fact: set MCP_HUB_DB (and the LOAD_METER_* baseline) in a
+# machine-local drop-in, never here — this file is in git for every machine,
+# and a default hub copy would be a source nobody chose.
+Description=mcp-hub load meter — one daily reading of the operator's load
+
+[Service]
+Type=oneshot
+ExecStart=%h/Projects/code/monkeypashion/mcp-hub/squad/load-meter-daily
