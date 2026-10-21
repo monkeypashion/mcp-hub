@@ -262,9 +262,3 @@ def test_claude_project_dirname_maps_dots_and_underscores_too():
     assert _claude_project_dirname("/tmp/brain-status-_0btdeij") == (
         "-tmp-brain-status--0btdeij")
 
-
-def test_the_conversation_reader_uses_the_same_rule():
-    from mcp_hub.conversation import project_dirname
-
-    for path in ("/home/monke/.mcp-hub/hooks-clone", "/a/b_c/", "D:\\x\\y.z"):
-        assert project_dirname(path) == _claude_project_dirname(path)

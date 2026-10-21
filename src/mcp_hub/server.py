@@ -1611,10 +1611,9 @@ def _reclaim_terminated(manager: Any, sid: str = "") -> int:
     a far worse bug than the one being fixed — so `is_terminated` is the
     whole gate, and anything that cannot answer it is LEFT ALONE.
 
-    Every DELETE sweeps the whole set (`sid` names the session just closed,
-    but a terminated straggler has no DELETE of its own to trigger it). The
-    sweep runs only on DELETE — rare next to tool calls, and exactly the
-    moment one has just terminated.
+    `sid` targets the session just deleted (O(1)); the sweep behind it is the
+    backstop for any terminated straggler, and runs only on DELETE — rare
+    next to tool calls, and exactly the moment one has just terminated.
     Returns how many were reclaimed. Never raises.
     """
     dropped = 0
@@ -1630,13 +1629,8 @@ def _reclaim_terminated(manager: Any, sid: str = "") -> int:
             # is terminated is not evidence that it is.
             return t is not None and bool(getattr(t, "is_terminated", False))
 
-        # EVERY key, on every DELETE — not just the closing session's. A
-        # straggler (terminated with no DELETE of its own) is reclaimed by
-        # nothing else, so a targeted-only pass held it for the life of the
-        # process. `sid` is kept for the call signature; the gate below is
-        # still `is_terminated` alone, so widening what is EXAMINED does not
-        # widen what is DROPPED.
-        for key in list(instances.keys()):
+        keys = [sid] if sid and sid in instances else list(instances.keys())
+        for key in keys:
             if _gone(key):
                 instances.pop(key, None)
                 if isinstance(owners, dict):
@@ -2796,17 +2790,9 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 continue
             extra = []
             if held_bc["n"]:
-                # NOT a promise of delivery. This wake carries DM bodies
-                # only; broadcast bodies are the client Stop-hook drain's
-                # job, and nothing here can observe whether that drain ran
-                # (2026-09-05: "3 waiting" on two turns, none surfaced, and
-                # the missing row withdrew a fleet rule). So the note says
-                # whose job it is and carries the recovery.
                 extra.append(
                     f"({held_bc['n']} queued broadcast(s) also waiting — "
-                    f"this wake carries DMs only; the Stop-hook drain "
-                    f"surfaces broadcasts. If they do not appear, pull them "
-                    f"with get_broadcasts_for_agent)"
+                    f"they surface at this turn's end)"
                 )
             urgent_held = (held_dm["u"] or 0) or (held_bc["u"] or 0)
             outcome = await _wake_with_queue(
@@ -6452,20 +6438,7 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             return "n/a (no session manager)"
         if instances is None:
             return "n/a (manager exposes no instance set)"
-        # The live/terminated split is SELF-REPORTED — each transport's own
-        # `is_terminated`. It can say what the process believes it holds,
-        # never what is actually open; the kernel's socket count (procfs) is
-        # the independent instrument, and a gap between the two is the
-        # finding. A transport that cannot answer counts as live.
-        try:
-            items = list(instances.values())
-            dead = sum(
-                1 for t in items if bool(getattr(t, "is_terminated", False))
-            )
-        except Exception:  # noqa: BLE001 — a gauge must never break status
-            return str(len(instances))
-        return (f"{len(items)} (live {len(items) - dead}, "
-                f"terminated-but-held {dead})")
+        return str(len(instances))
 
     @mcp.tool()
     def claim_agent_key(name: str, ctx: Context | None = None) -> str:
@@ -6676,12 +6649,6 @@ _CLI_SUBCOMMANDS = {
     "voice-client",
     # Host-side /voice, same reachability requirement.
     "voice-host",
-    # The hibernation scanner (bar 59). Same reachability requirement: a verb
-    # missing here ships INERT, read as a server flag and refused.
-    "hibernate",
-    # The daily load meter (v2-fleet F1). The logic lives in load_meter.py,
-    # which the server never imports: this entry only forwards the verb.
-    "load-meter",
 }
 
 

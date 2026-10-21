@@ -262,82 +262,9 @@ function planAutoAttach(state, up, tabs, now, settleMs) {
   return out;
 }
 
-// ONE liveness read, shared by every window (2026-10-09, dev-vm-1: three
-// VSCode windows each ran their own `squad ls` every 8s — ~3.3 cores to learn
-// which agents were up). The first window to look publishes what it saw; any
-// window polling inside one poll interval reuses it. A read older than that,
-// or stamped in the FUTURE (a clock that moved, a file from another box), is
-// not reused — "could not look" is never "nothing is up", but a stale read
-// is not a fresh one either.
-const LS_SHARE_FILE = path.join(os.homedir(), ".mcp-hub", "squad-ls-up.json");
-
-function writeSharedLs(stdout, now) {
-  try {
-    fs.mkdirSync(path.dirname(LS_SHARE_FILE), { recursive: true });
-    const tmp = `${LS_SHARE_FILE}.${process.pid}`;
-    fs.writeFileSync(tmp, JSON.stringify({ ts: now, stdout: String(stdout) }));
-    fs.renameSync(tmp, LS_SHARE_FILE);
-  } catch (_) {
-    // sharing is an optimisation: a window that cannot publish still polls
-  }
-}
-
-function readSharedLs(now) {
-  try {
-    const doc = JSON.parse(fs.readFileSync(LS_SHARE_FILE, "utf8"));
-    const age = now - Number(doc.ts);
-    if (!(age >= 0 && age < AUTO_ATTACH_POLL_MS)) return null;
-    return typeof doc.stdout === "string" ? doc.stdout : null;
-  } catch (_) {
-    return null;
-  }
-}
-
-// After a read that took `ms`, rest 3x as long before the next one, never
-// less than the poll and never more than a minute: a box so loaded that
-// `squad ls` takes seconds is the box that can least afford it back to back.
-function restAfter(ms) {
-  return Math.min(60000, Math.max(AUTO_ATTACH_POLL_MS, 3 * ms));
-}
-
 function startAutoAttach(context) {
   const state = { upSince: new Map(), seeded: false, preexisting: new Set() };
   let busy = false;
-  let timer = null;
-  let stopped = false;
-
-  const plan = (stdout) => {
-    const terms = [...agentOf];
-    const due = planAutoAttach(
-      state,
-      parseUpAgents(stdout),
-      terms.map(([term, agent]) => ({
-        agent,
-        attachedStamp: autoAttached.get(term),
-      })),
-      Date.now(),
-      AUTO_ATTACH_SETTLE_MS
-    );
-    for (const { agent, stamp } of due) {
-      const entry = terms.find(([, a]) => a === agent);
-      if (!entry) continue;
-      const term = entry[0];
-      // Someone is already watching — this tab, another window, or a
-      // `squad dash` pane. Leave it alone and do NOT mark it done: if that
-      // viewer detaches, this tab is a fair candidate again.
-      cp.execFile(SQUAD, ["attached", agent], { timeout: 10000 }, (e) => {
-        if (!e) return;                       // exit 0 = a viewer exists
-        if (autoAttached.get(term) === stamp) return;
-        autoAttached.set(term, stamp);
-        sendWhenReady(term, `clear && squad attach ${agent} && clear`);
-      });
-    }
-  };
-
-  const schedule = (ms) => {
-    if (stopped) return;
-    timer = setTimeout(tick, ms);
-  };
 
   const tick = () => {
     if (busy) return;            // a slow `squad ls` must not stack passes
@@ -345,37 +272,42 @@ function startAutoAttach(context) {
       state.upSince.clear();
       state.preexisting.clear();
       state.seeded = false;      // re-seed on enable, so turning it on mid
-      schedule(AUTO_ATTACH_POLL_MS);   // session does not attach every live agent
-      return;
-    }
-    const shared = readSharedLs(Date.now());
-    if (shared !== null) {
-      plan(shared);
-      schedule(AUTO_ATTACH_POLL_MS);
-      return;
+      return;                    // session does not attach every live agent
     }
     busy = true;
-    const t0 = Date.now();
-    // `ls --up`: liveness only. The HUB column costs a docker exec per
-    // container seat and this poll never reads it.
-    cp.execFile(SQUAD, ["ls", "--up"], { timeout: 10000 }, (err, stdout) => {
+    cp.execFile(SQUAD, ["ls"], { timeout: 10000 }, (err, stdout) => {
       busy = false;
-      const took = Date.now() - t0;
-      if (!(err && !stdout)) {             // could not look — not a verdict
-        writeSharedLs(stdout, Date.now());
-        plan(stdout);
+      if (err && !stdout) return;          // could not look — not a verdict
+      const terms = [...agentOf];
+      const due = planAutoAttach(
+        state,
+        parseUpAgents(stdout),
+        terms.map(([term, agent]) => ({
+          agent,
+          attachedStamp: autoAttached.get(term),
+        })),
+        Date.now(),
+        AUTO_ATTACH_SETTLE_MS
+      );
+      for (const { agent, stamp } of due) {
+        const entry = terms.find(([, a]) => a === agent);
+        if (!entry) continue;
+        const term = entry[0];
+        // Someone is already watching — this tab, another window, or a
+        // `squad dash` pane. Leave it alone and do NOT mark it done: if that
+        // viewer detaches, this tab is a fair candidate again.
+        cp.execFile(SQUAD, ["attached", agent], { timeout: 10000 }, (e) => {
+          if (!e) return;                       // exit 0 = a viewer exists
+          if (autoAttached.get(term) === stamp) return;
+          autoAttached.set(term, stamp);
+          sendWhenReady(term, `clear && squad attach ${agent} && clear`);
+        });
       }
-      schedule(restAfter(took));
     });
   };
 
-  schedule(AUTO_ATTACH_POLL_MS);
-  context.subscriptions.push({
-    dispose: () => {
-      stopped = true;
-      if (timer) clearTimeout(timer);
-    },
-  });
+  const timer = setInterval(tick, AUTO_ATTACH_POLL_MS);
+  context.subscriptions.push({ dispose: () => clearInterval(timer) });
 }
 
 // Type into a terminal only once its shell is actually reading. sendText at
@@ -2698,7 +2630,4 @@ function activate(context) {
 
 function deactivate() {}
 
-module.exports = {
-  activate, deactivate, shortLabel, planAutoAttach, parseUpAgents,
-  writeSharedLs, readSharedLs, LS_SHARE_FILE, restAfter,
-};
+module.exports = { activate, deactivate, shortLabel, planAutoAttach, parseUpAgents };

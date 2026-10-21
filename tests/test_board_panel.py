@@ -395,54 +395,6 @@ def test_collect_survives_missing_squad_and_missing_caches(tmp_path):
     assert snap["agents"] == {} and "squad not found" in snap["error"]
 
 
-def _counting_squad(tmp_path, payload, rc=0):
-    """A stand-in `squad` that also records each time it is run."""
-    exe = tmp_path / "squad"
-    runs = tmp_path / "runs"
-    exe.write_text(f"#!/bin/sh\necho x >> {runs}\ncat <<'EOF'\n"
-                   + json.dumps(payload) + f"\nEOF\nexit {rc}\n")
-    exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
-    return str(exe), (lambda: len(runs.read_text().splitlines())
-                      if runs.exists() else 0)
-
-
-def test_two_boards_inside_the_share_window_run_one_scan(tmp_path):
-    """Two boards open on one box ran the same ~9 CPU-second scan twice
-    (dev-vm-1, 2026-10-08). Inside the window the second reads the first's."""
-    home = tmp_path / "home"
-    (home / ".mcp-hub").mkdir(parents=True)
-    exe, count = _counting_squad(tmp_path, _scan(("alpha", "working")))
-    first = board_data.collect(exe, home=home, now=1000.0)
-    second = board_data.collect(exe, home=home, now=1009.0)
-    assert count() == 1
-    assert second["agents"].keys() == first["agents"].keys() == {"alpha"}
-    # Past the window the data is old enough to be worth a fresh scan.
-    board_data.collect(exe, home=home, now=1010.5)
-    assert count() == 2
-
-
-def test_a_failed_scan_is_not_shared(tmp_path):
-    """Only a scan that worked is published: sharing a failure would spread
-    one board's error to every board for the whole window."""
-    home = tmp_path / "home"
-    (home / ".mcp-hub").mkdir(parents=True)
-    exe, count = _counting_squad(tmp_path, _scan(("alpha", "idle")), rc=1)
-    board_data.collect(exe, home=home, now=1000.0)
-    board_data.collect(exe, home=home, now=1001.0)
-    assert count() == 2
-    assert not (home / ".mcp-hub" / board_data.SCAN_SHARE_FILE).exists()
-
-
-def test_a_scan_from_the_future_is_not_fresh(tmp_path):
-    """A clock that stepped back must not freeze the board on old data."""
-    home = tmp_path / "home"
-    (home / ".mcp-hub").mkdir(parents=True)
-    exe, count = _counting_squad(tmp_path, _scan(("alpha", "idle")))
-    board_data.collect(exe, home=home, now=5000.0)
-    board_data.collect(exe, home=home, now=1000.0)
-    assert count() == 2
-
-
 def test_collect_recap_hand_needs_idle(tmp_path):
     home = tmp_path / "home"
     mh = home / ".mcp-hub"
@@ -628,7 +580,7 @@ async def test_a_seat_enrolled_after_the_board_opened_appears_in_it():
         await pilot.pause()
         assert "delta" not in _tree_agents(app)
         rows.append({"agent": "delta", "worktree": "/d", "klass": "faculty"})
-        app._poll_board(force=True)                       # the tick, not a restart
+        app._poll_board()                       # the tick, not a restart
         await pilot.pause()
         await pilot.pause()
         assert "delta" in _tree_agents(app), _tree_agents(app)
@@ -642,7 +594,7 @@ async def test_a_seat_retired_after_the_board_opened_leaves_it():
         await pilot.pause()
         await pilot.pause()
         rows.remove(AGENTS[2])                  # gamma retired
-        app._poll_board(force=True)
+        app._poll_board()
         await pilot.pause()
         await pilot.pause()
         assert "gamma" not in _tree_agents(app), _tree_agents(app)
@@ -662,7 +614,7 @@ async def test_the_cursor_holds_its_seat_when_the_roster_shifts_under_it():
         await _goto(app, pilot, "beta")
         assert "rm -rf" in _detail_text(app)
         rows.insert(0, {"agent": "aaa-new", "worktree": "/n", "klass": "squad"})
-        app._poll_board(force=True)
+        app._poll_board()
         await pilot.pause()
         await pilot.pause()
         assert app.selected["agent"] == "beta"
@@ -697,7 +649,7 @@ async def test_an_emptied_roster_is_reported_rather_than_ignored():
         await pilot.pause()
         await pilot.pause()
         rows.clear()
-        app._poll_board(force=True)
+        app._poll_board()
         await pilot.pause()
         await pilot.pause()
         assert _tree_agents(app) == [], _tree_agents(app)

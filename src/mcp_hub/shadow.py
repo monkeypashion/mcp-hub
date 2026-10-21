@@ -66,12 +66,8 @@ MATCH_PREFIX = 60
 # get_messages render. The ⟨ref⟩ segment is W3's lineage handle and OPTIONAL:
 # transcripts predating the wave carry lines without it, and a parser that
 # demanded it would go silently blind on exactly the history it audits.
-# The grade slot (`·verified`, `·asserted`, `·hub`, `·ungraded`, card #271)
-# sits between name and ref and is OPTIONAL for the same reason; without it
-# the parser matched no real get_messages line at all.
 _RENDERED_RE = re.compile(
     r"^\[(?P<ts>\d{2}:\d{2}:\d{2})\] \*\*(?P<agent>[^*]+)\*\*"
-    r"(?: ·[\w-]+)*"
     r"(?: ⟨(?P<ref>[^⟩]+)⟩)?"
     r"(?P<prio> \[[a-z]+\])?: (?P<rest>.*)$"
 )

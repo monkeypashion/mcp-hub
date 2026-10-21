@@ -818,63 +818,6 @@ def _prompt_submitted(pane: str, text: str) -> str:
             "settling — submission unverified")
 
 
-# How recently a tmux client must have been active for the seat's pane to
-# count as IN USE — someone at that keyboard. Same default as squad's
-# SQUAD_IN_USE_SECONDS (600): the edge and squad answer one question, "is
-# Tim using this pane?", and two windows would give two answers.
-SEAT_IN_USE_SECONDS = 600.0
-
-
-def _seat_client_in_use(seat: dict[str, Any], runner: Any,
-                        now: float | None = None) -> str:
-    """The tty of a client active on this seat's pane inside the window, or ''.
-
-    ASKS tmux (`list-clients`) rather than inferring from the pane: an
-    attached terminal is a fact tmux holds, and a capture cannot show it.
-
-    🔴 FAILS OPEN, like the hold mirror. A probe that errors, lists nobody,
-    or answers in a shape this cannot read returns '' — a guard nobody can
-    read must not become a second way for every seat action to fail. The
-    pane capture after it is still the fail-closed gate on typing blind.
-    """
-    try:
-        rc, out = runner(_seat_tmux_argv(
-            seat, ["list-clients", "-F", "#{client_activity} #{client_tty}"]))
-        if rc != 0:
-            return ""
-        cutoff = (time.time() if now is None else now) - SEAT_IN_USE_SECONDS
-        for line in str(out or "").splitlines():
-            parts = line.split(None, 1)
-            if len(parts) != 2:
-                continue
-            try:
-                activity = float(parts[0])
-            except ValueError:
-                continue
-            if activity >= cutoff:
-                return parts[1].strip()
-    except Exception:  # noqa: BLE001 — fail open, see docstring
-        return ""
-    return ""
-
-
-def _ledger_note(seat: dict[str, Any], door: str, text: str) -> bool:
-    """One injections-ledger row for a keystroke the edge is ABOUT to send.
-
-    Written before the send, never after: the load meter discounts the turn
-    the keystroke causes, and a row written after could lose the race with
-    the turn it explains. The lane is the tmux SESSION name — the name this
-    door knows, which squad names for the roster agent. Never raises and
-    never gates: the ledger is an instrument, not a door.
-    """
-    try:
-        from mcp_hub import injections
-        lane = str(seat.get("session") or seat.get("identity") or "")
-        return injections.record(lane, door, text, by="edge")
-    except Exception:  # noqa: BLE001 — bookkeeping never stops a send
-        return False
-
-
 def realize_seat_action(
     action: dict[str, Any], seat: dict[str, Any], runner: Any,
     pause: Any = None,
@@ -926,23 +869,6 @@ def realize_seat_action(
             "pane_after": None,
         }
 
-    # Before anything else that touches the pane: a client active on it is
-    # Tim at that keyboard, and an automated keystroke would land in the
-    # middle of whatever he is typing. Refused BY NAME — "pane in use" sends
-    # the operator looking; the tty tells them which of their own windows.
-    tty = _seat_client_in_use(seat, runner)
-    if tty:
-        return {
-            "status": "refused",
-            "observed": {
-                "why": f"the seat's pane is in use — client {tty} was active "
-                       f"within the last {SEAT_IN_USE_SECONDS:.0f}s; the "
-                       f"edge does not type into a pane someone is using",
-                "client_tty": tty,
-            },
-            "pane_after": None,
-        }
-
     readable, before = _capture_pane(seat, runner)
     if not readable:
         return {
@@ -958,7 +884,6 @@ def realize_seat_action(
     if kind == "interrupt":
         # Escape ALONE. Escape-then-Enter would interrupt and then submit
         # whatever was left in the box — a different act than the one asked.
-        _ledger_note(seat, "edge_interrupt", "Escape")
         rc, out = runner(_seat_tmux_argv(seat, ["send-keys", "Escape"]))
         sent: dict[str, Any] = {"sent": "Escape"}
     else:
@@ -967,7 +892,6 @@ def realize_seat_action(
         # makes tmux interpret the literal as a KEY NAME whenever it happens
         # to match one — a prompt whose text is "Enter" or "C-c" would be
         # executed as that key. `-l` types it literally; Enter submits.
-        _ledger_note(seat, "edge_prompt", text)
         rc, out = runner(
             _seat_tmux_argv(seat, ["send-keys", "-l", text])
         )
@@ -1048,12 +972,6 @@ def _hold_state(actions: list[dict[str, Any]], now: float) -> dict[str, Any] | N
             "held_at": held_at,
             "reason": str(args.get("reason") or ""),
             "release_condition": str(args.get("release_condition") or ""),
-            # Verbatim, never defaulted (bar 59). An unkinded hold stays
-            # unkinded: the lane reads "" as NOT hibernation, so silence keeps
-            # the old hard-stoppable behaviour instead of earning an
-            # exemption nobody granted.
-            "kind": str(args.get("kind") or ""),
-            "owner": str(args.get("owner") or ""),
         }
     return None
 

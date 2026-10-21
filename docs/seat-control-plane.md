@@ -68,44 +68,6 @@ pane_after (text)`.
 - **One pending action per seat** (upsert semantics): mashing the button
   re-states, never queues five interrupts.
 
-### Pane in use, and the injections ledger
-
-- **The edge does not type into a pane someone is using.** Before a prompt
-  or an interrupt it asks tmux (`list-clients`, `#{client_activity}`) and
-  refuses when a client was active inside `SEAT_IN_USE_SECONDS` (600, the
-  same window as squad's `SQUAD_IN_USE_SECONDS`), naming the client's tty —
-  "pane in use" sends the operator looking; `/dev/pts/9` tells them which
-  of their own windows. The probe **fails open** (an unreadable answer is not
-  "in use"); the pane capture after it is still the fail-closed gate.
-- **Every keystroke the edge is about to send is ledgered first**
-  (`edge._ledger_note` → `injections.record`, door `edge_prompt` /
-  `edge_interrupt`, lane = the tmux session). A refusal writes nothing.
-
-### Holds carry a KIND and an OWNER (bar 59)
-
-`hold` / `release` are control-plane records (no keystroke). A hold's
-`args.kind` is a closed set — `brake` | `hibernation` — or absent; an unknown
-kind is refused by name. **No kind = not exempt**: the lane hard-stops
-anything that is not exactly `hibernation`, and the edge mirror carries both
-fields verbatim, never defaulted.
-
-- A kinded hold needs `args.owner` (400 without one).
-- `MCP_HUB_HIBERNATION_EXEMPT` (comma-separated, read once at hub start):
-  hibernating a listed seat is 409; while any listed name matches no seat,
-  **every** hibernation is refused (500, naming it). Brakes are unaffected.
-- A release that names an `owner` is refused (409) while a LIVE hold
-  (`done`, unexpired) belongs to someone else. A release with no owner is
-  the by-hand override. A pending or expired hold scopes nothing.
-
-`mcp-hub hibernate --thread <id>` is the scanner that places hibernations:
-it asks the console (`GET /threads/<id>/hibernation-candidates`) every pass,
-holds each candidate for 12h as a fresh entry (never an expiry bump), and
-releases only its own live holds on lanes no longer listed, copying the
-console's `left_out[].why` verbatim as the cause (or `cause_source:
-unrecorded`). An unreadable answer, or any row without a `lane`, does
-nothing at all — releases included. **Report-only unless `--arm`**; ships
-unarmed.
-
 ## Watch leg — the live view
 
 `POST /api/v1/seats/<identity>/watch` (operator token) declares a viewer,
