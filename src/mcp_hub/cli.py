@@ -260,53 +260,15 @@ def _read_last_assistant_text(transcript_path: str | None) -> str:
     return ""
 
 
-# Card #943: the closing marker must OWN its line. The unanchored pattern
-# matched the token wherever it appeared, so a sentence ABOUT the marker ("I
-# have emitted no `DECIDED:` line.") closed the lane's card with whatever
-# followed the colon — 15 fabricated operator verdicts across 7 lanes in 39
-# days. Every gate below fails TOWARD NOT CLOSING: a missed verdict costs a
-# restatement, an invented one forges a consent record.
-#
-# Three balanced forms only. Unbalanced emphasis ("**DECIDED: x",
-# "DECIDED:** x") means the line was torn out of something.
-_DECIDED_RE = re.compile(
-    r"^\s*(?:\*\*DECIDED:\*\*|\*\*DECIDED\*\*:|DECIDED:)[ \t]*(.*?)\s*$"
-)
-_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+_DECIDED_RE = re.compile(r"\*{0,2}DECIDED:\*{0,2}\s*(.+?)\s*$", re.M)
 
 
 def _extract_decided(turn_text: str) -> str:
-    """The `**DECIDED:** <verdict>` closing marker, '' if none.
-
-    Read ONLY from the turn's last non-empty line, outside any code fence: a
-    closing marker closes, and one with turn text after it was being
-    discussed, not emitted. The verdict must start with a word — a verdict
-    torn out of a quotation begins with the punctuation that closed it.
-
-    The return is the verdict, then a receipt naming the mechanism and
-    quoting the line, so a hook-made close is distinguishable from a
-    hand-made one in the record alone."""
-    lines = (turn_text or "").split("\n")
-    fenced = False
-    last = ""
-    last_fenced = False
-    for line in lines:
-        if _FENCE_RE.match(line):
-            fenced = not fenced
-            last, last_fenced = line, True
-            continue
-        if line.strip():
-            last, last_fenced = line, fenced
-    if not last.strip() or last_fenced:
-        return ""
-    m = _DECIDED_RE.match(last)
-    if not m:
-        return ""
-    verdict = m.group(1).strip()
-    if not verdict or not verdict[0].isalnum():
-        return ""
-    return (f"{verdict}\n"
-            f"[auto-closed by stop-hook · read from: {last.strip()}]")
+    """The `**DECIDED:** <verdict>` closing marker, '' if none. The agent
+    that received an in-pane answer records the verdict itself (it just
+    understood and acted on it) — machinery only ships; last one wins."""
+    matches = list(_DECIDED_RE.finditer(turn_text))
+    return matches[-1].group(1).strip() if matches else ""
 
 
 def _extract_decision_card(turn_text: str) -> str:
@@ -585,50 +547,6 @@ def _all_low_priority(*texts: str) -> bool:
     return seen
 
 
-# Bar 47 (g#24): the hub's own "already delivered live" claim. A drain made
-# of nothing else re-reads text that already reached this context, so it
-# costs no turn. Unlike the low spool above there is no only-copy to lose —
-# the suppressed line IS the hub saying the full text was rendered — so the
-# failure direction is a wasted turn. Still fails open on any line it does
-# not recognise: an unknown render must surface, never vanish.
-_LIVE_LINE_RE = re.compile(
-    r"^\[\d{2}:\d{2}(?::\d{2})?\] \*\*[^*]+\*\*(?: ·[\w-]+)* ⟨[^⟩]+⟩"
-    r"(?: \[\w+\])?: \(already delivered live — .*\)$"
-)
-# The render's own footer, and the section headers the spool writes: read as
-# STRUCTURE, never as items. Only these exact shapes; anything else fails open.
-_COMPACT_FOOTER_RE = re.compile(
-    r"^\(\d+ already surfaced live — shortened to save context, and now "
-    r"marked read\. Full text: get_history\('[^']*'\)\)$"
-)
-_SECTION_HEADERS = frozenset({
-    "**Direct messages:**",
-    "**Broadcasts (since you last looked):**",
-})
-
-
-def _all_already_delivered(*texts: str) -> bool:
-    """True iff every non-empty line is an `(already delivered live — …)`
-    item, the compact footer, or a section header — with at least one item.
-
-    Fails OPEN everywhere else: an unknown line, a full body's continuation
-    line or a header-only text returns False and the drain surfaces as
-    before. Headers and the footer never count as items, so they cannot
-    launder a fresh one."""
-    seen = False
-    for text in texts:
-        for raw in (text or "").split("\n"):
-            line = raw.strip()
-            if not line or line in _SECTION_HEADERS \
-                    or _COMPACT_FOOTER_RE.match(line):
-                continue
-            if _LIVE_LINE_RE.match(line):
-                seen = True
-                continue
-            return False
-    return seen
-
-
 def _defer_spool(agent_name: str) -> pathlib.Path:
     safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in agent_name)
     return _state_dir() / f"deferred-{safe}.txt"
@@ -690,90 +608,6 @@ def _spool_take(agent_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# The drain record (bar 47, g#24) — <state>/activity-log.jsonl
-# ---------------------------------------------------------------------------
-#
-# A drain that surfaces nothing prints nothing and blocks nothing, so it
-# leaves no transcript entry at all: "drains are free" and "no drain
-# happened" look identical from there. So the process that performs the
-# drain writes one line per drain, silent ones and hub failures included,
-# and the heartbeat daemon one presence line per UTC hour.
-#
-# ⚠️ This records the ACT, never the COST: there is deliberately no turn
-# count here. The hook cannot see how many turns the lane spent, and a field
-# that claimed to would have been inferred. Every write fails open.
-
-
-def _elapsed_ms(start: float) -> float:
-    """Milliseconds since a `time.monotonic()` reading. Monotonic, never the
-    wall clock: a wall-clock difference goes negative across an NTP step or
-    a resume, and a negative outlier silently drags a median."""
-    return round((time.monotonic() - start) * 1000.0, 3)
-
-
-def _activity_log_path() -> pathlib.Path:
-    return _state_dir() / "activity-log.jsonl"
-
-
-def _log_activity(record: dict[str, Any]) -> None:
-    """Append one JSON line. Fail-open: an instrument that can break a turn
-    boundary is worse than no instrument."""
-    try:
-        path = _activity_log_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def _log_beat_if_new_hour(agent_name: str, last_hour: str,
-                          elapsed_ms: float | None = None) -> str:
-    """One `beat` line per UTC hour, a PRESENCE marker for the hour; returns
-    the hour now current so the caller can pass it back next beat.
-
-    `elapsed_ms` is the ONE heartbeat call that opened the hour — a sample
-    of size 1, not a summary. Absent is not zero: a caller that did not time
-    its call leaves the field off rather than faking a fast sample."""
-    hour = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H")
-    if hour == last_hour:
-        return hour
-    rec: dict[str, Any] = {"kind": "beat", "ts": round(time.time(), 3),
-                           "agent": agent_name, "hour": hour}
-    if elapsed_ms is not None:
-        rec["elapsed_ms"] = elapsed_ms
-    _log_activity(rec)
-    return hour
-
-
-def _stop_output_shape(agent_name: str,
-                       response: dict[str, Any]) -> dict[str, Any]:
-    """The JSON a Stop block is printed as.
-
-    Default is `hookSpecificOutput.additionalContext`: the text is delivered
-    once, as context, rather than as a blocking Stop error the lane spends a
-    turn acknowledging. A lane listed (one name per line) in
-    <state>/stop-output-block keeps the old `{decision: block}` shape — the
-    per-lane escape, read fail-open as "not listed"."""
-    try:
-        listed = (_state_dir() / "stop-output-block").read_text(
-            encoding="utf-8").split()
-    except OSError:
-        listed = []
-    if agent_name in listed:
-        return response
-    return {"hookSpecificOutput": {
-        "hookEventName": "Stop",
-        "additionalContext": response.get("reason", ""),
-    }}
-
-
-def _offline_nag_marker(agent_name: str) -> pathlib.Path:
-    safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in agent_name)
-    return _state_dir() / f"offline-nag.{safe}"
-
-
-# ---------------------------------------------------------------------------
 # Hook output building
 # ---------------------------------------------------------------------------
 
@@ -790,10 +624,6 @@ def build_hook_response(
     card_notice: str = "",
     held_notice: str = "",
     defer_low: bool = False,
-    held_owed: bool = True,
-    offline_owed: bool = True,
-    inbox_text: str = "",
-    trace: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Decide whether to emit a hook block and what the reason should be.
 
@@ -819,21 +649,7 @@ def build_hook_response(
     has no fresh content (DMs were marked read, the broadcast cursor advanced
     on the first fire), so a content-less block would re-emit forever. When
     it's set and there's nothing new to surface, we let Stop proceed.
-
-    v2-fleet r5 F3: a forced turn always carries something new. The hold
-    notice and the offline nag are DERIVED (re-read every Stop), so the
-    caller says whether each is still OWED (`held_owed`, `offline_owed`);
-    one already delivered still renders on a block that something else pays
-    for, but buys none of its own. `trace`, when given, receives what was
-    decided (deferral fields, `cause`, and which corrections rendered) so
-    the drain record can say why a turn was or was not spent. No rendered
-    text depends on any of this.
     """
-    t: dict[str, Any] = trace if trace is not None else {}
-    t["defer_low"] = bool(defer_low)
-    t["defer_effect"] = "off" if not defer_low else "none"
-    t["cause"] = "none"
-
     # Bar 47: a spool held from earlier low-only drains rides THIS block,
     # whatever triggered it. Taken before the has_content decision so spooled
     # text alone can justify a block (the DEFER_MAX_SECONDS path), and so no
@@ -845,10 +661,7 @@ def build_hook_response(
 
     has_messages = bool(messages_text.strip())
     has_broadcasts = bool(broadcasts_text.strip())
-    has_inbox = bool(inbox_text.strip())
-    has_content = has_messages or has_broadcasts or has_inbox
-    held_notice = held_notice.strip()
-    card_notice = card_notice.strip()
+    has_content = has_messages or has_broadcasts
 
     # Defer only a drain that is ENTIRELY low-priority, with nothing else
     # owed. A card nag, an owner notice or an offline agent are corrections,
@@ -856,12 +669,11 @@ def build_hook_response(
     if (
         defer_low
         and agent_name
-        and (has_messages or has_broadcasts)
-        and not has_inbox
+        and has_content
         and is_online
         and not card_nag
-        and not card_notice
-        and not held_notice
+        and not card_notice.strip()
+        and not held_notice.strip()
         and spool_age < DEFER_MAX_SECONDS
         and _all_low_priority(messages_text, broadcasts_text)
     ):
@@ -874,7 +686,6 @@ def build_hook_response(
             ) if p
         )
         if _spool_append(agent_name, blob):
-            t["defer_effect"] = "spooled"
             return None
         # Could not write the spool → fall through and block. The hub has
         # already marked these read; the ONLY other copy is this text.
@@ -883,42 +694,15 @@ def build_hook_response(
         deferred = _spool_take(agent_name)
         if deferred:
             has_content = True
-            t["defer_effect"] = "released"
-            t["defer_held_s"] = float(round(spool_age, 3))
 
     # An open card makes the "you have no card" nag factually wrong — the
     # right prompt is the notice ("card #N still open / STALE"), which the
     # server returns from the same decision_clear that used to count silent
     # strikes. Live specimen 2026-07-27: the nag told this repo's own agent
     # to file a card while its #79 sat open (and then evaporated).
+    card_notice = card_notice.strip()
     if card_notice:
         card_nag = False
-
-    # What each correction is still OWED. A held notice or an offline nag
-    # already delivered (r5 F3) renders if something else pays for the
-    # block, but cannot pay for one itself.
-    held_pays = bool(held_notice) and held_owed
-    offline_pays = (not is_online) and offline_owed
-
-    # Bar 47 (g#24): a drain whose every line is the hub's own "already
-    # delivered live" claim costs no turn — spool included, since a spool of
-    # such lines has nothing to deliver either, however old it is. Traffic
-    # only: a correction the lane owes (offline, held, a card) still blocks.
-    # `_spool_take` has already unlinked the spool, so suppressing here
-    # DISCARDS it — recorded, because a silent destroy is the one thing the
-    # record must not omit.
-    if (
-        (has_messages or has_broadcasts or deferred)
-        and not has_inbox
-        and not held_pays
-        and not offline_pays
-        and not card_nag
-        and not card_notice
-        and _all_already_delivered(messages_text, broadcasts_text, deferred)
-    ):
-        if deferred:
-            t["defer_discarded"] = True
-        return None
 
     # Loop backstop: never re-block a Stop that's only firing because a prior
     # block fired, when there's nothing new to surface. Guards against any
@@ -927,28 +711,27 @@ def build_hook_response(
     # card nag in particular gets exactly ONE shot per natural Stop: if the
     # agent's nag-response turn still lacks a card, we let it go rather than
     # loop.
-    if stop_hook_active and not has_content and not held_pays:
+    if stop_hook_active and not has_content and not held_notice.strip():
         return None
 
     # No work needed: online + nothing queued + no correction owed.
     # (Online — not ⚡ — is the gate: an idle agent legitimately lacks ⚡
     # between turns.)
-    #
-    # A HELD LANE SURFACES, even on the happy path — empty inbox, online,
-    # nothing owed — until it has been told ONCE about this hold. Being
-    # stopped is the one thing an agent must not learn by having its pane
-    # disappear. It also outranks the loop backstop above for the same
-    # reason: a re-fired Stop on a held lane is still a lane about to be
-    # stopped, until the notice has gone out.
-    if not has_content and not offline_pays and not card_nag \
-            and not card_notice and not held_pays:
+    held_notice = held_notice.strip()
+
+    # A HELD LANE ALWAYS SURFACES, even on the happy path — empty inbox,
+    # online, nothing owed. Being stopped is the one thing an agent must not
+    # learn by having its pane disappear, and this is the last turn boundary
+    # it gets. It also outranks the loop backstop below for the same reason:
+    # a re-fired Stop on a held lane is still a lane about to be stopped.
+    if not has_content and is_online and not card_nag and not card_notice \
+            and not held_notice:
         return None
 
     parts: list[str] = []
 
     if held_notice:
         parts.extend([held_notice, ""])
-        t["held_rendered"] = True
 
     if has_content:
         parts.append("📬 Auto-checked at Stop boundary — queued items below:")
@@ -956,8 +739,6 @@ def build_hook_response(
             parts.extend(["", "**Direct messages:**", messages_text.strip()])
         if has_broadcasts:
             parts.extend(["", "**Broadcasts (since you last looked):**", broadcasts_text.strip()])
-        if has_inbox:
-            parts.extend(["", inbox_text.strip()])
         if deferred:
             parts.extend([
                 "",
@@ -991,7 +772,6 @@ def build_hook_response(
             parts.extend(["", warning])
         else:
             parts.append(warning)
-        t["offline_rendered"] = True
 
     # Card nag — the authoring-compliance leg of the DECISION convention:
     # last turn reads as waiting-on-operator but carries no card. One line,
@@ -1029,22 +809,6 @@ def build_hook_response(
     # ~230 bytes x every content-bearing Stop x every agent — ~20% of all
     # stop-hook bytes fleet-wide on 2026-07-26 — repeating guidance that
     # already lives in the hub's connect-time instructions.)
-
-    # The cause: what PAID for this block. Content counts only when it is
-    # news — traffic that was all already-delivered rides along but bought
-    # nothing. A block nothing else explains (a card nag) is content.
-    fresh = has_inbox or (
-        (has_messages or has_broadcasts)
-        and not _all_already_delivered(messages_text, broadcasts_text))
-    if deferred and _all_already_delivered(deferred):
-        deferred_pays = False
-    else:
-        deferred_pays = bool(deferred)
-    paid = [c for c, on in (("content", fresh), ("spool", deferred_pays),
-                            ("held_first", held_pays),
-                            ("offline_first", offline_pays)) if on]
-    t["cause"] = ("mixed" if len(paid) > 1 else paid[0] if paid
-                  else "content")
 
     return {"decision": "block", "reason": "\n".join(parts)}
 
@@ -1143,33 +907,17 @@ def _workspace_suffix(cwd: str) -> str | None:
     unlike the old committed marker, it cannot be dragged to another clone.
     Absent → unchanged derivation, so the existing fleet keeps its names.
 
-    An entry covers its worktree AND every folder below it (card #432): git
-    walks UP from cwd, so a session in a subdirectory derives the repo half
-    of the name and must derive the suffix half too, or two clones collapse
-    into one name one level down. Matched on path COMPONENTS (`/a/b` never
-    claims `/a/bc`), the longest root wins (a submodule with its own entry
-    keeps its suffix), and a `/` root is skipped — one stray character in a
-    hand-edited config must not re-suffix every lane on the box.
-
     Mirrored in statusline-command.js — change both or neither.
     """
     table = _load_hub_config().get("workspaces")
     if not isinstance(table, dict):
         return None
     target = _norm_path(cwd)
-    best: tuple[int, str] | None = None
     for path, suffix in table.items():
-        if not (isinstance(path, str) and isinstance(suffix, str)
-                and suffix.strip()):
-            continue
-        root = _norm_path(path)
-        if not root.strip("/\\"):
-            continue  # "/" — a prefix of every path
-        if target == root or target.startswith(root + os.sep) \
-                or target.startswith(root + "/"):
-            if best is None or len(root) > best[0]:
-                best = (len(root), suffix.strip())
-    return best[1] if best else None
+        if isinstance(path, str) and isinstance(suffix, str) and suffix.strip():
+            if _norm_path(path) == target:
+                return suffix.strip()
+    return None
 
 
 def _resolve_squads(cwd: str) -> list[str]:
@@ -2168,60 +1916,6 @@ def _with_agent_key(name: str) -> dict[str, Any]:
     return {"headers": headers} if headers else {}
 
 
-# The interactive session's half of MH-H1: Claude Code runs a connection's
-# `headersHelper` and sends what it prints as request headers. The helper is
-# a dependency-free sh script (no python start-up on every connect, nothing
-# to break when the venv moves), installed once under <state>/bin. It prints
-# the key header ONLY for a well-formed key (64 lowercase hex) and a plain
-# lane name — anything path-shaped could read another file — and `{}`
-# otherwise, so a lane with no key connects exactly as it did before.
-_AGENT_KEY_HELPER = r"""#!/bin/sh
-# mcp-hub agent-key-header <lane> — headersHelper for the hub connection.
-# Prints {"x-mcp-hub-agent-key": "<key>"} for a held well-formed key, else {}.
-# Installed by mcp-hub (rebind-url); do not edit, it is not rewritten.
-name="$1"
-case "$name" in
-  ""|-*|*[!a-z0-9_-]*) echo '{}'; exit 0 ;;
-esac
-dir=$(dirname "$0")/../agent-keys
-key=$(cat "$dir/$name.key" 2>/dev/null) || { echo '{}'; exit 0; }
-case "$key" in
-  *[!0-9a-f]*|"") echo '{}'; exit 0 ;;
-esac
-if [ "${#key}" -ne 64 ]; then echo '{}'; exit 0; fi
-printf '{"x-mcp-hub-agent-key": "%s"}\n' "$key"
-"""
-
-
-def _agent_key_helper_path() -> pathlib.Path:
-    return _state_dir() / "bin" / "agent-key-header"
-
-
-def _install_agent_key_helper() -> pathlib.Path:
-    """Write the helper (mode 0755) unless it is already there as written —
-    installed ONCE, so re-stamping a lane never touches a file a running
-    session may be executing."""
-    path = _agent_key_helper_path()
-    try:
-        if path.read_text(encoding="utf-8") == _AGENT_KEY_HELPER \
-                and os.access(path, os.X_OK):
-            return path
-    except OSError:
-        pass
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(_AGENT_KEY_HELPER, encoding="utf-8")
-    os.chmod(tmp, 0o755)
-    os.replace(tmp, path)
-    return path
-
-
-def _agent_key_helper_command(name: str, *, install: bool = True) -> str:
-    """The headersHelper value for `name`: the helper's path and the lane."""
-    path = _install_agent_key_helper() if install else _agent_key_helper_path()
-    return f"{shlex.quote(str(path))} {shlex.quote(name)}"
-
-
 def _ephemeral_hub_url(url: str) -> str:
     """Strip the ?agent= identity from a hub URL before an EPHEMERAL client
     connects with it.
@@ -2426,107 +2120,26 @@ def edge_command(args: argparse.Namespace) -> int:
     return 0
 
 
-def _url_agent_param(url: str) -> str | None:
-    """The `agent=` a hub URL names itself by, or None. Present-and-empty is
-    not a name."""
-    from urllib.parse import parse_qsl, urlsplit
-    try:
-        query = urlsplit(url or "").query
-    except ValueError:
-        return None
-    for k, v in parse_qsl(query, keep_blank_values=True):
-        if k == "agent":
-            return v or None
-    return None
-
-
-def _find_hub_entry(cwd: str) -> tuple[pathlib.Path | None, Any, list[str]]:
-    """(file, parsed data, key path) of the first candidate scope carrying a
-    hub URL, in `_hub_config_candidates`' precedence — the ONE reading both
-    the stamping verb and the fleet check use, or they would disagree about
-    which file the lane actually connects with. (None, None, []) if none."""
-    for candidate, path in _hub_config_candidates(cwd):
-        try:
-            candidate_data = json.loads(candidate.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        hub_entry = _dig(candidate_data, path)
-        if isinstance(hub_entry, dict) and hub_entry.get("url"):
-            return candidate, candidate_data, path
-    return None, None, []
-
-
-def _rebind_url_fleet() -> int:
-    """`rebind-url --fleet`: which comms lanes' hub connections name them.
-
-    READ-ONLY, with or without --dry-run: stamping is each lane owner's act,
-    and this is the check that says which lanes are missing it. Per lane:
-      ok             the URL's agent= is the roster name or the derived one
-      missing-agent  a URL that names nobody
-      mismatch       a URL naming another seat (both names printed)
-      no-url         no hub URL in a scope that denotes this one seat — the
-                     shared global entry is never a lane's stamp
-      container      the config that matters lives inside the container, so
-                     nothing out here can measure it: reported, never `ok`,
-                     and it decides nothing
-    A roster name that differs from the derived identity is reported as
-    `name-split` beside the verdict — a real fault, but a different one.
-    Lanes without the comms flag are not listed. Exit 1 when any checked
-    lane is not ok."""
-    rows = _roster_all()
-    if not rows:
-        print(f"no roster rows in {SQUAD_CONF} — nothing to check")
-        return 0
-    checked = good = 0
-    lines: list[str] = []
-    for row in rows:
-        agent, worktree, launch = row["agent"], row["worktree"], row["args"]
-        if launch.startswith("@docker:"):
-            lines.append(f"  {agent}: container: not checkable from host")
-            continue
-        if not _launch_flags(launch)["comms"]:
-            continue
-        checked += 1
-        derived, _project = _derive_agent_identity(worktree)
-        names = {agent} | ({derived} if derived else set())
-        split = (f"  [name-split: roster {agent}, derived {derived}]"
-                 if derived and derived != agent else "")
-        _file, data, path = _find_hub_entry(worktree)
-        if data is None:
-            lines.append(f"  {agent}: no-url (no hub URL in this lane's own "
-                         f"scopes){split}")
-            continue
-        named = _url_agent_param(_dig(data, path).get("url", ""))
-        if named is None:
-            lines.append(f"  {agent}: missing-agent (the URL names nobody; "
-                         f"`mcp-hub rebind-url --cwd <worktree>` stamps it){split}")
-        elif named in names:
-            good += 1
-            lines.append(f"  {agent}: ok{split}")
-        else:
-            lines.append(f"  {agent}: mismatch — the URL names {named}{split}")
-    print("hub connections that name their lane (rebind-url --fleet, read-only):")
-    for ln in lines:
-        print(ln)
-    print(f"{good}/{checked} comms lanes self-identifying")
-    return 0 if good == checked else 1
-
-
 def rebind_url_command(args: argparse.Namespace) -> int:
     """Stamp ?agent=<derived name> into this seat's hub URL — the per-seat
-    rollout leg of transport-level auto-rebind — and the connection's
-    headersHelper, so it presents the lane's agent key (MH-H1).
-
-    `--fleet` is the read-only check across the roster instead. Read with
-    getattr: hand-built Namespaces (tests, the settings app) predate it."""
-    if getattr(args, "fleet", False):
-        return _rebind_url_fleet()
+    rollout leg of transport-level auto-rebind."""
     cwd = args.cwd or os.getcwd()
     name, _project = _derive_agent_identity(cwd)
     if not name:
         print(f"no derived identity for {cwd} (not opted in?) — nothing written")
         return 1
-    mcp_json, data, hub_path = _find_hub_entry(cwd)
+    mcp_json = None
+    data: Any = None
+    hub_path: list[str] = []
+    for candidate, path in _hub_config_candidates(cwd):
+        try:
+            candidate_data = json.loads(candidate.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue
+        hub_entry = _dig(candidate_data, path)
+        if isinstance(hub_entry, dict) and hub_entry.get("url"):
+            mcp_json, data, hub_path = candidate, candidate_data, path
+            break
     if mcp_json is None:
         looked = ", ".join(str(c) for c, _ in _hub_config_candidates(cwd))
         print(f"no hub server URL found (looked in: {looked}) — nothing written")
@@ -2538,25 +2151,18 @@ def rebind_url_command(args: argparse.Namespace) -> int:
     query = [(k, v) for k, v in parse_qsl(parts.query) if k != "agent"]
     query.append(("agent", name))
     new_url = urlunsplit(parts._replace(query=urlencode(query)))
-    helper = _agent_key_helper_command(name, install=False)
-    if new_url == url and hub.get("headersHelper") == helper:
+    if new_url == url:
         print(f"already stamped: {url}")
         return 0
     where = f"{mcp_json}:{'.'.join(hub_path)}"
     if args.dry_run:
-        # The helper's PATH, never the key: the key is the helper's to read.
-        if new_url != url:
-            print(f"would rewrite {where}: {url} -> {new_url}")
-        print(f"would set {where}.headersHelper: {_agent_key_helper_path()}")
+        print(f"would rewrite {where}: {url} -> {new_url}")
         return 0
     # Mutate in place — these files carry unrelated state (~/.claude.json
-    # holds every project's settings), so only these keys change.
-    _install_agent_key_helper()
+    # holds every project's settings), so only the one key changes.
     hub["url"] = new_url
-    hub["headersHelper"] = helper
     mcp_json.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     print(f"stamped {where}: {new_url}")
-    print(f"headersHelper: {_agent_key_helper_path()}")
     print("(takes effect at the session's next MCP reconnect or relaunch)")
     return 0
 
@@ -4834,9 +4440,7 @@ async def _mute_squad(hub_url: str, name: str, squad: str, muted: bool) -> str:
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
 
-    async with streamablehttp_client(
-            _ephemeral_hub_url(hub_url), timeout=15,
-            **_with_agent_key(name)) as (read, write, _):
+    async with streamablehttp_client(_ephemeral_hub_url(hub_url), timeout=15) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
             return _extract_text(await session.call_tool(
@@ -4849,7 +4453,7 @@ async def _set_focus(hub_url: str, name: str, minutes: int, reason: str) -> str:
     from mcp.client.streamable_http import streamablehttp_client
 
     async with streamablehttp_client(
-        _ephemeral_hub_url(hub_url), timeout=15, **_with_agent_key(name)
+        _ephemeral_hub_url(hub_url), timeout=15
     ) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
@@ -4865,7 +4469,7 @@ async def _send_dm(hub_url: str, frm: str, to: str, message: str,
     from mcp.client.streamable_http import streamablehttp_client
 
     async with streamablehttp_client(
-        _ephemeral_hub_url(hub_url), timeout=15, **_with_agent_key(frm)
+        _ephemeral_hub_url(hub_url), timeout=15
     ) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
@@ -5279,7 +4883,6 @@ def _resolve_agent_identity(
 
 def stop_hook_command(args: argparse.Namespace) -> int:
     """Run the stop-hook subcommand. Always returns 0 (fail-open)."""
-    t0 = time.monotonic()
     # Read stdin ONCE — both agent identity (cwd marker) and the
     # stop_hook_active loop-backstop flag come from this single payload.
     payload = _read_hook_stdin()
@@ -5292,7 +4895,6 @@ def stop_hook_command(args: argparse.Namespace) -> int:
 
     # True when this Stop is firing because a prior Stop-hook block fired.
     stop_hook_active = bool(payload.get("stop_hook_active"))
-    session_id = str(payload.get("session_id") or "")
 
     # Self-heal the keep-alive daemon before anything else — this runs even if
     # the hub is unreachable (the daemon will retry-connect on its own), so a
@@ -5311,41 +4913,18 @@ def stop_hook_command(args: argparse.Namespace) -> int:
     from mcp_hub import hold as _hold
 
     held_notice = ""
-    held_owed = True
-    _entry = None
     try:
         _entry = _hold.held_entry(name)
-        if _entry and _hold.deferred(name):
-            # r5 F6: squad has DEFERRED this hold — the lane is in
-            # conversation with Tim — so it is NOT being stopped at this
-            # boundary and must not be told it is. No stamp either: one left
-            # now would stop the lane mid-sentence on the next pass. The
-            # deferral is a deadline, so a squad that stops running cannot
-            # silence the notice for longer than its TTL.
-            _entry = None
-        elif _entry:
+        if _entry:
             _hold.stamp_boundary(name)
             held_notice = _hold.hook_notice(name, _entry)
-            # r5 F3: once per hold, keyed to its `until`. Delivered already
-            # means it rides along on a paid block but buys none of its own.
-            held_owed = not _hold.notice_delivered(name, _entry)
         else:
             # Not held (or released, or expired): drop any stamp, or it
             # would outlive its hold and make the NEXT one look as though
-            # it had already reached a boundary. Same for the told-them
-            # marker.
+            # it had already reached a boundary.
             _hold.clear_boundary(name)
-            _hold.clear_notice_marker(name)
     except Exception:  # noqa: BLE001 — a hold must never break a turn end
-        held_notice, _entry = "", None
-
-    # r5 F5: what an automated door refused to type into this lane's pane
-    # while a person was using it. Peeked, not taken: the items are cleared
-    # only once the block carrying them is out.
-    from mcp_hub import lane_inbox
-
-    inbox_items = lane_inbox.peek(name)
-    inbox_text = "\n\n".join(text.strip() for _p, text in inbox_items)
+        held_notice = ""
 
     # The DECISION card leg is gone (2026-10-06, the operator's word: cards
     # are retired for Fleet V2). The hook no longer harvests, files, clears
@@ -5373,27 +4952,6 @@ def stop_hook_command(args: argparse.Namespace) -> int:
     except Exception:  # noqa: BLE001
         turn_evidence = None
 
-    defer_low = os.environ.get("MCP_HUB_DEFER_LOW", "").lower() in (
-        "1", "true", "yes")
-
-    def _record(surfaced: bool, error: bool, trace: dict[str, Any]) -> None:
-        # The drain record (bar 47): every drain, silent ones and hub
-        # failures included, with what it decided and why — never a turn
-        # count, which the hook cannot see.
-        rec: dict[str, Any] = {
-            "kind": "drain", "ts": round(time.time(), 3), "agent": name,
-            "surfaced": surfaced, "error": error,
-            "cause": trace.get("cause", "none") if surfaced else "none",
-            "defer_low": trace.get("defer_low", defer_low),
-            "defer_effect": trace.get(
-                "defer_effect", "none" if defer_low else "off"),
-        }
-        for k in ("defer_held_s", "defer_discarded"):
-            if k in trace:
-                rec[k] = trace[k]
-        rec["elapsed_ms"] = _elapsed_ms(t0)
-        _log_activity(rec)
-
     try:
         messages_text, broadcasts_text, is_online, _card_notice = asyncio.run(
             _query_hub(args.hub_url, name, project or "",
@@ -5403,7 +4961,6 @@ def stop_hook_command(args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001
         # Fail open — never block the agent on hub flakiness.
         print(f"[mcp-hub stop-hook] hub query failed: {exc!r}", file=sys.stderr)
-        _record(False, True, {})
         return 0
 
     # Shadow mode: compare the hub's "already delivered live" inference against
@@ -5414,22 +4971,6 @@ def stop_hook_command(args: argparse.Namespace) -> int:
 
     shadow.run_shadow(name, messages_text, payload.get("transcript_path"))
 
-    # r5 F3: the offline-only nag blocks at most once per offline EPISODE,
-    # per session — a new session is a context that has never read the line.
-    # Reading online ends the episode, so a lane that recovers and drops
-    # again is told again. Like the hold notice it is derived (list_agents,
-    # every Stop), so not re-delivering it loses nothing.
-    marker = _offline_nag_marker(name)
-    offline_owed = True
-    try:
-        if is_online:
-            marker.unlink(missing_ok=True)
-        elif marker.exists():
-            offline_owed = marker.read_text(encoding="utf-8") != session_id
-    except OSError:
-        offline_owed = True
-
-    trace: dict[str, Any] = {}
     response = build_hook_response(
         agent_name=name,
         project=project,
@@ -5438,34 +4979,17 @@ def stop_hook_command(args: argparse.Namespace) -> int:
         is_online=is_online,
         stop_hook_active=stop_hook_active,
         held_notice=held_notice,
-        held_owed=held_owed,
-        offline_owed=offline_owed,
-        inbox_text=inbox_text,
         # Opt-IN, and off by default: this is the one path that can decide
         # not to show an agent something the hub has already marked read, so
         # it ships dark and is turned on per box once its spool is trusted.
-        defer_low=defer_low,
-        trace=trace,
+        defer_low=os.environ.get("MCP_HUB_DEFER_LOW", "").lower()
+        in ("1", "true", "yes"),
     )
 
     if response is None:
-        _record(False, False, trace)
         return 0  # No block — Stop proceeds normally
 
-    print(json.dumps(_stop_output_shape(name, response)))
-
-    # Only now that the block is out: mark what it delivered.
-    if trace.get("held_rendered") and _entry:
-        _hold.mark_notice_delivered(name, _entry)
-    if trace.get("offline_rendered"):
-        try:
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.write_text(session_id, encoding="utf-8")
-        except OSError:
-            pass
-    if inbox_items:
-        lane_inbox.clear([p for p, _t in inbox_items])
-    _record(True, False, trace)
+    print(json.dumps(response))
     return 0
 
 
@@ -5558,19 +5082,14 @@ def agent_key_command(args: argparse.Namespace) -> int:
     The key is returned by the hub exactly once, so it is PERSISTED (0600)
     BEFORE anything else happens to it, and it is never printed by ensure.
     """
-    if args.action == "header":
-        # A headersHelper runs in the lane's folder with no hook payload on
-        # stdin, so with no --name the lane is derived from the folder. No
-        # identity there means no key: `{}`, never an error, or the
-        # connection itself would fail.
-        name = args.name or _derive_agent_identity(os.getcwd())[0]
-        print(json.dumps(_agent_key_headers(name) if name else {}))
-        return 0
     payload: dict[str, Any] = {} if args.name else _read_hook_stdin()
     name, _project = _resolve_agent_identity(args, payload)
     if name is None:
         return 0  # not a hub agent here: silent, like every hook
     path = _agent_key_file(name)
+    if args.action == "header":
+        print(json.dumps(_agent_key_headers(name)))
+        return 0
     if path.exists() and not args.force:
         print(f"agent key for {name}: held ({path})")
         return 0
@@ -6392,16 +5911,10 @@ async def _heartbeat_loop(hub_url: str, agent_name: str) -> bool:
     # rejected these arguments is the same hub after a blip, and re-probing
     # every reconnect would reintroduce the per-beat cost the latch removes.
     send_transcript = True
-    # Bar 47's heartbeat half: one presence line per UTC hour in the
-    # activity log, carrying the duration of the beat that opened the hour.
-    beat_hour = ""
     while True:
         try:
-            # The key is re-read on every (re)connect, so a key ensured or
-            # reset while the daemon runs is presented from the next one.
             async with streamablehttp_client(
-                _ephemeral_hub_url(hub_url), timeout=10,
-                **_with_agent_key(agent_name)
+                _ephemeral_hub_url(hub_url), timeout=10
             ) as (read, write, _):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
@@ -6409,12 +5922,9 @@ async def _heartbeat_loop(hub_url: str, agent_name: str) -> bool:
                     since_heartbeat = HEARTBEAT_INTERVAL_SECONDS
                     while True:
                         if since_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
-                            hb_t0 = time.monotonic()
                             hb_text, send_transcript = await _call_heartbeat(
                                 session, agent_name, send_transcript
                             )
-                            beat_hour = _log_beat_if_new_hour(
-                                agent_name, beat_hour, _elapsed_ms(hb_t0))
                             _maybe_stamp_hub_restart(hb_text)
                             since_heartbeat = 0
                             if baseline_head is not None:
@@ -6502,19 +6012,6 @@ def heartbeat_daemon_command(args: argparse.Namespace) -> int:
         # A live daemon already owns this agent — stand down rather than
         # leak a second one. This is the fix for the daemon accumulation.
         return 0
-    # Hold this lane's key BEFORE the first connect (MH-H1), so the daemon's
-    # very first beat already presents it. Quietly — the daemon's output
-    # goes nowhere anyone reads — and failing open: a hub that is down or
-    # issues no keys must never stop the beat that keeps the binding alive.
-    try:
-        with open(os.devnull, "w", encoding="utf-8") as _null, \
-                contextlib.redirect_stdout(_null), \
-                contextlib.redirect_stderr(_null):
-            agent_key_command(argparse.Namespace(
-                action="ensure", name=name, project=None, force=False,
-                hub_url=args.hub_url))
-    except Exception:  # noqa: BLE001
-        pass
     respawn = False
     try:
         respawn = asyncio.run(_heartbeat_loop(args.hub_url, name))
@@ -7757,95 +7254,6 @@ def seat_entry_command(args: argparse.Namespace) -> int:
     return _seat_supervise([(s, c) for s, c, _w in prepared])
 
 
-def hibernate_command(args: argparse.Namespace) -> int:
-    """`mcp-hub hibernate` — one pass of the hibernation scanner (bar 59).
-
-    REPORT ONLY unless `--arm`: the first armed pass runs only after a
-    report-only pass has shown candidates BY NAME, so this prints every row
-    the console returned, verbatim words and all. `--dry-run` writes nothing
-    even when armed. Ships unarmed — no timer runs this.
-    """
-    from mcp_hub import hibernate as hib
-    from mcp_hub import operator_api
-
-    # `is None`, never truthiness: an EMPTY --token is a mistake to report,
-    # not a request for the token on disk — falling through would act under
-    # a credential the operator just tried not to use.
-    token = operator_api.resolve_token() if args.token is None else args.token
-    if not token.strip():
-        print("hibernate: no operator token (--token was empty, or none is "
-              "configured in $MCP_HUB_API_TOKEN / ~/.mcp-hub/api.token) — "
-              "nothing asked, nothing written", file=sys.stderr)
-        return 2
-    console = hib.ConsoleAPI(
-        base_url=args.console_url or os.environ.get("MCP_HUB_CONSOLE_URL", ""),
-        token=token)
-    hub = hib.HubHolds(base_url=operator_api.api_base(args.hub_url),
-                       token=token)
-    report_only = not args.arm
-    rep = hib.scan(console, hub, thread=args.thread, now=time.time(),
-                   dry_run=report_only or args.dry_run)
-    if report_only:
-        print("hibernate: REPORT ONLY — nothing written (pass --arm to "
-              "place and release holds)")
-    print(rep.line())
-    if rep.asked:
-        n = len(rep.candidates_seen)
-        if n:
-            print(f"{n} candidate row(s):")
-        else:
-            print("0 candidate row(s) — NO candidate rows. A quiet fleet and "
-                  "a scanner that cannot see its candidates print this same "
-                  "reading; the left-out rows below are the only witness.")
-        for row in rep.candidates_seen:
-            if isinstance(row, dict):
-                print(f"  candidate {row.get('lane', '?')}: "
-                      f"{row.get('why') or '(no why given)'}"
-                      f" — released by: {row.get('release') or '(not stated)'}")
-            else:
-                print(f"  candidate (unreadable row): {row!r}")
-        print(f"{len(rep.left_out_seen)} left-out row(s):")
-        for row in rep.left_out_seen:
-            if isinstance(row, dict):
-                print(f"  left out {row.get('lane', '?')}: "
-                      f"{row.get('why') or '(no why given)'}")
-            else:
-                print(f"  left out (unreadable row): {row!r}")
-    for why in rep.reasons:
-        print(f"  {why}")
-    return 0 if rep.asked and not rep.unparsable else 1
-
-
-def _add_hibernate_parser(sub: Any) -> None:
-    hib = sub.add_parser(
-        "hibernate",
-        help="Hibernation scanner: park lanes with nothing open (REPORT ONLY "
-             "unless --arm)",
-        description=(
-            "One pass: ask the console for this thread's hibernation "
-            "candidates, park each with a kind=hibernation, "
-            "owner=hibernation-scanner hold (12h, re-held as a FRESH entry "
-            "each pass), and release only this scanner's own holds on lanes "
-            "no longer listed, recording the console's reason verbatim. "
-            "Without --arm it writes nothing and prints every row by name."
-        ),
-    )
-    hib.add_argument("--thread", required=True,
-                     help="The console thread whose candidates to read")
-    hib.add_argument("--arm", action="store_true",
-                     help="Actually place and release holds")
-    hib.add_argument("--dry-run", action="store_true",
-                     help="Write nothing, even with --arm")
-    hib.add_argument("--hub-url", default=DEFAULT_HUB_URL,
-                     help="Hub base URL (default: $MCP_HUB_URL or built-in)")
-    hib.add_argument("--console-url", default=None,
-                     help="Console base URL (default: $MCP_HUB_CONSOLE_URL)")
-    hib.add_argument("--token", default=None,
-                     help="Operator token (default: $MCP_HUB_API_TOKEN, then "
-                          "~/.mcp-hub/api.token). An empty value is refused, "
-                          "never replaced by the one on disk")
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mcp-hub",
@@ -8189,12 +7597,6 @@ def build_parser() -> argparse.ArgumentParser:
     rebind.add_argument("--cwd", default=None, help="Worktree (default: current directory)")
     rebind.add_argument(
         "--dry-run", action="store_true", help="Print the rewritten URL; write nothing"
-    )
-    rebind.add_argument(
-        "--fleet", action="store_true",
-        help=("Check every comms lane in the roster instead: does its hub URL "
-              "name it (ok / missing-agent / mismatch / no-url)? Read-only, "
-              "even without --dry-run; exit 1 if any lane is not ok"),
     )
 
     focus_p = sub.add_parser(
@@ -8792,13 +8194,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Validate + write files, but do not launch claude (tests/debug)",
     )
 
-    _add_hibernate_parser(sub)
-
-    # The load meter (v2-fleet F1): read-only, never imported by the server.
-    from . import load_meter as _load_meter
-    _load_meter.add_arguments(
-        sub.add_parser("load-meter", help="Take one load-meter reading (read-only)")
-    )
     return parser
 
 
@@ -8876,11 +8271,6 @@ def main(argv: list[str] | None = None) -> int:
         return voice_host_command(args)
     if args.subcommand == "seat-entry":
         return seat_entry_command(args)
-    if args.subcommand == "hibernate":
-        return hibernate_command(args)
-    if args.subcommand == "load-meter":
-        from . import load_meter
-        return load_meter.run(args)
 
     parser.print_help()
     return 0

@@ -28,40 +28,6 @@ from typing import Any
 
 US = "\x1f"
 
-# One box, several boards: each ran the same ~9 CPU-second `squad board
-# --json` on its own tick (dev-vm-1, 2026-10-08). A SUCCESSFUL scan is
-# published here and any board inside the window reads it instead of
-# scanning. Only successes: sharing a failure would spread one board's error
-# to every board for the whole window. A stamp from the future (a clock that
-# stepped back) is not fresh — it would freeze the board on old data.
-SCAN_SHARE_FILE = "board-scan.json"
-SCAN_SHARE_SECONDS = 10.0
-
-
-def _shared_scan(cache: Path, squad_bin: str, now: float) -> dict[str, Any] | None:
-    data = _read_json(cache / SCAN_SHARE_FILE)
-    try:
-        age = now - float(data.get("ts"))
-    except (TypeError, ValueError):
-        return None
-    if not 0 <= age < SCAN_SHARE_SECONDS or data.get("squad_bin") != squad_bin:
-        return None
-    doc = data.get("doc")
-    return doc if isinstance(doc, dict) else None
-
-
-def _share_scan(cache: Path, squad_bin: str, now: float,
-                doc: dict[str, Any]) -> None:
-    """Atomic, and never raises: a board must not fail over a cache write."""
-    try:
-        target = cache / SCAN_SHARE_FILE
-        tmp = target.with_name(f".{target.name}.{os.getpid()}")
-        tmp.write_text(json.dumps({"ts": now, "squad_bin": squad_bin,
-                                   "doc": doc}), encoding="utf-8")
-        tmp.replace(target)
-    except OSError:
-        pass
-
 # Mirror of squad's WAIT_ON_OP_RE (the 🙋 phrase gate). Read from the
 # environment when squad exported it — one pattern, one owner — with the
 # squad:260 value as fallback for launches outside a squad shell.
@@ -118,18 +84,12 @@ def collect(squad_bin: str, home: Path | None = None,
     scan: list[dict[str, Any]] = []
     unmanaged: list[dict[str, Any]] = []
     try:
-        doc = _shared_scan(cache, squad_bin, now)
-        proc = None
-        if doc is None:
-            proc = subprocess.run(
-                [squad_bin, "board", "--json"],
-                capture_output=True, text=True, timeout=20,
-            )
-            if proc.returncode == 0:
-                doc = json.loads(proc.stdout)
-                if isinstance(doc, dict):
-                    _share_scan(cache, squad_bin, now, doc)
-        if doc is not None:
+        proc = subprocess.run(
+            [squad_bin, "board", "--json"],
+            capture_output=True, text=True, timeout=20,
+        )
+        if proc.returncode == 0:
+            doc = json.loads(proc.stdout)
             scan = doc.get("agents", [])
             # Box-wide inventory: tmux sessions outside the roster, every
             # socket. An older squad emits no key — that is "not measured",
@@ -139,7 +99,7 @@ def collect(squad_bin: str, home: Path | None = None,
                 u for u in doc.get("unmanaged") or []
                 if isinstance(u, dict) and u.get("session")
             ]
-        elif proc is not None:
+        else:
             error = (proc.stderr or "squad board failed").strip().splitlines()[-1][:120]
     except FileNotFoundError:
         error = "squad not found — live board data unavailable"

@@ -128,12 +128,6 @@ def hard_stop_due(entry: dict[str, Any], agent: str,
     the fleet.
     """
     now = time.time() if now is None else now
-    # A PARKED lane has no turn worth hurrying: hibernation means it ran out
-    # of open work, so it waits for its boundary however long that takes.
-    # Only the exact word earns this — no kind, or one the hub would refuse,
-    # is hard-stopped as before rather than promoted into the exempt class.
-    if str(entry.get("kind") or "") == "hibernation":
-        return False
     if boundary_reached_at(agent):
         return False
     try:
@@ -157,19 +151,6 @@ def hook_notice(agent: str, entry: dict[str, Any]) -> str:
     until = float(entry.get("until") or 0)
     when = time.strftime("%H:%M", time.localtime(until)) if until else "?"
     reason = str(entry.get("reason") or "")
-    if str(entry.get("kind") or "") == "hibernation":
-        # Parked, not braked. The brake's wording reads as a reprimand for
-        # overspending, and a lane that merely ran out of work would go
-        # looking for what it did wrong.
-        return (
-            f"💤 THIS LANE IS HIBERNATING — it is being stopped at this turn "
-            f"boundary because it has no open work, not for anything it did.\n"
-            f"· Wakes: {when} at the latest, or when — {cond}\n"
-            + (f"· Reason: {reason}\n" if reason else "")
-            + "· The stop lands between turns, so no turn of yours is lost, "
-            "and waking restarts this lane with --continue.\n"
-            "· You do not need to do anything. Do NOT start new work."
-        )
     return (
         f"⏸️ THIS LANE IS HELD — it is being stopped at this turn boundary, "
         f"which is the one you have just reached.\n"
@@ -179,129 +160,3 @@ def hook_notice(agent: str, entry: dict[str, Any]) -> str:
         "and release restarts this lane with --continue.\n"
         "· You do not need to do anything. Do NOT start new work."
     )
-
-
-# --- once per hold: the notice marker (v2-fleet r5 F3) ----------------------
-#
-# A block costs the lane a model turn, and the notice is DERIVED — re-read
-# from the mirror at every Stop — so delivering it consumes nothing and not
-# re-delivering it loses nothing. The marker records "this lane has been told
-# about THIS hold", keyed to the hold's `until`: a bare told-them flag would
-# silence every LATER hold too, the silencer-with-no-expiry shape. It is not
-# a suppression either: the notice still rides, first, on any block that real
-# content pays for. It only stops buying blocks of its own.
-
-def _state_dir() -> Path:
-    override = os.environ.get("MCP_HUB_STATE_DIR")
-    return Path(override) if override else Path.home() / ".mcp-hub"
-
-
-def notice_marker_path(agent: str) -> Path:
-    return _state_dir() / "hold-notice" / f"{agent}.json"
-
-
-def notice_delivered(agent: str, entry: dict[str, Any]) -> bool:
-    """Has this lane already been told about THIS hold? False on any doubt,
-    which re-delivers: the failure direction is a wasted turn, never an
-    unannounced stop."""
-    try:
-        raw = json.loads(notice_marker_path(agent).read_text("utf-8"))
-        return float(raw.get("until")) == float(entry.get("until"))
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def mark_notice_delivered(agent: str, entry: dict[str, Any],
-                          now: float | None = None) -> None:
-    now = time.time() if now is None else now
-    try:
-        target = notice_marker_path(agent)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"until": float(entry.get("until") or 0),
-                                   "told_at": now}), encoding="utf-8")
-        tmp.replace(target)
-    except Exception:  # noqa: BLE001 — unwritten means told again next Stop
-        pass
-
-
-def clear_notice_marker(agent: str) -> None:
-    """Drop the marker once the hold is gone, so it can never outlive the
-    hold it was written for."""
-    try:
-        notice_marker_path(agent).unlink(missing_ok=True)
-    except Exception:  # noqa: BLE001
-        pass
-
-
-# --- the conversation exemption's deferral (v2-fleet r5 F6) -----------------
-#
-# squad decides; the hook reads. A hold placed by a MECHANISM (it carries an
-# `owner`) is deferred while the lane is in conversation with Tim, and squad
-# leaves `hold-deferred/<lane>.json` saying so. While it stands the lane is
-# NOT being stopped at this boundary, so the hook must neither say it is nor
-# stamp one — a stamp left now would stop the lane mid-sentence on the next
-# pass.
-#
-# ⭐ A DEADLINE, NOT A FLAG. A squad that stops running must not silence the
-# "being stopped" notice forever — the same reason focus mode stores an
-# expiry. Every pass that still defers re-writes the record; one that stops
-# re-writing lets it lapse within the TTL.
-#
-# 🔴 FAILS OPEN AS NOT DEFERRED: an unreadable record means the lane hears the
-# notice, which is the direction that loses nothing.
-
-DEFERRAL_TTL_SECONDS = 600.0
-
-
-def deferral_path(agent: str) -> Path:
-    """`$MCP_HUB_STATE_DIR/hold-deferred/<lane>.json` — squad writes the same
-    name with the roster's spelling of the lane."""
-    return _state_dir() / "hold-deferred" / f"{agent}.json"
-
-
-def record_deferral(agent: str, *, until: float, owner: str,
-                    now: float | None = None) -> bool:
-    now = time.time() if now is None else now
-    try:
-        target = deferral_path(agent)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_suffix(".tmp")
-        tmp.write_text(json.dumps({
-            "agent": agent, "until": until, "owner": owner,
-            "deferred_at": now, "expires": now + DEFERRAL_TTL_SECONDS,
-        }), encoding="utf-8")
-        tmp.replace(target)
-        return True
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def deferred(agent: str, now: float | None = None) -> bool:
-    """Is this lane's hold deferred right now? Never raises.
-
-    Reads `expires` when present, else `deferred_at` plus the TTL; a record
-    carrying neither falls back to its file's mtime, so a writer that only
-    touches the file still gets a deadline rather than a forever."""
-    now = time.time() if now is None else now
-    path = deferral_path(agent)
-    try:
-        raw = json.loads(path.read_text("utf-8"))
-        if not isinstance(raw, dict):
-            return False
-        if raw.get("expires") is not None:
-            expires = float(raw["expires"])
-        elif raw.get("deferred_at") is not None:
-            expires = float(raw["deferred_at"]) + DEFERRAL_TTL_SECONDS
-        else:
-            expires = path.stat().st_mtime + DEFERRAL_TTL_SECONDS
-        return now < expires
-    except Exception:  # noqa: BLE001 — unreadable means NOT deferred
-        return False
-
-
-def clear_deferral(agent: str) -> None:
-    try:
-        deferral_path(agent).unlink(missing_ok=True)
-    except Exception:  # noqa: BLE001
-        pass

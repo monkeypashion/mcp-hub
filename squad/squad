@@ -22,9 +22,6 @@ HEAL_MAX_RELAUNCH="${SQUAD_HEAL_MAX_RELAUNCH:-2}"   # relaunches per heal pass (
 # Don't judge an agent younger than this — Claude Code needs to boot and
 # register, and the status cache it's judged on lags by up to 3 min.
 HEAL_GRACE_SECONDS="${SQUAD_HEAL_GRACE_SECONDS:-180}"
-# Nudges per agent LIFE (reset by a relaunch, or once it reads healthy) —
-# see heal_action's `spent`.
-HEAL_MAX_NUDGES="${SQUAD_HEAL_MAX_NUDGES:-2}"
 SLICE="${SQUAD_SLICE:-}"                 # optional systemd user slice for ceilings; empty = none
 CMD="$(basename "$0")"                   # whatever you symlinked this as (help text only)
 SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"   # real script path (for tmux key bindings)
@@ -158,15 +155,6 @@ has_resume() {
 #   relaunch  the nudge failed and the roster permits a resuming restart
 #   blocked   the nudge failed, a restart IS the cure, the roster forbids it
 #   nudge     first strike: ask it to re-register
-#   spent     a nudge is due, but this life has had HEAL_MAX_NUDGES already
-#
-# `spent` is the nudge BUDGET (deputy ruling 2026-09-10, hub.msg 26196). The
-# strike flag decays after ten minutes, and that decay is load-bearing — it is
-# what escalates a nudge into a relaunch — so a lane whose transport is dead
-# fell back through it into `nudge` every pass: 63 typed lines to three lanes
-# in half an hour the night prod-1's tailnet key expired, none of which could
-# work. The budget replaces only the NUDGE: the cheap pane-free verdicts and
-# the busy guard come first, and a struck lane still escalates.
 #
 # `blocked` is the case this function was extracted for. It used to fall into
 # `nudge`, so a wake-capable agent without $RESUME_FLAG was told to re-register
@@ -178,7 +166,7 @@ has_resume() {
 # the channel. So the operator — the only party who can fix it — is told
 # instead.
 heal_action() {
-  local state="$1" struck="$2" args="$3" idle="$4" nudges="${5:-0}"
+  local state="$1" struck="$2" args="$3" idle="$4"
   if [ "$state" = "no-signal" ] && [ "$struck" != 1 ]; then echo daemon; return; fi
   if [ "$idle" != 1 ]; then echo defer; return; fi
   if [ "$struck" = 1 ]; then
@@ -188,7 +176,6 @@ heal_action() {
     esac
     return
   fi
-  if [ "${nudges:-0}" -ge "$HEAL_MAX_NUDGES" ] 2>/dev/null; then echo spent; return; fi
   echo nudge
 }
 
@@ -570,25 +557,15 @@ status_json() {
   cat "$sf" 2>/dev/null
 }
 
-# One key of the daemon's status body: `true`, `false`, or nothing. Each key is
-# read on its OWN — `*'"online"'*true*` matched ANY `true` after the key, so a
-# lane the daemon reported offline-but-wakeable read ⚡, and so did one whose
-# body carried "true" in some other field. No fork: bash's own regex.
-status_key() {  # <json body> <key>
-  local re="\"$2\"[[:space:]]*:[[:space:]]*(true|false)"
-  if [[ "$1" =~ $re ]]; then printf '%s' "${BASH_REMATCH[1]}"; fi
-  return 0
-}
-
 hub_glyph() {
   local body
   body="$(status_json "$1")" || { printf '?'; return; }
   [ -n "$body" ] || { printf '?'; return; }
-  if [ "$(status_key "$body" online)" = true ]; then
-    if [ "$(status_key "$body" wakeable)" = true ]; then printf '⚡'; else printf '⚠'; fi
-  else
-    printf '✖'
-  fi
+  case "$body" in
+    *'"online"'*true*)
+      case "$body" in *'"wakeable"'*true*) printf '⚡' ;; *) printf '⚠' ;; esac ;;
+    *) printf '✖' ;;
+  esac
   # 🔕 rides BESIDE the wake glyph, never instead of it: ⚡ answers "bound and
   # push-deliverable", 🔕 answers "wakes suppressed", and urgent pierces focus
   # so a focused agent really is still wakeable. Replacing ⚡ would make a
@@ -603,14 +580,14 @@ hub_glyph() {
 }
 
 # 🔕 if the snapshot's focus_until is still in the future, else nothing.
-# Fork-free (bash's regex and clock): `who` calls this per lane per pass.
 focus_glyph() {
-  local until now re='"focus_until"[[:space:]]*:[[:space:]]*([0-9]+)'
-  [[ "$1" =~ $re ]] || return 0
-  until="${BASH_REMATCH[1]}"
-  printf -v now '%(%s)T' -1
+  local until now
+  until="$(printf '%s' "$1" | grep -o '"focus_until"[[:space:]]*:[[:space:]]*[0-9.]*' \
+           | grep -o '[0-9.]*$')" || return 0
+  [ -n "$until" ] || return 0
+  now="$(date +%s)"
   # Integer compare: the field is epoch seconds, possibly with a float tail.
-  if [ "$until" -gt "$now" ] 2>/dev/null; then printf '🔕'; fi
+  [ "${until%%.*}" -gt "$now" ] 2>/dev/null && printf '🔕'
   return 0
 }
 
@@ -619,101 +596,6 @@ hub_bin() {
   local d; d="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
   if [ -x "$d/.venv/bin/mcp-hub" ]; then printf '%s' "$d/.venv/bin/mcp-hub"
   else command -v mcp-hub 2>/dev/null; fi
-}
-
-# The python beside the mcp-hub cli — the interpreter that has mcp_hub on its
-# path (a venv's bin/ holds both). The modules squad reaches directly
-# (injections, lane_inbox, conversation) are not hub verbs on purpose: none of
-# them needs the hub, and server.py stays out of it.
-hub_python() {
-  local hb; hb="$(hub_bin)" || return 1
-  [ -n "$hb" ] || return 1
-  [ -x "$(dirname "$hb")/python" ] || return 1
-  printf '%s\n' "$(dirname "$hb")/python"
-}
-
-# ---------------------------------------------------------------------------
-# What squad TYPES, and into whose pane (v2-fleet r5 F4/F5).
-#
-# THE INJECTIONS LEDGER. Every door that types into a pane leaves one row
-# BEFORE its first keystroke: {ts, lane, door, by, chars, sha256} — the
-# length and the hash, NEVER the text. A `cmd` line can carry a credential,
-# and argv is readable in `ps`, so the text is piped in, never passed as an
-# argument. A ledger that cannot be written must never stop the send: the
-# row is for the load meter's honest count, the keystroke is the operator's.
-ledger_note() {  # <lane> <door> <by> <text>
-  local py; py="$(hub_python 2>/dev/null)" || return 0
-  printf '%s' "$4" | "$py" -m mcp_hub.injections --lane "$1" --door "$2" --by "$3" >/dev/null 2>&1 || true
-}
-
-# THE LANE INBOX. A door refused because a person is in the pane does not
-# DROP its item: it is left here and the lane's next Stop blocks with it. The
-# sentence the lane reads ("this was not typed into your pane") is defined
-# once, in mcp_hub.lane_inbox — squad reaches the module rather than writing
-# the file itself, so there is no second copy to drift.
-lane_inbox_put() {  # <lane> <door> <text>
-  local py
-  if ! py="$(hub_python 2>/dev/null)"; then
-    echo "!! $1: lane inbox unreachable (no mcp-hub python) — the $2 item was NOT left for it" >&2
-    return 1
-  fi
-  printf '%s' "$3" | "$py" -m mcp_hub.lane_inbox put "$1" "$2" - \
-    || { echo "!! $1: could not leave the $2 item in its lane inbox" >&2; return 1; }
-}
-
-# IS A PERSON IN THE WAY? One door, and it asks tmux — the only thing that
-# knows. In use = an ATTACHED client whose client_activity is within the
-# window. Attached-but-idle is deliberately NOT in use: a cockpit terminal
-# left open for a week would otherwise make a lane permanently un-nudgeable,
-# the silencer-with-no-expiry shape this codebase has shipped bugs in before.
-#
-# ⚠️ Only the AUTOMATED doors ask (heal's nudge, compaction_type, the hold
-# exemption). The hand verbs — cmd, key, answer, model — never do: his
-# cockpit buttons call them, and the pane they would be refused for is the
-# pane he is pressing the button about. Called only right before an
-# attempted send, so a quiet heal pass costs no client listing at all.
-# Sets IN_USE_BY ("<tty>, active Ns ago") for the caller's message.
-SQUAD_IN_USE_SECONDS="${SQUAD_IN_USE_SECONDS:-600}"
-IN_USE_BY=""
-pane_in_use() {
-  local a="$1" now act tty listing
-  IN_USE_BY=""
-  container_of "$a" >/dev/null && return 1
-  listing="$(tm list-clients -t "=$a" -F '#{client_activity} #{client_tty}' 2>/dev/null || true)"
-  [ -n "$listing" ] || return 1
-  now="$(date +%s)"
-  while read -r act tty; do
-    case "$act" in ''|*[!0-9]*) continue ;; esac      # unreadable: fails OPEN
-    if [ $(( now - act )) -lt "$SQUAD_IN_USE_SECONDS" ]; then
-      IN_USE_BY="${tty:-a client}, active $(( now - act ))s ago"
-      return 0
-    fi
-  done <<< "$listing"
-  return 1
-}
-
-# THE SQUAD BOUND on every door that ACTS on a lane: the compaction ask, the
-# hold stop, heal's relaunch and the hold release (his ruling, hub.msg 26539:
-# "any controls like that should only apply to dreamteam"). Membership comes
-# from the hub, read once per run.
-#   0 = a member · 1 = readable, and not a member · 2 = UNREADABLE
-# 🔴 FAILS CLOSED: an unreadable list (hub down, unknown squad, a squad with
-# no members — indistinguishable here) acts on NOBODY. The opposite default
-# would turn every hub blip into the incident this bound exists to end. The
-# cache holds "!" for unreadable, so one blip costs one hub call per run.
-SQUAD_BOUND_MEMBERS=""
-squad_bound() {  # <agent>
-  if [ -z "$SQUAD_BOUND_MEMBERS" ]; then
-    local hb out=""
-    if hb="$(hub_bin)" && [ -n "$hb" ]; then
-      out="$("$hb" squads members "$COMPACT_ASK_SQUAD" </dev/null 2>/dev/null \
-             | awk '$1 !~ /^\047/ && NF {print $1}' | tr '\n' ' ' || true)"
-    fi
-    if [ -z "${out// /}" ]; then SQUAD_BOUND_MEMBERS="!"; else SQUAD_BOUND_MEMBERS=" $out "; fi
-  fi
-  [ "$SQUAD_BOUND_MEMBERS" = "!" ] && return 2
-  case "$SQUAD_BOUND_MEMBERS" in *" $1 "*) return 0 ;; esac
-  return 1
 }
 
 # Epoch seconds when this agent's claude process started (empty if not found).
@@ -756,18 +638,7 @@ relaunch_agent() {
     echo "$a HELD until $(date -d "@$hu" '+%H:%M' 2>/dev/null || echo "$hu") — $(held_reason "$a") (heal will not relaunch it)"
     return 0
   fi
-  # The squad bound, at this door as well as the stop's: heal reaches a
-  # restart from two loops, and guarding one is the four-of-five-routes bug.
-  # Fails closed — an unreadable membership relaunches nobody.
-  local rc
-  if squad_bound "$a"; then rc=0; else rc=$?; fi
-  if [ "$rc" != 0 ]; then
-    echo "$a: NOT relaunched — $([ "$rc" = 2 ] && echo "squad '$COMPACT_ASK_SQUAD' membership is UNREADABLE" || echo "outside squad '$COMPACT_ASK_SQUAD'") (squad-bounded)"
-    return 0
-  fi
   kill_daemon "$a"
-  # A new life: its nudge budget starts again.
-  rm -f "$HOME/.mcp-hub/heal-nudges-$(safe_name "$a")" 2>/dev/null || true
   # Launch marker: heal's grace window reads this so nothing judges an agent
   # whose claude hasn't finished booting (there is no process to measure yet,
   # and its status cache still describes the process we just killed).
@@ -921,78 +792,26 @@ launch_agent_cmd() {
 # holding forever.
 HELD_FILE="${MCP_HUB_HELD_FILE:-$HOME/.mcp-hub/held-lanes.json}"
 
-# ONE read of the mirror per enforcement pass. Each reader below otherwise
-# forks a jq per lane per field — at 46 held lanes that was most of the
-# pass. The cache is pass-scoped (hold_enforce_pass loads and drops it); a
-# reader called on its own goes to the file, exactly as before.
-# Rows: lane US until US held_at US owner US release_condition. US (\037),
-# not TAB: tab is IFS whitespace to `read`, so an EMPTY owner (a hold by
-# hand) collapsed into the next field and read as a mechanism's.
-HELD_CACHE=""; HELD_CACHED=0
-held_cache_load() {
-  HELD_CACHE=""; HELD_CACHED=0
-  [ -r "$HELD_FILE" ] || return 0
-  command -v jq >/dev/null 2>&1 || return 0
-  HELD_CACHE="$(jq -r '.held | to_entries[] | [.key,
-      (.value.until // 0 | tostring), (.value.held_at // 0 | tostring),
-      (.value.owner // "" | tostring),
-      (.value.release_condition // "no condition recorded" | tostring)]
-      | map(gsub("[\u001f\n]"; " ")) | join("\u001f")' \
-      "$HELD_FILE" 2>/dev/null || true)"
-  HELD_CACHED=1
-}
-held_cache_field() {  # <agent> <1-based field after the name> -> value, exit 1 if no row
-  local l u h o r
-  while IFS=$'\037' read -r l u h o r; do
-    [ "$l" = "$1" ] || continue
-    case "$2" in 1) printf '%s\n' "$u" ;; 2) printf '%s\n' "$h" ;; 3) printf '%s\n' "$o" ;; 4) printf '%s\n' "$r" ;; esac
-    return 0
-  done <<< "$HELD_CACHE"
-  return 1
-}
-
 held_until() { # agent -> prints the expiry if held RIGHT NOW, else nothing
-  local a="$1" now u
-  if [ "$HELD_CACHED" = 1 ]; then
-    u="$(held_cache_field "$a" 1)" || return 1
-    case "${u%.*}" in ''|*[!0-9]*) return 1 ;; esac
-    printf -v now '%(%s)T' -1
-    if [ "${u%.*}" -gt "$now" ] || { [ "${u%.*}" = "$now" ] && [ "$u" != "${u%.*}" ]; }; then
-      printf '%s\n' "$u"; return 0
-    fi
-    return 1
-  fi
+  local a="$1" now
   [ -r "$HELD_FILE" ] || return 1
   command -v jq >/dev/null 2>&1 || return 1
   now="$(date +%s)"
-  u="$(jq -r --arg a "$a" --argjson now "$now" '
+  jq -r --arg a "$a" --argjson now "$now" '
     (.held[$a] // empty) | select((.until // 0) > $now) | .until
-  ' "$HELD_FILE" 2>/dev/null || true)"
-  [ -n "$u" ] || return 1
-  printf '%s\n' "$u"
+  ' "$HELD_FILE" 2>/dev/null | grep -q . || return 1
+  jq -r --arg a "$a" '.held[$a].until' "$HELD_FILE" 2>/dev/null
 }
 
 held_reason() { # agent -> the release condition the operator stated
-  if [ "$HELD_CACHED" = 1 ]; then held_cache_field "$1" 4 || echo "no condition recorded"; return 0; fi
   jq -r --arg a "$1" '.held[$a].release_condition // "no condition recorded"' \
     "$HELD_FILE" 2>/dev/null
 }
 
 held_at() { # agent -> unix time the hold was ASKED FOR, or nothing
-  local h
-  if [ "$HELD_CACHED" = 1 ]; then
-    h="$(held_cache_field "$1" 2)" || return 1
-    case "$h" in ''|0|*[!0-9.]*) return 1 ;; esac
-    printf '%s\n' "$h"; return 0
-  fi
   jq -r --arg a "$1" '(.held[$a].held_at // 0) | select(. > 0)' \
     "$HELD_FILE" 2>/dev/null | grep -q . || return 1
   jq -r --arg a "$1" '.held[$a].held_at' "$HELD_FILE" 2>/dev/null
-}
-
-held_owner() { # agent -> the MECHANISM that placed the hold, or nothing (by hand)
-  if [ "$HELD_CACHED" = 1 ]; then held_cache_field "$1" 3 || true; return 0; fi
-  jq -r --arg a "$1" '.held[$a].owner // "" | tostring' "$HELD_FILE" 2>/dev/null || true
 }
 
 # --- stopping a lane that is ALREADY RUNNING (#318, his ruling) -------------
@@ -1011,13 +830,10 @@ held_owner() { # agent -> the MECHANISM that placed the hold, or nothing (by han
 # killing.
 HOLD_BOUNDARY_DIR="${MCP_HUB_HOLD_BOUNDARY_DIR:-$HOME/.mcp-hub/hold-boundary}"
 HOLD_HARD_STOP_AFTER="${MCP_HUB_HOLD_HARD_STOP_AFTER:-600}"   # his ten minutes
-# The state dir the hook reads (mcp_hub.hold): the deferral record lives here.
-HUB_STATE_DIR="${MCP_HUB_STATE_DIR:-$HOME/.mcp-hub}"
 
 boundary_reached() { # agent -> 0 if its Stop hook stamped a boundary
   [ -f "$HOLD_BOUNDARY_DIR/$1.json" ]
 }
-boundary_clear() { rm -f "${HOLD_BOUNDARY_DIR:?}/${1:?}.json" 2>/dev/null || true; }
 
 # Marks a lane as "down because it is HELD", which is the fact release needs
 # and nothing else on the box records. Without it, a released lane is
@@ -1025,139 +841,22 @@ boundary_clear() { rm -f "${HOLD_BOUNDARY_DIR:?}/${1:?}.json" 2>/dev/null || tru
 # second kind would undo a deliberate act.
 hold_stopped_flag() { echo "$HOME/.mcp-hub/hold-stopped-$(safe_name "$1")"; }
 
-# A HAND started this lane while it was held (his ruling 2026-09-14: a hold
-# "should not prevent claude from starting — just stop lanes from working").
-# Holds THIS hold's `until`, never a bare flag: a flag would disarm every
-# later hold on the lane, an expiry dies with the hold it was written against.
-hold_hand_flag() { echo "$HOME/.mcp-hub/hold-hand-started-$(safe_name "$1")"; }
-
 hold_stop_lane() { # the stop itself, one door for both the clean and hard path
   local a="$1"
   mkdir -p "$HOME/.mcp-hub" 2>/dev/null
   : > "$(hold_stopped_flag "$a")" 2>/dev/null || true
-  # Stopping SPENDS the hand's start: one `up` must not cover every later
-  # stop inside the same hold.
-  rm -f "$(hold_hand_flag "$a")" 2>/dev/null || true
   tm kill-session -t "=$a" 2>/dev/null || true
   kill_daemon "$a"
-  boundary_clear "$a"
+  rm -f "$HOLD_BOUNDARY_DIR/$a.json" 2>/dev/null || true
 }
-
-# --- the conversation exemption (v2-fleet r5 F6) ----------------------------
-#
-# A hold placed by a MECHANISM (it carries an `owner`: the brake, the
-# hibernation scanner) does not stop a lane in conversation with Tim. He asks
-# a question, the boundary stop lands on the answer, and the pane he is typing
-# into is gone. ⭐ A hold with NO owner was placed BY HAND — his own act — and
-# is never deferred: the tool must not overrule the person it protects him
-# from. The question of fact is mcp_hub.conversation's (a typed, NON-INJECTED
-# turn inside the window — a heal nudge or a `squad cmd` line is not him
-# talking, which is what F4's ledger is for), asked ONCE per pass for every
-# owner-held lane: 46 python forks inside a two-minute timer is the cost this
-# feature is bounded on. A pane in use counts as conversation too.
-CONV_SEEN=""     # "<lane> <1|0> <end>" lines, this run
-CONV_ASKED=" "   # lanes already asked, answered or not
-conversation_scan() {  # <lane>...
-  local py out a specs=()
-  for a in "$@"; do
-    CONV_ASKED="$CONV_ASKED$a "
-    specs+=("$a=$(untilde "$(field "$a" 2)")")
-  done
-  [ "${#specs[@]}" -gt 0 ] || return 0
-  py="$(hub_python 2>/dev/null)" || return 1
-  out="$("$py" -m mcp_hub.conversation "${specs[@]}" 2>/dev/null)" || return 1
-  CONV_SEEN="$CONV_SEEN$out"$'\n'
-}
-
-# 0 if the lane is in conversation. Sets CONV_END (epoch seconds the talk
-# ends, 0 when there was no typed turn) and CONV_WHY.
-CONV_END=0; CONV_WHY=""
-in_conversation() {  # <lane>
-  local a="$1" l inc end
-  CONV_END=0; CONV_WHY=""
-  case "$CONV_ASKED" in *" $a "*) ;; *) conversation_scan "$a" || true ;; esac
-  while read -r l inc end; do
-    [ "$l" = "$a" ] || continue
-    CONV_END="${end%.*}"
-    case "$CONV_END" in ''|*[!0-9]*) CONV_END=0 ;; esac
-    if [ "$inc" = 1 ]; then CONV_WHY="a typed turn inside the window"; return 0; fi
-  done <<< "$CONV_SEEN"
-  if pane_in_use "$a"; then
-    CONV_WHY="pane in use: $IN_USE_BY"
-    CONV_END="$(date +%s)"
-    return 0
-  fi
-  return 1
-}
-
-# The record the Stop hook reads (mcp_hub.hold.deferred): while it stands the
-# lane is NOT being stopped at this boundary, so the hook neither says so nor
-# stamps one. A DEADLINE, not a flag — every deferring pass rewrites it, and a
-# squad that stops running lets it lapse (the same reason focus stores an
-# expiry). The filename is the roster's spelling of the lane.
-hold_deferral_file() { printf '%s/hold-deferred/%s.json' "$HUB_STATE_DIR" "$1"; }
-hold_record_deferral() {  # <lane> <until> <owner>
-  local f now u="${2:-0}" o="${3//[\"\\]/}"
-  f="$(hold_deferral_file "$1")"
-  printf -v now '%(%s)T' -1
-  case "$u" in ''|*[!0-9.]*) u=0 ;; esac
-  [ -d "${f%/*}" ] || mkdir -p "${f%/*}" 2>/dev/null || return 0
-  if printf '{"agent": "%s", "until": %s, "owner": "%s", "deferred_at": %s, "expires": %s}\n' \
-       "${1//[\"\\]/}" "$u" "$o" "$now" "$(( now + 600 ))" > "$f.tmp" 2>/dev/null; then
-    mv -f "$f.tmp" "$f" 2>/dev/null || true
-  fi
-}
-hold_clear_deferral() { rm -f "$(hold_deferral_file "${1:?}")" 2>/dev/null || true; }
 
 # One held lane. Prints exactly what it did and why; never silent, because a
 # lane that vanishes without a line is indistinguishable from one that died.
 hold_enforce_one() {
-  local a="$1" hu ha now waited owner hf clock rc
-  hu="$(held_until "$a")" || return 0              # not held — nothing to do
+  local a="$1" ha now waited
+  held_until "$a" >/dev/null || return 0           # not held — nothing to do
   tm has-session -t "=$a" 2>/dev/null || return 0  # already down; the skip
   pane_alive "$a" || return 0                      # in up_one covers restart
-
-  # The squad bound. Everything else may say stop; a lane outside the squad
-  # is never stopped, flagged or restarted, whatever held-lanes.json says —
-  # and an unreadable membership stops NOBODY.
-  if squad_bound "$a"; then rc=0; else rc=$?; fi
-  if [ "$rc" = 2 ]; then
-    echo "$a HELD but NOT stopped — squad '$COMPACT_ASK_SQUAD' membership is UNREADABLE (squad-bounded, fails closed)"
-    return 0
-  elif [ "$rc" != 0 ]; then
-    echo "$a HELD but NOT stopped — outside squad '$COMPACT_ASK_SQUAD' (squad-bounded)"
-    return 0
-  fi
-
-  # A hand started it under THIS hold: leave it up. A marker written under an
-  # earlier hold covers nothing — it is spent here and the stop proceeds.
-  hf="$(hold_hand_flag "$a")"
-  if [ -f "$hf" ]; then
-    if [ "$(tr -d '[:space:]' 2>/dev/null < "$hf" || true)" = "$hu" ]; then
-      echo "$a HELD, hand-started under this hold — left up (the hold stands; a stop by hand or the hold's end changes that)"
-      return 0
-    fi
-    rm -f "$hf" 2>/dev/null || true
-  fi
-
-  # A mechanism's hold waits while Tim is talking to the lane. The deferral
-  # also CLEARS the boundary stamp: a stamp left now would stop the lane on
-  # the next pass, mid-sentence.
-  clock=0
-  owner="$(held_owner "$a")"
-  if [ -n "$owner" ]; then
-    if in_conversation "$a"; then
-      echo "$a HELD ($owner) — deferred: in conversation with Tim ($CONV_WHY); a mechanism's hold waits for the talk to end"
-      boundary_clear "$a"
-      hold_record_deferral "$a" "$hu" "$owner"
-      return 0
-    fi
-    hold_clear_deferral "$a"
-    # The hard-stop clock runs from the END of the conversation, not from
-    # the hold: a lane held at 12:00 that he talked to until 12:20 has not
-    # spent twenty minutes ignoring the hold.
-    clock="$CONV_END"
-  fi
 
   if boundary_reached "$a"; then
     # The clean case, and the one his ruling asks for: the lane is between
@@ -1178,9 +877,7 @@ hold_enforce_one() {
     echo "$a HELD, mid-turn — no held_at in the mirror, so the 10-minute hard stop cannot be timed; waiting for a turn boundary"
     return 0
   fi
-  ha="${ha%.*}"
-  if [ "${clock:-0}" -gt "$ha" ] 2>/dev/null; then ha="$clock"; fi
-  now="$(date +%s)"; waited=$(( now - ha ))
+  now="$(date +%s)"; waited=$(( now - ${ha%.*} ))
   if [ "$waited" -lt "$HOLD_HARD_STOP_AFTER" ]; then
     echo "$a HELD, mid-turn — waiting for its turn boundary (${waited}s of ${HOLD_HARD_STOP_AFTER}s before a hard stop)"
     return 0
@@ -1198,507 +895,108 @@ hold_enforce_one() {
 #
 # His words: "some automatic detection that doesn't auto compact or auto
 # clear. That's not what I want." So detection NEVER acts, the lane itself
-# decides, and the exec leg types only a command the LANE named, only when
-# armed, and only into claude's own idle chrome.
+# decides, and the exec leg is OFF behind a flag until bar 52 is built.
 #
-# THE TRIP POINT IS ABSOLUTE TOKENS off the lane's own transcript, not the
-# statusline percent: a ~1M-window lane sat at 169,255 tokens showing 16%, so
-# every percent mark this fleet had would have let it sail past a token cap
-# unasked. The reading is the newest assistant record's usage, summed over the
-# three fields the board sums (input + cache_read + cache_creation). The
-# rendered ctx% rides along on every row as decoration only.
-#
-# 🔴 THE ASK IS OFF IN CODE (v2-fleet r5 Term 2). Until r5 the only thing
-# between an idle lane over the cap and a typed ask was a drop-in on ONE box,
-# and the complaint this area comes from is about a lane typed into on a box
-# nobody had configured. MCP_HUB_COMPACT_ASK=1 arms it; nothing else does.
-COMPACT_ASK="${MCP_HUB_COMPACT_ASK:-0}"
-# The deputy's measured cap (#327 ruling, 2026-09-04: 180000 - 41889 over 65
-# post-fix episodes). Arming the ask must never require re-deriving it.
-COMPACT_ASK_TOKENS="${MCP_HUB_COMPACT_ASK_TOKENS:-138111}"
-# 🔴 The exec leg types /clear or /compact into a live pane, and `/clear`
-# DESTROYS context. Armed by EXACTLY "1" and by nothing else — the gate below
-# is the fail-closed `!= "1"`, so "yes", "true", " 1" and "01" all read OFF.
+# ctx% is NOT derived here and is not guessed: Claude Code hands each lane's
+# statusline `context_window.used_percentage`, the statusline renders it, and
+# the board already scrapes that rendered number. Detection reads what the
+# harness computed. (Per-lane WINDOW SIZE is a separate fact, needed only for
+# the --autocompact net, which is a token count.)
+COMPACT_ASK_PCT="${MCP_HUB_COMPACT_ASK_PCT:-50}"
+COMPACT_REASK_PCT="${MCP_HUB_COMPACT_REASK_PCT:-60}"
+# 🔴 BAR 52 IS NOT BUILT AND THIS STAYS 0. The exec leg types /clear or
+# /compact into a live pane, and `/clear` DESTROYS context — it must never
+# fire without the lane's own answer AFTER a flush. Flag exists so the leg
+# can be enabled in one place when 52 lands and reviewed as its own change.
 COMPACT_EXEC="${MCP_HUB_COMPACTION_EXEC:-0}"
 COMPACT_DOOR="${MCP_HUB_COMPACTION_DOOR:-operator-console}"
-# Answer -> exec deadline: the p90 of the MEASURED fire->exec lag. It bounds
-# the IDLE wait only, and it starts at the ANSWER — a lane that never answered
-# is never typed into, however long it waits (no answer = no action).
-COMPACT_EXEC_DEADLINE="${MCP_HUB_COMPACT_EXEC_DEADLINE:-900}"
-# A real /compact takes 98-148s. Inside this window a missing compact_boundary
-# is a compaction still running, not a keystroke that failed to take.
-COMPACT_LANDED_AFTER="${MCP_HUB_COMPACT_LANDED_AFTER:-300}"
-# A command that will not parse will not start parsing: after this many execs
-# that left no compact_boundary, the leg stops TYPING for the session (and
-# keeps watching — a genuine climb past the floor still re-arms the ask).
-COMPACT_EXEC_TRIES=2
-# Card #440, his words 2026-09-06: "I do not want the auto compact thing
-# running outside of this squad". The same bound covers the heal pass's other
-# acting doors (stop, relaunch, release) — see squad_bound.
-COMPACT_ASK_SQUAD="${MCP_HUB_COMPACT_ASK_SQUAD:-dreamteam}"
 
-# The lane's transcript directory. ONE rule, shared with the client and with
-# mcp_hub.conversation.project_dirname: the worktree path with every
-# non-alphanumeric character turned into '-'. A second spelling of this rule
-# is a lane whose transcript reads as absent.
-compaction_dir() {
-  local wt; wt="$(untilde "$(field "$1" 2)")"
-  [ -n "$wt" ] || return 1
-  wt="${wt%/}"
-  printf '%s/.claude/projects/%s' "$HOME" "${wt//[^A-Za-z0-9]/-}"
-}
-
-# The lane's CURRENT transcript: the newest *.jsonl by mtime. Session ids are
-# uuids and sort arbitrarily, so a name order would read a resumed lane's
-# oldest session as its current one. No fork: `-nt` compares in bash.
-compaction_transcript() {
-  local d f newest=""
-  d="$(compaction_dir "$1")" || return 1
-  for f in "$d"/*.jsonl; do
-    [ -f "$f" ] || continue
-    if [ -z "$newest" ] || [ "$f" -nt "$newest" ]; then newest="$f"; fi
-  done
-  [ -n "$newest" ] || return 1
-  printf '%s\n' "$newest"
-}
-
-# The session id the cycle is keyed by: the transcript's own name. It used to
-# be COMPUTED as (now - etimes), and `ps -o etimes=` is truncated whole
-# seconds, so it alternated by one between passes and every other sweep asked
-# the lane again. Read, not computed, a jittering clock cannot move it.
-compaction_session() {
-  local tr; tr="$(compaction_transcript "$1")" || return 1
-  tr="${tr##*/}"
-  printf '%s\n' "${tr%.jsonl}"
-}
-
-# ONE read of the transcript tail, every fact the leg needs, on one line:
-#   <tok> <verdict> <boundary_ts> <boundary_pre> <boundary_post>
-# '-' wherever a fact is absent — ABSENT, never 0. The verdict is read only
-# from ASSISTANT records stamped after <since> (the ask): the ask itself
-# arrives as a user turn and names both words, so reading it back would answer
-# every ask AMBIGUOUS. Word-bounded and uppercase, so `unclear` and
-# `compaction` in ordinary prose are not verdicts. Records are split on "\n"
-# alone — str.splitlines() would also break inside a JSON string at the raw
-# U+2028/U+2029 the format allows there.
-compaction_scan() {
-  python3 - "$1" "${2:-0}" <<'PYSCAN' 2>/dev/null || echo "- - - - -"
-import datetime, json, os, re, sys
-path, since = sys.argv[1], float(sys.argv[2] or 0)
-TAIL = 16 * 1024 * 1024
-
-def epoch(ts):
-    try:
-        return datetime.datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
-    except Exception:
-        return None
-
-def num(v):
-    return v if isinstance(v, int) and not isinstance(v, bool) else 0
-
-tok = verdict = None
-bound = None
-size = 0
-try:
-    size = os.path.getsize(path)
-    with open(path, "rb") as fh:
-        fh.seek(max(0, size - TAIL))
-        data = fh.read()
-except OSError:
-    data = b""
-lines = data.split(b"\n")
-if size > TAIL:
-    lines = lines[1:]                       # the first line is torn
-for raw in lines:
-    if not raw.strip():
-        continue
-    try:
-        rec = json.loads(raw)
-    except Exception:
-        continue
-    if not isinstance(rec, dict):
-        continue
-    kind = rec.get("type")
-    if kind == "assistant":
-        msg = rec.get("message") or {}
-        u = msg.get("usage") if isinstance(msg, dict) else None
-        if isinstance(u, dict):
-            tok = (num(u.get("input_tokens")) + num(u.get("cache_read_input_tokens"))
-                   + num(u.get("cache_creation_input_tokens")))
-        if since > 0 and verdict is None:
-            at = epoch(rec.get("timestamp"))
-            if at is not None and at > since:
-                content = msg.get("content") if isinstance(msg, dict) else None
-                if isinstance(content, str):
-                    text = content
-                else:
-                    text = "\n".join(b.get("text", "") for b in (content or [])
-                                     if isinstance(b, dict) and b.get("type") == "text")
-                c = re.search(r"\bCLEAR\b", text)
-                m = re.search(r"\bCOMPACT\b", text)
-                if c and m:
-                    verdict = "AMBIGUOUS"
-                elif c:
-                    verdict = "CLEAR"
-                elif m:
-                    verdict = "COMPACT"
-    elif kind == "system" and rec.get("subtype") == "compact_boundary":
-        md = rec.get("compactMetadata") or {}
-        at = epoch(rec.get("timestamp"))
-        pre, post = md.get("preTokens"), md.get("postTokens")
-        if at is not None and isinstance(pre, int) and isinstance(post, int):
-            bound = (at, pre, post)
-out = [str(tok) if tok is not None else "-", verdict or "-"]
-out += ["%.3f" % bound[0], str(bound[1]), str(bound[2])] if bound else ["-", "-", "-"]
-print(" ".join(out))
-PYSCAN
-}
-
-# The lane's context size in tokens, or NOTHING (exit 1) when the transcript
-# cannot be read. Unmeasured is never 0: a blind instrument must not look like
-# an empty context.
-compaction_tokens() {
-  local tr tok _rest
-  tr="$(compaction_transcript "$1")" || return 1
-  read -r tok _rest <<< "$(compaction_scan "$tr" 0)"
-  case "$tok" in ''|-|*[!0-9]*) return 1 ;; esac
-  printf '%s\n' "$tok"
-}
-
-# The lane's rendered ctx%, decoration for the row. Nothing when the pane
-# shows no statusline — the row then says ctx=?%, never ctx=0%.
+# The lane's context percentage, from its own rendered statusline. Prints
+# nothing when the pane cannot be read or shows no ctx — ABSENCE, never 0:
+# a lane whose number we cannot see must not read as an empty context.
 compaction_ctx() {
   tm capture-pane -p -t "$1" 2>/dev/null \
     | grep -oE '[c]tx \[[^]]*\][[:space:]]*[0-9]+%' | tail -1 \
-    | grep -oE '[0-9]+' | tail -1 || true
+    | grep -oE '[0-9]+' | tail -1
 }
 
-# One row through bar 53's door. The first line is the CONTRACT and is exact:
-#   COMPACTION <seat> <step> ctx=<pct|?>% [tok=<n> thr=<cap>] [session=<id>]
-# `ctx=` keeps its position for the door's existing parse; `tok=`/`thr=` carry
-# the quantity that actually decided. `session=` is OMITTED, never `?`, when
-# unreadable: the door reads it with a regex, so `?` would not bind and a bare
-# `session=` would parse as NO session — making a restart look like a repeat.
-# Failure to write a row never stops the sweep, but it is reported.
+# ONCE PER LANE SESSION. Keyed by the session's start time, so a relaunch
+# re-arms the ask and a mere re-scrape does not. A flag keyed by agent alone
+# would fire once ever; keyed by nothing, once every two minutes.
+compaction_flag() {
+  local a="$1" st; st="$(agent_started "$a" 2>/dev/null)" || return 1
+  [ -n "$st" ] || return 1
+  printf '%s/.mcp-hub/compaction-%s-%s' "$HOME" "$(safe_name "$a")" "$st"
+}
+
+# One row through bar 53's door. First line is the CONTRACT and is exact;
+# anything after it is row body. Failure to write a row must never stop the
+# sweep — but it is reported, because a silent door is one nobody can audit.
 compaction_row() {
-  local seat="$1" step="$2" pct="${3:-}" tok="${4:-}" detail="${5:-}" hb sid head
+  local seat="$1" step="$2" pct="$3" detail="${4:-}" hb
   hb="$(hub_bin)" || return 1
   [ -n "$hb" ] || return 1
-  head="COMPACTION $seat $step ctx=${pct:-?}%"
-  case "$tok" in ''|-|*[!0-9]*) ;; *) head="$head tok=$tok thr=$COMPACT_ASK_TOKENS" ;; esac
-  if sid="$(compaction_session "$seat" 2>/dev/null)" && [ -n "$sid" ]; then
-    head="$head session=$sid"
-  fi
-  { printf '%s\n' "$head"
-    if [ -n "$detail" ]; then printf '%s\n' "$detail"; fi
+  { printf 'COMPACTION %s %s ctx=%s%%\n' "$seat" "$step" "$pct"
+    [ -n "$detail" ] && printf '%s\n' "$detail"
   } | "$hb" send --to "$COMPACT_DOOR" --message - --priority low \
         --cwd "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)" \
         >/dev/null 2>&1 \
     || echo "!! compaction: could not write the $step row for $seat" >&2
 }
 
-# The ask itself. A BOUNDED flush-and-park (card #405, his press 2026-09-04):
-# the ask and the keystroke are both idle-gated, so a lane that answers and
-# then stays busy is reachable by neither — the lane is the only actor that
-# can stop a busy lane without anyone typing into it, so it is asked to stop
-# ITSELF, bound first: finish the step, flush, park, then act. Its own slash
-# commands are lowercase, so an echo of the ask is never read as a verdict.
-# The last sentence is chosen by the exec leg: promising "typed for you" on a
-# box where nothing will ever be typed was a false promise on every box.
-COMPACT_ASK_TEXT="hub: your context is at %s tokens, over the %s-token cap. Bounded, in this order: finish the step you are on (do not abandon work mid-edit), flush anything worth keeping to memory, then park and run /compact or /clear yourself. Then reply with one line naming CLEAR (start fresh) or COMPACT (summarise and continue), and why. %s"
-
-compaction_ask_text() {
-  local tail
-  if [ "$COMPACT_EXEC" = "1" ]; then
-    tail="If you would rather not run it yourself, reply anyway and the command you name is typed for you at your next quiet moment."
-  else
-    tail="Nothing will be typed into this pane on your behalf (the exec leg is off here): run the command yourself, then reply."
-  fi
-  # shellcheck disable=SC2059  # the format is ours, the values are numbers
-  printf "$COMPACT_ASK_TEXT" "$1" "$COMPACT_ASK_TOKENS" "$tail"
-}
-
-# Is this pane POSITIVELY claude's own idle chrome? An ALLOWLIST, and that is
-# the point (card #381): 2026-09-03 the leg's Enter answered vps-hetzner's
-# open AskUserQuestion, because a lane blocked on a dialog nobody had written
-# a pattern for is `idle` to classify_text — its permissive branch is also
-# its blind branch. So: chrome must be at the bottom of the screen AND
-# classify_text must read idle. Unreadable or empty is NOT safe.
-compaction_safe_to_type() {
-  local t="$1" bottom
-  bottom="$(printf '%s\n' "$t" | grep -v '^[[:space:]]*$' | tail -3 || true)"
-  [ -n "$bottom" ] || return 1
-  local chrome='accept edits on|manual mode on|plan mode on|bypass permissions on|for agents|ctx \['
-  [[ "$bottom" =~ $chrome ]] || return 1
-  [ "$(classify_text "$(printf '%s\n' "$t" | grep -v '^[[:space:]]*$' | tail -20 || true)")" = idle ]
-}
-
-# THE door both legs type through — the ask and the exec's slash command.
-# Gated ONCE here, for every caller: gating the callers instead would leave
-# whichever path is added next silently unguarded. In order:
-#   1. a person in the way (pane_in_use): the ASK goes to the lane inbox and
-#      reaches the lane at its next Stop (exit 2); a slash command is refused
-#      outright — a `/compact` left in an inbox runs nothing.
-#   2. claude's idle chrome, positively (compaction_safe_to_type).
-#   3. the ledger row, BEFORE the first keystroke.
-#   4. the literal, then a RE-CHECK, then Enter as its own send: the Enter is
-#      the half that ANSWERS a dialog, and ~1s separates it from the check
-#      above. An unsent line is visible and harmless; a pressed default is
-#      neither. (`send-keys "<text>" Enter` in one call also makes tmux read
-#      the literal as a KEY NAME wherever it matches one.)
-compaction_type() {
-  local a="$1" text="$2" mode="${3:-}" pane
-  if pane_in_use "$a"; then
-    if [ "$mode" = ask ]; then
-      if lane_inbox_put "$a" compaction_type "$text"; then
-        echo "$a: pane in use ($IN_USE_BY) — the ask is left in its lane inbox for its next Stop"
-        return 2
-      fi
-      return 1
-    fi
-    echo "!! $a: pane in use ($IN_USE_BY) — NOT typing $text" >&2
-    return 1
-  fi
-  pane="$(tm capture-pane -p -t "$a" 2>/dev/null || true)"
-  if ! compaction_safe_to_type "$pane"; then
-    echo "!! $a: NOT typing — the pane is not claude's idle chrome (an unrecognised dialog, a live turn, or a screen that cannot be read)" >&2
-    return 1
-  fi
-  ledger_note "$a" compaction_type squad "$text"
-  tmt send-keys -l -t "$a" "$text" 2>/dev/null || return 1
-  sleep 1
-  pane="$(tm capture-pane -p -t "$a" 2>/dev/null || true)"
-  if ! compaction_safe_to_type "$pane"; then
-    echo "!! $a: Enter NOT sent — the pane stopped being claude's idle chrome after the text went in; the line sits unsent in its input box" >&2
-    return 1
-  fi
-  tmt send-keys -t "$a" Enter 2>/dev/null || return 1
-}
-
-# A CLOSED cycle (`.closed` holds the floor it closed at). /compact rewrites
-# the conversation IN PLACE — same transcript, same session id — so a cycle
-# closed once per session was never asked again however far the lane climbed
-# (176,714 -> 87,054 -> 379,280 on the author's own seat). It re-arms when the
-# reading grows PAST the floor, never merely while still over the cap — right
-# after an exec the reading IS the floor, and re-asking then is the thrash.
-#   · an EMPTY marker is the previous version's (and the disarmed close's):
-#     it falls back to the exec's BEFORE reading, the stricter bar; with no
-#     exec at all it never re-arms — that cycle had no measurement.
-#   · a reading under HALF the floor is a compaction by another hand: the
-#     floor is re-taken, from the client's compact_boundary when it holds a
-#     lower post, else from the sample (the boundary can be out of the tail,
-#     and the cost of being wrong is one ask to a lane over the cap). Half,
-#     not any dip: ordinary variation moves the reading by thousands.
-# Exit 0 = re-armed (the cycle's markers are gone); 1 = still closed.
-compaction_recross() {
-  local a="$1" flag="$2" tok="$3" bpost="$4" floor newfloor src
-  floor="$(tr -d '[:space:]' 2>/dev/null < "$flag.closed" || true)"
-  case "$floor" in *[!0-9]*) floor="" ;; esac
-  if [ -z "$floor" ]; then
-    [ -f "$flag.exec" ] || return 1
-    read -r floor _ < "$flag.exec" || true
-    case "$floor" in ''|*[!0-9]*) return 1 ;; esac
-  elif [ "$tok" -lt $(( floor / 2 )) ]; then
-    case "$bpost" in
-      ''|-|*[!0-9]*) newfloor="$tok"; src="sampled" ;;
-      *) if [ "$bpost" -lt "$floor" ]; then newfloor="$bpost"; src="compact_boundary"
-         else newfloor="$tok"; src="sampled"; fi ;;
-    esac
-    printf '%s\n' "$newfloor" > "$flag.closed"
-    echo "$a: re-floor — reading $tok is under half the closed floor $floor; floor now $newfloor ($src)"
-    return 1
-  fi
-  [ "$tok" -gt "$floor" ] || return 1
-  echo "$a: re-arming — $tok tokens has grown past the closed cycle's floor $floor"
-  rm -f "$flag" "$flag.fired" "$flag.answer" "$flag.exec" "$flag.closed"
-  return 0
-}
+# The ask itself. Typed into the lane's own session, because the lane is the
+# only thing that knows what is worth keeping.
+COMPACT_ASK_TEXT="You are at %s%% of your context window. Flush anything worth keeping to memory NOW, then reply with one line: CLEAR (start fresh) or COMPACT (summarise and continue), and why. Nothing will be done to this session until you answer."
 
 compaction_one() {
-  local a="$1" tr sid flag since tok verdict bts bpre bpost pct st rc
-  [ "$COMPACT_ASK" != 1 ] && return 0
-  tr="$(compaction_transcript "$a")" || return 0       # no transcript = unmeasured
-  sid="${tr##*/}"; sid="${sid%.jsonl}"
-  flag="$HOME/.mcp-hub/compaction-$(safe_name "$a")-$sid"
-  since=0
-  if [ -s "$flag" ]; then since="$(tr -d '[:space:]' < "$flag")"; fi
-  read -r tok verdict bts bpre bpost <<< "$(compaction_scan "$tr" "${since:-0}")"
-  case "$tok" in ''|-|*[!0-9]*) return 0 ;; esac      # unreadable = UNMEASURED, not 0
-
-  if [ -f "$flag.closed" ]; then
-    compaction_recross "$a" "$flag" "$tok" "$bpost" || return 0
-  fi
-  # Nothing open and under the cap: nothing to do, and nothing to ask the hub.
-  if [ ! -f "$flag.fired" ] && [ "$tok" -lt "$COMPACT_ASK_TOKENS" ]; then return 0; fi
-
-  # The squad bound, failing CLOSED: an unreadable membership asks nobody.
-  if squad_bound "$a"; then rc=0; else rc=$?; fi
-  case "$rc" in
-    0) ;;
-    2) echo "!! compaction: squad '$COMPACT_ASK_SQUAD' membership UNREADABLE — asking nobody ($a not asked)" >&2
-       return 0 ;;
-    *) echo "$a: outside squad '$COMPACT_ASK_SQUAD' — not asked (squad-bounded)"
-       return 0 ;;
-  esac
-  mkdir -p "$HOME/.mcp-hub" 2>/dev/null
+  local a="$1" pct flag threshold
   pct="$(compaction_ctx "$a")"
+  [ -n "$pct" ] || return 0                 # unreadable = unmeasured, not 0
+  flag="$(compaction_flag "$a")" || return 0
 
-  # FIRE is a CROSSING, not a per-scan level log: once per cycle, busy or not.
-  # Detection and delivery are separate facts — a fire with no ask is exactly
-  # the row that shows the ask never landed.
-  if [ ! -f "$flag.fired" ]; then
-    compaction_row "$a" fire "$pct" "$tok" "detected at $tok tokens (cap $COMPACT_ASK_TOKENS)"
-    printf '%s\n' "$tok" > "$flag.fired"
-  fi
+  # Re-ask threshold once the first ask has been made and gone unanswered.
+  threshold="$COMPACT_ASK_PCT"
+  [ -f "$flag" ] && threshold="$COMPACT_REASK_PCT"
+  [ "$pct" -ge "$threshold" ] 2>/dev/null || return 0
+  # Already re-asked at the higher mark? Then we are done for this session.
+  # Asked at both marks already — this session is done, answered or not.
+  # Nagging a third time is the "auto" behaviour he ruled out, one step
+  # removed.
+  [ -f "$flag.reask" ] && return 0
 
-  # --- the ask: idle only, through the one door --------------------------
-  if [ ! -s "$flag" ]; then
-    st="$(classify_agent "$a")"
-    if [ "$st" != "idle" ]; then
-      echo "$a at $tok tokens but $st — not asking this pass (idle only)"
-      return 0
-    fi
-    if compaction_type "$a" "$(compaction_ask_text "$tok")" ask; then rc=0; else rc=$?; fi
-    case "$rc" in
-      0) date +%s > "$flag"
-         compaction_row "$a" ask "$pct" "$tok" "asked in-session at $tok tokens; awaiting CLEAR or COMPACT"
-         echo "$a: compaction ask sent at $tok tokens" ;;
-      2) date +%s > "$flag"
-         compaction_row "$a" ask "$pct" "$tok" "pane in use: left in the lane inbox at $tok tokens; awaiting CLEAR or COMPACT"
-         echo "$a: compaction ask sent at $tok tokens (lane inbox)" ;;
-      # Refused: NO marker. The crossing survives, and the next sweep asks
-      # again — a lane silenced by one badly-timed dialog would be the same
-      # silent stall this leg exists to remove.
-      *) ;;
-    esac
+  mkdir -p "$HOME/.mcp-hub" 2>/dev/null
+  compaction_row "$a" fire "$pct" "detected at ${pct}% (threshold ${threshold}%)"
+
+  # 🔴 IDLE ONLY, FAILING CLOSED. send-keys into a working lane appends to
+  # whatever is in its input box; into a 🔴 dialog it answers a question that
+  # is the operator's. A lane that is busy simply misses this pass and is
+  # caught at the re-ask.
+  local st; st="$(classify_agent "$a")"
+  if [ "$st" != "idle" ]; then
+    echo "$a at ${pct}% but $st — not asking this pass (idle only)"
     return 0
   fi
 
-  if [ ! -f "$flag.exec" ]; then
-    # The lane obeyed the ask itself: a compact_boundary AFTER the ask. The
-    # keystroke would land on a session that no longer holds what was
-    # measured, and `/clear` would destroy what the lane chose to keep. No
-    # reply is needed to have obeyed.
-    if [ "$bts" != - ] && [ "${bts%.*}" -ge "$since" ]; then
-      echo "$a: compacted itself on the ask — nothing typed ($bpre -> $bpost)"
-      compaction_row "$a" net "$pct" "$bpost" "THE LANE DID IT ITSELF: recovered $(( bpre - bpost )) tokens: $bpre -> $bpost (compact_boundary)"
-      printf '%s\n' "$bpost" > "$flag.closed"
-      return 0
-    fi
-    if [ ! -f "$flag.answer" ]; then
-      case "$verdict" in
-        CLEAR|COMPACT)
-          printf '%s\n' "$verdict" > "$flag.answer"
-          compaction_row "$a" answer "$pct" "$tok" "lane answered $verdict" ;;
-        AMBIGUOUS)
-          # Fails closed on the KEYSTROKE — and closes with a MEASURED floor,
-          # so a genuine climb past it re-arms. The empty marker it used to
-          # write disarmed the lane for the rest of its session (362 turns at
-          # 2.2x the cap, vps-hetzner, 2026-09-03).
-          echo "$a: the answer names both CLEAR and COMPACT — no action (fail closed)"
-          compaction_row "$a" answer "$pct" "$tok" "lane answered AMBIGUOUS (names both CLEAR and COMPACT) — NOT EXECUTED, no action (fail closed)"
-          printf '%s\n' "$tok" > "$flag.closed"
-          return 0 ;;
-        *) return 0 ;;                      # no answer = no action, absolutely
-      esac
-    fi
-    verdict="$(tr -d '[:space:]' < "$flag.answer")"
-    local cmd=/compact
-    [ "$verdict" = CLEAR ] && cmd=/clear
-    if [ "$COMPACT_EXEC" != "1" ]; then
-      # Disarmed still RECORDS the answer — the Ledger sees what lanes chose
-      # long before anyone lets the keystroke through. The cycle closes with
-      # NO floor: nothing was measured, so it never re-arms this session.
-      echo "$a answered $verdict — exec leg OFF (MCP_HUB_COMPACTION_EXEC=$COMPACT_EXEC): nothing typed"
-      compaction_row "$a" exec "$pct" "$tok" "lane answered $verdict — exec leg OFF: exec leg disarmed (MCP_HUB_COMPACTION_EXEC=$COMPACT_EXEC), nothing typed"
-      : > "$flag.closed"
-      return 0
-    fi
-    local tries; tries="$(tr -d '[:space:]' 2>/dev/null < "$flag.attempts" || true)"
-    case "$tries" in ''|*[!0-9]*) tries=0 ;; esac
-    if [ "$tries" -ge "$COMPACT_EXEC_TRIES" ]; then
-      echo "$a answered $verdict — typing GIVEN UP for this session after $tries failed execs; watching for growth past $tok"
-      printf '%s\n' "$tok" > "$flag.closed"
-      return 0
-    fi
-    # Guard 1, bounded: state chrome. Waiting on it for ever is the 455k
-    # case, so after the deadline the attempt is made — and guard 2 below
-    # (compaction_type's idle-chrome check) still refuses a live turn, out
-    # loud. Measured: guard 2 is a strict subset of guard 1, so the set of
-    # keystrokes the deadline can buy is EMPTY; it exists so the wait is
-    # reported, not so a busy pane is typed into.
-    st="$(classify_agent "$a")"
-    if [ "$st" != "idle" ]; then
-      local answered waited
-      answered="$(stat -c %Y "$flag.answer" 2>/dev/null || date +%s)"
-      waited=$(( $(date +%s) - answered ))
-      if [ "$waited" -lt "$COMPACT_EXEC_DEADLINE" ]; then
-        echo "$a answered $verdict but $st — not typing this pass (idle only) — ${waited}s of ${COMPACT_EXEC_DEADLINE}s before the deadline"
-        return 0
-      fi
-      echo "$a: deadline reached, typing $cmd although $st (answered ${waited}s ago)"
-      compaction_row "$a" deadline "$pct" "$tok" "DEADLINE: answered $verdict ${waited}s ago and has not been idle since ($st) — typing anyway at the ${COMPACT_EXEC_DEADLINE}s bound"
-    fi
-    if ! compaction_safe_to_type "$(tm capture-pane -p -t "$a" 2>/dev/null || true)"; then
-      echo "!! $a: NOT typing $cmd — the pane is not claude's idle chrome" >&2
-      return 0
-    fi
-    # The row PRECEDES the keystroke: if the send goes wrong, the record still
-    # says what was about to happen and at what reading.
-    compaction_row "$a" exec "$pct" "$tok" "typing $cmd at $tok tokens (lane answered $verdict)"
-    if compaction_type "$a" "$cmd"; then
-      printf '%s %s\n' "$tok" "$(date +%s)" > "$flag.exec"
-      echo "$a: typed $cmd at $tok tokens"
-    fi
-    return 0
-  fi
+  local text; text="$(printf "$COMPACT_ASK_TEXT" "$pct")"
+  # Two sends, as everywhere else in this file: `send-keys "<text>" Enter` in
+  # one call makes tmux read the literal as a KEY NAME wherever it matches.
+  tm send-keys -l -t "$a" "$text" 2>/dev/null || return 0
+  sleep 1
+  tm send-keys -t "$a" Enter 2>/dev/null || return 0
 
-  # --- after the exec: the NET is read, never predicted --------------------
-  # From the client's own compact_boundary — the exact pre/post from the
-  # process that compacted. A sampled drop is not a saving: squad-proxy's
-  # reading fell 3,222 below `before` for six seconds on ordinary variation.
-  local before exec_at
-  read -r before exec_at < "$flag.exec" || true
-  case "$exec_at" in ''|*[!0-9]*) exec_at=0 ;; esac
-  if [ "$bts" != - ] && [ "${bts%.*}" -ge "$exec_at" ]; then
-    compaction_row "$a" net "$pct" "$bpost" "recovered $(( bpre - bpost )) tokens: $bpre -> $bpost (compact_boundary)"
-    echo "$a: compaction landed — $bpre -> $bpost"
-    printf '%s\n' "$bpost" > "$flag.closed"
-    rm -f "$flag.attempts"
-    return 0
-  fi
-  # Inside the window a missing boundary is a compaction still running.
-  [ $(( $(date +%s) - exec_at )) -ge "$COMPACT_LANDED_AFTER" ] || return 0
-  local tries; tries="$(tr -d '[:space:]' 2>/dev/null < "$flag.attempts" || true)"
-  case "$tries" in ''|*[!0-9]*) tries=0 ;; esac
-  tries=$(( tries + 1 ))
-  printf '%s\n' "$tries" > "$flag.attempts"
-  if [ "$tries" -lt "$COMPACT_EXEC_TRIES" ]; then
-    compaction_row "$a" exec "$pct" "$tok" "NOT COMPACTED: no compact_boundary since $(cat "$flag.answer" 2>/dev/null) was typed — the keystroke did not take (attempt $tries of $COMPACT_EXEC_TRIES); re-arming the ask"
-    echo "!! $a: the exec typed ${COMPACT_LANDED_AFTER}s+ ago never compacted — re-arming (attempt $tries of $COMPACT_EXEC_TRIES)"
-    rm -f "$flag" "$flag.fired" "$flag.answer" "$flag.exec"
-  else
-    compaction_row "$a" exec "$pct" "$tok" "NOT COMPACTED: no compact_boundary since the exec — the keystroke did not take (attempt $tries of $COMPACT_EXEC_TRIES); GIVING UP on typing for this session after $tries failed execs, watching for growth past $tok"
-    echo "!! $a: GIVING UP on typing for this session after $tries failed execs — the floor is $tok"
-    printf '%s\n' "$tok" > "$flag.closed"
-    rm -f "$flag.exec"
-  fi
+  if [ "$threshold" = "$COMPACT_REASK_PCT" ]; then : > "$flag.reask"; else : > "$flag"; fi
+  compaction_row "$a" ask "$pct" "asked in-session at ${pct}%; awaiting CLEAR or COMPACT"
+  echo "$a: compaction ask sent at ${pct}%"
 }
 
-# Every ROSTER pane, faculty included: grouping decides who hears a
-# broadcast, it must not decide who gets MEASURED (squad_agents() hid
-# squad-proxy and every ad-hoc spike from a sweep whose whole subject is what
-# a pane is burning). Container seats are the edge's. Off unless armed.
 compaction_pass() {
-  [ "$COMPACT_ASK" != 1 ] && return 0
+  # Bar 52's exec leg is not built; this pass detects and asks only.
   local a
-  for a in $(agents); do
-    container_of "$a" >/dev/null && continue
+  for a in $(squad_agents); do
     tm has-session -t "=$a" 2>/dev/null || continue
     pane_alive "$a" || continue
     compaction_one "$a"
   done
-  return 0
 }
 
 # --- release: the lane comes back, with its conversation (his ruling) ------
@@ -1709,67 +1007,15 @@ compaction_pass() {
 # skips — so a released faculty lane would sit down forever while every
 # surface reported it released. This restarts it explicitly instead, from the
 # flag the stop left behind.
-#
-# 🔴 RELEASE FAILS CLOSED, where enforcement fails open. Enforcement stopping
-# nobody on a dead mirror costs nothing; release STARTING a lane on one is how
-# a held lane came back burning its share while the pass reported a clean
-# release (the 01:00:44Z shape). So a missing, unreadable, unstamped or stale
-# mirror restarts NOBODY and keeps every flag — this DEFERS a release, it
-# never cancels one.
-HELD_FRESH_SECONDS="${MCP_HUB_HELD_FRESH_SECONDS:-300}"
-
-held_mirror_fresh() { # 0 when the mirror is readable, stamped and fresh; else prints why
-  local gen age
-  if [ ! -r "$HELD_FILE" ]; then echo "missing or unreadable"; return 1; fi
-  if ! gen="$(jq -r '.generated // empty' "$HELD_FILE" 2>/dev/null)"; then
-    echo "unreadable"; return 1
-  fi
-  case "${gen%.*}" in
-    '') echo "unstamped (no 'generated' — its freshness is unknown)"; return 1 ;;
-    *[!0-9]*) echo "unreadable ('generated' is not a time)"; return 1 ;;
-  esac
-  age=$(( $(date +%s) - ${gen%.*} ))
-  if [ "$age" -gt "$HELD_FRESH_SECONDS" ]; then
-    echo "stale (${age}s old, over ${HELD_FRESH_SECONDS}s)"; return 1
-  fi
-  return 0
-}
-
-# THE PACE GATE. His word 2026-09-11: while we are over the line, nobody
-# restarts a lane — the release pass had spent five restarts on one lane at
-# each hour boundary. Revised 2026-09-12: the week line is a TARGET; the brake
-# is a DAILY share, and the console serves that verdict as a top-level `mode`
-# — TURBO under, SILENT over. This reads `mode` and does not recompute the
-# line. An ALLOW-LIST: anything else (no mode, an unfamiliar one, a non-JSON
-# body, an unreachable console) is UNKNOWN and restarts nobody — a third mode
-# invented next month must not start a lane by being unfamiliar. Read once
-# per pass, and only when a release is actually waiting.
-PACE_URL="${MCP_HUB_PACE_URL:-http://127.0.0.1:8765/ceiling/pace}"
-PACE_GATE="${MCP_HUB_PACE_GATE:-on}"
-PACE_READ=""
-pace_mode() {  # -> under | over | unknown
-  if [ "$PACE_GATE" = off ]; then echo under; return 0; fi
-  if [ -z "$PACE_READ" ]; then
-    local body mode
-    body="$(curl -fsS --max-time 5 "$PACE_URL" 2>/dev/null || true)"
-    mode="$(printf '%s' "$body" | jq -r 'if type == "object" then (.mode // "" | tostring) else "" end' 2>/dev/null || true)"
-    case "${mode^^}" in
-      TURBO)  PACE_READ=under ;;
-      SILENT) PACE_READ=over ;;
-      *)      PACE_READ=unknown ;;
-    esac
-  fi
-  echo "$PACE_READ"
-}
-
 hold_release_pass() {
-  local a f args why rc
+  local a f args
   for f in "$HOME"/.mcp-hub/hold-stopped-*; do
     [ -e "$f" ] || continue
     a="${f##*/hold-stopped-}"
+    # Still held? Nothing to do — the stop stands.
+    held_until "$a" >/dev/null && continue
     # The roster is the authority on whether this agent still exists; a flag
-    # outliving its agent must not resurrect a retired lane. Bookkeeping, so
-    # no gate below holds it back — a ghost flag starts nothing.
+    # outliving its agent must not resurrect a retired lane.
     # `field` prints nothing and still exits 0 for an unknown agent, so the
     # emptiness is the test — an exit status here would always pass.
     if [ -z "$(field "$a" 2)" ]; then
@@ -1781,26 +1027,6 @@ hold_release_pass() {
       rm -f "$f" 2>/dev/null || true   # already back by some other route
       continue
     fi
-    if ! why="$(held_mirror_fresh)"; then
-      echo "!! $a: hold-stopped, but the held-lanes mirror is $why — not restarting, flag kept (release fails closed)" >&2
-      continue
-    fi
-    # Still held? Nothing to do — the stop stands.
-    held_until "$a" >/dev/null && continue
-    if squad_bound "$a"; then rc=0; else rc=$?; fi
-    if [ "$rc" != 0 ]; then
-      echo "$a: hold released but NOT restarted — $([ "$rc" = 2 ] && echo "squad '$COMPACT_ASK_SQUAD' membership is UNREADABLE" || echo "outside squad '$COMPACT_ASK_SQUAD'") (squad-bounded); flag kept"
-      continue
-    fi
-    case "$(pace_mode)" in
-      under) ;;
-      over)
-        echo "!! $a: hold released, but the console pace is over the line (SILENT) — not restarting, flag kept" >&2
-        continue ;;
-      *)
-        echo "!! $a: hold released, but the console pace is unreadable (no TURBO/SILENT verdict from $PACE_URL) — not restarting, flag kept" >&2
-        continue ;;
-    esac
     args="$(field "$a" 4)"
     case " $args " in
       *" $RESUME_FLAG "*)
@@ -1818,141 +1044,24 @@ hold_release_pass() {
 }
 
 # Every held lane on the box. Fails open with everything else here: no
-# mirror, no jq, no held lanes = nothing to enforce and no output. The
-# conversation exemption is asked ONCE here, for the owner-held lanes only:
-# a fleet held entirely by hand costs this pass nothing extra.
+# mirror, no jq, no held lanes = nothing to enforce and no output.
 hold_enforce_pass() {
   [ -r "$HELD_FILE" ] || return 0
   command -v jq >/dev/null 2>&1 || return 0
-  local a l _rest owner lanes="" owned=()
-  held_cache_load
-  while IFS=$'\037' read -r l _rest; do [ -n "$l" ] && lanes="$lanes $l"; done <<< "$HELD_CACHE"
-  for a in $lanes; do
-    held_until "$a" >/dev/null || continue
-    owner="$(held_owner "$a")"
-    if [ -n "$owner" ]; then owned+=("$a"); fi
-  done
-  if [ "${#owned[@]}" -gt 0 ]; then conversation_scan "${owned[@]}" || true; fi
-  for a in $lanes; do
+  local a
+  for a in $(jq -r '.held | keys[]?' "$HELD_FILE" 2>/dev/null); do
     hold_enforce_one "$a"
   done
-  HELD_CACHE=""; HELD_CACHED=0
-}
-
-# --- lifecycle intent on a placement (2026-09-17) ---------------------------
-#
-# `squad stop` killed tmux and retired the daemon, both purely local, and left
-# the hub's placement at desired=running — so the edge re-planned a start on
-# its next pass and the seat was back before the operator saw it go: "every
-# time I find you are running again". An imperative kill wired into a
-# declarative system can never mean "stay down". So the hand's doors write
-# INTENT: stop -> want=stopped, start -> want=running. Both, or neither: a
-# stop that wrote `stopped` while start left the row alone would mirror the
-# bug rather than fix it. Heal's door (relaunch_agent) writes nothing — heal
-# resurrecting a lane is not the operator saying "I want this running".
-
-# The one placement id for this seat (the `placements list` columns: id seat
-# machine ...). Nothing for a lane with no placement; REFUSES on two —
-# picking either would write lifecycle intent to an arbitrary machine's seat.
-placement_id() {  # <seat>
-  local hb ids n
-  hb="$(hub_bin)" || return 1
-  [ -n "$hb" ] || return 1
-  ids="$("$hb" placements list </dev/null 2>/dev/null | awk -v s="$1" '$2 == s {print $1}' || true)"
-  [ -n "$ids" ] || return 1
-  n="$(printf '%s\n' "$ids" | grep -c . || true)"
-  if [ "$n" -gt 1 ]; then
-    echo "!! $1: $n placements match this seat — writing no lifecycle intent rather than guessing which machine's" >&2
-    return 2
-  fi
-  printf '%s\n' "$ids"
-}
-
-# Loud, NEVER fatal: the local kill/start is the part the operator is
-# watching, so a hub failure must not abort it — but an intent that silently
-# failed to stick is the bug being fixed, not a quieter version of it.
-set_placement_intent() {  # <seat> <running|stopped>
-  local seat="$1" want="$2" id hb
-  id="$(placement_id "$seat")" || return 0
-  hb="$(hub_bin)" || return 0
-  if "$hb" placements set "$id" "$want" </dev/null >/dev/null 2>&1; then
-    echo "$seat: placement $id want=$want"
-  else
-    echo "!! $seat: placement $id NOT set to $want — until it is, the edge reconciler will restart it or stop it against this act" >&2
-  fi
-  return 0
-}
-
-# A hand's stop: the local marker the supervisor reads, beside the placement.
-want_down_flag() { echo "$HOME/.mcp-hub/want-down-$(safe_name "$1")"; }
-
-# --- supervise: a faculty lane that stops comes back, and only then ---------
-#
-# Bar 414: `up` skips faculty by design and heal demands a live session before
-# it judges anything, so a supervised seat that STOPPED was invisible to both
-# while heal reported "all up agents healthy". PER-ROW opt-in, never per class
-# (`touch ~/.mcp-hub/supervise-<agent>`): teaching `up` to start faculty would
-# revive fourteen seats to bring back one. The hard part is the cases where
-# starting it would be WRONG, each refused here: a hand's stop sticks, a hold
-# stands, a pace-gate refusal is not overturned (the lane waits behind its
-# hold-stopped flag), a placed seat is the edge's, and a row without
-# --continue would come back blank. A launch that does not take is not
-# retried inside the grace window, so claude failing to boot cannot become a
-# respawn every two minutes.
-supervise_pass() {
-  local a s lm gmin
-  for a in $(agents); do
-    s="$(safe_name "$a")"
-    [ -e "$HOME/.mcp-hub/supervise-$s" ] || continue
-    if [ -e "$(want_down_flag "$a")" ]; then
-      echo "$a: supervised, but stopped by hand — leaving it down"
-      continue
-    fi
-    if held_until "$a" >/dev/null; then
-      echo "$a: supervised, but HELD — leaving it down"
-      continue
-    fi
-    if [ -e "$(hold_stopped_flag "$a")" ]; then
-      echo "$a: supervised, but waiting behind its hold-stopped flag (the release pass and its pace gate own it)"
-      continue
-    fi
-    tm has-session -t "=$a" 2>/dev/null && continue    # live — nothing to do
-    local pid
-    if pid="$(placement_id "$a")"; then
-      echo "$a: supervised, but placed ($pid) — the edge reconciler owns its lifecycle"
-      continue
-    fi
-    if ! has_resume "$a"; then
-      echo "!! $a: supervised and DOWN, but its roster lacks $RESUME_FLAG — NOT starting it (it would come back with no conversation). Fix: $CMD resume on $a" >&2
-      continue
-    fi
-    lm="$HOME/.mcp-hub/supervise-launched-$s"
-    gmin=$(( (HEAL_GRACE_SECONDS + 59) / 60 ))
-    if [ -n "$(find "$lm" -mmin -"$gmin" 2>/dev/null)" ]; then
-      echo "$a: supervised and still down, but started moments ago — within grace, not retrying yet"
-      continue
-    fi
-    echo "$a: supervised and DOWN — starting it with $RESUME_FLAG (conversation kept)"
-    touch "$lm" 2>/dev/null || true
-    up_one "$a" || echo "!! $a: supervised start failed" >&2
-  done
-  return 0
 }
 
 up_one() {
   local a="$1" dir hu
-  # The hand's door: a start here is the operator saying "I want this
-  # running", so a stop by hand stops being the last word.
-  rm -f "$(want_down_flag "$a")" 2>/dev/null || true
-  # A HELD lane may still be started BY HAND (his ruling 2026-09-14: the hold
-  # "should not prevent claude from starting — just stop lanes from
-  # working"). Said out loud, with the condition, and recorded against THIS
-  # hold's expiry so enforcement leaves the lane up under the same hold —
-  # heal's door (relaunch_agent) still refuses.
+  # BEFORE the worktree check and before anything is launched: a held lane
+  # is not a failure, so this returns 0. `up` must not report an error for a
+  # deliberate, recorded, expiring stop.
   if hu="$(held_until "$a")"; then
-    echo "$a HELD until $(date -d "@${hu%.*}" '+%H:%M' 2>/dev/null || echo "$hu") — $(held_reason "$a"). THE HOLD STANDS: starting it anyway because a hand asked; it does no work until the boundary the hold names, and the enforcer leaves it up under this hold"
-    mkdir -p "$HOME/.mcp-hub" 2>/dev/null
-    printf '%s\n' "$hu" > "$(hold_hand_flag "$a")" 2>/dev/null || true
+    echo "$a HELD until $(date -d "@$hu" '+%H:%M' 2>/dev/null || echo "$hu") — $(held_reason "$a") (not started; releases itself)"
+    return 0
   fi
   dir="$(untilde "$(field "$a" 2)")"
   [ -d "$dir" ] || { echo "!! $a: missing worktree $dir"; return 1; }
@@ -1961,7 +1070,6 @@ up_one() {
     else echo "!! $a: session exists but claude is NOT running — try: $CMD restart $a"; fi
     return 0
   fi
-  set_placement_intent "$a" running
   # new-session bootstraps the tmux server on first launch; wrap under the slice if one is configured
   if [ -n "$SLICE" ] && ! tm list-sessions >/dev/null 2>&1 && systemctl --user list-unit-files 2>/dev/null | grep -q "^$SLICE"; then
     # -x/-y: a real size for the detached window (tmux defaults 80x24 with no
@@ -3733,15 +2841,6 @@ case "${1:-help}" in
             # The conversation is not lost: restart --resume / --continue picks
             # it back up.
             a="$(need_agent "${2:-}")" || exit 1
-            # INTENT, before the kill (see set_placement_intent): the hub's
-            # placement is told to WANT it down, and the local supervisor's
-            # marker says the same — a hand's stop must outlive the next pass
-            # of everything that restarts lanes. A stop also spends a hand
-            # start made under a hold.
-            mkdir -p "$HOME/.mcp-hub" 2>/dev/null
-            : > "$(want_down_flag "$a")" 2>/dev/null || true
-            rm -f "$(hold_hand_flag "$a")" 2>/dev/null || true
-            set_placement_intent "$a" stopped
             if ! tm has-session -t "=$a" 2>/dev/null; then echo "$a already down"; exit 0; fi
             tm kill-session -t "=$a"
             kill_daemon "$a"
@@ -3750,31 +2849,25 @@ case "${1:-help}" in
             # The keep-alive daemons are detached (they outlive tmux), so kill
             # them explicitly via their pidfiles and clear the stale claim.
             for a in $(agents); do kill_daemon "$a"; done ;;
-  compaction) # goal 81 bars 50-52: detect on TOKENS, ASK the lane, act only
-            # on its own answer (and only when armed). `--dry-run` reports
-            # what it would do and writes no rows and no keystrokes — the only
-            # safe way to inspect a leg that types into live panes. It reads
-            # every roster pane, faculty included, as the sweep does.
+  compaction) # goal 81 bars 50-52: detect at 50%, ASK the lane, never act.
+            # `--dry-run` reports what it would do and writes no rows and no
+            # keystrokes — the only safe way to inspect a leg that types into
+            # live panes.
             if [ "${2:-}" = "--dry-run" ]; then
-              echo "ask $([ "$COMPACT_ASK" = 1 ] && echo ARMED || echo OFF) (MCP_HUB_COMPACT_ASK) · exec leg $([ "$COMPACT_EXEC" = "1" ] && echo ARMED || echo OFF) (MCP_HUB_COMPACTION_EXEC) · cap ${COMPACT_ASK_TOKENS} tokens · squad '$COMPACT_ASK_SQUAD'"
-              for a in $(agents); do
-                container_of "$a" >/dev/null && continue
+              for a in $(squad_agents); do
                 tm has-session -t "=$a" 2>/dev/null || continue
                 pane_alive "$a" || continue
-                if ! tok="$(compaction_tokens "$a")"; then
-                  echo "$a: tokens UNMEASURED (no readable transcript)"
+                pct="$(compaction_ctx "$a")"
+                if [ -z "$pct" ]; then
+                  echo "$a: ctx UNMEASURED (no statusline number on the pane)"
                   continue
                 fi
                 st="$(classify_agent "$a")"
-                sid="$(compaction_session "$a" 2>/dev/null || true)"
-                f="$HOME/.mcp-hub/compaction-$(safe_name "$a")-$sid"
-                mark="open=no"
-                [ -f "$f.fired" ] && mark="fired=yes"
-                [ -s "$f" ] && mark="$mark,asked=yes"
-                [ -f "$f.answer" ] && mark="$mark,answered=$(tr -d '[:space:]' 2>/dev/null < "$f.answer" || true)"
-                [ -f "$f.exec" ] && mark="$mark,exec=yes"
-                [ -f "$f.closed" ] && mark="$mark,closed(floor=$(tr -d '[:space:]' 2>/dev/null < "$f.closed" || true))"
-                echo "$a: tok=$tok (cap $COMPACT_ASK_TOKENS) state=$st session=${sid:-?} $mark"
+                f="$(compaction_flag "$a" 2>/dev/null || true)"
+                mark="asked=no"
+                [ -n "$f" ] && [ -f "$f" ] && mark="asked=yes"
+                [ -n "$f" ] && [ -f "$f.reask" ] && mark="asked=yes,reasked=yes"
+                echo "$a: ctx=${pct}% state=$st $mark (ask at ${COMPACT_ASK_PCT}%, re-ask at ${COMPACT_REASK_PCT}%)"
               done
               exit 0
             fi
@@ -3821,13 +2914,10 @@ case "${1:-help}" in
             # it naturally: it no longer has a session.
             hold_enforce_pass
             hold_release_pass
-            # Detect, ask, and (armed only) act on the lane's own answer; the
-            # ask is OFF unless MCP_HUB_COMPACT_ASK=1. Runs after the hold legs
-            # so a lane being stopped is not asked to compact on its way down.
+            # Detect-and-ask only; the exec leg is behind COMPACT_EXEC and is
+            # not built. Runs after the hold legs so a lane being stopped is
+            # not asked to compact on its way down.
             compaction_pass
-            # Opted-in rows that STOPPED come back — after the hold legs, so a
-            # lane just stopped or still refused is seen as such.
-            supervise_pass
             healed=0
             relaunched=0
             # Agents this pass has already relaunched. The two recovery loops
@@ -3848,25 +2938,9 @@ case "${1:-help}" in
               for a in $(comms_agents); do
                 tm has-session -t "=$a" 2>/dev/null || continue
                 pane_alive "$a" || continue
-                # A braked lane is the hold's, not heal's: relaunching it is
-                # the one thing the brake exists to prevent.
-                held_until "$a" >/dev/null && continue
                 started="$(agent_started "$a")" || continue
                 [ -n "$started" ] || continue
                 [ "$started" -lt "$disrupt" ] || continue      # postdates it — stream is fine
-                # Deaf BY CONSTRUCTION is an inference; the daemon's own
-                # status is a measurement. A cache written AFTER the
-                # disruption, fresh, and reading wakeable is a lane whose
-                # stream came back — relaunching it spends a conversation's
-                # boot on a lane that is fine.
-                sf="$(status_file "$a")"
-                if [ -n "$(find "$sf" -mmin -3 2>/dev/null)" ] \
-                   && [ "$(stat -c %Y "$sf" 2>/dev/null || echo 0)" -gt "$disrupt" ] \
-                   && [ "$(status_key "$(cat "$sf" 2>/dev/null || true)" online)" = true ] \
-                   && [ "$(status_key "$(cat "$sf" 2>/dev/null || true)" wakeable)" = true ]; then
-                  echo "$a: predates the hub disruption, but its daemon reports it wakeable since — leaving it up"
-                  continue
-                fi
                 args="$(field "$a" 4)"
                 # A CONTAINER seat reaches here — comms_agents includes it,
                 # since has_comms answers ON for containers — and its field 4 is
@@ -3967,18 +3041,14 @@ case "${1:-help}" in
                 echo "$a: started $(( $(date +%s) - started ))s ago — within grace, not judging it yet"
                 continue
               fi
-              # Braked: the hold owns this lane's lifecycle; nudging it to
-              # re-register or relaunching it would fight the stop.
-              if held_until "$a" >/dev/null; then continue; fi
               sf="$(status_file "$a")"
               flag="$HOME/.mcp-hub/heal-flag-$(safe_name "$a")"
-              ncnt="$HOME/.mcp-hub/heal-nudges-$(safe_name "$a")"
               state=""
               if [ -z "$(find "$sf" -mmin -3 2>/dev/null)" ]; then state="no-signal"
               elif grep -q '"online"[[:space:]]*:[[:space:]]*false' "$sf" 2>/dev/null; then state="offline"
               elif grep -q '"wakeable"[[:space:]]*:[[:space:]]*false' "$sf" 2>/dev/null; then state="unwakeable"
               fi
-              if [ -z "$state" ]; then rm -f "$flag" "$ncnt"; continue; fi   # healthy — clear strikes and the budget
+              if [ -z "$state" ]; then rm -f "$flag"; continue; fi   # healthy — clear strikes
               args="$(field "$a" 4)"
               # Every intervention below TOUCHES THE PANE, so none may run
               # unless the agent is idle:
@@ -3992,9 +3062,7 @@ case "${1:-help}" in
               st="$(classify_agent "$a")"
               struck=0; if [ -n "$(find "$flag" -mmin -10 2>/dev/null)" ]; then struck=1; fi
               idle=0; if [ "$st" = "idle" ]; then idle=1; fi
-              nudges="$(tr -d '[:space:]' 2>/dev/null < "$ncnt" || true)"
-              case "$nudges" in ''|*[!0-9]*) nudges=0 ;; esac
-              case "$(heal_action "$state" "$struck" "$args" "$idle" "$nudges")" in
+              case "$(heal_action "$state" "$struck" "$args" "$idle")" in
               daemon)
                 # first strike: revive the daemon quietly — no agent turn spent.
                 # If the binding is also gone, the revived daemon writes an
@@ -4034,13 +3102,6 @@ case "${1:-help}" in
                 echo "!! $a: STILL $state and a restart is the cure — but the roster lacks $RESUME_FLAG, so heal will not relaunch it (the conversation would be lost). Fix: $CMD resume on $a && $CMD restart $a" >&2
                 touch "$flag"
                 ;;
-              spent)
-                # The budget is spent for this life: a nudge asks the lane to
-                # re-register over the very transport that is failing, and
-                # repeating it costs the lane a turn each time. Say so once a
-                # pass, type nothing; a relaunch or a recovery resets it.
-                echo "!! $a: STILL $state after $nudges nudge(s) this life — nudge budget spent (HEAL_MAX_NUDGES=$HEAL_MAX_NUDGES); typing nothing more. The cure is a relaunch (heal escalates on a strike) or the transport itself." >&2
-                ;;
               nudge)
                 echo "$a: $state on hub — nudging re-register"
                 # Copy branches on WHY the agent looks offline. The correlation
@@ -4057,25 +3118,12 @@ case "${1:-help}" in
                 [ -n "$(find "$stamp" -mmin -5 2>/dev/null)" ] && churn=1
                 read -r fw ft <<< "$(fleet_wake_counts "$a")" || true
                 nudge="$(nudge_copy "$state" "$churn" "${fw:-}" "${ft:-}")"
-                # A PERSON IN THE PANE (F5): the nudge would append to
-                # whatever he is typing. It goes to the lane inbox instead and
-                # reaches the lane at its next Stop — NOT charged against the
-                # budget and NO strike: the lane was never asked anything, so
-                # it cannot have failed to answer, and a strike would escalate
-                # the next pass to a relaunch of a lane somebody is working in.
-                if pane_in_use "$a"; then
-                  echo "$a: pane in use ($IN_USE_BY) — the nudge is left in its lane inbox for its next Stop, not typed"
-                  lane_inbox_put "$a" nudge "$nudge" || true
-                else
-                  # A wedged pane must cost this ONE nudge, not the whole pass
-                  # (2026-07-23: an unbounded send-keys here hung heal 2h28m and
-                  # blocked all post-deploy recovery behind it).
-                  ledger_note "$a" nudge squad "$nudge"
-                  type_line "$a" "$nudge" \
-                    || echo "!! $a: nudge send-keys failed/timed out (pane wedged?) — skipping" >&2
-                  touch "$flag"
-                  printf '%s\n' "$(( nudges + 1 ))" > "$ncnt" 2>/dev/null || true
-                fi
+                # A wedged pane must cost this ONE nudge, not the whole pass
+                # (2026-07-23: an unbounded send-keys here hung heal 2h28m and
+                # blocked all post-deploy recovery behind it).
+                type_line "$a" "$nudge" \
+                  || echo "!! $a: nudge send-keys failed/timed out (pane wedged?) — skipping" >&2
+                touch "$flag"
                 ;;
               *)
                 # An unmatched verdict does NOTHING and still counts as healed,
@@ -4112,7 +3160,6 @@ case "${1:-help}" in
               claude-*) ;;
               *) echo "usage: $CMD model [agent] default|opus|fable|sonnet|haiku|<alias>[1m]|claude-<full-id>" >&2; exit 1 ;;
             esac
-            ledger_note "$a" model hand "/model $m"
             type_line "$a" "/model $m"
             for i in 1 2 3 4 5 6 7 8 9 10; do
               sleep 1
@@ -4130,22 +3177,15 @@ case "${1:-help}" in
                 echo "$a: model already $m (no switch needed)"; break
               fi
             done ;;
-  cmd)      # HAND VERBS (cmd, key, model, answer) are his cockpit buttons:
-            # NEVER refused on a pane in use (v2-fleet r5 Term 1 — the pane
-            # they would be refused for is the pane he is pressing the button
-            # about), and ALWAYS ledgered `by: hand` before the keystroke.
-            if [ "${2:-}" = all ]; then shift 2
-                 for a in $(squad_agents); do ledger_note "$a" cmd hand "$*"; type_line "$a" "$@"; done
-            elif [ -n "${2:-}" ] && agents | grep -qxF -- "${2:-}"; then a="$2"; shift 2
-                 ledger_note "$a" cmd hand "$*"; type_line "$a" "$@"
+  cmd)      if [ "${2:-}" = all ]; then shift 2; for a in $(squad_agents); do type_line "$a" "$@"; done
+            elif [ -n "${2:-}" ] && agents | grep -qxF -- "${2:-}"; then a="$2"; shift 2; type_line "$a" "$@"
             else a="$(need_agent "")" || exit 1; shift
                  [ -n "${1:-}" ] || { echo "usage: $CMD cmd [agent|all] \"text\"" >&2; exit 1; }
-                 ledger_note "$a" cmd hand "$*"; type_line "$a" "$@"; fi ;;
-  key)      if [ -n "${2:-}" ] && agents | grep -qxF -- "${2:-}"; then t="$2"; shift 2
-                 ledger_note "$t" key hand "$*"; tm send-keys -t "$t" "$@"
+                 type_line "$a" "$@"; fi ;;
+  key)      if [ -n "${2:-}" ] && agents | grep -qxF -- "${2:-}"; then t="$2"; shift 2; tm send-keys -t "$t" "$@"
             else t="$(need_agent "")" || exit 1; shift
                  [ -n "${1:-}" ] || { echo "usage: $CMD key [agent] <keys>" >&2; exit 1; }
-                 ledger_note "$t" key hand "$*"; tm send-keys -t "$t" "$@"; fi ;;
+                 tm send-keys -t "$t" "$@"; fi ;;
   attach)   # --no-start: attach ONLY if the session exists — never launch.
             # Built for the cockpit extension, whose terminals attach at
             # window-open: with auto-start, opening a workspace mass-launches
@@ -4221,80 +3261,36 @@ case "${1:-help}" in
             # ONE reader for hub state — status_json handles the substrate,
             # so this cannot drift from the board's hub_glyph the way the
             # container branch I first wrote here immediately did.
-            #
-            # COST (2026-10-09, dev-vm-1): with 46 agents one `ls` took ~9 s
-            # and 5.5 CPU-seconds, and the cockpit ran it every 8 s in every
-            # window — ~3.3 cores to learn which agents were up. Most of it
-            # was per-agent forks: a grep+awk per roster lookup, three tmux
-            # calls and a docker call per agent. Now tmux and docker are each
-            # asked ONCE per run, and the roster is read by bash itself.
-            # `--up` is LIVENESS ONLY: the HUB column reads `-` and no status
-            # is read — the remaining cost was a docker exec per container
-            # seat, for a column the cockpit's poll never looks at.
-            ls_up=""; [ "${2:-}" = "--up" ] && ls_up=1
             hub_state() {
-              local body on wk
-              body="$(status_json "$1")" || { printf -- '-'; return; }
+              local body; body="$(status_json "$1")" || { printf -- '-'; return; }
               [ -n "$body" ] || { printf -- '-'; return; }
-              # each key on its own: {online:false, wakeable:true} is offline
-              on="$(status_key "$body" online)"; wk="$(status_key "$body" wakeable)"
-              if [ "$on" = true ]; then
-                if [ "$wk" = true ]; then printf '⚡ online'; else printf 'online'; fi
-              else
-                printf '✖ offline'
-              fi
+              case "$body" in
+                *'"online"'*true*)
+                  case "$body" in
+                    *'"wakeable"'*true*) printf '⚡ online' ;;
+                    *) printf 'online' ;;
+                  esac ;;
+                *) printf '✖ offline' ;;
+              esac
             }
-            declare -A LS_CMD=() LS_ARGS=()
-            ls_names=()
-            if [ -r "$CONF" ]; then
-              while IFS='|' read -r n _wt _gh largs _rest; do
-                [[ "$n" =~ ^[[:space:]]*(#|$) ]] && continue
-                [ -n "${LS_ARGS[$n]+x}" ] && continue
-                ls_names+=("$n"); LS_ARGS[$n]="$largs"
-              done < "$CONF"
-            fi
-            while IFS=$'\t' read -r s c; do
-              [ -n "$s" ] || continue
-              [ -n "${LS_CMD[$s]+x}" ] || LS_CMD[$s]="$c"
-            done <<< "$(tm list-panes -a -F $'#{session_name}\t#{pane_current_command}' 2>/dev/null || true)"
-            ls_dock=" "
-            for a in "${ls_names[@]}"; do
-              case "${LS_ARGS[$a]}" in
-                @docker:*)
-                  if command -v docker >/dev/null 2>&1; then
-                    while IFS= read -r c; do [ -n "$c" ] && ls_dock="$ls_dock$c "; done \
-                      <<< "$(docker ps --format '{{.Names}}' 2>/dev/null || true)"
-                  fi
-                  break ;;
-              esac
-            done
             printf '%-26s %-10s %-11s %s\n' 'AGENT' 'TMUX' 'HUB' ''
-            for a in "${ls_names[@]}"; do
-              largs="${LS_ARGS[$a]}"
-              if [ -n "$ls_up" ]; then hs="-"
-              else
-                case "$largs" in
-                  @docker:*|*--dangerously-load-development-channels*hub*|*--channels*hub*) hs="$(hub_state "$a")" ;;
-                  *) hs="·" ;;     # no comms flag: no hub state to show
-                esac
+            for a in $(agents); do
+              hs="$(hub_state "$a")"; has_comms "$a" || hs="·"   # no comms flag: no hub state to show
+              # A container seat has no HOST tmux session by construction, and
+              # this gate ran before pane_alive ever did — so a running,
+              # ⚡-on-the-hub seat printed `down`. Ask docker instead, and say
+              # which substrate the answer came from rather than implying tmux.
+              if cseat="$(container_of "$a")"; then
+                if container_alive "$cseat"; then
+                  printf '%-26s %-10s %-11s (container %s)\n' "$a" up "$hs" "$cseat"
+                else
+                  printf '%-26s %-10s %-11s container not running — the EDGE starts it\n' "$a" down "$hs"
+                fi
+                continue
               fi
-              # A container seat has no HOST tmux session by construction, so
-              # asking tmux printed `down` for a running, ⚡-on-the-hub seat.
-              # Ask docker instead, and say which substrate answered.
-              case "$largs" in
-                @docker:*)
-                  cseat="${largs#@docker:}"; cseat="${cseat%%:*}"
-                  case "$ls_dock" in
-                    *" $cseat "*) printf '%-26s %-10s %-11s (container %s)\n' "$a" up "$hs" "$cseat" ;;
-                    *) printf '%-26s %-10s %-11s container not running — the EDGE starts it\n' "$a" down "$hs" ;;
-                  esac
-                  continue ;;
-              esac
-              if [ -n "${LS_CMD[$a]+x}" ]; then
-                case "${LS_CMD[$a]}" in
-                  ''|bash|sh|zsh) printf '%-26s %-10s %-11s session up, claude not running — try: %s restart %s\n' "$a" DEGRADED "$hs" "$CMD" "$a" ;;
-                  *) printf '%-26s %-10s %-11s (%s)\n' "$a" up "$hs" "${LS_CMD[$a]}" ;;
-                esac
+              if tm has-session -t "=$a" 2>/dev/null; then
+                if pane_alive "$a"; then printf '%-26s %-10s %-11s (%s)\n' "$a" up "$hs" "$(pane_cmd "$a")"
+                else printf '%-26s %-10s %-11s session up, claude not running — try: %s restart %s\n' "$a" DEGRADED "$hs" "$CMD" "$a"; fi
               else printf '%-26s %-10s %-11s\n' "$a" down "$hs"; fi
             done ;;
   args)     if [ -n "${2:-}" ] && agents | grep -qxF -- "${2:-}"; then a="$2"; shift 2
@@ -4569,218 +3565,62 @@ case "${1:-help}" in
             esac
             num="$(printf '%s\n' "$line" | grep -oE '[0-9]+' | head -1 || true)"
             [ -n "$num" ] || { echo "!! $a: no '$intent' option on screen — not waiting, or dialog has no such choice" >&2; exit 1; }
-            ledger_note "$a" answer hand "$num"
             tm send-keys -t "$a" "$num"
             echo "$a: answered '$intent' (option $num: $(printf '%s' "$line" | sed 's/^[[:space:]❯]*//'))" ;;
   who)      # Who needs YOU? Reads every agent's screen and reports: 🔴 waiting
-            # on operator input · 🟢 working · 💤 idle. With -w/--watch it
-            # loops: on a terminal it repaints the whole board (and paints
-            # dash tile borders red/green/grey, so the dash doubles as the
-            # needs-me board); anywhere else — the systemd unit, a journal —
-            # it writes ONE LINE PER CHANGE ("who: <lane> <old> -> <new>")
-            # and nothing at all while nothing moves.
-            #
-            # THE QUIET POLL (v2-fleet F2, T15). It runs for weeks, so what it
-            # costs while nothing happens is the number that matters: under a
-            # tenth of a core at the live fleet's 46 lanes. Two levers:
-            #   · the wait backs off from SQUAD_WHO_INTERVAL, doubling to
-            #     SQUAD_WHO_MAX_INTERVAL while nothing moves, and drops back to
-            #     the base on any change — ONE `sleep` a pass, so the poll's
-            #     cost is readable from outside the process;
-            #   · a PASS does not scale with the roster: ONE list-panes for
-            #     every lane's liveness, command and title, ONE tmux command
-            #     sequence capturing every live screen, ONE list-clients for
-            #     the badges, ONE stat for every status cache and ONE docker ps
-            #     for every container seat. A lane whose screen did not change
-            #     is not re-classified; a title that did not change is not
-            #     re-sent. At 46 lanes the per-lane forks were 0.18 of a core
-            #     and ~80 s for one lane going down to reach the journal.
-            # The base leaves a pass room inside 0.1 x base (every change
-            # drops the poll back to it, and the live fleet changes about
-            # every 40 s), and cap + two passes stays inside a minute.
+            # on operator input · 🟢 working · 💤 idle. With -w/--watch, loops
+            # every 2s and also paints dash tile borders (red/green/grey) so
+            # the dash doubles as the needs-me board.
             wmode=""; case "${2:-}" in -w|--watch) wmode=1 ;; esac
-            declare -A WST   # agent -> state this pass ("" = down faculty, not shown)
+            declare -A WST   # agent -> state, one classify pass per refresh
             # Compact hub-presence glyph from the daemon's status cache (same
             # source as the statusline / `ls` HUB column):
             #   ⚡ wakeable · ⚠ online but unwakeable · ✖ offline · ? stale · '' no data
-            declare -A WG    # agent -> hub glyph this pass
             declare -A WCTX  # agent -> context % (scraped from its own statusline)
             declare -A WMOD  # agent -> model initial (O/F/S/H), same scrape
             declare -A WGH   # agent -> repo marker (🐙 = GitHub remote), computed once
             declare -A WWAIT # agent -> 1 when its newest recap says it awaits the OPERATOR
                              # (flag computed at harvest against WAIT_ON_OP_RE; see the
                              # detector note at that definition — errs noisy by design)
-            declare -A WSCR  # agent -> the screen last classified (skip if unchanged)
-            declare -A WTS   # agent -> the tab title last SENT (skip if unchanged)
-            declare -A WLBL  # agent -> short tab label, computed once
-            declare -A JST   # agent -> the state last JOURNALED
-            declare -A WR_WT WR_ARGS WR_CLASS WP_CMD WP_TITLE WSM
-            WR_NAMES=()
-            WHO_MARK="@@squad-who-end@@"
-            # The roster, read by bash itself once a pass: `field` is a grep and
-            # an awk per lookup, and a pass looked a lane up a dozen times.
-            who_roster() {
-              local n wt gh args cls _rest
-              WR_NAMES=(); WR_WT=(); WR_ARGS=(); WR_CLASS=()
-              [ -r "$CONF" ] || return 0
-              while IFS='|' read -r n wt gh args cls _rest; do
-                [[ "$n" =~ ^[[:space:]]*(#|$) ]] && continue
-                [ -n "${WR_WT[$n]+x}" ] && continue        # first row wins, as `field` does
-                WR_NAMES+=("$n"); WR_WT[$n]="$wt"; WR_ARGS[$n]="$args"
-                WR_CLASS[$n]="${cls//[[:space:]]/}"
-              done < "$CONF"
-            }
-            who_container() {  # <agent> -> WC=container name; exit 1 for a host lane
-              WC=""
-              case "${WR_ARGS[$1]:-}" in
-                @docker:*) WC="${WR_ARGS[$1]#@docker:}"; WC="${WC%%:*}"; return 0 ;;
-                *) return 1 ;;
-              esac
-            }
-            who_comms() {  # same rule as has_comms, off the pass's own roster read
-              case "${WR_ARGS[$1]:-}" in
-                @docker:*|*--dangerously-load-development-channels*hub*|*--channels*hub*) return 0 ;;
-                *) return 1 ;;
-              esac
-            }
-            # Hub glyph for a HOST lane, off the one stat of the pass: fresh =
-            # modified inside three minutes (status_json's `find -mmin -3`),
-            # read by bash, each key on its own. A cache nobody rewrote ages
-            # into `?`; the glyph is never cached on an mtime.
-            # No subshell either: it sets WG[agent] itself, and reads each
-            # key (the same rule as status_key) with bash's own regex.
-            who_glyph() {  # <agent> <now>
-              local a="$1" now="$2" f m body="" on="" wk="" g
-              local re_on='"online"[[:space:]]*:[[:space:]]*(true|false)'
-              local re_wk='"wakeable"[[:space:]]*:[[:space:]]*(true|false)'
-              local re_fu='"focus_until"[[:space:]]*:[[:space:]]*([0-9]+)'
-              f="status-${a//[^A-Za-z0-9_-]/_}.json"
-              m="${WSM[$f]:-}"
-              if [ -z "$m" ] || [ $(( now - m )) -ge 180 ]; then WG[$a]='?'; return 0; fi
-              IFS= read -r -d '' body < "$HOME/.mcp-hub/$f" || true
-              if [ -z "$body" ]; then WG[$a]='?'; return 0; fi
-              if [[ "$body" =~ $re_on ]]; then on="${BASH_REMATCH[1]}"; fi
-              if [[ "$body" =~ $re_wk ]]; then wk="${BASH_REMATCH[1]}"; fi
-              if [ "$on" = true ]; then
-                if [ "$wk" = true ]; then g='⚡'; else g='⚠'; fi
-              else
-                g='✖'
-              fi
-              # 🔕 rides BESIDE the wake glyph (see hub_glyph), off the expiry.
-              if [[ "$body" =~ $re_fu ]] && [ "${BASH_REMATCH[1]}" -gt "$now" ] 2>/dev/null; then g="$g🔕"; fi
-              WG[$a]="$g"
-            }
-            # ONE pass over the fleet: every lane's state, ctx, model and glyph.
-            who_scan() {
-              local a s c t now up listing out line buf args=()
-              local dock=" " have_dock=0 have_comms=0 tail st ctx mod
-              printf -v now '%(%s)T' -1
-              who_roster
-              WP_CMD=(); WP_TITLE=()
-              # A fleet with NO tmux server at all is a fleet that is down,
-              # not a fatal error: `|| true` everywhere a listing can fail.
-              listing="$(tm list-panes -a -F $'#{session_name}\t#{pane_current_command}\t#{pane_title}' 2>/dev/null || true)"
-              while IFS=$'\t' read -r s c t; do
-                [ -n "$s" ] || continue
-                [ -n "${WP_CMD[$s]+x}" ] && continue
-                WP_CMD[$s]="$c"; WP_TITLE[$s]="$t"
-              done <<< "$listing"
-              for a in "${WR_NAMES[@]}"; do
-                if who_container "$a"; then have_dock=1
-                elif who_comms "$a"; then have_comms=1; fi
-              done
-              # ONE listing answers every container seat's liveness — a docker
-              # client start is ~50 ms of CPU, and nothing is kept past the pass.
-              if [ "$have_dock" = 1 ] && command -v docker >/dev/null 2>&1; then
-                while IFS= read -r line; do [ -n "$line" ] && dock="$dock$line "; done \
-                  <<< "$(docker ps --format '{{.Names}}' 2>/dev/null || true)"
-              fi
-              WSM=()
-              if [ "$have_comms" = 1 ]; then
-                while read -r c line; do
-                  [ -n "$line" ] && WSM[${line##*/}]="$c"
-                done <<< "$(stat -c '%Y %n' "$HOME"/.mcp-hub/status-*.json 2>/dev/null || true)"
-              fi
-              # ONE capture for every live host lane: a tmux command SEQUENCE,
-              # each screen followed by a marker. A target that dies between
-              # the scan and the capture ABORTS the sequence, so a lane with no
-              # marker behind its screen is re-read on its own below — never
-              # credited with a blank capture, which classifies `idle`.
-              for a in "${WR_NAMES[@]}"; do
-                who_container "$a" && continue
-                c="${WP_CMD[$a]-}"
-                case "$c" in ''|bash|sh|zsh) continue ;; esac
-                [ "${#args[@]}" -gt 0 ] && args+=(";")
-                args+=(capture-pane -p -t "$a" ";" display-message -p "$WHO_MARK $a")
-              done
-              declare -A got=()
-              if [ "${#args[@]}" -gt 0 ]; then
-                out="$(tm "${args[@]}" 2>/dev/null || true)"
-                buf=""
-                while IFS= read -r line; do
-                  if [[ "$line" == "$WHO_MARK "* ]]; then got[${line#"$WHO_MARK "}]="$buf"; buf=""
-                  else buf+="$line"$'\n'; fi
-                done <<< "$out"
-              fi
-              for a in "${WR_NAMES[@]}"; do
-                up=0; tail=""
-                if who_container "$a"; then
-                  case "$dock" in *" $WC "*) up=1 ;; esac
-                  if [ "$up" = 1 ]; then
-                    tail="$(capture_for "$a" || true)"
-                  fi
-                else
-                  c="${WP_CMD[$a]-}"
-                  case "$c" in ''|bash|sh|zsh) ;; *) up=1 ;; esac
-                  if [ "$up" = 1 ]; then
-                    if [ -n "${got[$a]+x}" ]; then tail="${got[$a]}"
-                    elif ! tail="$(tm capture-pane -p -t "$a" 2>/dev/null)"; then up=0; fi
-                  fi
-                fi
-                if [ "$up" != 1 ]; then
+            who_board() {
+              local a st g tail ctx mod
+              for a in $(agents); do
+                ctx=""; mod=""
+                if ! tm has-session -t "=$a" 2>/dev/null || ! pane_alive "$a"; then
                   # down faculty is invisible here (14 grey rows would bury
                   # the squad signal); it reappears the moment it runs
-                  if [ "${WR_CLASS[$a]:-}" = faculty ]; then WST[$a]=""; else WST[$a]="down"; fi
-                  WSCR[$a]=""; WCTX[$a]=""; WMOD[$a]=""
+                  if is_faculty "$a"; then WST[$a]=""; continue; fi
+                  st="down"
                 else
-                  if [ -z "${WSCR[$a]+x}" ] || [ "$tail" != "${WSCR[$a]}" ] \
-                     || [ -z "${WST[$a]:-}" ] || [ "${WST[$a]}" = down ]; then
-                    WSCR[$a]="$tail"
-                    # one capture, three harvests: waiting/working state, the
-                    # ctx % AND the model — all already rendered by the agent's
-                    # own statusline ("⚡ 9/9 · Fable5 high · ctx [..] 14% · …")
-                    tail="$(printf '%s\n' "$tail" | grep -v '^[[:space:]]*$' | tail -20 || true)"
-                    st="$(classify_text "$tail")"   # shared patterns — never re-implement here
-                    ctx="$(printf '%s\n' "$tail" | grep -oE '[c]tx \[[^]]*\][[:space:]]*[0-9]+%' | tail -1 | grep -oE '[0-9]+%' || true)"
-                    # first letter only — tab space is precious: O/F/S/H
-                    mod="$(printf '%s\n' "$tail" | grep -oE '[O]pus|[F]able|[S]onnet|[H]aiku' | tail -1 | cut -c1 || true)"
-                    WST[$a]="$st"
-                    # sticky: a capture racing the agent's redraw sometimes
-                    # misses the statusline — keep the last reading rather than
-                    # blinking the % out of the title. BUT an empty pane title
-                    # means a just-restarted claude (restart clears it) — drop
-                    # the dead session's cached %. Model: same terms.
-                    if [ -n "$ctx" ]; then WCTX[$a]="$ctx"
-                    elif [ -z "${WP_TITLE[$a]-}" ]; then WCTX[$a]=""; fi
-                    if [ -n "$mod" ]; then WMOD[$a]="$mod"
-                    elif [ -z "${WP_TITLE[$a]-}" ]; then WMOD[$a]=""; fi
-                  fi
+                  # one capture, three harvests: waiting/working state, the
+                  # ctx % AND the model — all already rendered by the agent's
+                  # own statusline ("⚡ 9/9 · Fable5 high · ctx [..] 14% · …")
+                  tail="$(capture_for "$a" | grep -v '^[[:space:]]*$' | tail -20)"
+                  st="$(classify_text "$tail")"   # shared patterns — never re-implement here
+                  ctx="$(printf '%s\n' "$tail" | grep -oE '[c]tx \[[^]]*\][[:space:]]*[0-9]+%' | tail -1 | grep -oE '[0-9]+%' || true)"
+                  # first letter only — tab space is precious: O/F/S/H
+                  mod="$(printf '%s\n' "$tail" | grep -oE '[O]pus|[F]able|[S]onnet|[H]aiku' | tail -1 | cut -c1 || true)"
                 fi
-                # No comms flag => no hub daemon and no wake path, so "?" (= no
-                # status data) is a real alarm for a comms agent but pure noise
-                # here; such an agent is simply ▶. Keyed on capability, not
-                # class: a comms-enabled faculty agent shows its REAL glyph.
-                if ! who_comms "$a"; then WG[$a]='▶'
-                elif who_container "$a"; then
-                  if [ "$up" = 1 ]; then WG[$a]="$(hub_glyph "$a")"; else WG[$a]='?'; fi
-                else who_glyph "$a" "$now"; fi
-              done
-            }
-            who_board() {
-              local a st g ctx
-              for a in "${WR_NAMES[@]}"; do
-                st="${WST[$a]:-}"; [ -n "$st" ] || continue
-                g="${WG[$a]:-?}"; ctx="${WCTX[$a]:-}"
+                WST[$a]="$st"
+                # sticky: a capture racing the agent's redraw sometimes misses
+                # the statusline — keep the last reading rather than blinking
+                # the % out of the title (title churn = visible tab flicker).
+                # BUT an empty pane title means a just-restarted claude
+                # (restart clears it) — drop the dead session's cached %.
+                if [ -n "$ctx" ]; then WCTX[$a]="$ctx"
+                elif [ "$st" = "down" ] || [ -z "$(tm display -p -t "$a" '#{pane_title}' 2>/dev/null)" ]; then WCTX[$a]=""
+                fi
+                # model is sticky on the same terms (scrape misses shouldn't
+                # blink the tag out; a restart clears it like the ctx cache)
+                if [ -n "$mod" ]; then WMOD[$a]="$mod"
+                elif [ "$st" = "down" ] || [ -z "$(tm display -p -t "$a" '#{pane_title}' 2>/dev/null)" ]; then WMOD[$a]=""
+                fi
+                # No comms flag => no hub daemon and no wake path, so hub_glyph's
+                # "?" (= no status data) is a real alarm for a comms agent but
+                # pure noise here; such an agent is simply ▶. Keyed on capability,
+                # not class: a comms-enabled faculty agent shows its REAL hub
+                # glyph, because it now has hub state that can genuinely break.
+                if has_comms "$a"; then g="$(hub_glyph "$a")"; else g='▶'; fi
                 case "$st" in
                   waiting) printf '  \033[1;31m🔴 %-28s %-2s %-4s WAITING ON YOU\033[0m\n' "$a" "$g" "$ctx" ;;
                   working) printf '  \033[32m🟢 %-28s %-2s %-4s working\033[0m\n' "$a" "$g" "$ctx" ;;
@@ -4789,48 +3629,19 @@ case "${1:-help}" in
                 esac
               done
             }
-            # The JOURNAL form: one line per lane whose STATE moved, the first
-            # pass naming every lane. ctx% and the model letter move
-            # constantly and reach the TAB, never this — counting them as
-            # state would make every pass a change again. Returns 0 when
-            # something was written (the backoff resets on it).
-            who_journal() {
-              local a st was moved=1
-              for a in "${WR_NAMES[@]}"; do
-                st="${WST[$a]:-}"; was="${JST[$a]-}"
-                if [ -z "$st" ]; then
-                  # down faculty leaves the board; say so if it was on it
-                  if [ -n "$was" ] && [ "$was" != down ]; then
-                    printf 'who: %s %s -> down\n' "$a" "$was"; JST[$a]=down; moved=0
-                  fi
-                  continue
-                fi
-                if [ -z "${JST[$a]+x}" ]; then printf 'who: %s %s\n' "$a" "$st"; moved=0
-                elif [ "$was" != "$st" ]; then printf 'who: %s %s -> %s\n' "$a" "$was" "$st"; moved=0; fi
-                JST[$a]="$st"
-              done
-              return "$moved"
-            }
             who_paint() {   # dash borders mirror the board (no-op without a dash)
-              [ -n "${WP_CMD[dash]+x}" ] || return 0
+              tm has-session -t "=dash" 2>/dev/null || return 0
               local p ag
-              for p in $(tm list-panes -t dash -F '#{pane_id}' 2>/dev/null || true); do
-                ag="$(tm display -p -t "$p" '#{@agent}' 2>/dev/null || true)"
+              for p in $(tm list-panes -t dash -F '#{pane_id}'); do
+                ag="$(tm display -p -t "$p" '#{@agent}' 2>/dev/null)"
                 [ -n "$ag" ] || continue
                 case "${WST[$ag]:-}" in
-                  waiting) tm select-pane -t "$p" -P 'fg=red,bold' 2>/dev/null || true ;;
-                  working) tm select-pane -t "$p" -P 'fg=green' 2>/dev/null || true ;;
-                  *)       tm select-pane -t "$p" -P 'fg=colour240' 2>/dev/null || true ;;
+                  waiting) tm select-pane -t "$p" -P 'fg=red,bold' ;;
+                  working) tm select-pane -t "$p" -P 'fg=green' ;;
+                  *)       tm select-pane -t "$p" -P 'fg=colour240' ;;
                 esac
               done
             }
-            # 🙋 comes out of caches OTHER processes write and moves on the
-            # order of minutes; re-reading it cost a transcript scan and two
-            # python starts every pass. So it is re-read on its own clock
-            # (SQUAD_WHO_FLAGS_TTL), while 🔴 — a dialog on screen — is read
-            # from the pane every pass: this one is slowed, that one is not.
-            WHO_FLAGS_TTL="${SQUAD_WHO_FLAGS_TTL:-60}"
-            WHO_FLAGS_AT=""
             load_wait_flags() {
               # 🙋 authority is the HUB CARD QUEUE (decisions-open.json,
               # daemon-written): an open card = a hand, nothing else does.
@@ -4838,11 +3649,8 @@ case "${1:-help}" in
               # is stale/absent (daemons down) — they linger until the agent
               # next takes a turn, which is exactly the stuck-hand class the
               # operator toured every pane failing to clear (2026-07-26).
-              local wa we wf wrest hubnames="" now
-              printf -v now '%(%s)T' -1
-              if [ -n "$WHO_FLAGS_AT" ] && [ $(( now - WHO_FLAGS_AT )) -lt "$WHO_FLAGS_TTL" ]; then return 0; fi
-              WHO_FLAGS_AT="$now"
               usage_refresh
+              local wa we wf wrest hubnames=""
               WWAIT=()
               hubnames="$(python3 -c '
 import json, sys, time
@@ -4853,56 +3661,59 @@ try:
         print("FRESH " + " ".join(n for n in names if n))
 except Exception:
     pass
-' "$HOME/.mcp-hub/decisions-open.json" 2>/dev/null || true)"
+' "$HOME/.mcp-hub/decisions-open.json" 2>/dev/null)"
               if [ "${hubnames%% *}" = "FRESH" ] || [ "$hubnames" = "FRESH" ]; then
                 for wa in ${hubnames#FRESH}; do WWAIT[$wa]=1; done
-              elif [ -r "$HOME/.mcp-hub/board-recap.cache" ]; then
+              else
                 while IFS=$'\037' read -r wa we wf wrest; do
                   [ -n "$wa" ] && [ "$wf" = 1 ] && WWAIT[$wa]=1
-                done < "$HOME/.mcp-hub/board-recap.cache"
+                done < "$HOME/.mcp-hub/board-recap.cache" 2>/dev/null || true
               fi
-              return 0
             }
             who_badge() {   # State -> VSCode tab, two channels per agent:
               # 1. per-session set-titles-string prefix: 🔴 lands INSIDE the
               #    grey ${sequence} text (proven to render in plain terminals).
+              #    Waiting agents alternate a trailing space so the title
+              #    CHANGES every pass — tmux only re-pushes on change, and a
+              #    fresh window needs a push before it shows anything.
               # 2. OSC 9;4 progress straight to the client tty (rendered by
               #    ${progress} where supported; harmless where not).
               # The short agent label is baked into the title because the
               # VSCode terminals are UNNAMED (a fixed name suppresses live
               # titles) — the title IS the tab name: "dt ⚡ · ✳ <status>".
-              # Re-push discipline: a title is SENT only when it differs from
-              # the one this watcher last sent — a show AND a set per lane per
-              # pass was 92 tmux clients a pass at fleet size, for a string
-              # that changes when the operator is needed. A trailing-space
-              # jiggle still forces a push when a new client appears (a fresh
-              # window needs a backfill) or on a slow heartbeat.
-              local a seq ts sp='' g jig='' m label ctx n cur s tty term cl
+              # Re-push discipline: tmux transmits only on change; content
+              # changes (#T, state, glyph) push themselves. A trailing-space
+              # jiggle forces a push ONLY when a new client appears (fresh
+              # window needs a backfill) or on a slow ~60s heartbeat —
+              # constant alternation made tabs visibly flicker every pass.
+              local a tty seq ts sp='' hostsafe short g cur jig='' m label ctx n
               load_wait_flags
-              [ -n "$WHO_HOSTSAFE" ] || WHO_HOSTSAFE="$(sanitize_ident "$(hostname)")"
-              # ONE list-clients for every badge: the jiggle's backfill signal
-              # and each session's xterm clients for the progress escape.
-              cl="$(tm list-clients -F $'#{session_name}\t#{client_tty}\t#{client_termname}' 2>/dev/null || true)"
-              cur="${cl//$'\n'/,}"
+              hostsafe="$(sanitize_ident "$(hostname)")"
+              cur="$(tm list-clients -F '#{client_tty}' 2>/dev/null | sort | paste -sd, -)"
               [ "$cur" != "$WHO_LAST" ] && jig=1; WHO_LAST="$cur"
               WHO_PASS=$((WHO_PASS+1)); [ $(( WHO_PASS % 30 )) = 0 ] && jig=1
               [ -n "$jig" ] && sp=' '
-              for a in "${WR_NAMES[@]}"; do
+              local ctx
+              for a in $(agents); do
                 # down faculty: no session, no clients, nothing to badge
-                if [ "${WR_CLASS[$a]:-}" = faculty ] && [ -z "${WP_CMD[$a]+x}" ] \
-                   && ! who_container "$a"; then continue; fi
-                [ -n "${WLBL[$a]+x}" ] || WLBL[$a]="$(short_label "$a" "$WHO_HOSTSAFE")"
+                if is_faculty "$a" && ! tm has-session -t "=$a" 2>/dev/null; then continue; fi
+                short="$(short_label "$a" "$hostsafe")"
                 # glyph FIRST (right after the tab icon) so the status column
                 # lines up; 🔴 slots in after it when waiting — the name
-                # jumping right is deliberate attention-grabbing.
-                g="${WG[$a]:-?}"
+                # jumping right is deliberate attention-grabbing. ctx % rides
+                # after the label: "⚡ dt 44% · ✳ <status>".
+                # Capability, not class — see the who/board glyph note above.
+                if has_comms "$a"; then g="$(hub_glyph "$a")"; else g='▶'; fi
                 # repo marker, faculty only (squad repos are ALL GitHub —
                 # implied, so the glyph only earns tab space where it
-                # varies). Cached for the painter's lifetime.
+                # varies). Cached for the painter's lifetime: repo-ness
+                # doesn't change mid-session, and a git call per agent per
+                # 2s pass would be pure waste. Trailing, like the ctx emoji
+                # (137374f), so the name column stays put.
                 if [ -z "${WGH[$a]+x}" ]; then
                   ghm=""
-                  if [ "${WR_CLASS[$a]:-}" = faculty ]; then
-                    case "$(git -C "$(untilde "${WR_WT[$a]:-}")" remote get-url origin 2>/dev/null || true)" in
+                  if is_faculty "$a"; then
+                    case "$(git -C "$(untilde "$(field "$a" 2)")" remote get-url origin 2>/dev/null || true)" in
                       *github.com*|*github-*) ghm="🐙" ;;
                     esac
                   fi
@@ -4910,12 +3721,16 @@ except Exception:
                 fi
                 ctx="${WCTX[$a]:-}"
                 # model + ctx are ONE field — "mcp-hub F-39%" — so the tab stays
-                # narrow; the tier emoji TRAILS it so the letter and the number
-                # stay in the same column.
+                # narrow and a mis-set model is obvious at a glance. The tier
+                # emoji TRAILS it — "mcp-hub F-52%🔥" — so the model letter and
+                # the number stay in the same column whether or not an emoji is
+                # present; a leading emoji shunted them right on exactly the
+                # agents you most want to read quickly.
                 m="${WMOD[$a]:-}"
-                label="${WLBL[$a]}${WGH[$a]:-}"
+                label="$short${WGH[$a]:-}"
                 # context-pressure tiers (titles can't carry ANSI colour):
-                # plain <40 · 🟡 40-49 · 🔥 50+  (🔴 stays "waiting", ⚠ stays hub)
+                # operator clears context before 50% — plain <40 · 🟡 40-49 ·
+                # 🔥 50+  (🔴 stays "waiting", ⚠ stays hub)
                 if [ -n "$ctx" ]; then
                   n="${ctx%\%}"
                   ctx="${m:+$m-}$ctx"
@@ -4926,7 +3741,8 @@ except Exception:
                 fi
                 # 🔴 (dialog) outranks 🙋 (free-text ask, from the recap
                 # harvest) — both mean "needs you", but 🔴 is instant and
-                # certain while 🙋 is inferred; a working pane suppresses 🙋.
+                # certain while 🙋 is inferred; a working pane suppresses 🙋
+                # (the agent moved past its own ask).
                 case "${WST[$a]:-}" in
                   waiting) ts="$g 🔴 $label${ctx:+ $ctx} · #T$sp"; seq='\033]9;4;2;0\a' ;;
                   working) ts="$g $label${ctx:+ $ctx} · #T$sp";    seq='\033]9;4;3;0\a' ;;
@@ -4936,20 +3752,19 @@ except Exception:
                         ts="$g $label${ctx:+ $ctx} · #T$sp";       seq='\033]9;4;0;0\a'
                       fi ;;
                 esac
-                # NB: set-option rejects the "=" prefix — bare name
-                if [ "${WTS[$a]-}" != "$ts" ]; then
-                  tm set -t "$a" set-titles-string "$ts" 2>/dev/null || true
-                  WTS[$a]="$ts"
-                fi
-                while IFS=$'\t' read -r s tty term; do
-                  [ "$s" = "$a" ] && [ "$term" = xterm-256color ] && [ -n "$tty" ] || continue
+                # NB: show/set-option reject the "=" prefix too — bare name
+                [ "$(tm show -t "$a" -v set-titles-string 2>/dev/null)" = "$ts" ] \
+                  || tm set -t "$a" set-titles-string "$ts" 2>/dev/null || true
+                for tty in $(tm list-clients -t "=$a" -F '#{?#{==:#{client_termname},xterm-256color},#{client_tty},}' 2>/dev/null); do
                   # BOUNDED write. A client whose reader died (VSCode window
                   # closed uncleanly) stays "attached" in tmux, and a raw
                   # printf into its pty blocks FOREVER once the buffer fills —
                   # 2026-07-24: the who engine sat wedged on one zombie tty
-                  # for hours, titles frozen fleet-wide.
+                  # for hours, titles frozen fleet-wide. A blocked loop can't
+                  # reach its own re-exec guard, so bounding this write is the
+                  # prerequisite for every other self-heal in this script.
                   [ -w "$tty" ] && timeout 2 sh -c 'printf %b "$1" > "$2"' _ "$seq" "$tty" 2>/dev/null || true
-                done <<< "$cl"
+                done
               done
             }
             who_unmanaged() {
@@ -4967,35 +3782,16 @@ except Exception:
                 printf '  \033[33m⚠ %-28s sock=%s  since %s\033[0m\n' "$name" "$sock" "$when"
               done <<< "$lines"
             }
-            WHO_PASS=0; WHO_LAST=''; WHO_HOSTSAFE=''
+            WHO_PASS=0; WHO_LAST=''
             if [ -n "$wmode" ]; then
-              # A terminal gets the board, repainted every pass (the clock in
-              # the header is the proof it is live); anything else gets the
-              # journal. The wait doubles in awk — bash cannot double 0.4.
-              who_base="${SQUAD_WHO_INTERVAL:-10}"
-              who_cap="${SQUAD_WHO_MAX_INTERVAL:-45}"
-              wait_s="$who_base"
               while true; do
                 # top of a pass = quiescent — safe to swap in new code here
                 if self_stale; then exec "$SELF" who --watch; fi
-                who_scan
-                moved=1
-                if [ -t 1 ]; then
-                  printf '\033[2J\033[H'
-                  printf 'squad who — %(%H:%M:%S)T   (🔴 dialog needs you · 🙋 asked, awaiting your word · 🟢 working · 💤 idle · ⚡ wakeable)\n\n' -1
-                  who_board; who_unmanaged
-                  who_journal >/dev/null && moved=0 || true
-                else
-                  who_journal && moved=0 || true
-                fi
-                # The pass that SAW a move waits the base again; a quiet one
-                # doubles the wait, up to the cap.
-                if [ "$moved" = 0 ]; then wait_s="$who_base"
-                else wait_s="$(awk -v w="$wait_s" -v c="$who_cap" 'BEGIN { w *= 2; if (w > c + 0) w = c + 0; print w }')"; fi
-                who_paint; who_badge
-                sleep "$wait_s"
+                printf '\033[2J\033[H'
+                printf 'squad who — %s   (🔴 dialog needs you · 🙋 asked, awaiting your word · 🟢 working · 💤 idle · ⚡ wakeable)\n\n' "$(date +%H:%M:%S)"
+                who_board; who_unmanaged; who_paint; who_badge; sleep 2
               done
-            else who_scan; who_board; who_unmanaged; who_paint; who_badge; fi ;;
+            else who_board; who_unmanaged; who_paint; who_badge; fi ;;
   board)    # OPERATOR DASHBOARD. `who` answers "what state is each agent in";
             # this answers the operator's actual questions: what is blocking
             # ME, what is running right now (the parallel picture), and what
@@ -5887,27 +4683,15 @@ watch + repair
                                 visible options and presses the matching digit (fail-closed:
                                 refuses when no matching option is on screen)
   $CMD who [-w]                 who needs YOU: 🔴 waiting on your input · 🟢 working · 💤 idle
-                                (reads each agent's screen). -w: poll every SQUAD_WHO_INTERVAL
-                                (default 10s), backing off to SQUAD_WHO_MAX_INTERVAL (45s)
-                                while nothing moves. On a terminal it repaints the board and
-                                paints dash tile borders (red = blocked on you); anywhere else
-                                it writes one "who: <lane> <old> -> <new>" line per CHANGE
-  $CMD ls [--up]                status: tmux liveness + hub presence per agent. --up:
-                                liveness only (HUB reads -), the cockpit's cheap poll
+                                (reads each agent's screen). -w: refresh every 2s and paint
+                                dash tile borders to match — red border = agent is blocked on you
+  $CMD ls                       status: tmux liveness + hub presence per agent
   $CMD heal                     fix agents that are up in tmux but broken on the hub:
                                 a dead heartbeat daemon (stale status) is respawned quietly;
-                                offline/unwakeable agents get nudged to re-register (at most
-                                SQUAD_HEAL_MAX_NUDGES=2 per life, and never typed into a pane
-                                in use — it goes to the lane inbox instead); if still broken
-                                on the next pass they auto-restart — but ONLY agents whose
-                                roster args include --continue (no conversation lost). Also:
-                                holds (stop at the boundary, release under the pace gate),
-                                the compaction ask (OFF unless MCP_HUB_COMPACT_ASK=1), and
-                                supervised rows (touch ~/.mcp-hub/supervise-<agent>).
+                                offline/unwakeable agents get nudged to re-register; if still
+                                broken on the next pass they auto-restart — but ONLY agents
+                                whose roster args include --continue (no conversation lost).
                                 a systemd user timer (squad-heal.timer) runs this every 2 min.
-  $CMD compaction [--dry-run|agent]
-                                the token-cap ask (MCP_HUB_COMPACT_ASK_TOKENS) on its own;
-                                --dry-run reads every pane and types nothing
 
 interact
   $CMD cmd [agent|all] "..."    type text + Enter into session(s)   e.g. $CMD cmd all "/compact"

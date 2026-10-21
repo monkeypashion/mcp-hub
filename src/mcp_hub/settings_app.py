@@ -66,16 +66,6 @@ from textual.widgets.tree import TreeNode
 
 from mcp_hub.fleet_tree import build_tree, structure_key
 
-# Backpressure for the three thread pollers (board, workspaces, presence).
-# A finished run buys a rest of its own length times this, capped, before the
-# next TICK may start one: a slow scan then spends at most a quarter of the
-# time scanning, and a healthy box (0.2s scan, 3s tick) polls exactly as
-# before. Priced from the measured run, not a hand-chosen interval, because
-# the script's runtime grows with the fleet. Measured 2026-09-17: a 9-12s
-# `squad board --json` against a 3s tick ran 3-4 scans at once.
-POLL_REST_FACTOR = 3.0
-POLL_REST_CAP_SECONDS = 30.0
-
 # Claude's own palette, read out of the Claude Code binary's CSS custom
 # properties rather than recalled — `--clay: #d97757`, `--clay-emphasized`,
 # `--plum`, `--mineral`, `--peach`, and a 40-step WARM grey ramp (#fcfcfb …
@@ -371,10 +361,6 @@ class SettingsApp(App):
         # open-now window is 180s, so 30 is ten times finer than the fact.
         self._workspaces_seconds = workspaces_seconds
         self._now = now or time.time
-        # Per poller group: whether its thread is running, and when its rest
-        # ends. See _poll_guarded.
-        self._polls_in_flight: set[str] = set()
-        self._poll_rest_until: dict[str, float] = {}
         self.scoped_to = scoped_to
         self._model_for = model_for       # injected so tests need no real repo
         self._board_for = board_for       # injected so tests need no real fleet
@@ -1103,43 +1089,9 @@ class SettingsApp(App):
 
     # ---- the workspace registry ----
 
-    def _poll_guarded(self, group: str, work: Any, force: bool = False) -> bool:
-        """Start `work` on a thread worker for `group` — unless one is running.
-
-        `exclusive=True` reads as if it prevented a second copy. It does not:
-        cancelling a THREAD worker only sets a flag, and the executor runs the
-        callable to completion, subprocess and all. So a tick slower than its
-        interval stacked silently for as long as the panel was open. This
-        guard is the thing that actually holds: a tick arriving while the
-        group's thread is in flight is skipped.
-
-        `force` (Reload: a hand on a key, not a timer) skips the REST, never
-        the in-flight guard. Only the pollers come through here; the
-        exclusive one-shot workers (settings writes) are not ticks and are
-        never guarded. Returns whether a run was started.
-        """
-        if group in self._polls_in_flight:
-            return False
-        if not force and self._now() < self._poll_rest_until.get(group, 0.0):
-            return False
-        self._polls_in_flight.add(group)
-
-        def run() -> None:
-            started = self._now()
-            try:
-                work()
-            finally:
-                ended = self._now()
-                ran = max(0.0, ended - started)
-                self._poll_rest_until[group] = ended + min(
-                    ran * POLL_REST_FACTOR, POLL_REST_CAP_SECONDS)
-                self._polls_in_flight.discard(group)
-
-        self.run_worker(run, thread=True, group=group, exclusive=True)
-        return True
-
-    def _poll_workspaces(self, force: bool = False) -> None:
-        self._poll_guarded("workspace-poll", self._collect_workspaces, force)
+    def _poll_workspaces(self) -> None:
+        self.run_worker(self._collect_workspaces, thread=True,
+                        group="workspace-poll", exclusive=True)
 
     def _collect_workspaces(self) -> None:
         try:
@@ -1198,12 +1150,12 @@ class SettingsApp(App):
 
     # ---- the live board ----
 
-    def _poll_board(self, force: bool = False) -> None:
+    def _poll_board(self) -> None:
         """Collect on a WORKER THREAD — the scan captures a pane per agent and
         the UI must never wait on it (group of its own: a poll must not cancel
-        an in-flight settings write, or vice versa). Guarded: see
-        `_poll_guarded`; `force` is Reload's, and overrides only the rest."""
-        self._poll_guarded("board-poll", self._collect_board, force)
+        an in-flight settings write, or vice versa)."""
+        self.run_worker(self._collect_board, thread=True,
+                        group="board-poll", exclusive=True)
 
     def _collect_board(self) -> None:
         roster = self._read_roster()
@@ -1240,7 +1192,8 @@ class SettingsApp(App):
         exclusive, and a 60s network call landing mid-scan would drop the
         board's refresh on the floor.
         """
-        self._poll_guarded("presence-ping", self._send_presence)
+        self.run_worker(self._send_presence, thread=True,
+                        group="presence-ping", exclusive=True)
 
     def _send_presence(self) -> None:
         try:
@@ -2098,9 +2051,9 @@ class SettingsApp(App):
     async def action_reload(self) -> None:
         await self.refresh_detail()
         if self._board_for is not None or self._roster_for is not None:
-            self._poll_board(force=True)
+            self._poll_board()
         if self._workspaces_for is not None:
-            self._poll_workspaces(force=True)
+            self._poll_workspaces()
         self._set_status("reloaded")
 
     def action_narrow(self) -> None:
