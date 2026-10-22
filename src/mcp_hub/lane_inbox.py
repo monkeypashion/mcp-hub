@@ -22,6 +22,7 @@ squad reaches this as `python -m mcp_hub.lane_inbox put <lane> <door> [text]`
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -45,12 +46,27 @@ def inbox_dir(lane: str) -> Path:
     return _state_dir() / "lane-inbox" / _safe(lane)
 
 
+def waiting(lane: str, door: str) -> list[Path]:
+    """The items from `door` still waiting for `lane`, matched on the door
+    field of <time>-<door>-<pid>[-n].txt exactly — never as a prefix of
+    another door's name. [] on any trouble."""
+    item = re.compile(rf"^[0-9.]+-{re.escape(_safe(door))}-[0-9]+(?:-[0-9]+)?\.txt$")
+    return [p for p, _t in peek(lane) if item.match(p.name)]
+
+
 def put(lane: str, door: str, text: str, now: float | None = None) -> bool:
     """Leave one item for `lane`. False when it could not be written — the
     caller has still refused to type, and must say the item did not land
-    rather than pretend it did."""
+    rather than pretend it did.
+
+    A door that already has an item waiting for this lane gets no second
+    one (r11 F45): the lane will read the first at its next Stop, and N
+    copies of one nudge drained as one block say nothing the first did not.
+    That is still True — the item IS waiting; `waiting()` tells them apart."""
     now = time.time() if now is None else now
     try:
+        if waiting(lane, door):
+            return True
         d = inbox_dir(lane)
         d.mkdir(parents=True, exist_ok=True)
         stem = f"{now:020.6f}-{_safe(door)}-{os.getpid()}"
@@ -109,6 +125,10 @@ def main(argv: list[str] | None = None) -> int:
     if not text.strip():
         print("lane_inbox: nothing to leave", file=sys.stderr)
         return 2
+    if waiting(lane, door):
+        print(f"lane_inbox: {lane} already has a {door} item waiting — "
+              "not leaving a second one", file=sys.stderr)
+        return 0
     if not put(lane, door, text):
         print(f"lane_inbox: could not write {lane}'s inbox", file=sys.stderr)
         return 1
