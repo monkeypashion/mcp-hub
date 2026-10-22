@@ -1401,21 +1401,18 @@ compaction_row() {
 # the ask and the keystroke are both idle-gated, so a lane that answers and
 # then stays busy is reachable by neither — the lane is the only actor that
 # can stop a busy lane without anyone typing into it, so it is asked to stop
-# ITSELF, bound first: finish the step, flush, park, REPLY, then act. The
-# reply comes before the command: after /clear the lane has lost the ask and
-# cannot answer it, and the exec leg reads the answer from the old session.
-# Its own slash commands are lowercase, so an echo of the ask is never read
-# as a verdict. The last sentence is chosen by the exec leg: promising "typed
-# for you" on a box where nothing will ever be typed was a false promise on
-# every box.
-COMPACT_ASK_TEXT="hub: your context is at %s tokens, over the %s-token cap. Bounded, in this order: finish the step you are on (do not abandon work mid-edit), flush anything worth keeping to memory, park, then reply with one line naming CLEAR (start fresh) or COMPACT (summarise and continue), and why. Only after that reply, run /compact or /clear yourself. %s"
+# ITSELF, bound first: finish the step, flush, park, then act. Its own slash
+# commands are lowercase, so an echo of the ask is never read as a verdict.
+# The last sentence is chosen by the exec leg: promising "typed for you" on a
+# box where nothing will ever be typed was a false promise on every box.
+COMPACT_ASK_TEXT="hub: your context is at %s tokens, over the %s-token cap. Bounded, in this order: finish the step you are on (do not abandon work mid-edit), flush anything worth keeping to memory, then park and run /compact or /clear yourself. Then reply with one line naming CLEAR (start fresh) or COMPACT (summarise and continue), and why. %s"
 
 compaction_ask_text() {
   local tail
   if [ "$COMPACT_EXEC" = "1" ]; then
-    tail="If you would rather not run it yourself, leave it once you have answered: the command you name is typed for you at your next quiet moment."
+    tail="If you would rather not run it yourself, reply anyway and the command you name is typed for you at your next quiet moment."
   else
-    tail="Nothing will be typed into this pane on your behalf (the exec leg is off here): run the command yourself, once you have answered."
+    tail="Nothing will be typed into this pane on your behalf (the exec leg is off here): run the command yourself, then reply."
   fi
   # shellcheck disable=SC2059  # the format is ours, the values are numbers
   printf "$COMPACT_ASK_TEXT" "$1" "$COMPACT_ASK_TOKENS" "$tail"
@@ -1615,15 +1612,6 @@ compaction_one() {
       echo "$a answered $verdict — exec leg OFF (MCP_HUB_COMPACTION_EXEC=$COMPACT_EXEC): nothing typed"
       compaction_row "$a" exec "$pct" "$tok" "lane answered $verdict — exec leg OFF: exec leg disarmed (MCP_HUB_COMPACTION_EXEC=$COMPACT_EXEC), nothing typed"
       : > "$flag.closed"
-      return 0
-    fi
-    # A PERSON IN THE PANE (F45): checked before ANY row. One NOT EXECUTED
-    # row and nothing else — no 'typing' row, no 'DEADLINE ... typing anyway'
-    # — and $flag.exec is NOT written, so a later pass tries again. The
-    # deadline still counts from $flag.answer's mtime, untouched here.
-    if pane_in_use "$a"; then
-      echo "$a answered $verdict — pane in use ($IN_USE_BY): NOT typing $cmd this pass"
-      compaction_row "$a" exec "$pct" "$tok" "NOT EXECUTED: pane in use ($IN_USE_BY) — lane answered $verdict, $cmd not typed; tried again on a later pass"
       return 0
     fi
     local tries; tries="$(tr -d '[:space:]' 2>/dev/null < "$flag.attempts" || true)"
