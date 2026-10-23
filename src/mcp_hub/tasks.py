@@ -1850,13 +1850,53 @@ def get(
     return _render_task(conn, hooks, row, events)
 
 
+def addressee_agent(addressed_to: str) -> str:
+    """The agent an `addressed_to=` filter names, or '' when it names none
+    (empty, a squad ref, or no usable ref). The caller reads that agent's
+    squads BEFORE the query, for the lock rule `claim` keeps: the membership
+    read purges lapsed loans and commits."""
+    text = (addressed_to or "").strip()
+    if not text:
+        return ""
+    kind, name, refusal = parse_addressee(text)
+    return name if (kind == "agent" and not refusal) else ""
+
+
+def member_squads_of(conn: sqlite3.Connection, agent: str) -> list[str]:
+    """Every squad `agent` is a member of now, muted included — the squads
+    `_may_claim` lets it claim from. Reads only: the caller purges lapsed
+    loans first."""
+    return sorted(r[0] for r in conn.execute(
+        "SELECT squad FROM squad_members WHERE agent = ?", (agent,)
+    ).fetchall())
+
+
 def _filter(
     owner: str = "", requester: str = "", squad: str = "", state: str = "",
+    addressed_to: str = "", member_squads: list[str] | tuple[str, ...] = (),
 ) -> tuple[str, list[Any], str, str]:
     """(sql tail, params, refusal, what-was-filtered) — ONE filter, so the
-    HTTP list and the tool cannot disagree about what matches."""
+    HTTP list and the tool cannot disagree about what matches.
+
+    `addressed_to` names an agent (bare, or its ref): it matches tasks
+    addressed to that agent AND to every squad in `member_squads`, which the
+    caller read for that agent (muted included: mute is about what wakes
+    you, never what you may claim). A squad ref matches as `squad=` does."""
     where: list[str] = []
     params: list[Any] = []
+    if addressed_to.strip():
+        kind, name, refusal = parse_addressee(addressed_to.strip())
+        if refusal:
+            return "", [], refusal, ""
+        if kind == "squad":
+            where.append("addressed_to = ?")
+            params.append(_addressed_ref("squad", name))
+        else:
+            wanted = [_addressed_ref("agent", name)] + [
+                _addressed_ref("squad", sq) for sq in member_squads]
+            where.append(
+                "addressed_to IN (" + ", ".join("?" for _ in wanted) + ")")
+            params.extend(wanted)
     if owner.strip():
         where.append("owner = ?")
         params.append(owner.strip())
@@ -1888,7 +1928,8 @@ def _filter(
     tail = (" WHERE " + " AND ".join(where)) if where else ""
     shown = ", ".join(
         f"{k}={v}" for k, v in (("owner", owner), ("requester", requester),
-                                ("squad", squad), ("state", state)) if v.strip()
+                                ("squad", squad), ("state", state),
+                                ("addressed_to", addressed_to)) if v.strip()
     ) or "no filters"
     return tail, params, "", shown
 
@@ -1900,6 +1941,8 @@ def summaries(
     requester: str = "",
     squad: str = "",
     state: str = "",
+    addressed_to: str = "",
+    member_squads: list[str] | tuple[str, ...] = (),
 ) -> tuple[list[dict], str]:
     """(rows, refusal) — the cockpit's list, filtered exactly as `list_tasks`.
 
@@ -1907,7 +1950,8 @@ def summaries(
     single-task json keeps: a column added to `tasks` is not interface here
     until somebody names it.
     """
-    tail, params, refusal, _shown = _filter(owner, requester, squad, state)
+    tail, params, refusal, _shown = _filter(
+        owner, requester, squad, state, addressed_to, member_squads)
     if refusal:
         return [], refusal
     rows = conn.execute(
@@ -1937,8 +1981,24 @@ def list_tasks(
     requester: str = "",
     squad: str = "",
     state: str = "",
+    addressed_to: str = "",
+    member_squads: list[str] | tuple[str, ...] = (),
+    format: str = "text",
 ) -> str:
-    tail, params, refusal, shown = _filter(owner, requester, squad, state)
+    if format not in ("text", "json"):
+        return (
+            f"REFUSED: format={format!r} — one of 'text' (default) or 'json'."
+        )
+    if format == "json":
+        rows_json, refusal = summaries(
+            conn, owner=owner, requester=requester, squad=squad, state=state,
+            addressed_to=addressed_to, member_squads=member_squads,
+        )
+        if refusal:
+            return refusal
+        return json.dumps({"tasks": rows_json}, ensure_ascii=False)
+    tail, params, refusal, shown = _filter(
+        owner, requester, squad, state, addressed_to, member_squads)
     if refusal:
         return refusal
     rows = conn.execute(

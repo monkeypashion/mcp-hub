@@ -1840,10 +1840,18 @@ def mount_api(mcp: Any, db_path: Path, registry: Any) -> None:
             return got
         from mcp_hub import tasks as _tasks
         q = request.query_params
+        member_squads: list[str] = []
+        who = _tasks.addressee_agent(q.get("addressed_to", ""))
+        if who:
+            # Lapsed loans end before membership is read, as everywhere.
+            purge_expired_memberships(db())
+            member_squads = _tasks.member_squads_of(db(), who)
         rows, refusal = _tasks.summaries(
             db(),
             owner=q.get("owner", ""), requester=q.get("requester", ""),
             squad=q.get("squad", ""), state=q.get("state", ""),
+            addressed_to=q.get("addressed_to", ""),
+            member_squads=member_squads,
         )
         if refusal:
             return _err(422, refusal)

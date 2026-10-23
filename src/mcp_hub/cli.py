@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import contextvars
 import datetime as _dt
 import hashlib
 import json
@@ -352,6 +353,153 @@ def _turn_evidence(payload: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+# ---------------------------------------------------------------------------
+# v2-fleet r13 F49: the tasks waiting on a lane, read at its turn boundary
+#
+# The Stop hook asks for the reads through _TASK_READ, never through an
+# argument: _query_hub's signature and return are an interface ten kept test
+# files stub, and the r5 F3 guards allow ONE hub round-trip per Stop. So the
+# reads ride the drain's own client session, after list_agents, and a caller
+# (or a stub) that never set the variable gets none. The dict is shared into
+# asyncio.run's copied context, so the result lands where the hook reads it:
+#   "served": the real _query_hub ran      "result": the reads, or "error"
+# ---------------------------------------------------------------------------
+
+_TASK_READ: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "mcp_hub_task_read", default=None)
+STOP_TASK_READ_S = 2.0           # the three list_tasks and list_squads, at Stop
+SESSION_START_TASK_READ_S = 3.0  # the one read at session start, connect included
+TASK_BLOCK_HEAD = "🗂 Your tasks (read-only; get_task(ref) reads one):"
+TASK_BLOCK_MAX_REFS = 5
+# (key, the list_tasks query beyond addressee and state, the line's label)
+_TASK_LISTS = (
+    ("open", "addressed_to", "open", "addressed to you, open"),
+    ("claimed", "owner", "claimed", "yours, claimed, not done"),
+    ("done", "requester", "done", "done, awaiting your accept"),
+)
+# A shown ref is a task ref and nothing else: no row text reaches the block.
+_TASK_REF_ONLY = re.compile(r"hub\.task/1\?id=[0-9]{1,19}")
+_SQUAD_REF_PREFIX = "hub.squad/1?name="
+
+
+async def _read_lane_tasks(session: Any, agent_name: str) -> dict[str, Any]:
+    """The lane's three task lists and its muted squads, on `session`.
+
+    Reads only (list_tasks, list_squads). Raises on anything that is not the
+    answer asked for — an error result, a hub that refuses addressed_to or
+    format, or text that is not the json list — so the caller fails open."""
+    out: dict[str, Any] = {}
+    for key, field, state, _label in _TASK_LISTS:
+        res = await session.call_tool("list_tasks", {
+            field: agent_name, "state": state, "format": "json"})
+        if getattr(res, "isError", False):
+            raise RuntimeError(f"list_tasks {key}: error result")
+        rows = json.loads(_extract_text(res))["tasks"]
+        if not isinstance(rows, list):
+            raise ValueError(f"list_tasks {key}: no task list")
+        kept = []
+        for r in rows:
+            ref = str(r.get("ref") or "") if isinstance(r, dict) else ""
+            if _TASK_REF_ONLY.fullmatch(ref):
+                kept.append({"ref": ref,
+                             "addressed_to": str(r.get("addressed_to") or "")})
+        out[key] = kept
+    res = await session.call_tool("list_squads", {"agent": agent_name})
+    if getattr(res, "isError", False):
+        raise RuntimeError("list_squads: error result")
+    muted = []
+    text = _extract_text(res)
+    if text.startswith(f"{agent_name} is in:"):
+        for line in text.splitlines()[1:]:
+            line = line.strip()
+            if line.endswith("(muted)"):
+                muted.append(line[: -len("(muted)")].strip())
+    out["muted"] = muted
+    return out
+
+
+def _task_block(read: dict[str, Any]) -> tuple[str, list[str], list[str]]:
+    """(block text, every entry shown, the entries that may pay for a turn).
+
+    An entry is '<list> <ref>'. One addressed to a squad the lane has muted is
+    shown but never pays: mute suppresses both delivery paths. '' when every
+    list is empty — no task work, no block, the output unchanged."""
+    from urllib.parse import unquote
+
+    muted = set(read.get("muted") or ())
+    lines = [TASK_BLOCK_HEAD]
+    shown: list[str] = []
+    pays: list[str] = []
+    for key, _field, _state, label in _TASK_LISTS:
+        rows = read.get(key) or []
+        if not rows:
+            continue
+        line = f"  {label}: {len(rows)}"
+        refs_shown = [f"⟨{r['ref']}⟩" for r in rows[:TASK_BLOCK_MAX_REFS]]
+        line += " " + " ".join(refs_shown)
+        if len(rows) > TASK_BLOCK_MAX_REFS:
+            line += f" +{len(rows) - TASK_BLOCK_MAX_REFS} more"
+        lines.append(line)
+        for r in rows:
+            entry = f"{key} {r['ref']}"
+            shown.append(entry)
+            to = r.get("addressed_to", "")
+            if not (to.startswith(_SQUAD_REF_PREFIX)
+                    and unquote(to[len(_SQUAD_REF_PREFIX):]) in muted):
+                pays.append(entry)
+    if not shown:
+        return "", [], []
+    return "\n".join(lines), shown, pays
+
+
+def _task_block_marker(agent_name: str) -> pathlib.Path:
+    safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in agent_name)
+    return _state_dir() / f"task-block.{safe}"
+
+
+def _task_block_owed(agent_name: str, session_id: str, pays: list[str]) -> bool:
+    """Does this block buy a turn of its own? Only when what may pay differs
+    from the last block delivered to this lane in this session."""
+    last: list[str] = []
+    try:
+        doc = json.loads(_task_block_marker(agent_name).read_text(
+            encoding="utf-8"))
+        if doc.get("session") == session_id:
+            last = list(doc.get("pays") or [])
+    except (OSError, ValueError, AttributeError):
+        pass
+    return sorted(pays) != sorted(last)
+
+
+def _mark_task_block(agent_name: str, session_id: str, shown: list[str],
+                     pays: list[str]) -> None:
+    """Written only once the block is out, as the offline nag's marker is."""
+    try:
+        path = _task_block_marker(agent_name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"session": session_id, "shown": shown,
+                                    "pays": sorted(pays)}), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _task_counts(read: dict[str, Any]) -> dict[str, int]:
+    return {key: len(read.get(key) or []) for key, *_ in _TASK_LISTS}
+
+
+async def _session_start_task_read(hub_url: str, agent_name: str) -> dict[str, Any]:
+    """session-start's one ephemeral read: its own short client, reads only."""
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    async with streamablehttp_client(
+            _ephemeral_hub_url(hub_url), timeout=SESSION_START_TASK_READ_S,
+            **_with_agent_key(agent_name)) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            return await _read_lane_tasks(session, agent_name)
+
+
 async def _query_hub(
     hub_url: str, agent_name: str, project: str = "", card: str = "",
     decided: str = "", rendered_refs: str = "",
@@ -384,6 +532,9 @@ async def _query_hub(
     # failure still raises, exactly as before: nothing has been consumed.
     messages_result = broadcasts_result = agents_result = None
     card_notice = ""
+    task_req = _TASK_READ.get()
+    if task_req is not None:
+        task_req["served"] = True
     try:
         async with streamablehttp_client(
                 _ephemeral_hub_url(hub_url), timeout=10,
@@ -480,6 +631,17 @@ async def _query_hub(
                     agents_result = await session.call_tool("list_agents", {})
                 except Exception:  # noqa: BLE001
                     agents_result = None   # unknown, NOT offline: see below
+
+                # r13 F49: the lane's tasks, AFTER the drain, so a task read
+                # that fails can never cost drained text (MH-H2). Bounded;
+                # any failure is "error" and the block is omitted.
+                if task_req is not None:
+                    try:
+                        task_req["result"] = await asyncio.wait_for(
+                            _read_lane_tasks(session, agent_name),
+                            task_req.get("budget", STOP_TASK_READ_S))
+                    except Exception:  # noqa: BLE001
+                        task_req["result"] = "error"
     except Exception:  # noqa: BLE001
         if messages_result is None and broadcasts_result is None:
             raise
@@ -794,6 +956,8 @@ def build_hook_response(
     offline_owed: bool = True,
     inbox_text: str = "",
     trace: dict[str, Any] | None = None,
+    task_block: str = "",
+    tasks_owed: bool = False,
 ) -> dict[str, Any] | None:
     """Decide whether to emit a hook block and what the reason should be.
 
@@ -828,8 +992,14 @@ def build_hook_response(
     decided (deferral fields, `cause`, and which corrections rendered) so
     the drain record can say why a turn was or was not spent. No rendered
     text depends on any of this.
+
+    r13 F49: `task_block` (the lane's tasks, refs only) rides LAST on any
+    block something else pays for, and pays for one of its own only when
+    `tasks_owed`. Both default to nothing, which changes nothing.
     """
     t: dict[str, Any] = trace if trace is not None else {}
+    task_block = task_block.strip()
+    tasks_pays = bool(task_block) and tasks_owed
     t["defer_low"] = bool(defer_low)
     t["defer_effect"] = "off" if not defer_low else "none"
     t["cause"] = "none"
@@ -862,6 +1032,7 @@ def build_hook_response(
         and not card_nag
         and not card_notice
         and not held_notice
+        and not tasks_pays
         and spool_age < DEFER_MAX_SECONDS
         and _all_low_priority(messages_text, broadcasts_text)
     ):
@@ -914,6 +1085,7 @@ def build_hook_response(
         and not offline_pays
         and not card_nag
         and not card_notice
+        and not tasks_pays
         and _all_already_delivered(messages_text, broadcasts_text, deferred)
     ):
         if deferred:
@@ -927,7 +1099,8 @@ def build_hook_response(
     # card nag in particular gets exactly ONE shot per natural Stop: if the
     # agent's nag-response turn still lacks a card, we let it go rather than
     # loop.
-    if stop_hook_active and not has_content and not held_pays:
+    if stop_hook_active and not has_content and not held_pays \
+            and not tasks_pays:
         return None
 
     # No work needed: online + nothing queued + no correction owed.
@@ -941,7 +1114,7 @@ def build_hook_response(
     # reason: a re-fired Stop on a held lane is still a lane about to be
     # stopped, until the notice has gone out.
     if not has_content and not offline_pays and not card_nag \
-            and not card_notice and not held_pays:
+            and not card_notice and not held_pays and not tasks_pays:
         return None
 
     parts: list[str] = []
@@ -1030,6 +1203,14 @@ def build_hook_response(
     # stop-hook bytes fleet-wide on 2026-07-26 — repeating guidance that
     # already lives in the hub's connect-time instructions.)
 
+    # r13 F49: the lane's tasks, LAST, after every section and notice. No
+    # line of it starts like a message header or a ** section header.
+    if task_block:
+        if parts and parts[-1] != "":
+            parts.append("")
+        parts.append(task_block)
+        t["tasks_rendered"] = True
+
     # The cause: what PAID for this block. Content counts only when it is
     # news — traffic that was all already-delivered rides along but bought
     # nothing. A block nothing else explains (a card nag) is content.
@@ -1042,7 +1223,8 @@ def build_hook_response(
         deferred_pays = bool(deferred)
     paid = [c for c, on in (("content", fresh), ("spool", deferred_pays),
                             ("held_first", held_pays),
-                            ("offline_first", offline_pays)) if on]
+                            ("offline_first", offline_pays),
+                            ("tasks", tasks_pays)) if on]
     t["cause"] = ("mixed" if len(paid) > 1 else paid[0] if paid
                   else "content")
 
@@ -5391,9 +5573,17 @@ def stop_hook_command(args: argparse.Namespace) -> int:
         for k in ("defer_held_s", "defer_discarded"):
             if k in trace:
                 rec[k] = trace[k]
+        if task_summary is not None:
+            rec["tasks"] = task_summary
         rec["elapsed_ms"] = _elapsed_ms(t0)
         _log_activity(rec)
 
+    # r13 F49: ask the drain's own session for the lane's tasks (see
+    # _TASK_READ). A stub that never serves the request leaves no block and
+    # no 'tasks' field.
+    task_summary: Any = None
+    task_req: dict[str, Any] = {"budget": STOP_TASK_READ_S}
+    task_token = _TASK_READ.set(task_req)
     try:
         messages_text, broadcasts_text, is_online, _card_notice = asyncio.run(
             _query_hub(args.hub_url, name, project or "",
@@ -5405,6 +5595,29 @@ def stop_hook_command(args: argparse.Namespace) -> int:
         print(f"[mcp-hub stop-hook] hub query failed: {exc!r}", file=sys.stderr)
         _record(False, True, {})
         return 0
+    finally:
+        _TASK_READ.reset(task_token)
+
+    task_block = ""
+    task_shown: list[str] = []
+    task_pays: list[str] = []
+    tasks_owed = False
+    if task_req.get("served"):
+        task_read = task_req.get("result", "error")
+        if isinstance(task_read, dict):
+            try:
+                task_block, task_shown, task_pays = _task_block(task_read)
+                task_summary = _task_counts(task_read)
+                if task_block:
+                    tasks_owed = _task_block_owed(name, session_id, task_pays)
+                else:
+                    _task_block_marker(name).unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001 — fail open, block omitted
+                task_block, task_shown, task_pays = "", [], []
+                tasks_owed = False
+                task_summary = "error"
+        else:
+            task_summary = "error"
 
     # Shadow mode: compare the hub's "already delivered live" inference against
     # what the transcript shows actually rendered. Diagnostic only — the return
@@ -5446,6 +5659,8 @@ def stop_hook_command(args: argparse.Namespace) -> int:
         # it ships dark and is turned on per box once its spool is trusted.
         defer_low=defer_low,
         trace=trace,
+        task_block=task_block,
+        tasks_owed=tasks_owed,
     )
 
     if response is None:
@@ -5463,6 +5678,8 @@ def stop_hook_command(args: argparse.Namespace) -> int:
             marker.write_text(session_id, encoding="utf-8")
         except OSError:
             pass
+    if trace.get("tasks_rendered"):
+        _mark_task_block(name, session_id, task_shown, task_pays)
     if inbox_items:
         lane_inbox.clear([p for p, _t in inbox_items])
     _record(True, False, trace)
@@ -5528,6 +5745,22 @@ def session_start_command(args: argparse.Namespace) -> int:
         + "hook auto-pull) and your statusline shows `hub ✖ REGISTER`."
     )
 
+    # r13 F49: the tasks waiting on this lane, after the register
+    # instruction, from one bounded read. Fail-open: any error, a timeout or
+    # an older hub leaves the instruction exactly as it is without it.
+    task_block, task_shown, task_pays = "", [], []
+    hub_url = getattr(args, "hub_url", None)
+    if hub_url:
+        try:
+            task_read = asyncio.run(asyncio.wait_for(
+                _session_start_task_read(hub_url, name),
+                SESSION_START_TASK_READ_S))
+            task_block, task_shown, task_pays = _task_block(task_read)
+        except Exception:  # noqa: BLE001
+            task_block, task_shown, task_pays = "", [], []
+    if task_block:
+        context = context + "\n\n" + task_block
+
     output = {
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
@@ -5535,6 +5768,10 @@ def session_start_command(args: argparse.Namespace) -> int:
         }
     }
     print(json.dumps(output))
+    # Only now that it is out: this session has been shown these tasks.
+    if task_block:
+        _mark_task_block(name, str(payload.get("session_id") or ""),
+                         task_shown, task_pays)
     return 0
 
 
@@ -7907,6 +8144,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--project",
         default=None,
         help="Project name override (otherwise auto-discovered from marker).",
+    )
+    session_start.add_argument(
+        "--hub-url",
+        default=DEFAULT_HUB_URL,
+        help=(f"Hub MCP endpoint for the read of this lane's tasks (default: "
+              f"{DEFAULT_HUB_URL}, or $MCP_HUB_URL)"),
     )
 
     agent_key = sub.add_parser(
