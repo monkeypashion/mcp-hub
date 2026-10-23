@@ -417,6 +417,21 @@ def lm(tmp_path):
     return {"tmp": tmp_path, "db": db, "snap": snap, "tr": tr, "ledger": ledger, "rows": rows}
 
 
+# run as `python -c _METER_CPU <cpu-file> load-meter ...`: the load-meter call alone, timed in a
+# child that has already imported the cli and the meter; its CPU seconds go to <cpu-file>
+_METER_CPU = (
+    "import sys, time\n"
+    "from mcp_hub import cli, load_meter\n"
+    "t0 = time.process_time()\n"
+    "try:\n"
+    "    rc = cli.main(sys.argv[2:])\n"
+    "finally:\n"
+    "    used = time.process_time() - t0\n"
+    "    open(sys.argv[1], 'w').write(repr(used))\n"
+    "if rc:\n"
+    "    raise RuntimeError(f'load-meter failed: {rc}')\n")
+
+
 def _meter(lm, injections, *, cpu=False, tr=None):
     out = lm["tmp"] / "reading.json"
     if out.exists():
@@ -424,14 +439,22 @@ def _meter(lm, injections, *, cpu=False, tr=None):
     cmd = [sys.executable, "-m", "mcp_hub.cli", "load-meter", "--hub-db", str(lm["db"]), "--snapshot", str(lm["snap"]),
            "--transcripts", str(tr or lm["tr"]), "--out", str(out), "--baseline-start", LM_START, "--baseline-end", LM_END,
            "--now", LM_NOW, "--hub-db-taken-at", LM_NOW, "--injections", str(injections)]
-    r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+    if cpu:
+        # the meter's own work: the child imports the cli first, then times only the load-meter
+        # call with process_time(), so interpreter start-up and imports are outside the reading
+        used = lm["tmp"] / "reading.cpu"
+        if used.exists():
+            used.unlink()
+        cmd = [sys.executable, "-c", _METER_CPU, str(used), *cmd[3:]]
     p = subprocess.run(cmd, capture_output=True, text=True, cwd=lm["tmp"], env=CHILD_ENV, timeout=300)
-    r1 = resource.getrusage(resource.RUSAGE_CHILDREN)
     assert p.returncode == 0, f"load-meter --injections exited {p.returncode}: {p.stderr[-600:]}"
     r = json.loads(out.read_text())
     errors = list(Draft202012Validator(SCHEMA).iter_errors(r))
     assert not errors, errors[0].message
     if cpu:
+        # the child's reading, as the rusage pair the line below subtracts
+        r0 = resource.struct_rusage((0.0, 0.0) + (0,) * 14)
+        r1 = resource.struct_rusage((float(used.read_text()), 0.0) + (0,) * 14)
         return r, (r1.ru_utime - r0.ru_utime) + (r1.ru_stime - r0.ru_stime)
     return r
 
@@ -629,7 +652,9 @@ class Fleet:
                    MCP_HUB_HELD_FILE=str(self.home / "held-lanes.json"), MCP_HUB_HOLD_BOUNDARY_DIR=str(self.home / "hold-boundary"),
                    MCP_HUB_PACE_URL=f"file://{self.home}/pace.json", LANG="C.UTF-8", PYTHONPATH=CHILD_ENV["PYTHONPATH"])
         self.env = env
-        self.tenv = {**env, "PATH": os.environ["PATH"]}
+        # the scratch fleet's own tmux names its terminal itself: an attach under the caller's
+        # TERM (unset, empty or dumb) is refused, and only this environment changes
+        self.tenv = {**env, "PATH": os.environ["PATH"], "TERM": "xterm-256color"}
         self.clients = []
         fake = self.tmp / "fake_claude.py"
         fake.write_text(FAKE_CLAUDE)
@@ -1314,6 +1339,8 @@ def test_r5_f6_9_the_exemption_adds_under_3s_cpu_to_a_pass_over_46_held_lanes(tm
 # writers (squad's `python -m mcp_hub.injections` command line and `edge._ledger_note`).
 # ---------------------------------------------------------------------------
 from mcp_hub import edge as _live_edge  # noqa: E402
+
+
 class _NotBuilt:
     """Collection on r10's base (19 Oct): what this file reads here is the build's to add. Until it exists, the
     name is a stand-in that raises the original error the moment a test USES it (call, iteration, truth, maths,

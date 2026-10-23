@@ -30,8 +30,8 @@ from pathlib import Path
 SQUAD = Path(__file__).resolve().parents[1] / "squad" / "squad"
 
 AGENT = "planner-dev-vm-1"
-# The worktree is inside the test's own tmp_path (declared base test edit, v2f r10 m3): it was the shared
-# /tmp/planner, which every run created and left behind. `@WORK@` is filled in by run().
+# The worktree is inside the test's own tmp_path (declared base test edit, v2f r10 m3): it was the
+# shared /tmp/planner, which every run created and left behind. `@WORK@` is filled in by run().
 ROW_RESUME = f"{AGENT}|@WORK@||--continue --model fable|faculty"
 ROW_NO_RESUME = f"{AGENT}|@WORK@||--model fable|faculty"
 

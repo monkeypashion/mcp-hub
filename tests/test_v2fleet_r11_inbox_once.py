@@ -20,6 +20,7 @@ pane_in_use is made TRUE here the way squad reads it: `tmux list-clients` answer
 active this second. The compaction harness is tests/test_compaction_detect_and_ask.py's `run`; heal's
 nudge door runs on the r5 scratch fleet (a real private tmux socket and an attached pty client).
 """
+# ruff: noqa: E501 — the build's acceptance tests, kept as written
 from __future__ import annotations
 
 import os
@@ -28,11 +29,17 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 from mcp_hub import lane_inbox
 from tests.test_compaction_detect_and_ask import (
-    BUSY, PINNED_NOW, SAFE_PANE, answered, commands_typed, keys, pinned_now, rows, run,
+    BUSY,
+    PINNED_NOW,
+    SAFE_PANE,
+    answered,
+    commands_typed,
+    keys,
+    pinned_now,
+    rows,
+    run,
 )
 from tests.test_v2fleet_r5_falsifiers import IDLE_SCREEN, NUDGE_MARK, Fleet, Hook
 
