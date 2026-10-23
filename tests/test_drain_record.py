@@ -35,10 +35,9 @@ from mcp_hub import cli
 
 @pytest.fixture(autouse=True)
 def _private_home(tmp_path, monkeypatch):
-    """Hermetic (declared base test edit, v2f r10 m3): the Stop hook reads the hold mirror and
-    stamps or UNLINKS the hold-boundary marker under ~/.mcp-hub. Without this a run read the real
-    held-lanes.json and could delete the real hold-boundary/alice.json. HOME and both hold paths now
-    point into tmp_path."""
+    """Hermetic (declared base test edit, v2f r10 m3): the Stop hook reads the hold mirror and stamps or
+    UNLINKS the hold-boundary marker under ~/.mcp-hub. Without this a run read the real held-lanes.json and
+    could delete the real hold-boundary/alice.json. HOME and both hold paths now point into tmp_path."""
     home = tmp_path / "home"
     (home / ".mcp-hub").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))

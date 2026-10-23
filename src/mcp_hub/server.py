@@ -5891,7 +5891,6 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     @mcp.tool()
     def list_tasks(
         owner: str = "", requester: str = "", squad: str = "", state: str = "",
-        addressed_to: str = "", format: str = "text",
     ) -> str:
         """The tasks matching every filter you give, with their refs.
 
@@ -5901,23 +5900,10 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
             squad: Tasks addressed to this squad (name, or its ref).
             state: One of "open", "claimed", "done", "accepted", "failed",
                 "cancelled".
-            addressed_to: An agent (name, or its ref): tasks addressed to it
-                and to every squad it is a member of now, muted included —
-                the squads it may claim from. A squad ref matches as squad=.
-            format: "text" (default) or "json": {"tasks": [rows]}, each row
-                exactly the cockpit's summary fields.
         """
-        conn = _get_db(db_path)
-        member_squads: list[str] = []
-        who = tasks.addressee_agent(addressed_to)
-        if who:
-            # Read BEFORE the query: _squads_of purges lapsed loans and
-            # commits. include_muted=True is the membership view.
-            member_squads = _squads_of(conn, who, include_muted=True)
         return tasks.list_tasks(
-            conn, _task_hooks, owner=owner, requester=requester,
-            squad=squad, state=state, addressed_to=addressed_to,
-            member_squads=member_squads, format=format,
+            _get_db(db_path), _task_hooks, owner=owner, requester=requester,
+            squad=squad, state=state,
         )
 
     # -- Identity assertions (identity.py) --

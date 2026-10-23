@@ -18,7 +18,6 @@ so the ask under test is the one typed into the stub pane, keystroke for keystro
   (3)  GUARD: COMPACT and CLEAR occur once each, in the one instruction, and the ask reads as no answer;
   CONTROL: a compact_boundary after the ask still counts as done without a reply (F37 unchanged).
 """
-# ruff: noqa: E501 — the build's acceptance tests, kept as written
 from __future__ import annotations
 
 import re
@@ -26,13 +25,7 @@ import re
 import pytest
 
 from tests.test_compaction_detect_and_ask import (
-    OVER,
-    SAFE_PANE,
-    SHRUNK,
-    _ask_text,
-    commands_typed,
-    rows,
-    run,
+    OVER, SAFE_PANE, SHRUNK, _ask_text, commands_typed, rows, run,
 )
 
 # The four renders T58 names: the leg unset, "0", "true" (a truthy word that is NOT "1") and "1".
