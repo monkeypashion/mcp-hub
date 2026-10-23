@@ -26,6 +26,9 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "anyio>=4.0",
+    # One exact version, so `ruff check src tests` reads the same here, on a seat and in CI
+    # (ci.yml installs this version); requirements.lock, the image's pins, names no ruff.
+    "ruff==0.16.8",
 ]
 
 [project.scripts]
