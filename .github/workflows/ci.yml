@@ -28,7 +28,7 @@ jobs:
       - name: Install
         run: pip install -e . && pip install pytest pytest-asyncio starlette httpx
       - name: Ruff
-        run: pip install ruff==0.16.8 && ruff check src tests
+        run: pip install ruff && ruff check src
       - name: Tests
         # tmux refuses to attach a client without a usable TERM ("open
         # terminal failed: terminal does not support clear"), and the

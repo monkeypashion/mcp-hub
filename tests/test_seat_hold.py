@@ -15,7 +15,6 @@ that fails closed converts its own outage into an outage of the whole fleet.
 The cost is that a dead edge un-holds lanes, which is why every entry also
 carries its own expiry.
 """
-# ruff: noqa: E501 — a kept test's long check line, kept as written until Slipstream can re-earn a kept test whose check is rewrapped (F69)
 from __future__ import annotations
 
 import json
@@ -34,10 +33,9 @@ SQUAD = Path(__file__).resolve().parents[1] / "squad" / "squad"
 def _squad(tmp_path) -> Path:
     """squad, copied into tmp_path (declared base test edit, v2f r10 m3).
 
-    `hub_bin` prefers `<script dir>/../.venv/bin/mcp-hub`, so run from a checkout that has a
-    .venv, `squad start` called the REAL cli's `placements list` / `placements set`, which talk
-    to the live hub. A copy has no .venv beside it, and `_stub_bin` puts a stub `mcp-hub` on
-    PATH that only records its arguments."""
+    `hub_bin` prefers `<script dir>/../.venv/bin/mcp-hub`, so run from a checkout that has a .venv, `squad start`
+    called the REAL cli's `placements list` / `placements set`, which talk to the live hub. A copy has no .venv
+    beside it, and `_stub_bin` puts a stub `mcp-hub` on PATH that only records its arguments."""
     dst = tmp_path / "checkout" / "squad" / "squad"
     if not dst.exists():
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -418,8 +416,8 @@ def test_a_pending_release_lifts_the_hold_in_the_same_pass(tmp_path, monkeypatch
 
 
 def test_squad_start_reaches_only_the_stub_hub(tmp_path):
-    """Hermetic guard (declared base test edit, v2f r10 m3): `squad start` asks the hub for this
-    seat's placement. It must ask the stub on PATH, never a cli next to the script."""
+    """Hermetic guard (declared base test edit, v2f r10 m3): `squad start` asks the hub for this seat's
+    placement. It must ask the stub on PATH, never a cli next to the script."""
     run_squad(tmp_path, None)
     log = tmp_path / "hub-calls.log"
     assert log.exists() and "placements list" in log.read_text(), "squad start did not reach the stub hub"
