@@ -5847,9 +5847,13 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         """Write something on a task's log without moving it.
 
         A note MOVES NOTHING — not the state, not the owner, not the version,
-        not `updated_ts` — and it tells NOBODY: it is for the record, not for
-        anyone's attention. The requester or the current owner may write one,
-        on an open, claimed or done task.
+        not `updated_ts` — and it tells the OTHER PARTY with a pointer: the
+        requester's note tells the owner (or, while unclaimed, the agent it is
+        addressed to; a squad is told nothing), the owner's note tells the
+        requester, and you are never told of your own note. The notice is a
+        normal-priority pointer at get_task and never carries the note's text.
+        The requester or the current owner may write one, on an open, claimed
+        or done task.
 
         Args:
             from_agent: Your agent name — the requester or the current owner.
