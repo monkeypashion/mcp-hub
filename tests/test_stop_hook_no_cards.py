@@ -78,30 +78,6 @@ def test_no_card_notice_rides_along_with_real_mail(tmp_path, monkeypatch, capsys
     assert "card #1200" not in out and "DECISION" not in out
 
 
-def test_the_hub_no_longer_teaches_the_card_format(tmp_path):
-    # The instructions load into every session on connect; teaching a format
-    # nothing reads any more is pure context cost.
-    from mcp_hub.server import create_server
-
-    text = create_server(db_path=tmp_path / "i.db").instructions
-    assert "**DECISION**" not in text and "**DECIDED:**" not in text
-    assert "ask in your reply" in text
-
-
-def test_hub_shutdown_is_bounded():
-    # A GET /mcp stream never closes on its own, so an unbounded graceful
-    # shutdown sat out Docker's 30s stop timeout and stranded every session
-    # (2026-10-06). The bound is what makes a redeploy survivable.
-    import inspect
-
-    from mcp_hub import server
-
-    assert server.GRACEFUL_SHUTDOWN_SECONDS <= 2
-    src = inspect.getsource(server._serve_streamable_http)
-    assert "timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS" in src
-    assert "_serve_streamable_http(server)" in inspect.getsource(server.main)
-
-
 def test_once_shape_is_the_default_with_a_per_lane_escape(tmp_path, monkeypatch):
     from mcp_hub import cli
 

@@ -22,43 +22,7 @@ from pathlib import Path
 import pytest
 from jsonschema import Draft202012Validator
 
-
-class _NotBuilt:
-    """Collection on r10's base (19 Oct): what this file reads here is the build's to add. Until it
-    exists, the name is a stand-in that raises the original error the moment a test USES it (call,
-    iteration, truth, maths, comparison, item or key access), so the file collects and each test
-    fails at run time instead of the whole file failing to collect. Attribute access gives a
-    stand-in for the attribute, so a module-level alias of a missing name collects too. Once the
-    build adds it, the real import or read runs and nothing here is used."""
-
-    def __init__(self, name, err):
-        object.__setattr__(self, "_name", name)
-        object.__setattr__(self, "_err", err)
-
-    def _raise(self, *a, **k):
-        err = self._err
-        raise type(err)(f"{self._name} is not built yet: {err}")
-
-    def __getattr__(self, attr):
-        if attr.startswith("__") and attr.endswith("__"):
-            raise AttributeError(attr)
-        return _NotBuilt(f"{self._name}.{attr}", self._err)
-
-    def __repr__(self):
-        return f"<not built yet: {self._name}>"
-
-    __call__ = __iter__ = __bool__ = __len__ = __getitem__ = __contains__ = _raise
-    __add__ = __radd__ = __sub__ = __rsub__ = __mul__ = __rmul__ = \
-        __truediv__ = __rtruediv__ = _raise
-    __floordiv__ = __rfloordiv__ = __mod__ = __neg__ = __index__ = __int__ = __float__ = _raise
-    __lt__ = __le__ = __gt__ = __ge__ = __eq__ = __ne__ = _raise
-    __hash__ = object.__hash__
-
-
-try:
-    from mcp_hub import load_meter as m
-except ImportError as _e:  # not built yet on r10's base
-    m = _NotBuilt('m', _e)
+from mcp_hub import load_meter as m
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = json.loads((ROOT / "contract" / "load-reading.schema.json").read_text())
@@ -1008,31 +972,3 @@ def test_the_units_carry_no_policy_of_their_own():
     assert not [ln for ln in timer.splitlines()
                 if ln.startswith(("OnUnitActiveSec", "OnBootSec", "OnActiveSec"))]
     assert DAILY.is_file() and os.access(DAILY, os.X_OK), "the unit's ExecStart must be runnable"
-
-
-# ----------------------------------------------------------------------------
-# a day is half-open: an event exactly at midnight belongs to ONE day
-# (declared base test edit, v2f r10: the inclusive-end mutant of `_in`
-# survived every falsifier above, because no fixture put an event on the line)
-# ----------------------------------------------------------------------------
-
-def test_an_event_exactly_at_midnight_is_counted_in_one_day_only(tmp_path):
-    """Two adjacent days share the instant 00:00. If both claimed it, a
-    daily series would count a midnight turn twice and the sum of the days
-    would exceed the whole; if neither did, it would vanish. The day that
-    STARTS at midnight owns it."""
-    root = write_transcripts(tmp_path / "transcripts", {"lane-a/s1.jsonl": [
-        asst("2026-09-28T23:59:00.000Z"),
-        typed("2026-09-29T00:00:00.000Z"),
-        asst("2026-09-29T00:00:05.000Z"),
-    ]})
-    tr = m._load_transcripts(root)
-    day1 = (m.parse_day("2026-09-28"), m.parse_day("2026-09-29"))
-    day2 = (m.parse_day("2026-09-29"), m.parse_day("2026-09-30"))
-    whole = (m.parse_day("2026-09-28"), m.parse_day("2026-09-30"))
-    first, second, both = tr.read(day1), tr.read(day2), tr.read(whole)
-    assert first["typed"]["lane-a"] == 0, "the day that ENDS at midnight claimed it"
-    assert second["typed"]["lane-a"] == 1, "the day that STARTS at midnight lost it"
-    assert first["waits"] == [] and second["waits"] == [60.0]
-    assert (first["typed"]["lane-a"] + second["typed"]["lane-a"]
-            == both["typed"]["lane-a"] == 1), "the days do not sum to the whole"

@@ -218,12 +218,7 @@ class TestTransport:
         return create_server(db_path=tmp_path / "hub.db")
 
     async def _call(self, server, name, args):
-        # Each sender calls from its OWN bound session: declaring and
-        # clearing compare names, so they need a verified one (audit
-        # 2026-10-13, H1/H2). An unbound caller is refused — pinned in
-        # tests/test_audit_2026_10_13.py.
-        ctx = getattr(self, "_ctx", {}).get(args.get("from_agent", ""))
-        result = await server._tool_manager.call_tool(name, args, context=ctx)
+        result = await server._tool_manager.call_tool(name, args)
         if hasattr(result, "content"):
             for block in result.content:
                 if hasattr(block, "text"):
@@ -235,25 +230,8 @@ class TestTransport:
         return result if isinstance(result, str) else str(result)
 
     async def _pair(self, server):
-        class _Sess:
-            _write_stream = object()
-
-            async def send_ping(self):
-                return None
-
-            async def send_notification(self, notification):
-                return None
-
-        class _Ctx:
-            def __init__(self, session):
-                self.session = session
-
-        self._ctx = {}
-        for name in ("alice", "bob"):
-            await self._call(server, "register", {"name": name, "project": "p"})
-            sess = _Sess()
-            server._hub_registry.bind(name, sess)
-            self._ctx[name] = _Ctx(sess)
+        await self._call(server, "register", {"name": "alice", "project": "p"})
+        await self._call(server, "register", {"name": "bob", "project": "p"})
 
     def _db(self, server):
         conn = sqlite3.connect(server._hub_db_path)

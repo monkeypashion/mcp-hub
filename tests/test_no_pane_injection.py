@@ -29,59 +29,8 @@ from pathlib import Path
 
 import pytest
 
-
-class _NotBuilt:
-    """Collection on r10's base (19 Oct): what this file reads here is the build's to add. Until it
-    exists, the name is a stand-in that raises the original error the moment a test USES it (call,
-    iteration, truth, maths, comparison, item or key access), so the file collects and each test
-    fails at run time instead of the whole file failing to collect. Attribute access gives a
-    stand-in for the attribute, so a module-level alias of a missing name collects too. Once the
-    build adds it, the real import or read runs and nothing here is used."""
-
-    def __init__(self, name, err):
-        object.__setattr__(self, "_name", name)
-        object.__setattr__(self, "_err", err)
-
-    def _raise(self, *a, **k):
-        err = self._err
-        raise type(err)(f"{self._name} is not built yet: {err}")
-
-    def __getattr__(self, attr):
-        if attr.startswith("__") and attr.endswith("__"):
-            raise AttributeError(attr)
-        return _NotBuilt(f"{self._name}.{attr}", self._err)
-
-    def __repr__(self):
-        return f"<not built yet: {self._name}>"
-
-    __call__ = __iter__ = __bool__ = __len__ = __getitem__ = __contains__ = _raise
-    __add__ = __radd__ = __sub__ = __rsub__ = __mul__ = __rmul__ = \
-        __truediv__ = __rtruediv__ = _raise
-    __floordiv__ = __rfloordiv__ = __mod__ = __neg__ = __index__ = __int__ = __float__ = _raise
-    __lt__ = __le__ = __gt__ = __ge__ = __eq__ = __ne__ = _raise
-    __hash__ = object.__hash__
-
-
-try:
-    from mcp_hub import injections
-except ImportError as _e:  # not built yet on r10's base
-    injections = _NotBuilt('injections', _e)
-try:
-    from mcp_hub import lane_inbox
-except ImportError as _e:  # not built yet on r10's base
-    lane_inbox = _NotBuilt('lane_inbox', _e)
-try:
-    from mcp_hub.edge import SEAT_IN_USE_SECONDS
-except ImportError as _e:  # not built yet on r10's base
-    SEAT_IN_USE_SECONDS = _NotBuilt('SEAT_IN_USE_SECONDS', _e)
-try:
-    from mcp_hub.edge import _seat_client_in_use
-except ImportError as _e:  # not built yet on r10's base
-    _seat_client_in_use = _NotBuilt('_seat_client_in_use', _e)
-try:
-    from mcp_hub.edge import realize_seat_action
-except ImportError as _e:  # not built yet on r10's base
-    realize_seat_action = _NotBuilt('realize_seat_action', _e)
+from mcp_hub import injections, lane_inbox
+from mcp_hub.edge import SEAT_IN_USE_SECONDS, _seat_client_in_use, realize_seat_action
 
 ROOT = Path(__file__).resolve().parents[1]
 SQUAD = ROOT / "squad" / "squad"

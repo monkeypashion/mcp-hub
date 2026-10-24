@@ -417,21 +417,6 @@ def lm(tmp_path):
     return {"tmp": tmp_path, "db": db, "snap": snap, "tr": tr, "ledger": ledger, "rows": rows}
 
 
-# run as `python -c _METER_CPU <cpu-file> load-meter ...`: the load-meter call alone, timed in a
-# child that has already imported the cli and the meter; its CPU seconds go to <cpu-file>
-_METER_CPU = (
-    "import sys, time\n"
-    "from mcp_hub import cli, load_meter\n"
-    "t0 = time.process_time()\n"
-    "try:\n"
-    "    rc = cli.main(sys.argv[2:])\n"
-    "finally:\n"
-    "    used = time.process_time() - t0\n"
-    "    open(sys.argv[1], 'w').write(repr(used))\n"
-    "if rc:\n"
-    "    raise RuntimeError(f'load-meter failed: {rc}')\n")
-
-
 def _meter(lm, injections, *, cpu=False, tr=None):
     out = lm["tmp"] / "reading.json"
     if out.exists():
@@ -439,22 +424,14 @@ def _meter(lm, injections, *, cpu=False, tr=None):
     cmd = [sys.executable, "-m", "mcp_hub.cli", "load-meter", "--hub-db", str(lm["db"]), "--snapshot", str(lm["snap"]),
            "--transcripts", str(tr or lm["tr"]), "--out", str(out), "--baseline-start", LM_START, "--baseline-end", LM_END,
            "--now", LM_NOW, "--hub-db-taken-at", LM_NOW, "--injections", str(injections)]
-    if cpu:
-        # the meter's own work: the child imports the cli first, then times only the load-meter
-        # call with process_time(), so interpreter start-up and imports are outside the reading
-        used = lm["tmp"] / "reading.cpu"
-        if used.exists():
-            used.unlink()
-        cmd = [sys.executable, "-c", _METER_CPU, str(used), *cmd[3:]]
+    r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
     p = subprocess.run(cmd, capture_output=True, text=True, cwd=lm["tmp"], env=CHILD_ENV, timeout=300)
+    r1 = resource.getrusage(resource.RUSAGE_CHILDREN)
     assert p.returncode == 0, f"load-meter --injections exited {p.returncode}: {p.stderr[-600:]}"
     r = json.loads(out.read_text())
     errors = list(Draft202012Validator(SCHEMA).iter_errors(r))
     assert not errors, errors[0].message
     if cpu:
-        # the child's reading, as the rusage pair the line below subtracts
-        r0 = resource.struct_rusage((0.0, 0.0) + (0,) * 14)
-        r1 = resource.struct_rusage((float(used.read_text()), 0.0) + (0,) * 14)
         return r, (r1.ru_utime - r0.ru_utime) + (r1.ru_stime - r0.ru_stime)
     return r
 
@@ -652,9 +629,7 @@ class Fleet:
                    MCP_HUB_HELD_FILE=str(self.home / "held-lanes.json"), MCP_HUB_HOLD_BOUNDARY_DIR=str(self.home / "hold-boundary"),
                    MCP_HUB_PACE_URL=f"file://{self.home}/pace.json", LANG="C.UTF-8", PYTHONPATH=CHILD_ENV["PYTHONPATH"])
         self.env = env
-        # the scratch fleet's own tmux names its terminal itself: an attach under the caller's
-        # TERM (unset, empty or dumb) is refused, and only this environment changes
-        self.tenv = {**env, "PATH": os.environ["PATH"], "TERM": "xterm-256color"}
+        self.tenv = {**env, "PATH": os.environ["PATH"]}
         self.clients = []
         fake = self.tmp / "fake_claude.py"
         fake.write_text(FAKE_CLAUDE)
@@ -1339,42 +1314,7 @@ def test_r5_f6_9_the_exemption_adds_under_3s_cpu_to_a_pass_over_46_held_lanes(tm
 # writers (squad's `python -m mcp_hub.injections` command line and `edge._ledger_note`).
 # ---------------------------------------------------------------------------
 from mcp_hub import edge as _live_edge  # noqa: E402
-
-
-class _NotBuilt:
-    """Collection on r10's base (19 Oct): what this file reads here is the build's to add. Until it exists, the
-    name is a stand-in that raises the original error the moment a test USES it (call, iteration, truth, maths,
-    comparison, item or key access), so the file collects and each test fails at run time instead of the whole
-    file failing to collect. Attribute access gives a stand-in for the attribute, so a module-level alias of a
-    missing name collects too. Once the build adds it, the real import or read runs and nothing here is used."""
-
-    def __init__(self, name, err):
-        object.__setattr__(self, "_name", name)
-        object.__setattr__(self, "_err", err)
-
-    def _raise(self, *a, **k):
-        err = self._err
-        raise type(err)(f"{self._name} is not built yet: {err}")
-
-    def __getattr__(self, attr):
-        if attr.startswith("__") and attr.endswith("__"):
-            raise AttributeError(attr)
-        return _NotBuilt(f"{self._name}.{attr}", self._err)
-
-    def __repr__(self):
-        return f"<not built yet: {self._name}>"
-
-    __call__ = __iter__ = __bool__ = __len__ = __getitem__ = __contains__ = _raise
-    __add__ = __radd__ = __sub__ = __rsub__ = __mul__ = __rmul__ = __truediv__ = __rtruediv__ = _raise
-    __floordiv__ = __rfloordiv__ = __mod__ = __neg__ = __index__ = __int__ = __float__ = _raise
-    __lt__ = __le__ = __gt__ = __ge__ = __eq__ = __ne__ = _raise
-    __hash__ = object.__hash__
-
-
-try:
-    from mcp_hub import injections as _live_injections  # noqa: E402
-except ImportError as _e:  # not built yet on r10's base
-    _live_injections = _NotBuilt("_live_injections", _e)
+from mcp_hub import injections as _live_injections  # noqa: E402
 
 LIVE_VORTEX_AGENT = "vortex-dev-vm-1"
 LIVE_VORTEX_WORKTREE = "/home/monke/Projects/code/dreamteam-ai-labs/vortex-driver"

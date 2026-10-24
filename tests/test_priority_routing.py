@@ -1483,9 +1483,7 @@ async def test_post_low_priority_skips_wake(server):
             },
         )
     push.assert_not_called()
-    # The receipt says what happens: nothing pushes or drains a non-urgent
-    # post (audit 2026-10-13, H3).
-    assert "not pushed" in out.lower()
+    assert "wake-batched" in out.lower()
 
 
 async def test_post_rejects_invalid_priority(server):

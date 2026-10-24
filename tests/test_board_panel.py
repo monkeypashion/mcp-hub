@@ -628,7 +628,7 @@ async def test_a_seat_enrolled_after_the_board_opened_appears_in_it():
         await pilot.pause()
         assert "delta" not in _tree_agents(app)
         rows.append({"agent": "delta", "worktree": "/d", "klass": "faculty"})
-        app._poll_board(force=True)                       # the tick, not a restart
+        app._poll_board()                       # the tick, not a restart
         await pilot.pause()
         await pilot.pause()
         assert "delta" in _tree_agents(app), _tree_agents(app)
@@ -642,7 +642,7 @@ async def test_a_seat_retired_after_the_board_opened_leaves_it():
         await pilot.pause()
         await pilot.pause()
         rows.remove(AGENTS[2])                  # gamma retired
-        app._poll_board(force=True)
+        app._poll_board()
         await pilot.pause()
         await pilot.pause()
         assert "gamma" not in _tree_agents(app), _tree_agents(app)
@@ -662,7 +662,7 @@ async def test_the_cursor_holds_its_seat_when_the_roster_shifts_under_it():
         await _goto(app, pilot, "beta")
         assert "rm -rf" in _detail_text(app)
         rows.insert(0, {"agent": "aaa-new", "worktree": "/n", "klass": "squad"})
-        app._poll_board(force=True)
+        app._poll_board()
         await pilot.pause()
         await pilot.pause()
         assert app.selected["agent"] == "beta"
@@ -697,7 +697,7 @@ async def test_an_emptied_roster_is_reported_rather_than_ignored():
         await pilot.pause()
         await pilot.pause()
         rows.clear()
-        app._poll_board(force=True)
+        app._poll_board()
         await pilot.pause()
         await pilot.pause()
         assert _tree_agents(app) == [], _tree_agents(app)

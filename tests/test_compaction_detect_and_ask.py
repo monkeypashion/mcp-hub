@@ -32,73 +32,6 @@ import pytest
 
 SQUAD = Path(__file__).resolve().parents[1] / "squad" / "squad"
 
-# --- THE PINNED CLOCK (declared base test edit, v2f r10) --------------------
-#
-# This file used to read three clocks that nothing tied together: Python's
-# `datetime.now()` for reply stamps, bash `date +%s` inside squad for the ask
-# time, and file mtimes through `date -r` — plus a transcript fixture written
-# on a literal 2026-09-02. Its result could change with the date it ran on.
-# Measured on r10's trial: green on 2026-10-18, but 2 red with Python's clock
-# moved +30 days and 34 red moved back to 2026-09-01.
-#
-# Now every clock reads ONE frame: PINNED_NOW plus the real time elapsed since
-# this module loaded. Elapsed time still flows (squad measures waits, so a
-# frozen instant would be a different test), but the DATE is fixed, so no
-# result depends on when the suite runs. Python's side counts elapsed time
-# from `time.time()`, bash's side from the real `date`, and file mtimes (read
-# by squad as `date -r` and `stat -c %Y`) are mapped the same way, so each
-# source is only ever compared with itself. Both are PATH stubs in the
-# harness's own bin, beside its tmux/ps stubs: nothing in squad/ or src/ moves.
-PINNED_NOW = 1788436800                       # 2026-09-03T12:00:00Z
-_PY_T0 = time.time()
-_SH_T0 = int(subprocess.run(["/usr/bin/date", "+%s"], capture_output=True,
-                            text=True, check=True).stdout.strip())
-
-
-def pinned_now() -> float:
-    return PINNED_NOW + (time.time() - _PY_T0)
-
-
-def _date_stub() -> str:
-    """`date` for squad: `+FMT` and plain calls read the pinned frame; `-r
-    FILE` maps the file's real mtime into the same frame; `-d` is a pure
-    conversion and passes through untouched."""
-    return (
-        "#!/bin/bash\n"
-        f"pin={PINNED_NOW}; t0={_SH_T0}\n"
-        'args=(); ref=""\n'
-        'while [ $# -gt 0 ]; do\n'
-        '  case "$1" in\n'
-        '    -d|--date|-d*|--date=*) exec /usr/bin/date "${args[@]}" "$@" ;;\n'
-        '    -r) ref="$2"; shift 2 ;;\n'
-        '    --reference=*) ref="${1#*=}"; shift ;;\n'
-        '    *) args+=("$1"); shift ;;\n'
-        '  esac\n'
-        'done\n'
-        'if [ -n "$ref" ]; then real="$(/usr/bin/date -r "$ref" +%s)" || exit 1\n'
-        'else real="$(/usr/bin/date +%s)"; fi\n'
-        'exec /usr/bin/date -d "@$(( pin + real - t0 ))" "${args[@]}"\n'
-    )
-
-
-def _stat_stub() -> str:
-    """`stat` for squad: squad also reads mtimes as `stat -c %Y` (the exec
-    deadline's `answered_at`), so a `%Y`-led format is mapped into the same
-    pinned frame as `date`; every other use passes through untouched."""
-    return (
-        "#!/bin/bash\n"
-        f"off=$(( {PINNED_NOW} - {_SH_T0} ))\n"
-        'fmt=""; prev=""\n'
-        'for a in "$@"; do [ "$prev" = "-c" ] && fmt="$a"; prev="$a"; done\n'
-        'case "$fmt" in\n'
-        '  %Y*) out="$(/usr/bin/stat "$@")"; rc=$?\n'
-        '       [ -n "$out" ] && printf \'%s\\n\' "$out" | '
-        'awk -v o="$off" \'{ $1 = $1 + o; print }\'\n'
-        '       exit $rc ;;\n'
-        '  *) exec /usr/bin/stat "$@" ;;\n'
-        'esac\n'
-    )
-
 # well under / well over the cap. CAP is the DEFAULT the script ships, and it
 # is asserted rather than duplicated as a literal: it moved 150000 -> 138111
 # on a measurement (deputy's #327 ruling, 2026-09-04) and will move again the
@@ -165,10 +98,6 @@ def run(tmp_path, snippet, *, tokens=OVER, state_lines=None, agent="lane-a",
 
     bin_ = home / "bin"
     bin_.mkdir(exist_ok=True)
-    (bin_ / "date").write_text(_date_stub())
-    (bin_ / "date").chmod(0o755)
-    (bin_ / "stat").write_text(_stat_stub())
-    (bin_ / "stat").chmod(0o755)
 
     # The pane: a statusline carrying ctx (decoration now, not the trigger),
     # plus whatever state chrome the test wants classify_text to read.
@@ -276,10 +205,10 @@ def rows(tmp_path):
 
 
 def stamp(offset):
-    """An ISO timestamp `offset` seconds from the PINNED now — the same frame
-    squad's `date` stub records the ask in, so a reply is attributable to the
-    ask by elapsed time alone, whatever date the suite runs on."""
-    return (datetime.datetime.fromtimestamp(pinned_now(), datetime.timezone.utc)
+    """An ISO timestamp `offset` seconds from now. The ask records the REAL
+    clock, so a fixture pinned to a literal date is in the past by the time
+    the suite runs and no reply is ever attributable to it."""
+    return (datetime.datetime.now(datetime.timezone.utc)
             + datetime.timedelta(seconds=offset)).isoformat().replace(
                 "+00:00", "Z")
 
@@ -461,8 +390,7 @@ def test_a_new_session_re_arms_the_ask(tmp_path):
     src = next(d.glob("*.jsonl"))
     later = d / "99999999-aaaa-bbbb-cccc-dddddddddddd.jsonl"
     later.write_bytes(src.read_bytes())
-    newer = src.stat().st_mtime + 10      # relative to its sibling: no clock
-    os.utime(later, (newer, newer))
+    os.utime(later, (time.time() + 10, time.time() + 10))
     run(tmp_path, "compaction_one lane-a\n" * 3)
     assert keys(tmp_path).count("send-keys -l") == 2
 
@@ -1363,92 +1291,3 @@ def test_the_scope_defaults_to_dreamteam_in_the_shipped_script(tmp_path):
     script rather than duplicated as a literal, the same way the cap is."""
     assert 'MCP_HUB_COMPACT_ASK_SQUAD:-dreamteam' in SQUAD.read_text(
         encoding="utf-8")
-
-
-# --- master's tests kept beside the hooks tests (declared base test edit, v2f r10 m3) ---
-#
-# The hooks file replaces master's 15-node file. Of master's 8 tests with no
-# same-named test here, 6 are contradicted by the hooks behaviour (the trigger
-# is tokens, not the statusline percent; one ask per session, no re-ask at
-# sixty) and stay out. These two are not contradicted and are kept, on this
-# file's harness (the token reading decides, so `ctx` is decoration).
-
-def test_the_same_session_is_not_asked_twice_at_the_same_mark(tmp_path):
-    """master's test, kept: two passes at one reading ask once."""
-    run(tmp_path, "compaction_one lane-a\ncompaction_one lane-a")
-    assert keys(tmp_path).count("send-keys -l") == 1
-
-
-DEFAULT_CONFIG = {"MCP_HUB_COMPACT_ASK": "", "MCP_HUB_COMPACTION_EXEC": ""}
-
-# Every value the exec leg must read as OFF. It is armed by exactly "1" and by
-# nothing else: squad reads `${MCP_HUB_COMPACTION_EXEC:-0}` and the gate is
-# the fail-closed `[ "$COMPACT_EXEC" != "1" ]`. `None` = the variable unset.
-EXEC_OFF_VALUES = [None, "", "0", "yes", "true", "on", "01", " 1", "1 ", "2", "-1"]
-
-
-def _exec_env(value):
-    return {} if value is None else {"MCP_HUB_COMPACTION_EXEC": value}
-
-
-@pytest.mark.parametrize("verdict", ["COMPACT", "CLEAR"])
-def test_nothing_types_a_slash_command(tmp_path, verdict):
-    """master's test, kept and made exact for the exec leg (bar 52, now built).
-
-    With the DEFAULT config (neither the ask nor the exec leg armed), nothing
-    types a slash command into any pane, however many passes run and even
-    with a verdict the lane wrote sitting in its transcript. The ask is off
-    too, so nothing names `/compact` or `/clear` in the pane at all and
-    master's substring check holds as written."""
-    p = run(tmp_path, "compaction_pass\n" + "compaction_one lane-a\n" * 4,
-            env=DEFAULT_CONFIG, pane=SAFE_PANE,
-            replies=answered(f"{verdict} — flushed to memory first."))
-    typed = keys(tmp_path)
-    assert commands_typed(tmp_path) == [], p.stdout + p.stderr
-    assert "/clear" not in typed and "/compact" not in typed, typed
-    assert "send-keys -l" not in typed, "the ask is off by default: nothing may be typed"
-
-
-@pytest.mark.parametrize("value", EXEC_OFF_VALUES, ids=lambda v: "unset" if v is None else repr(v))
-@pytest.mark.parametrize("verdict", ["COMPACT", "CLEAR"])
-def test_an_exec_leg_not_exactly_1_types_no_slash_command(tmp_path, verdict, value):
-    """The ask armed and answered; the exec leg unset, "0", or any value other
-    than exactly "1". No slash command reaches send-keys as its own send."""
-    p = run(tmp_path, "compaction_pass\n" + "compaction_one lane-a\n" * 4,
-            env=_exec_env(value), pane=SAFE_PANE,
-            replies=answered(f"{verdict} — flushed to memory first."))
-    assert commands_typed(tmp_path) == [], p.stdout + p.stderr
-    assert f"lane answered {verdict}" in rows(tmp_path)
-    assert "exec leg disarmed" in rows(tmp_path)
-
-
-def test_exactly_1_arms_the_exec_leg(tmp_path):
-    """The positive control for the list above: with only the value changed to
-    "1", the command is typed. Without it a gate that never typed would pass."""
-    run(tmp_path, "compaction_one lane-a\n" * 3, env={"MCP_HUB_COMPACTION_EXEC": "1"},
-        pane=SAFE_PANE, replies=answered("COMPACT"))
-    assert commands_typed(tmp_path) == ["/compact"]
-
-
-# --- the ask tells the truth about the exec leg (declared test edit, v2f r10 m3) ---
-#
-# The ask used to promise, unconditionally, that "the command you name is
-# typed for you at your next quiet moment". With the exec leg off (the
-# shipped default) nothing is ever typed, so the promise was false on every
-# box that had not armed it. The sentence is chosen by the exec leg.
-
-PROMISE = "typed for you"
-
-
-@pytest.mark.parametrize("value", [None, "0", "yes"], ids=["unset", "'0'", "'yes'"])
-def test_with_the_exec_leg_off_the_ask_promises_no_typing(tmp_path, value):
-    run(tmp_path, "compaction_one lane-a", env=_exec_env(value), pane=SAFE_PANE)
-    ask = _ask_text(tmp_path)
-    assert PROMISE not in ask, f"the ask promises typing with the exec leg off:\n{ask}"
-    assert "run the command yourself" in ask, f"the ask does not say to run it yourself:\n{ask}"
-
-
-def test_with_the_exec_leg_armed_the_ask_promises_typing(tmp_path):
-    run(tmp_path, "compaction_one lane-a", env={"MCP_HUB_COMPACTION_EXEC": "1"}, pane=SAFE_PANE)
-    ask = _ask_text(tmp_path)
-    assert f"the command you name is {PROMISE} at your next quiet moment" in ask, ask

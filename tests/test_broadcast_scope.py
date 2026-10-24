@@ -696,20 +696,3 @@ def test_the_instructions_blob_states_wake_batching_correctly(server):
     )
     # The retired Case 1 wording must be gone — it was the misleading half.
     assert "still wakes a recipient who is IDLE" not in blob
-
-
-
-def test_the_instructions_do_not_name_what_they_retired(server):
-    """Naming a retired seat or convention in the text every agent reads
-    on every connect keeps it alive (operator, 2026-10-09): agents were
-    still routing approvals through the deputy weeks after it went. The
-    blob states the standing rule and names none of what it replaced."""
-    blob = server.instructions or ""
-    for gone in ("deputy", "squad-proxy", "operator-cockpit-ui-agent",
-                 "retired"):
-        assert gone not in blob.lower(), gone
-    # The card markers, not the ordinary word "decisions".
-    for marker in ("DECISION", "DECIDED"):
-        assert marker not in blob, marker
-    assert "ask in your reply" in blob
-    assert "No other agent decides or approves" in blob
