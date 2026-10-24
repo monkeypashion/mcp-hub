@@ -12,15 +12,14 @@ The interface these tests drive (r6's, plus):
   reassign_task(from_agent, ref, to, reason)   open|claimed -> open, addressed_to = to, owner cleared;
                                                requester or operator-verified operator; same open target refused.
   task_note(from_agent, ref, text, blocked_by="")  open|claimed|done; requester or current owner. Moves nothing
-      (state, owner, addressed_to, version and updated_ts unchanged), tells the other party (r14, F50); the text is the event's
+      (state, owner, addressed_to, version and updated_ts unchanged), sends no notice; the text is the event's
       `reason`. blocked_by is lineage's "<task-ref>|<object-ref>" (or "clear:..."), declared by the requester only.
   Event acts: create, claim, done, release, failed, accept, cancel, reassign, note. Terminal: accepted, failed,
   cancelled. Every successful act except a note moves `version`. Every refusal (role or state) writes one event
   with act "<act>-refused", to_state = from_state and a non-empty reason, and the reply starts "REFUSED".
   Notices (normal, hub-authored, chained by replies-to to the task's previous notice, never to oneself):
   release/failed -> requester; accept -> owner; cancel -> addressed agent (open) or owner (claimed), none for a
-  squad; reassign -> old owner (if claimed), then the new target if an agent; note -> the other party (r14, F50:
-  requester's note -> owner, or the addressed agent while unclaimed; owner's note -> requester; never a squad).
+  squad; reassign -> old owner (if claimed), then the new target if an agent; note -> nobody.
   Operator tasks (requester an operator name): created only at grade operator-verified; the requester's acts need
   it too. Override (cancel, reassign on anyone's task) needs the grade, never the name. Agent keys
   (MCP_HUB_AGENT_KEYS) read per act: in `enforce` owner acts (claim, done, failed, release, note) on an operator
@@ -434,7 +433,7 @@ async def test_r7_new6_notice_targets_per_act(server, monkeypatch):
             assert _replies_to(server, n["id"]) == ([f"hub.msg/1?id={prev}"] if prev else []), (
                 f"{act}: notice {n['id']} does not chain to the task's previous notice {prev}")
             prev = n["id"]
-        if new and act != "note":  # r14, F50: a note's notice chains but leaves the row as it was
+        if new:
             assert _row(server, ref)["last_notice_msg_id"] == new[-1]["id"]
 
     await told(await _in_state(server, "claimed"), "release", "bob", ["alice"])
@@ -447,8 +446,8 @@ async def test_r7_new6_notice_targets_per_act(server, monkeypatch):
     await told(await _in_state(server, "open"), "reassign", "alice", ["carol"])
     await told(await _in_state(server, "claimed"), "reassign", "alice", ["bob", "carol"])
     await told(await _in_state(server, "claimed"), "reassign", "alice", ["bob"], to=SQUAD)
-    await told(await _in_state(server, "claimed"), "note", "bob", ["alice"])
-    await told(await _in_state(server, "claimed"), "note", "alice", ["bob"])
+    await told(await _in_state(server, "claimed"), "note", "bob", [])
+    await told(await _in_state(server, "claimed"), "note", "alice", [])
     # A self-task tells nobody at any act.
     me = await _create(server, frm="dave", to="dave")
     for act in ("claim", "done", "accept"):
@@ -468,11 +467,11 @@ async def test_r7_new6_note_changes_nothing_and_wakes_nobody(server):
             frozen, n_msgs = _row(server, ref), _msg_count(server)
             text = f"note from {who} on a {state} task"
             _ok(await _act(server, "note", who, ref, text=text))
-            assert {k: v for k, v in _row(server, ref).items() if k != "last_notice_msg_id"} == {k: v for k, v in frozen.items() if k != "last_notice_msg_id"}, f"a note on a {state} task changed its row"
-            assert _msg_count(server) == n_msgs + 1, "a note did not send exactly one notice (r14, F50)"
+            assert _row(server, ref) == frozen, f"a note on a {state} task changed its row"
+            assert _msg_count(server) == n_msgs, "a note sent a message"
             last = (await _view(server, ref))["events"][-1]
             assert last["act"] == "note" and last["actor"] == who and text in last["reason"], last
-            assert last["from_state"] == last["to_state"] == state and last["notice"], last
+            assert last["from_state"] == last["to_state"] == state and not last["notice"], last
             assert text in await _call(server, "get_task", {"ref": ref})
         assert all(s.session.sent == [] for s in streams.values()), "a note woke someone"
 
