@@ -43,9 +43,7 @@ r7 completes the life r6 began (open → claimed → done):
 - the REQUESTER agrees it is finished (`accept`), stops it (`cancel`) or puts
   it on somebody else's desk (`reassign`);
 - anyone with standing — the requester or the current owner — records a
-  `note`, which moves NOTHING and tells the other party with a pointer (r14,
-  F50): the requester's note tells the owner (or, unclaimed, the agent it is
-  addressed to; a squad is not a party), the owner's tells the requester;
+  `note`, which moves NOTHING and tells nobody;
 - terminal is `accepted`, `failed`, `cancelled`. `done` is still only the
   owner's claim and waits for the requester: `list_tasks(requester=me,
   state=done)` is the to-accept list, and nothing auto-accepts.
@@ -497,8 +495,7 @@ def _append_event(
 
 
 def _notice(
-    conn: sqlite3.Connection, task_id: int, to: str, body: str,
-    *, move_last: bool = True,
+    conn: sqlite3.Connection, task_id: int, to: str, body: str
 ) -> tuple[int, int]:
     """Insert the hub-authored pointer DM for a transition, INSIDE the caller's
     transaction, and return (notice id, the previous notice's id).
@@ -514,9 +511,6 @@ def _notice(
     fired from here, and a reply to a notice cannot fast-wake either — the
     reply-wake rule fires only when the target's author is the recipient, and
     a notice's author is the hub.
-
-    `move_last=False` is a note's: its notice replies to the task's last notice
-    but does not become it, because a note leaves the whole task row as it was.
     """
     if not to:
         return 0, 0
@@ -530,11 +524,9 @@ def _notice(
         (time.time(), to, body),
     )
     msg_id = int(cur.lastrowid)
-    if move_last:
-        conn.execute(
-            "UPDATE tasks SET last_notice_msg_id = ? WHERE id = ?",
-            (msg_id, task_id),
-        )
+    conn.execute(
+        "UPDATE tasks SET last_notice_msg_id = ? WHERE id = ?", (msg_id, task_id)
+    )
     return msg_id, prev_id
 
 
@@ -1398,30 +1390,11 @@ def _transition(
                     f"{event_reason}\nblocked_by: {blocked_by}"
                     if event_reason else f"blocked_by: {blocked_by}"
                 )
-            # The other party is told with a pointer (r14, F50): the
-            # requester's note reaches the owner, or while unclaimed the agent
-            # it is addressed to (a squad is not a party); the owner's reaches
-            # the requester. The text stays on the record, never in a message.
-            if actor == requester:
-                kind, aname, _ = parse_addressee(addressed)
-                told = owner or (aname if kind == "agent" else "")
-            else:
-                told = requester
-            if told == actor:
-                told = ""
-            notices.append((told, (
-                f"task ⟨{tref}⟩ — {actor}{tag} added a note; nothing moved, "
-                f"it is still {state}. {pointer}"
-            )))
-            who_told = (
-                f"{told} was told with a pointer, not the note's text"
-                if told else
-                "nobody was told, as there is no other party"
-            )
             reply = (
                 f"Noted on ⟨{tref}⟩ — nothing moved: still {state} at version "
-                f"{new_version}, same owner, same addressee; {who_told}. The "
-                f"note is on the record, readable with get_task."
+                f"{new_version}, same owner, same addressee, and NOBODY was "
+                f"told. A note is for the record, not for anyone's attention; "
+                f"it is readable with get_task."
             )
 
         seq = _append_event(
@@ -1434,9 +1407,7 @@ def _transition(
             # noise, and noise is what makes a real notice ignorable.
             if not whom or whom == actor:
                 continue
-            msg_id, prev_id = _notice(
-                conn, task_id, whom, body, move_last=act != ACT_NOTE,
-            )
+            msg_id, prev_id = _notice(conn, task_id, whom, body)
             if msg_id:
                 if not sent:
                     _stamp_notice(conn, task_id, seq, msg_id)
@@ -1655,11 +1626,8 @@ def note(
     key_mode: str = "off",
 ) -> str:
     """Record something on the task's log without moving it. Nothing changes
-    — not the state, not the owner, not the version, not `updated_ts`, not
-    the task's last notice. The other party is told with a pointer (r14, F50):
-    the requester's note tells the owner, or while unclaimed the agent it is
-    addressed to (a squad is nobody); the owner's note tells the requester;
-    the actor is never told. The note's text stays on the record."""
+    — not the state, not the owner, not the version, not `updated_ts` — and
+    nobody is told."""
     return _transition(
         conn, hooks, act=ACT_NOTE, actor=actor, grade=grade, ref=ref,
         reason=text, blocked_by=blocked_by,

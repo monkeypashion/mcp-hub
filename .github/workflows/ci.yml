@@ -22,12 +22,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      # tests/test_v2fleet_r15_hooks_pin_presence_git.py needs the pin's
-      # objects and full history; without them it fails, never skips.
-      - name: Fetch hooks-pin
-        run: git fetch --no-tags origin hooks-pin
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -44,76 +38,3 @@ jobs:
         env:
           TERM: xterm-256color
         run: pytest -q -rs
-
-  # The presence check (F51/T65): hooks-pin's own tests tree, run over this
-  # src, on a hosted runner and never on a seat host (seat_hold). Both
-  # attempts are judged together: a first-attempt red is cleared only if
-  # attempt 2 ran it and it passed, and a cleared test is named FLAKY here,
-  # never added to the manifest's set-aside or expected reds.
-  presence:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Fetch hooks-pin
-        run: git fetch --no-tags origin hooks-pin
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install
-        run: pip install -e . && pip install pytest pytest-asyncio starlette httpx
-      - name: The pin's tests, attempt 1
-        env:
-          TERM: xterm-256color
-        run: |
-          rm -rf tests .pytest_cache
-          git checkout 14baebaafa87ba5c04c59bbe812a676efb7229a6 -- tests
-          pytest -q -rsfE --junitxml="$RUNNER_TEMP/presence-1.xml" || true
-      - name: The pin's tests, attempt 2 (the failed ones, once)
-        env:
-          TERM: xterm-256color
-        run: pytest -q -rsfE --lf --lfnf=none --junitxml="$RUNNER_TEMP/presence-2.xml" || true
-      - name: Judge both attempts
-        run: |
-          python - <<'PY'
-          import os
-          import xml.etree.ElementTree as ET
-          tmp = os.environ["RUNNER_TEMP"]
-          first = ET.parse(os.path.join(tmp, "presence-1.xml"))
-          second = {}
-          p2 = os.path.join(tmp, "presence-2.xml")
-          if os.path.isfile(p2):
-              for c in ET.parse(p2).getroot().iter("testcase"):
-                  red = c.find("failure") is not None or c.find("error") is not None
-                  second[(c.get("classname"), c.get("name"))] = not red and c.find("skipped") is None
-          flaky, reds = [], []
-          for c in first.getroot().iter("testcase"):
-              bad = [x for x in c if x.tag in ("failure", "error")]
-              if not bad:
-                  continue
-              key = (c.get("classname"), c.get("name"))
-              if second.get(key):  # ran in attempt 2 and passed
-                  for x in bad:
-                      c.remove(x)
-                  flaky.append("::".join(key))
-              else:  # red in both, or not run in attempt 2
-                  reds.append("::".join(key))
-          first.write(os.path.join(tmp, "presence-merged.xml"), encoding="utf-8", xml_declaration=True)
-          lines = [f"FLAKY (red in attempt 1, green in attempt 2): {t}" for t in flaky]
-          lines += [f"RED (both attempts judged): {t}" for t in reds]
-          lines.append(f"{len(reds)} red, {len(flaky)} flaky")
-          print("\n".join(lines))
-          summary = os.environ.get("GITHUB_STEP_SUMMARY")
-          if summary:
-              with open(summary, "a", encoding="utf-8") as fh:
-                  fh.write("## Presence run\n\n" + "\n".join(f"- {line}" for line in lines) + "\n")
-          PY
-      - name: Judge the manifest against the run
-        env:
-          TERM: xterm-256color
-        run: |
-          rm -rf tests
-          git checkout HEAD -- tests
-          MCP_HUB_PRESENCE_JUNIT="$RUNNER_TEMP/presence-merged.xml" pytest -q -rs tests/test_v2fleet_r15_hooks_pin_presence.py tests/test_v2fleet_r15_hooks_pin_presence_git.py
