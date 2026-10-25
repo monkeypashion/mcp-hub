@@ -1580,17 +1580,6 @@ _URL_SEEN_ATTR = "_hub_url_seen"
 # so the rebind sweep can hold a keyed ?agent= name to the same gate as a
 # tool call (MH-H1). The hash, never the key, sits on the transport.
 _URL_KEYHASH_ATTR = "_hub_url_key_hash"
-# r16 (mcp-hub #70): a transport with no ?agent= whose key is held by exactly
-# one agent_keys row is tagged with that name and marked key-tagged. The
-# lookup result is cached per transport as (key hash, holder or ""), so one
-# transport and key costs one SELECT; the other attrs make the bad-key log
-# and the mismatch row once-per-transport, and REVOKED is the sweep's mark
-# for a key reset while the transport was live: never bound again.
-_URL_KEYTAGGED_ATTR = "_hub_url_key_tagged"
-_URL_KEYLOOKUP_ATTR = "_hub_url_key_lookup"
-_URL_KEYNOTED_ATTR = "_hub_url_key_noted"
-_URL_KEYWARNED_ATTR = "_hub_url_key_warned"
-_URL_KEYREVOKED_ATTR = "_hub_url_key_revoked"
 _handle_request_patched = False
 
 
@@ -1670,91 +1659,38 @@ def _ensure_url_identity_patched() -> None:
 
     original = StreamableHTTPSessionManager.handle_request
 
-    def _key_holder(self, transport, key_hash: str) -> str:  # type: ignore[no-untyped-def]
-        """The one name holding key_hash, "" for none or several; looked up
-        through create_server's hook at most once per transport and key."""
-        cached = getattr(transport, _URL_KEYLOOKUP_ATTR, None)
-        if cached is not None and cached[0] == key_hash:
-            return cached[1]
-        lookup = getattr(getattr(self, "app", None), "_hub_key_holder", None)
-        if lookup is None:
-            return ""
-        holder = lookup(key_hash) or ""
-        setattr(transport, _URL_KEYLOOKUP_ATTR, (key_hash, holder))
-        return holder
-
     async def patched_handle_request(self, scope, receive, send):  # type: ignore[no-untyped-def]
         try:
             qs = parse_qs((scope.get("query_string") or b"").decode("latin-1"))
             agent = (qs.get("agent") or [""])[0]
-            sid = ""
-            presented_key = ""
-            for k, v in scope.get("headers") or ():
-                if k.lower() == b"mcp-session-id":
-                    sid = v.decode("latin-1")
-                elif k.lower() == AGENT_KEY_HEADER.encode():
-                    presented_key = v.decode("latin-1")
-            # The FIRST initialize POST has no session id yet — the
-            # follow-up requests (initialized notification, GET stream)
-            # arrive within a second and do, so association lags birth
-            # by one round-trip at most.
-            transport = (
-                getattr(self, "_server_instances", {}).get(sid) if sid else None
-            )
             if agent:
-                if transport is not None:
-                    setattr(transport, _URL_AGENT_ATTR, agent)
-                    setattr(transport, _URL_KEYHASH_ATTR,
-                            _agent_key_hash(presented_key)
-                            if presented_key else "")
-                    # Recency stamp: the sweep must track the CURRENT
-                    # transport, not the first one it saw. Claude Code
-                    # cycles sessions silently; an abandoned transport
-                    # stays warm server-side with its GET key registered,
-                    # so "bound + deliverable" can outlive the client's
-                    # actual attachment (proven 2026-07-27 18:22: the
-                    # shipped seat went deaf 30 min after its one-shot
-                    # bind while ⚡ showed green).
-                    setattr(transport, _URL_SEEN_ATTR, time.time())
-                    # ?agent= WINS; a key held by another name is recorded
-                    # under the stated one, once per transport and key.
-                    if presented_key and _agent_key_mode() != "off":
-                        key_hash = _agent_key_hash(presented_key)
-                        holder = _key_holder(self, transport, key_hash)
-                        if (holder and holder != agent and getattr(
-                                transport, _URL_KEYNOTED_ATTR, "") != key_hash):
-                            setattr(transport, _URL_KEYNOTED_ATTR, key_hash)
-                            note = getattr(getattr(self, "app", None),
-                                           "_hub_key_mismatch", None)
-                            if note is not None:
-                                note(agent, f"key held by '{holder}'")
-            elif (transport is not None and presented_key
-                    and _agent_key_mode() != "off"
-                    and not (getattr(transport, _URL_AGENT_ATTR, "")
-                             and not getattr(transport, _URL_KEYTAGGED_ATTR,
-                                             False))):
-                # r16: no ?agent=, so the key names the transport — exactly
-                # as ?agent= would, under every gate of the sweep.
-                key_hash = _agent_key_hash(presented_key)
-                holder = _key_holder(self, transport, key_hash)
-                if holder:
-                    setattr(transport, _URL_AGENT_ATTR, holder)
-                    setattr(transport, _URL_KEYHASH_ATTR, key_hash)
-                    setattr(transport, _URL_SEEN_ATTR, time.time())
-                    setattr(transport, _URL_KEYTAGGED_ATTR, True)
-                else:
-                    if getattr(transport, _URL_KEYTAGGED_ATTR, False):
-                        # A new key that names nobody untags it.
-                        setattr(transport, _URL_AGENT_ATTR, "")
-                        setattr(transport, _URL_KEYTAGGED_ATTR, False)
-                    if not getattr(transport, _URL_KEYWARNED_ATTR, False):
-                        setattr(transport, _URL_KEYWARNED_ATTR, True)
-                        client = scope.get("client") or ("?",)
-                        logger.warning(
-                            "url-rebind: a key from %s matches no single "
-                            "agent_keys row; transport left untagged",
-                            client[0],
-                        )
+                sid = ""
+                presented_key = ""
+                for k, v in scope.get("headers") or ():
+                    if k.lower() == b"mcp-session-id":
+                        sid = v.decode("latin-1")
+                    elif k.lower() == AGENT_KEY_HEADER.encode():
+                        presented_key = v.decode("latin-1")
+                # The FIRST initialize POST has no session id yet — the
+                # follow-up requests (initialized notification, GET stream)
+                # arrive within a second and do, so association lags birth
+                # by one round-trip at most.
+                if sid:
+                    transport = getattr(self, "_server_instances", {}).get(sid)
+                    if transport is not None:
+                        setattr(transport, _URL_AGENT_ATTR, agent)
+                        setattr(transport, _URL_KEYHASH_ATTR,
+                                _agent_key_hash(presented_key)
+                                if presented_key else "")
+                        # Recency stamp: the sweep must track the CURRENT
+                        # transport, not the first one it saw. Claude Code
+                        # cycles sessions silently; an abandoned transport
+                        # stays warm server-side with its GET key registered,
+                        # so "bound + deliverable" can outlive the client's
+                        # actual attachment (proven 2026-07-27 18:22: the
+                        # shipped seat went deaf 30 min after its one-shot
+                        # bind while ⚡ showed green).
+                        setattr(transport, _URL_SEEN_ATTR, time.time())
         except Exception:  # noqa: BLE001
             logger.exception("url-identity capture failed; request unaffected")
         result = await original(self, scope, receive, send)
@@ -2119,11 +2055,10 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                 # rebind — an idle agent's client refreshes its wake
                 # channel without ever making a tool call, and the sweep
                 # must follow it.
-                best: dict[str, tuple[tuple[int, float], Any, Any]] = {}
+                best: dict[str, tuple[tuple[int, float], Any]] = {}
                 for transport in list(instances.values()):
                     name = getattr(transport, _URL_AGENT_ATTR, "")
-                    if not name or getattr(transport, _URL_KEYREVOKED_ATTR,
-                                           False):
+                    if not name:
                         continue
                     t_ws = getattr(transport, "_write_stream", None)
                     session = (
@@ -2156,8 +2091,8 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                     seen = getattr(transport, _URL_SEEN_ATTR, 0.0)
                     rank = (1 if has_get else 0, seen)
                     if name not in best or rank > best[name][0]:
-                        best[name] = (rank, session, transport)
-                for name, (_rank, session, transport) in best.items():
+                        best[name] = (rank, session)
+                for name, (_rank, session) in best.items():
                     current = registry.get(name)
                     if current is session:
                         continue
@@ -2166,25 +2101,6 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
                     ).fetchone()
                     if row is None:
                         continue
-                    # r16: a key-tagged transport binds only while the name
-                    # still holds THAT key. Read by name and compare the
-                    # hash: a reset-and-reclaimed name holds a new one.
-                    if getattr(transport, _URL_KEYTAGGED_ATTR, False):
-                        held = conn.execute(
-                            "SELECT key_hash FROM agent_keys WHERE name = ?",
-                            (name,),
-                        ).fetchone()
-                        tagged_hash = getattr(transport, _URL_KEYHASH_ATTR, "")
-                        if held is None or not tagged_hash or not (
-                            secrets.compare_digest(
-                                tagged_hash.encode(),
-                                held["key_hash"].encode())):
-                            setattr(transport, _URL_KEYREVOKED_ATTR, True)
-                            logger.warning(
-                                "url-rebind: %s's key no longer held; its "
-                                "key-tagged transport will not be bound", name,
-                            )
-                            continue
                     was_bound = current is not None
                     registry.bind(name, session, source="url")
                     conn.execute(
@@ -2302,26 +2218,6 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
         return not _key_verdict(name, presented_hash, "url-rebind")[1]
 
     mcp._hub_url_bind_allowed = _url_bind_allowed  # type: ignore[attr-defined]
-
-    def _key_holder(key_hash: str) -> str:
-        """r16: the one name whose agent_keys row holds key_hash, "" for
-        none or several (key_hash carries no UNIQUE constraint)."""
-        if _agent_key_mode() == "off":
-            return ""
-        rows = _get_db(db_path).execute(
-            "SELECT name FROM agent_keys WHERE key_hash = ? LIMIT 2",
-            (key_hash,),
-        ).fetchall()
-        return rows[0]["name"] if len(rows) == 1 else ""
-
-    def _key_mismatch(name: str, detail: str) -> None:
-        _note_key_event(_get_db(db_path), name, "url-rebind", "mismatch",
-                        detail)
-
-    # The url-identity seam has no database: it reaches these through the
-    # session manager's app, which is this low-level server.
-    mcp._mcp_server._hub_key_holder = _key_holder  # type: ignore[attr-defined]
-    mcp._mcp_server._hub_key_mismatch = _key_mismatch  # type: ignore[attr-defined]
 
     def _attribution(ctx: Context | None, from_agent: str) -> tuple[str, str]:
         """Verify-when-bound (item 34, fo's accidental impersonation): the
