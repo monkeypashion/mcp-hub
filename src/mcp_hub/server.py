@@ -4548,35 +4548,6 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
     # -- Reading messages --
 
     @mcp.tool()
-    def unread_ids(agent_name: str, ctx: Context | None = None) -> str:
-        """Count your unread direct messages, with their priority, without
-        reading or marking anything.
-
-        Args:
-            agent_name: Your agent name.
-
-        Returns JSON: {"count": n, "unread": [{"id": .., "priority": ..}]},
-        oldest first. No body, sender or time.
-        """
-        # The lane doorbell asks this many times a minute, so it must stay a
-        # pure read: no touch_session, wake_ack, last_seen, idle flag, gap
-        # notice or receipt. The gate is get_messages' own; the key gate's
-        # agent_key_events count is the only write, as for every gated read.
-        refusal = _reader_refusal(ctx, agent_name)
-        if refusal:
-            return refusal
-        conn = _get_db(db_path)
-        rows = conn.execute(
-            "SELECT id, priority FROM messages WHERE to_agent = ? AND read = 0 "
-            "ORDER BY ts ASC, id ASC",
-            (agent_name,),
-        ).fetchall()
-        return json.dumps({
-            "count": len(rows),
-            "unread": [{"id": r["id"], "priority": r["priority"]} for r in rows],
-        })
-
-    @mcp.tool()
     def get_messages(
         agent_name: str,
         limit: int = 20,
@@ -6833,9 +6804,6 @@ _CLI_SUBCOMMANDS = {
     # The daily load meter (v2-fleet F1). The logic lives in load_meter.py,
     # which the server never imports: this entry only forwards the verb.
     "load-meter",
-    # The per-lane doorbell (v2-fleet F54). Logic in lane_doorbell.py; the
-    # server only forwards the verb.
-    "lane-doorbell",
 }
 
 

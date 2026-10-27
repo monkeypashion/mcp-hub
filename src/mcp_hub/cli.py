@@ -9062,18 +9062,6 @@ def build_parser() -> argparse.ArgumentParser:
     _load_meter.add_arguments(
         sub.add_parser("load-meter", help="Take one load-meter reading (read-only)")
     )
-
-    # The lane doorbell (v2-fleet F54), named apart from the edge-watch
-    # doorbell: rings an idle, opted-in lane for news that may interrupt.
-    from . import lane_doorbell as _lane_doorbell
-    _lane_doorbell.add_arguments(
-        sub.add_parser(
-            "lane-doorbell",
-            help="Per-lane doorbell: opt-in / opt-out, or the SessionStart "
-                 "hook's attached helper (--from-session-start)",
-        ),
-        DEFAULT_HUB_URL,
-    )
     return parser
 
 
@@ -9156,9 +9144,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.subcommand == "load-meter":
         from . import load_meter
         return load_meter.run(args)
-    if args.subcommand == "lane-doorbell":
-        from . import lane_doorbell
-        return lane_doorbell.command(args)
 
     parser.print_help()
     return 0
