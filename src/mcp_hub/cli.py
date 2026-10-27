@@ -2328,19 +2328,33 @@ def _rekey_transcript(text: str, old_cwd: str, new_cwd: str) -> tuple[str, dict[
 AGENT_KEY_HEADER = "x-mcp-hub-agent-key"
 
 
-def _agent_key_file(name: str) -> pathlib.Path:
-    """Where `agent-key ensure` keeps this name's hub-minted key (MH-H1)."""
+# A key file is only ever a PLAIN lane name's — the installed sh helper's
+# rule. A marker's name is free text from a committed file, so anything
+# path-shaped ("../../x") would otherwise reach a file outside the key folder.
+_PLAIN_LANE_NAME = re.compile(r"[a-z0-9_][a-z0-9_-]*")
+_WELL_FORMED_KEY = re.compile(r"[0-9a-f]{64}")
+
+
+def _agent_key_file(name: str | None) -> pathlib.Path | None:
+    """Where `agent-key ensure` keeps this name's hub-minted key (MH-H1), or
+    None for a name that is not plain: then nothing is read or written."""
+    if not name or not _PLAIN_LANE_NAME.fullmatch(name):
+        return None
     return _state_dir() / "agent-keys" / f"{name}.key"
 
 
-def _agent_key_headers(name: str) -> dict[str, str]:
+def _agent_key_headers(name: str | None) -> dict[str, str]:
     """The key header for an ephemeral client speaking as `name`, or {} when
-    this machine holds no key for it (an unkeyed name is legacy on the hub)."""
+    this machine holds no well-formed key for it (an unkeyed name is legacy
+    on the hub) or the name is not plain."""
+    path = _agent_key_file(name)
+    if path is None:
+        return {}
     try:
-        key = _agent_key_file(name).read_text(encoding="utf-8").strip()
+        key = path.read_text(encoding="utf-8").strip()
     except OSError:
         return {}
-    return {AGENT_KEY_HEADER: key} if key else {}
+    return {AGENT_KEY_HEADER: key} if _WELL_FORMED_KEY.fullmatch(key) else {}
 
 
 def _with_agent_key(name: str) -> dict[str, Any]:
@@ -5797,17 +5811,23 @@ def agent_key_command(args: argparse.Namespace) -> int:
     """
     if args.action == "header":
         # A headersHelper runs in the lane's folder with no hook payload on
-        # stdin, so with no --name the lane is derived from the folder. No
+        # stdin (and may hold it open), so stdin is NEVER read: the lane is
+        # --name, else the folder's derived identity, else its marker. No
         # identity there means no key: `{}`, never an error, or the
         # connection itself would fail.
-        name = args.name or _derive_agent_identity(os.getcwd())[0]
-        print(json.dumps(_agent_key_headers(name) if name else {}))
+        name, _project = _resolve_agent_identity(args, {"cwd": os.getcwd()})
+        print(json.dumps(_agent_key_headers(name)))
         return 0
     payload: dict[str, Any] = {} if args.name else _read_hook_stdin()
     name, _project = _resolve_agent_identity(args, payload)
     if name is None:
         return 0  # not a hub agent here: silent, like every hook
     path = _agent_key_file(name)
+    if path is None:
+        print(f"[mcp-hub agent-key] {name!r}: name refused — a key is only "
+              f"held for a plain lane name ([a-z0-9_-], no leading '-')",
+              file=sys.stderr)
+        return 1
     if path.exists() and not args.force:
         print(f"agent key for {name}: held ({path})")
         return 0
