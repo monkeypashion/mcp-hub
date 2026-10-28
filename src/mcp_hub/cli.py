@@ -2352,7 +2352,8 @@ def _agent_key_headers(name: str | None) -> dict[str, str]:
         return {}
     try:
         key = path.read_text(encoding="utf-8").strip()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # Not UTF-8 is malformed, like any other bad key: no key, never raise.
         return {}
     return {AGENT_KEY_HEADER: key} if _WELL_FORMED_KEY.fullmatch(key) else {}
 
@@ -5831,6 +5832,49 @@ def _agent_key_header_log(line: dict[str, Any]) -> None:
         pass
 
 
+# F60: Claude Code runs a user-scope connection's headersHelper with cwd = its
+# config folder, not the session's, so the helper reads the folder from its
+# own Claude process: up its parent chain, past shells only.
+_HEADER_WALK_SHELLS = frozenset({"sh", "bash", "dash", "zsh"})
+_HEADER_WALK_STEPS = 8
+
+
+def _proc_comm_ppid(pid: int) -> tuple[str, int]:
+    """comm and ppid from /proc/<pid>/stat, split after the LAST ')' since a
+    process name may hold spaces and parentheses."""
+    with open(f"/proc/{pid}/stat", "rb") as fh:
+        stat = fh.read().decode("utf-8", "surrogateescape")
+    head, _, rest = stat.rpartition(")")
+    comm = head.split("(", 1)[1]
+    return comm, int(rest.split()[1])
+
+
+def _proc_argv0_base(pid: int) -> str:
+    with open(f"/proc/{pid}/cmdline", "rb") as fh:
+        argv0 = fh.read().split(b"\0", 1)[0].decode("utf-8", "surrogateescape")
+    return os.path.basename(argv0).lstrip("-")
+
+
+def _header_session_folder() -> tuple[str | None, str | None, int | None]:
+    """(folder, ancestor comm, claude pid) from the helper's parent chain:
+    shells are passed, and the first other process gives its cwd only if it
+    is Claude. folder is None when it is not (ancestor is then its comm, or
+    None when the walk reached no non-shell). Any read failing raises."""
+    pid = os.getppid()
+    for _ in range(_HEADER_WALK_STEPS):
+        if pid <= 0:
+            return None, None, None
+        comm, ppid = _proc_comm_ppid(pid)
+        argv0 = _proc_argv0_base(pid)
+        if comm.lstrip("-") in _HEADER_WALK_SHELLS or argv0 in _HEADER_WALK_SHELLS:
+            pid = ppid
+            continue
+        if comm == "claude" or argv0 == "claude":
+            return os.readlink(f"/proc/{pid}/cwd"), comm, pid
+        return None, comm, None
+    return None, None, None
+
+
 def _agent_key_header_action(args: argparse.Namespace) -> int:
     """`agent-key header`: print the lane's key header, or {} — and log why.
 
@@ -5849,11 +5893,33 @@ def _agent_key_header_action(args: argparse.Namespace) -> int:
         "key_dir": None,
         "module": str(pathlib.Path(__file__).resolve().parent),
         "reason": "no identity",
+        "cwd_source": "getcwd",
+        "ancestor": None,
+        "claude_pid": "unset" if not os.environ.get("CLAUDE_PID") else "mismatch",
     }
     headers: dict[str, str] = {}
     try:
         line["key_dir"] = str(_state_dir() / "agent-keys")
-        cwd = os.getcwd()
+        cwd = None
+        # Only a connection's helper walks (F60), and --name still wins.
+        # CLAUDE_PID never chooses: a nested session's helper inherits the
+        # outer session's, so it is only compared with the Claude found.
+        if not args.name and os.environ.get("CLAUDE_CODE_MCP_SERVER_NAME"):
+            try:
+                folder, ancestor, claude = _header_session_folder()
+            except Exception:  # noqa: BLE001 - any read failing: getcwd
+                folder, ancestor, claude = None, None, None
+            if ancestor is not None:
+                line["ancestor"] = ancestor.encode("unicode_escape").decode("ascii")[:15]
+            if folder is not None:
+                cwd = folder
+                line["cwd_source"] = "ancestor"
+                if os.environ.get("CLAUDE_PID"):
+                    line["claude_pid"] = (
+                        "match" if os.environ["CLAUDE_PID"].strip() == str(claude)
+                        else "mismatch")
+        if cwd is None:
+            cwd = os.getcwd()
         line["cwd"] = cwd
         # _resolve_agent_identity's order, kept here so the source is known.
         if args.name:
