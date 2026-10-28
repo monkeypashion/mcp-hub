@@ -6788,55 +6788,26 @@ def create_server(db_path: Path = DB_PATH, host: str = "0.0.0.0", port: int = 80
 # CLI
 # ---------------------------------------------------------------------------
 
-# 🔴 A VERB REGISTERED IN cli.py's PARSER BUT MISSING HERE IS UNREACHABLE.
-# This set is the door: `mcp-hub <verb>` only delegates to the client CLI when
-# the verb is listed, so a parser entry alone gets "unrecognized arguments"
-# from the SERVER's parser — a message that names neither the real cause nor
-# this file. Same shape as the hold verb the hub could write and the edge
-# could not execute (2026-09-01): one vocabulary, two registries, and nothing
-# reporting the gap. tests/test_cli_subcommands_reachable.py pins them equal.
-_CLI_SUBCOMMANDS = {
-    "send",
-    "stop-hook",
-    "session-start",
-    "session-rewake",
-    "agent-key",
-    "heartbeat-daemon",
-    "onboard",
-    "memory-export",
-    "memory-import",
-    "memory-verify",
-    "transport-history",
-    "identity",
-    "settings",
-    "board",
-    "mute",
-    "rebind-url",
-    "edge",
-    "workspaces",
-    "seats",
-    "placements",
-    "capsules",
-    "squads",
-    "machines",
-    "focus",
-    "seat-entry",
-    # Container-side /voice. Must be here or the `mcp-hub` console script
-    # silently treats it as a server flag and never forwards it — which is
-    # exactly what the reachability test caught.
-    "voice-client",
-    # Host-side /voice, same reachability requirement.
-    "voice-host",
-    # The hibernation scanner (bar 59). Same reachability requirement: a verb
-    # missing here ships INERT, read as a server flag and refused.
-    "hibernate",
-    # The daily load meter (v2-fleet F1). The logic lives in load_meter.py,
-    # which the server never imports: this entry only forwards the verb.
-    "load-meter",
-    # The per-lane doorbell (v2-fleet F54). Logic in lane_doorbell.py; the
-    # server only forwards the verb.
-    "lane-doorbell",
-}
+# 🔴 THE CLI's VERBS ARE THE ONES cli.build_parser() DEFINES — no list here.
+# This used to be a hand-kept set, and a verb registered in the parser but
+# missing from it (lane-doorbell; rebind-url and hibernate before it) got "unrecognized
+# arguments" from the SERVER's parser, naming neither cause nor file.
+# `_CLI_SUBCOMMANDS` stays importable, derived on first read by the module
+# __getattr__ below, never at import: building the parser imports load_meter,
+# which the server must not import.
+def _cli_verbs() -> set[str]:
+    from . import cli
+
+    for action in cli.build_parser()._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return set(action.choices)
+    return set()
+
+
+def __getattr__(name: str) -> Any:
+    if name == "_CLI_SUBCOMMANDS":
+        return _cli_verbs()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # How long a stopping hub waits for open connections before cutting them.
@@ -6874,9 +6845,13 @@ def main():
     # server, preserving backward compatibility with existing invocations
     # (e.g. the Dockerfile CMD).
     import sys as _sys
-    if len(_sys.argv) > 1 and _sys.argv[1] in _CLI_SUBCOMMANDS:
-        from .cli import main as cli_main
-        _sys.exit(cli_main(_sys.argv[1:]))
+    # A first word that is not a flag is a verb candidate; only then does the
+    # server import the CLI (and so load_meter) to learn the verbs.
+    _first = _sys.argv[1] if len(_sys.argv) > 1 else ""
+    _wants_help = any(a in ("-h", "--help") for a in _sys.argv[1:])
+    if _first and not _first.startswith("-") and _first in _cli_verbs():
+        from . import cli as _cli
+        _sys.exit(_cli.main(_sys.argv[1:]))
 
     # 🔴 ADVERTISE THE SUBCOMMANDS. The console script is this module, so
     # `mcp-hub --help` renders THIS parser — which knows nothing about the 24
@@ -6885,9 +6860,9 @@ def main():
     # FOUND without already knowing its name (operator, 2026-08-08: "is it all
     # captured in cli args with proper help?" — it was not).
     #
-    # Built from `_CLI_SUBCOMMANDS` rather than typed out, so a verb cannot be
-    # added to the dispatch set and stay invisible here.
-    _verbs = "  ".join(sorted(_CLI_SUBCOMMANDS))
+    # Built from the CLI parser's verbs rather than typed out, so a verb cannot
+    # be added and stay invisible here. Only rendered when help is asked for.
+    _verbs = "  ".join(sorted(_cli_verbs())) if _wants_help else "(see --help)"
     parser = argparse.ArgumentParser(
         prog="mcp-hub",
         description="MCP Hub — the server, plus this machine's utility CLI",

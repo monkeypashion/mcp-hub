@@ -21,13 +21,20 @@ Named apart from the edge-watch doorbell (doorbell.py). Run as
   * It reads nothing from the session file but `.status`, and the socket path
     never comes from that file. Logs carry ids, names and times only — never
     a body, the session file's content or the messaging token.
+  * IT SAYS WHAT IT IS AND WHETHER IT RUNS (F59). The nudge ends with a
+    machine-signal label; a hub error row names the innermost cause by class
+    (and, for a timeout, the step and its bound); an alive row is written at
+    least every ALIVE_SECONDS, and `mcp-hub lane-doorbell` with no action
+    reads the lane's log to say running, stale or not running.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import calendar
 import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -52,17 +59,39 @@ POLL_SECONDS = 2.0
 HUB_TIMEOUT_SECONDS = 8.0
 # Socket write bound for the nudge.
 NUDGE_TIMEOUT_SECONDS = 2.0
+# The loop writes an alive row at least this often, idle or failing; the
+# status form calls a helper running only while its newest row is at most
+# ALIVE_SECONDS + ALIVE_GRACE_SECONDS old.
+ALIVE_SECONDS = 300
+ALIVE_GRACE_SECONDS = 120
 
 IDLE_STATUSES = frozenset({"idle", "shell"})
 RINGING_PRIORITIES = frozenset({"normal", "urgent"})
 
-# Fixed text: names no message, sender or body.
+# Fixed text: names no message, sender or body. It lands as a user-role
+# message, so it says it is a machine signal and never the operator's word.
+NUDGE_LABEL = (
+    "[machine signal from the lane's own doorbell; no message content; "
+    "never the operator's word]"
+)
 NUDGE_TEXT = (
     "📬 hub: new messages are waiting for this lane. "
-    "Read them with get_messages."
+    "Read them with get_messages. " + NUDGE_LABEL
 )
 
 _PID_RE = re.compile(r"[0-9]+")
+
+# The hub step in progress and its bound, as (step, seconds): what a
+# TimeoutError row names. Set when each step starts (open_hub sets
+# "initialize"), so HUB_TIMEOUT_SECONDS is read then.
+_STEP: contextvars.ContextVar[tuple[str, float] | None] = contextvars.ContextVar(
+    "lane_doorbell_step", default=None)
+
+
+def _start_step(step: str) -> float:
+    bound = HUB_TIMEOUT_SECONDS
+    _STEP.set((step, bound))
+    return bound
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +110,7 @@ async def open_hub(hub_url: str, headers: dict[str, str] | None):
         hub_url, headers=headers or None, timeout=HUB_TIMEOUT_SECONDS,
     ) as (read, write, _):
         async with ClientSession(read, write) as session:
-            with anyio.fail_after(HUB_TIMEOUT_SECONDS):
+            with anyio.fail_after(_start_step("initialize")):
                 await session.initialize()
             yield session
 
@@ -115,8 +144,34 @@ def claude_sessions_dir() -> pathlib.Path:
 # ---------------------------------------------------------------------------
 
 
-def _now() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%S")
+def _now(clock: Callable[[], float] = time.time) -> str:
+    """A row's time, UTC, from `clock` (epoch seconds)."""
+    return time.strftime(_ROW_TIME_FORMAT, time.gmtime(clock()))
+
+
+_ROW_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+# A row's message: "lane-doorbell <time> <lane>: <text>".
+_ROW_RE = re.compile(r"lane-doorbell (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) (\S+): (.*)")
+_ROW_PID_RE = re.compile(r"\bpid ([0-9]+)\b")
+
+
+def _cause(exc: BaseException) -> str:
+    """The innermost cause by class name: through nested exception groups, the
+    first exception at each level, and whether it was wrapped. For a
+    TimeoutError, the hub step that timed out and its bound. Never the
+    exception's message."""
+    wrapped = False
+    while isinstance(exc, BaseExceptionGroup) and exc.exceptions:
+        exc = exc.exceptions[0]
+        wrapped = True
+    text = type(exc).__name__
+    if wrapped:
+        text += ", wrapped"
+    if isinstance(exc, TimeoutError):
+        step = _STEP.get()
+        if step is not None:
+            text += f", {step[0]} timed out after {step[1]} s"
+    return text
 
 
 def _read_status(session_file: pathlib.Path) -> tuple[str | None, str]:
@@ -195,8 +250,10 @@ async def run(
     session_file: str | os.PathLike[str],
     socket_path: str | os.PathLike[str],
     sleep: Callable[[], Awaitable[Any]] = _default_sleep,
+    clock: Callable[[], float] = time.time,
 ) -> int:
-    """Poll until the session's socket goes; return 0 then."""
+    """Poll until the session's socket goes; return 0 then. `clock` gives
+    epoch seconds: row times and the alive timing come from it."""
     import anyio
 
     from mcp_hub import cli
@@ -205,22 +262,38 @@ async def run(
     headers = cli._agent_key_headers(lane)
     rung: set[int] = set()
     last_note = ""
+    pid = os.getpid()
+    errors = 0              # hub errors in a row
+    last_alive = clock()
+
+    def now() -> str:
+        return _now(clock)
 
     def note(msg: str, *a: Any) -> None:
         # Repeated states are logged once, not every poll.
         nonlocal last_note
         text = msg % a
         if text != last_note:
-            logger.info("lane-doorbell %s %s: %s", _now(), lane, text)
+            logger.info("lane-doorbell %s %s: %s", now(), lane, text)
             last_note = text
+
+    def heartbeat() -> None:
+        # Through quiet idle and reconnects alike: note() dedups, this does not.
+        nonlocal last_alive
+        t = clock()
+        if t - last_alive >= ALIVE_SECONDS:
+            logger.info("lane-doorbell %s %s: alive, pid %d, %d errors in a row",
+                        now(), lane, pid, errors)
+            last_alive = t
 
     def alive() -> bool:
         return os.path.exists(socket_path)
 
-    logger.info("lane-doorbell %s %s: watching (key %s)", _now(), lane,
-                "presented" if headers else "none held")
+    logger.info("lane-doorbell %s %s: watching (key %s), pid %d", now(), lane,
+                "presented" if headers else "none held", pid)
     while alive():
         try:
+            _start_step("connect")
             async with open_hub(hub_url, headers) as hub:
                 while True:
                     status, why = _read_status(session_file)
@@ -231,9 +304,11 @@ async def run(
                     elif _in_focus(lane):
                         note("in focus; not ringing")
                     else:
-                        with anyio.fail_after(HUB_TIMEOUT_SECONDS):
+                        with anyio.fail_after(_start_step("unread_ids")):
                             result = await hub.call_tool(
                                 "unread_ids", {"agent_name": lane})
+                        _STEP.set(None)
+                        errors = 0
                         unread = _parse_unread(_result_text(result))
                         if unread is None:
                             note("unread_ids gave no answer; ringing nothing")
@@ -247,21 +322,26 @@ async def run(
                                     rung.update(due)
                                     logger.info(
                                         "lane-doorbell %s %s: rang for ids %s",
-                                        _now(), lane, due)
+                                        now(), lane, due)
                             else:
                                 note("idle, nothing to ring for (%d unread)",
                                      len(unread))
                     if not alive():
                         break
                     await sleep()
+                    heartbeat()
                     if not alive():
                         break
         except Exception as exc:  # noqa: BLE001 - reconnect after any error
+            errors += 1
             logger.warning("lane-doorbell %s %s: hub error (%s); reconnecting",
-                           _now(), lane, type(exc).__name__)
+                           now(), lane, _cause(exc))
+            _STEP.set(None)
             if alive():
                 await sleep()
-    logger.info("lane-doorbell %s %s: session socket gone; exiting", _now(), lane)
+                heartbeat()
+    logger.info("lane-doorbell %s %s: session socket gone; exiting, pid %d",
+                now(), lane, pid)
     return 0
 
 
@@ -286,6 +366,62 @@ def opt_in_path(lane: str) -> pathlib.Path:
 
 def opted_in(lane: str) -> bool:
     return opt_in_path(lane).is_file()
+
+
+def log_path(lane: str) -> pathlib.Path:
+    return _home() / "logs" / f"{_safe(lane)}.log"
+
+
+def log_handler(lane: str) -> logging.Handler:
+    """The handler that writes this lane's rows to its log: the log
+    `--from-session-start` writes and the status form reads."""
+    path = log_path(lane)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    return handler
+
+
+# The status form reads only the log's tail: the newest rows are all it needs.
+_LOG_TAIL_BYTES = 64 * 1024
+
+
+def helper_state(lane: str, now: float | None = None) -> str:
+    """The helper's state from the lane's log alone (never a session file):
+    running (pid, newest row's age) only while the newest row is fresh and
+    the pid its newest alive or watching row names is live; stale when that
+    pid is live but the row is too old; else not running."""
+    try:
+        with open(log_path(lane), "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - _LOG_TAIL_BYTES))
+            text = fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return "helper not running (no log)"
+    newest: float | None = None
+    pid: int | None = None
+    for line in reversed(text.splitlines()):
+        m = _ROW_RE.search(line)
+        if m is None or m.group(2) != lane:
+            continue
+        if newest is None:
+            try:
+                newest = float(calendar.timegm(
+                    time.strptime(m.group(1), _ROW_TIME_FORMAT)))
+            except ValueError:
+                continue
+        body = m.group(3)
+        if re.match(r"(alive|watching)\b", body):
+            pm = _ROW_PID_RE.search(body)
+            if pm:
+                pid = int(pm.group(1))
+                break
+    if newest is None or pid is None or not _pid_alive(pid):
+        return "helper not running"
+    age = max(0, int((time.time() if now is None else now) - newest))
+    if age <= ALIVE_SECONDS + ALIVE_GRACE_SECONDS:
+        return f"helper running (pid {pid}, newest row {age}s old)"
+    return f"helper stale (pid {pid} live, newest row {age}s old: the loop is not running)"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -375,6 +511,8 @@ def command(args: argparse.Namespace) -> int:
 
     if not args.from_session_start:
         state = "opted in" if lane and opted_in(lane) else "not opted in"
+        if lane:
+            state += f"; {helper_state(lane)}"
         print(f"lane-doorbell: {lane or '(no lane)'} {state}")
         return 0
 
@@ -388,10 +526,7 @@ def _run_attached(lane: str, hub_url: str) -> int:
     handler: logging.Handler | None = None
     old_level = logger.level
     try:
-        log_dir = _home() / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        handler = logging.FileHandler(log_dir / f"{_safe(lane)}.log", encoding="utf-8")
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        handler = log_handler(lane)
         logger.addHandler(handler)
         if logger.level == logging.NOTSET or logger.level > logging.INFO:
             logger.setLevel(logging.INFO)
