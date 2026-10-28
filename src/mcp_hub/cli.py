@@ -5425,14 +5425,9 @@ def _discover_agent_from_marker(cwd: str | None) -> tuple[str | None, str | None
     if not cwd:
         return None, None
     marker = pathlib.Path(cwd) / AGENT_MARKER_PATH
-    # ANY marker that cannot be read as a JSON object names no lane, and the
-    # reader never raises: not UTF-8, [], "x", 42, null and true each once
-    # broke that folder's hooks and its hub connection (F56).
     try:
         data = json.loads(marker.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001 - incl. UnicodeDecodeError, RecursionError
-        return None, None
-    if not isinstance(data, dict):
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         return None, None
     name = data.get("name")
     project = data.get("project")
@@ -5807,93 +5802,6 @@ async def _claim_agent_key(hub_url: str, name: str) -> str:
             return _extract_text(result)
 
 
-# One JSON line per `agent-key header` run (F58): which branch the
-# headersHelper took and why, so "0 headers" at a relaunch can be read off the
-# lane's machine. Never the key, any part of it, a key file's content or an
-# exception's message: only the reason, from a fixed set.
-AGENT_KEY_HEADER_LOG = "agent-key-header.jsonl"
-AGENT_KEY_HEADER_LOG_LIMIT = 256 * 1024
-
-
-def _agent_key_header_log(line: dict[str, Any]) -> None:
-    """Append `line` to <state>/agent-key-header.jsonl (0600), moving a log
-    over the limit to .1 first. A line that cannot be written is dropped
-    silently: the log must never change what the header prints or its rc."""
-    try:
-        path = _state_dir() / AGENT_KEY_HEADER_LOG
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.is_file() and path.stat().st_size > AGENT_KEY_HEADER_LOG_LIMIT:
-            os.replace(path, path.with_name(AGENT_KEY_HEADER_LOG + ".1"))
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        with os.fdopen(fd, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(line) + "\n")
-    except Exception:  # noqa: BLE001 - dropped silently, by design
-        pass
-
-
-def _agent_key_header_action(args: argparse.Namespace) -> int:
-    """`agent-key header`: print the lane's key header, or {} — and log why.
-
-    A headersHelper runs in the lane's folder with no hook payload on stdin
-    (and may hold it open), so stdin is NEVER read: the lane is --name, else
-    the folder's derived identity, else its marker. No identity there means
-    no key: `{}`, never an error, or the connection itself would fail — and
-    an unexpected exception prints `{}` too, logged by its class alone.
-    """
-    line: dict[str, Any] = {
-        "time": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-        "cwd": None,
-        "pwd": os.environ.get("PWD"),
-        "source": "none",
-        "name": None,
-        "key_dir": None,
-        "module": str(pathlib.Path(__file__).resolve().parent),
-        "reason": "no identity",
-    }
-    headers: dict[str, str] = {}
-    try:
-        line["key_dir"] = str(_state_dir() / "agent-keys")
-        cwd = os.getcwd()
-        line["cwd"] = cwd
-        # _resolve_agent_identity's order, kept here so the source is known.
-        if args.name:
-            name, source = args.name, "--name"
-        else:
-            name, _project = _derive_agent_identity(cwd)
-            source = "derived"
-            if name is None:
-                name, _project = _discover_agent_from_marker(cwd)
-                source = "marker" if name is not None else "none"
-        line["source"] = source
-        if name is not None:
-            # A not-plain name is free text: escaped, and cut to 64 characters.
-            line["name"] = name.encode("unicode_escape").decode("ascii")[:64]
-            path = _agent_key_file(name)
-            if path is None:
-                line["reason"] = "not plain"
-            else:
-                try:
-                    key = path.read_text(encoding="utf-8").strip()
-                except FileNotFoundError:
-                    line["reason"] = "no key file"
-                except UnicodeDecodeError:
-                    line["reason"] = "malformed"
-                except OSError:
-                    line["reason"] = "unreadable"
-                else:
-                    if _WELL_FORMED_KEY.fullmatch(key):
-                        headers = {AGENT_KEY_HEADER: key}
-                        line["reason"] = "key"
-                    else:
-                        line["reason"] = "malformed"
-    except Exception as exc:  # noqa: BLE001 - the connection must not fail
-        headers = {}
-        line["reason"] = f"error: {type(exc).__name__}"
-    print(json.dumps(headers))
-    _agent_key_header_log(line)
-    return 0
-
-
 def agent_key_command(args: argparse.Namespace) -> int:
     """`agent-key ensure`: hold this lane's hub-minted key (MH-H1).
     `agent-key header`: print it as a headers JSON object (headersHelper).
@@ -5907,7 +5815,9 @@ def agent_key_command(args: argparse.Namespace) -> int:
         # --name, else the folder's derived identity, else its marker. No
         # identity there means no key: `{}`, never an error, or the
         # connection itself would fail.
-        return _agent_key_header_action(args)
+        name, _project = _resolve_agent_identity(args, {"cwd": os.getcwd()})
+        print(json.dumps(_agent_key_headers(name)))
+        return 0
     payload: dict[str, Any] = {} if args.name else _read_hook_stdin()
     name, _project = _resolve_agent_identity(args, payload)
     if name is None:
@@ -8191,15 +8101,6 @@ def _add_hibernate_parser(sub: Any) -> None:
                      help="Operator token (default: $MCP_HUB_API_TOKEN, then "
                           "~/.mcp-hub/api.token). An empty value is refused, "
                           "never replaced by the one on disk")
-    hib.set_defaults(handler=hibernate_command)
-
-
-def _board_command(args: argparse.Namespace) -> int:
-    # `board` IS the panel: settings --tui wearing the screen's real name.
-    args.tui = True
-    args.cwd = None
-    args.json = False
-    return settings_command(args)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -8207,10 +8108,6 @@ def build_parser() -> argparse.ArgumentParser:
         prog="mcp-hub",
         description="MCP Hub — server + utility CLI",
     )
-    # 🔴 THIS PARSER IS THE ONLY LIST OF VERBS. Each verb's parser carries its
-    # handler (set_defaults(handler=fn), called as fn(args) -> rc); main runs
-    # it, and server.main dispatches on the verbs defined here. A verb added
-    # without a handler fails loudly in main, never a help screen with rc 0.
     sub = parser.add_subparsers(dest="subcommand")
 
     stop_hook = sub.add_parser(
@@ -8226,7 +8123,6 @@ def build_parser() -> argparse.ArgumentParser:
             "on hub errors or missing markers."
         ),
     )
-    stop_hook.set_defaults(handler=stop_hook_command)
     stop_hook.add_argument(
         "--name",
         default=None,
@@ -8259,7 +8155,6 @@ def build_parser() -> argparse.ArgumentParser:
             "no-op if no marker found."
         ),
     )
-    session_start.set_defaults(handler=session_start_command)
     session_start.add_argument(
         "--name",
         default=None,
@@ -8287,7 +8182,6 @@ def build_parser() -> argparse.ArgumentParser:
             "...} for a headersHelper. The key is never placed by hand."
         ),
     )
-    agent_key.set_defaults(handler=agent_key_command)
     agent_key.add_argument("action", choices=["ensure", "header"])
     agent_key.add_argument("--name", default=None)
     agent_key.add_argument("--project", default=None)
@@ -8308,7 +8202,6 @@ def build_parser() -> argparse.ArgumentParser:
             "still drives the register on first prompt."
         ),
     )
-    session_rewake.set_defaults(handler=session_rewake_command)
     session_rewake.add_argument(
         "--name",
         default=None,
@@ -8331,7 +8224,6 @@ def build_parser() -> argparse.ArgumentParser:
             "self-heal take it from there."
         ),
     )
-    onboard.set_defaults(handler=onboard_command)
     onboard.add_argument(
         "--path",
         default=None,
@@ -8348,7 +8240,6 @@ def build_parser() -> argparse.ArgumentParser:
             "memory-import. Filenames preserved verbatim."
         ),
     )
-    mem_export.set_defaults(handler=memory_export_command)
     mem_export.add_argument("--path", default=None, help="Repo path (default: cwd).")
     mem_export.add_argument(
         "--hub-url",
@@ -8367,7 +8258,6 @@ def build_parser() -> argparse.ArgumentParser:
             "clobbered."
         ),
     )
-    mem_import.set_defaults(handler=memory_import_command)
     mem_import.add_argument("--path", default=None, help="Repo path (default: cwd).")
     mem_import.add_argument(
         "--force", action="store_true",
@@ -8400,7 +8290,6 @@ def build_parser() -> argparse.ArgumentParser:
             "files not in the staged set are reported as extras."
         ),
     )
-    mem_verify.set_defaults(handler=memory_verify_command)
     mem_verify.add_argument("--path", default=None, help="Repo path (default: cwd).")
     mem_verify.add_argument(
         "--hub-url",
@@ -8421,7 +8310,6 @@ def build_parser() -> argparse.ArgumentParser:
             "transient hub errors."
         ),
     )
-    heartbeat.set_defaults(handler=heartbeat_daemon_command)
     heartbeat.add_argument(
         "--name",
         default=None,
@@ -8452,7 +8340,6 @@ def build_parser() -> argparse.ArgumentParser:
             "statusline read `hub ?`."
         ),
     )
-    ident.set_defaults(handler=identity_command)
     ident.add_argument("--cwd", default=None, help="Worktree (default: current directory)")
     ident.add_argument("--json", action="store_true", help="Emit {name, project, cwd}")
     ident.add_argument(
@@ -8473,7 +8360,6 @@ def build_parser() -> argparse.ArgumentParser:
             "the cockpit extension so a web UI can render the same model."
         ),
     )
-    settings.set_defaults(handler=settings_command)
     settings.add_argument("--cwd", default=None, help="Worktree (default: current directory)")
     settings.add_argument("--json", action="store_true", help="Emit the panel model as JSON")
     settings.add_argument(
@@ -8500,7 +8386,6 @@ def build_parser() -> argparse.ArgumentParser:
             "stay because the cockpit predates the rename."
         ),
     )
-    board.set_defaults(handler=_board_command)
     board.add_argument(
         "--workspace", default=None,
         help="A .code-workspace file to scope the roster to (see `settings --workspace`)",
@@ -8518,7 +8403,6 @@ def build_parser() -> argparse.ArgumentParser:
             "with the workspace eventually."
         ),
     )
-    mute.set_defaults(handler=mute_command)
     mute.add_argument("--agent", required=True, help="Agent whose attention this is")
     mute.add_argument("--squad", required=True, help="Squad to silence or unsilence")
     mute.add_argument("--state", required=True, choices=["hearing", "muted"])
@@ -8537,7 +8421,6 @@ def build_parser() -> argparse.ArgumentParser:
             "structural field still points at the source."
         ),
     )
-    xport_hist.set_defaults(handler=transport_history_command)
     xport_hist.add_argument("--from-cwd", required=True, help="Source worktree (absolute)")
     xport_hist.add_argument("--to-cwd", required=True, help="Destination worktree (absolute)")
     xport_hist.add_argument(
@@ -8566,7 +8449,6 @@ def build_parser() -> argparse.ArgumentParser:
             "wake binding through it."
         ),
     )
-    rebind.set_defaults(handler=rebind_url_command)
     rebind.add_argument("--cwd", default=None, help="Worktree (default: current directory)")
     rebind.add_argument(
         "--dry-run", action="store_true", help="Print the rewritten URL; write nothing"
@@ -8590,7 +8472,6 @@ def build_parser() -> argparse.ArgumentParser:
             "silencer you can leave on forever is a silent-drop bug."
         ),
     )
-    focus_p.set_defaults(handler=focus_command)
     send_p = sub.add_parser(
         "send",
         help="Send one DM to another agent (for scripts and sweeps)",
@@ -8601,7 +8482,6 @@ def build_parser() -> argparse.ArgumentParser:
             "stdin, so a multi-line row need not survive shell quoting."
         ),
     )
-    send_p.set_defaults(handler=send_command)
     send_p.add_argument("--to", required=True, help="Recipient agent name")
     send_p.add_argument(
         "--message", required=True,
@@ -8651,7 +8531,6 @@ def build_parser() -> argparse.ArgumentParser:
             "writes it to disk before printing anything."
         ),
     )
-    machines.set_defaults(handler=machines_command)
     machines.add_argument(
         "action", choices=["list", "enrol", "rotate", "rm"],
         help="list: enrolled machines · enrol: add this machine · "
@@ -8696,7 +8575,6 @@ def build_parser() -> argparse.ArgumentParser:
             "you get a ghost row or a feral file."
         ),
     )
-    workspaces.set_defaults(handler=workspaces_command)
     workspaces.add_argument(
         "action", choices=["list", "register", "remove"],
         help="list: the merged view · register: define on the hub · "
@@ -8748,7 +8626,6 @@ def build_parser() -> argparse.ArgumentParser:
             "must not be able to name a seat."
         ),
     )
-    seats.set_defaults(handler=seats_command)
     seats.add_argument(
         "action",
         choices=["list", "add", "rm", "restore", "logs", "update", "clone"],
@@ -8885,7 +8762,6 @@ def build_parser() -> argparse.ArgumentParser:
             "check first, not the hub."
         ),
     )
-    placements.set_defaults(handler=placements_command)
     placements.add_argument(
         "action", choices=["list", "set", "reclaim", "unplace", "move"],
         help="list · set: running|stopped|ran · reclaim: harvest then DESTROY "
@@ -8956,7 +8832,6 @@ def build_parser() -> argparse.ArgumentParser:
             "reconciliation."
         ),
     )
-    edge.set_defaults(handler=edge_command)
     edge.add_argument(
         "action", choices=["apply", "watch"],
         help="apply: one reconcile pass · watch: hold the hub's doorbell "
@@ -9000,7 +8875,6 @@ def build_parser() -> argparse.ArgumentParser:
             "runs until that machine's edge pass realizes them."
         ),
     )
-    capsules.set_defaults(handler=capsules_command)
     capsules.add_argument(
         "action", choices=["list", "compose", "place", "attach", "rm"],
         help=("list · compose: freeze a squad · place: one placement per seat "
@@ -9060,7 +8934,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    squads.set_defaults(handler=squads_command)
     squads.add_argument(
         "action",
         choices=["list", "create", "rm", "rename", "members",
@@ -9124,7 +8997,6 @@ def build_parser() -> argparse.ArgumentParser:
             "Never binds a port. Never fails a seat."
         ),
     )
-    voice_client.set_defaults(handler=voice_client_command)
     voice_client.add_argument("--seat", default="",
                               help="Override SEAT_IDENTITY (tests/manual runs)")
     voice_client.add_argument("--port", type=int, default=_VOICE_PORT,
@@ -9140,7 +9012,6 @@ def build_parser() -> argparse.ArgumentParser:
             "caller against docker, then streams one way and never reads."
         ),
     )
-    voice_host.set_defaults(handler=voice_host_command)
     voice_host.add_argument("--port", type=int, default=_VOICE_PORT,
                             help=f"Listen port (default {_VOICE_PORT})")
     voice_host.add_argument("--gateway", default="",
@@ -9173,7 +9044,6 @@ def build_parser() -> argparse.ArgumentParser:
             "Idempotent: a container restart re-runs it safely."
         ),
     )
-    seat_entry.set_defaults(handler=seat_entry_command)
     seat_entry.add_argument(
         "--workdir",
         default=None,
@@ -9189,21 +9059,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     # The load meter (v2-fleet F1): read-only, never imported by the server.
     from . import load_meter as _load_meter
-    load_meter_p = sub.add_parser(
-        "load-meter", help="Take one load-meter reading (read-only)")
-    _load_meter.add_arguments(load_meter_p)
-    load_meter_p.set_defaults(handler=lambda a: _load_meter.run(a))
+    _load_meter.add_arguments(
+        sub.add_parser("load-meter", help="Take one load-meter reading (read-only)")
+    )
 
     # The lane doorbell (v2-fleet F54), named apart from the edge-watch
     # doorbell: rings an idle, opted-in lane for news that may interrupt.
     from . import lane_doorbell as _lane_doorbell
-    lane_doorbell_p = sub.add_parser(
-        "lane-doorbell",
-        help="Per-lane doorbell: opt-in / opt-out, or the SessionStart "
-             "hook's attached helper (--from-session-start)",
+    _lane_doorbell.add_arguments(
+        sub.add_parser(
+            "lane-doorbell",
+            help="Per-lane doorbell: opt-in / opt-out, or the SessionStart "
+                 "hook's attached helper (--from-session-start)",
+        ),
+        DEFAULT_HUB_URL,
     )
-    _lane_doorbell.add_arguments(lane_doorbell_p, DEFAULT_HUB_URL)
-    lane_doorbell_p.set_defaults(handler=lambda a: _lane_doorbell.command(a))
     return parser
 
 
@@ -9223,13 +9093,75 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.subcommand is None:
-        parser.print_help()
-        return 0
-    handler = getattr(args, "handler", None)
-    if handler is None:
-        parser.error(f"verb {args.subcommand!r} has no handler")
-    return handler(args)
+    if args.subcommand == "stop-hook":
+        return stop_hook_command(args)
+    if args.subcommand == "session-start":
+        return session_start_command(args)
+    if args.subcommand == "agent-key":
+        return agent_key_command(args)
+    if args.subcommand == "session-rewake":
+        return session_rewake_command(args)
+    if args.subcommand == "heartbeat-daemon":
+        return heartbeat_daemon_command(args)
+    if args.subcommand == "onboard":
+        return onboard_command(args)
+    if args.subcommand == "memory-export":
+        return memory_export_command(args)
+    if args.subcommand == "memory-import":
+        return memory_import_command(args)
+    if args.subcommand == "memory-verify":
+        return memory_verify_command(args)
+    if args.subcommand == "identity":
+        return identity_command(args)
+    if args.subcommand == "settings":
+        return settings_command(args)
+    if args.subcommand == "board":
+        # `board` IS the panel: settings --tui wearing the screen's real name.
+        args.tui = True
+        args.cwd = None
+        args.json = False
+        return settings_command(args)
+    if args.subcommand == "mute":
+        return mute_command(args)
+    if args.subcommand == "transport-history":
+        return transport_history_command(args)
+    if args.subcommand == "rebind-url":
+        return rebind_url_command(args)
+    if args.subcommand == "edge":
+        return edge_command(args)
+    if args.subcommand == "workspaces":
+        return workspaces_command(args)
+    if args.subcommand == "seats":
+        return seats_command(args)
+    if args.subcommand == "placements":
+        return placements_command(args)
+    if args.subcommand == "capsules":
+        return capsules_command(args)
+    if args.subcommand == "squads":
+        return squads_command(args)
+    if args.subcommand == "machines":
+        return machines_command(args)
+    if args.subcommand == "send":
+        return send_command(args)
+    if args.subcommand == "focus":
+        return focus_command(args)
+    if args.subcommand == "voice-client":
+        return voice_client_command(args)
+    if args.subcommand == "voice-host":
+        return voice_host_command(args)
+    if args.subcommand == "seat-entry":
+        return seat_entry_command(args)
+    if args.subcommand == "hibernate":
+        return hibernate_command(args)
+    if args.subcommand == "load-meter":
+        from . import load_meter
+        return load_meter.run(args)
+    if args.subcommand == "lane-doorbell":
+        from . import lane_doorbell
+        return lane_doorbell.command(args)
+
+    parser.print_help()
+    return 0
 
 
 if __name__ == "__main__":
